@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, Notify, oneshot};
 
 use crate::audit_effort;
 use crate::cli::Cli;
-use crate::ipc_log::IpcLogger;
 use crate::completion::{
     CommandPrDetector, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
@@ -21,6 +20,11 @@ use crate::coordinator::{
     CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
 };
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
+use crate::external_tracker::github_oauth::{
+    DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore,
+    probe_and_record_org_state,
+};
+use crate::ipc_log::IpcLogger;
 use crate::live_status_loop::{
     LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger,
 };
@@ -33,10 +37,7 @@ use crate::protocol::{
     InterruptWorkerPaneInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
     RevealWorkItemInput, SendToPaneInput, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
     TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
-    magic_wand_dispatch_topic, execution_topic, probe_topic, work_product_topic,
-};
-use crate::external_tracker::github_oauth::{
-    DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
+    execution_topic, magic_wand_dispatch_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -46,6 +47,44 @@ use crate::work::{
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
 use tokio::time::{Duration, timeout};
+
+mod attentions;
+mod automations;
+mod ci_remediation;
+mod comments;
+mod conflict_resolution;
+mod dependencies;
+mod effort;
+mod engine_meta;
+mod executions;
+mod external_tracker;
+mod github_auth;
+mod live_status;
+mod metrics;
+mod panes;
+mod products;
+mod projects;
+mod review;
+mod sessions;
+mod subscriptions;
+mod work_items;
+
+/// Per-request handler context: the connection-scoped state every
+/// [`FrontendRequest`] handler needs. Built once per request in
+/// [`handle_frontend_connection`] and consumed by the dispatched handler.
+/// Bundling these into one struct keeps the dispatch match a thin
+/// alphabetical table of `Variant => module::handler(ctx, r)` arms so
+/// concurrent PRs adding new requests don't all collide at the tail.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct Dispatch {
+    server_state: Arc<ServerState>,
+    work_db: Arc<WorkDb>,
+    sink: Arc<SessionSink>,
+    session_id: String,
+    request_id: String,
+    peer_pid: Option<libc::pid_t>,
+}
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/boss-engine.sock";
 const DEFAULT_PID_PATH: &str = "/tmp/boss-engine.pid";
@@ -459,7 +498,8 @@ struct ServerState {
     /// Resolves credentials for external-tracker sync. Uses
     /// `KeychainOAuthResolver` in production so a stored OAuth token
     /// takes precedence over ambient `gh` auth.
-    tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver>,
+    tracker_credential_resolver:
+        Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver>,
     /// Shared kick signal for the merge-poller loop. The macOS app
     /// fires [`FrontendRequest::KickPrReconcilers`] on window
     /// activation; the handler calls `notify_one()` here so the
@@ -635,9 +675,7 @@ impl ServerState {
         // Logged at `info` for the happy path so a `grep "live_status:"`
         // sweep still shows the engine made a decision.
         if anthropic_api_key.is_some() {
-            tracing::info!(
-                "live_status: ANTHROPIC_API_KEY is configured; summarizer enabled",
-            );
+            tracing::info!("live_status: ANTHROPIC_API_KEY is configured; summarizer enabled",);
         } else {
             tracing::error!(
                 "live_status: ANTHROPIC_API_KEY is NOT configured — \
@@ -807,10 +845,13 @@ impl ServerState {
         );
         let github_auth_for_state = Arc::new(github_auth_controller);
 
-        let tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver> =
-            Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
+        let tracker_credential_resolver: Arc<
+            dyn crate::external_tracker::credentials::TrackerCredentialResolver,
+        > = Arc::new(
+            crate::external_tracker::credentials::KeychainOAuthResolver::new(
                 crate::external_tracker::github_oauth::KeychainTokenStore::new(),
-            ));
+            ),
+        );
         let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -867,9 +908,8 @@ impl ServerState {
             // execution transitions to `running`, the completion
             // handler captures the bound chore PR's head SHA into
             // `work_executions.pr_head_before`.
-            execution_coordinator_inner.set_execution_started_hook(
-                completion_handler_for_coordinator.clone(),
-            );
+            execution_coordinator_inner
+                .set_execution_started_hook(completion_handler_for_coordinator.clone());
             let execution_coordinator = Arc::new(execution_coordinator_inner);
 
             ServerState {
@@ -887,15 +927,11 @@ impl ServerState {
                 dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new(
                     metrics_for_dispatcher,
                 )),
-                transcript_path_cache: Arc::new(
-                    crate::live_status_loop::TranscriptPathCache::new(),
-                ),
+                transcript_path_cache: Arc::new(crate::live_status_loop::TranscriptPathCache::new()),
                 staged_pr_urls,
                 editorial_deny_tracker: Arc::new(crate::editorial_hook::DenyTracker::new()),
                 anthropic_api_key,
-                syspolicyd_health: Arc::new(
-                    crate::syspolicyd_monitor::SyspolicydHealth::new(),
-                ),
+                syspolicyd_health: Arc::new(crate::syspolicyd_monitor::SyspolicydHealth::new()),
                 next_session_id: AtomicU64::new(1),
                 work_revision,
                 app_pid: StdMutex::new(app_pid),
@@ -931,8 +967,7 @@ impl ServerState {
         // counter totals span engine restarts. Failures are logged
         // and the registry is left at zero — better than refusing to
         // start because the metrics table is corrupted.
-        if let Err(err) =
-            crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db)
+        if let Err(err) = crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db)
         {
             tracing::warn!(
                 ?err,
@@ -1157,9 +1192,7 @@ impl ServerState {
                 server.release_worker_pane(&run_id).await;
             });
         }
-        let join_all = async {
-            while set.join_next().await.is_some() {}
-        };
+        let join_all = async { while set.join_next().await.is_some() {} };
         if tokio::time::timeout(total_timeout, join_all).await.is_err() {
             tracing::warn!(
                 timeout_secs = total_timeout.as_secs(),
@@ -1228,14 +1261,15 @@ impl ServerState {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(InterruptPaneError::UnknownRun);
         };
-        let request =
-            EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
+        let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
             Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
                 Err(InterruptPaneError::App(err))
             }
-            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
+            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!(
+                "{other:?}"
+            ))),
             Err(err) => Err(InterruptPaneError::Send(err)),
         }
     }
@@ -1689,11 +1723,7 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
             .await;
     }
 
-    async fn publish_frontend_event_on_product(
-        &self,
-        product_id: &str,
-        event: FrontendEvent,
-    ) {
+    async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
         let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
         let topic = work_product_topic(product_id);
         self.topic_broker
@@ -2301,10 +2331,8 @@ pub async fn serve(
                 token_path = %path.display(),
                 "engine-control token: ready",
             );
-            let guard = crate::engine_control::ControlTokenGuard::new(
-                path.clone(),
-                std::process::id(),
-            );
+            let guard =
+                crate::engine_control::ControlTokenGuard::new(path.clone(), std::process::id());
             (Some(Arc::new(token)), Some(guard))
         }
         None => (None, None),
@@ -2328,8 +2356,10 @@ pub async fn serve(
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Err(anyhow::Error::new(err)
-                .context(format!("failed to remove existing socket {}", socket_path.display())));
+            return Err(anyhow::Error::new(err).context(format!(
+                "failed to remove existing socket {}",
+                socket_path.display()
+            )));
         }
     }
 
@@ -2349,8 +2379,10 @@ pub async fn serve(
                 &socket_path,
                 crate::audit::SocketBindResult::Failed(&msg),
             );
-            return Err(anyhow::Error::new(err)
-                .context(format!("failed to bind unix socket {}", socket_path.display())));
+            return Err(anyhow::Error::new(err).context(format!(
+                "failed to bind unix socket {}",
+                socket_path.display()
+            )));
         }
     };
 
@@ -2459,10 +2491,8 @@ pub async fn serve(
             None,
         );
         if let Some(home) = std::env::var_os("HOME") {
-            let stable_bin_dir =
-                PathBuf::from(home).join("Library/Application Support/Boss/bin");
-            match crate::runner::install_boss_event_to_stable_bin(&current_shim, &stable_bin_dir)
-            {
+            let stable_bin_dir = PathBuf::from(home).join("Library/Application Support/Boss/bin");
+            match crate::runner::install_boss_event_to_stable_bin(&current_shim, &stable_bin_dir) {
                 Ok(stable) => {
                     tracing::info!(
                         stable_path = %stable.display(),
@@ -2497,10 +2527,7 @@ pub async fn serve(
         new_path = %stable_boss_event_path.display(),
         "healing boss-event path in worker settings files",
     );
-    crate::worker_setup::heal_worker_settings_json(
-        &worker_settings_dir,
-        &stable_boss_event_path,
-    );
+    crate::worker_setup::heal_worker_settings_json(&worker_settings_dir, &stable_boss_event_path);
 
     // Rehydrate dispatch for any work items that were in "Doing"
     // (status=active) when the engine last shut down but whose
@@ -2747,15 +2774,14 @@ pub async fn serve(
     // the design doc's §"Cadence" rationale (Design Q5). Fires immediately
     // on spawn so any drift accumulated while the engine was offline is
     // reconciled at boot without waiting for the first interval.
-    let _external_tracker_handle =
-        crate::external_tracker::reconcile::spawn_loop(
-            server_state.work_db.clone(),
-            server_state.tracker_registry.clone(),
-            Duration::from_secs(120),
-            server_state.metrics.clone(),
-            server_state.clone(),
-            server_state.tracker_credential_resolver.clone(),
-        );
+    let _external_tracker_handle = crate::external_tracker::reconcile::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.tracker_registry.clone(),
+        Duration::from_secs(120),
+        server_state.metrics.clone(),
+        server_state.clone(),
+        server_state.tracker_credential_resolver.clone(),
+    );
 
     // GitHub OAuth auth-state forwarder: restores any persisted token at boot,
     // then watches the controller's state machine and (a) pushes every
@@ -2832,11 +2858,10 @@ pub async fn serve(
     // hang spent 46s in `worker_claimed` with no event firing
     // because the global threshold hadn't elapsed; a 30s override
     // catches it on the first sweep after the wedge.
-    let stage_thresholds =
-        crate::dispatch_reader::StageThresholds::new(Duration::from_secs(120))
-            .with_override("worker_claimed", Duration::from_secs(30))
-            .with_override("cube_repo_ensured", Duration::from_secs(60))
-            .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
+    let stage_thresholds = crate::dispatch_reader::StageThresholds::new(Duration::from_secs(120))
+        .with_override("worker_claimed", Duration::from_secs(30))
+        .with_override("cube_repo_ensured", Duration::from_secs(60))
+        .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
     let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
         server_state.dispatch_event_root.clone(),
         server_state.dispatch_events.clone(),
@@ -3143,11 +3168,7 @@ fn reap_worker_process_tree(shell_pid: i32, grace: Duration) {
 fn process_group_signal_target(pid: libc::pid_t) -> libc::pid_t {
     // SAFETY: `getpgid` only reads kernel state for `pid`.
     let pgid = unsafe { libc::getpgid(pid) };
-    if pgid > 0 {
-        -pgid
-    } else {
-        pid
-    }
+    if pgid > 0 { -pgid } else { pid }
 }
 
 fn signal_shell_pids(pids: &[libc::pid_t], grace: Duration) {
@@ -3230,7 +3251,10 @@ async fn graceful_shutdown_signal() -> &'static str {
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(err) => {
-            tracing::error!(?err, "failed to install SIGTERM handler; only SIGINT will trigger graceful shutdown");
+            tracing::error!(
+                ?err,
+                "failed to install SIGTERM handler; only SIGINT will trigger graceful shutdown"
+            );
             tokio::signal::ctrl_c().await.ok();
             return "SIGINT";
         }
@@ -3355,9 +3379,7 @@ async fn dispatch_live_worker_state(
         "live_status: hook payload arrived at dispatcher",
     );
     let Some(run_id) = incoming.run_id.as_deref() else {
-        server_state
-            .dispatcher_stats
-            .inc_dropped_missing_run_id();
+        server_state.dispatcher_stats.inc_dropped_missing_run_id();
         tracing::warn!(
             kind = event_kind,
             peer_pid = ?incoming.peer_pid,
@@ -3402,7 +3424,9 @@ async fn dispatch_live_worker_state(
     let (resolved_path, from_cache) = match payload_path {
         Some(path) => {
             server_state.dispatcher_stats.inc_with_transcript_path();
-            let _ = server_state.transcript_path_cache.record_if_unset(run_id, path);
+            let _ = server_state
+                .transcript_path_cache
+                .record_if_unset(run_id, path);
             (Some(path.to_owned()), false)
         }
         None => {
@@ -3528,68 +3552,67 @@ async fn dispatch_live_worker_state(
                             "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
                         );
                     } else {
-                    // Gate the URL against the product's repo before
-                    // staging. Workers running tests can emit fixture
-                    // URLs (e.g. `https://github.com/foo/bar/pull/42`)
-                    // in tool_response.stdout; without this gate those
-                    // bind to the work_item as if they were real PRs.
-                    let execution_id = run_id;
-                    let repo_url_result = server_state
-                        .work_db
-                        .get_execution(execution_id)
-                        .map(|e| e.repo_remote_url);
-                    let valid = match repo_url_result {
-                        Ok(ref repo_url) => {
-                            match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
-                                Ok(()) => true,
-                                Err(reason) => {
+                        // Gate the URL against the product's repo before
+                        // staging. Workers running tests can emit fixture
+                        // URLs (e.g. `https://github.com/foo/bar/pull/42`)
+                        // in tool_response.stdout; without this gate those
+                        // bind to the work_item as if they were real PRs.
+                        let execution_id = run_id;
+                        let repo_url_result = server_state
+                            .work_db
+                            .get_execution(execution_id)
+                            .map(|e| e.repo_remote_url);
+                        let valid = match repo_url_result {
+                            Ok(ref repo_url) => {
+                                match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
+                                    Ok(()) => true,
+                                    Err(reason) => {
+                                        tracing::info!(
+                                            execution_id,
+                                            rejected_url = %pr_url,
+                                            %reason,
+                                            "pr_url_capture: dropping URL — failed product-repo gate",
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    execution_id,
+                                    rejected_url = %pr_url,
+                                    ?err,
+                                    "pr_url_capture: could not load execution to validate URL; dropping for safety",
+                                );
+                                false
+                            }
+                        };
+                        if valid {
+                            let outcome =
+                                server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
+                            match outcome {
+                                crate::pr_url_capture::StagePrUrlOutcome::Staged => {
                                     tracing::info!(
-                                        execution_id,
-                                        rejected_url = %pr_url,
-                                        %reason,
-                                        "pr_url_capture: dropping URL — failed product-repo gate",
+                                        execution_id = run_id,
+                                        pr_url = %pr_url,
+                                        "pr_url_capture: staged PR URL from worker hook stream",
                                     );
-                                    false
+                                }
+                                crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+                                    // Worker emitted another PR URL after
+                                    // already staging one — typically a
+                                    // `gh pr view` follow-up referencing a
+                                    // different PR. First-writer-wins so
+                                    // the original (the worker's own
+                                    // `gh pr create`) is kept.
+                                    tracing::debug!(
+                                        execution_id = run_id,
+                                        pr_url = %pr_url,
+                                        "pr_url_capture: ignoring later URL (already staged for this execution)",
+                                    );
                                 }
                             }
                         }
-                        Err(err) => {
-                            tracing::warn!(
-                                execution_id,
-                                rejected_url = %pr_url,
-                                ?err,
-                                "pr_url_capture: could not load execution to validate URL; dropping for safety",
-                            );
-                            false
-                        }
-                    };
-                    if valid {
-                        let outcome = server_state
-                            .staged_pr_urls
-                            .record_if_unset(run_id, &pr_url);
-                        match outcome {
-                            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
-                                tracing::info!(
-                                    execution_id = run_id,
-                                    pr_url = %pr_url,
-                                    "pr_url_capture: staged PR URL from worker hook stream",
-                                );
-                            }
-                            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
-                                // Worker emitted another PR URL after
-                                // already staging one — typically a
-                                // `gh pr view` follow-up referencing a
-                                // different PR. First-writer-wins so
-                                // the original (the worker's own
-                                // `gh pr create`) is kept.
-                                tracing::debug!(
-                                    execution_id = run_id,
-                                    pr_url = %pr_url,
-                                    "pr_url_capture: ignoring later URL (already staged for this execution)",
-                                );
-                            }
-                        }
-                    }
                     } // else (is_gh_pr_command)
                 }
             }
@@ -3630,7 +3653,12 @@ async fn dispatch_editorial_on_pretooluse(
     use boss_editorial::CompiledRules;
     use std::path::Path;
 
-    let WorkerEvent::PreToolUse { tool_name, tool_input, .. } = &incoming.event else {
+    let WorkerEvent::PreToolUse {
+        tool_name,
+        tool_input,
+        ..
+    } = &incoming.event
+    else {
         return;
     };
     if tool_name != "Bash" {
@@ -3761,7 +3789,10 @@ async fn dispatch_editorial_on_pretooluse(
         .build();
 
     // Emit topic event so subscribers can observe decisions live.
-    let revision = server_state.work_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let revision = server_state
+        .work_revision
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let topic = editorial_actions_topic(&product_id);
     let event = FrontendEvent::TopicEvent {
         topic: topic.clone(),
@@ -3774,7 +3805,10 @@ async fn dispatch_editorial_on_pretooluse(
     };
     server_state
         .topic_broker
-        .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
+        .publish(
+            &topic,
+            FrontendEventEnvelope::push_with_revision(revision, event),
+        )
         .await;
 }
 
@@ -3953,7 +3987,10 @@ async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_id: &str) {
 
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Worker not yet mapped to a slot (spawning) — probe stays queued.
-        tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
+        tracing::debug!(
+            run_id,
+            "probe-if-idle: no slot mapping; probe waits for Stop"
+        );
         return;
     };
     let is_idle = server_state
@@ -4027,10 +4064,7 @@ async fn transcript_offset_for_run(
     server_state: &Arc<ServerState>,
     run_id: &str,
 ) -> (Option<String>, u64) {
-    let path = match server_state
-        .work_db
-        .transcript_path_for_execution(run_id)
-    {
+    let path = match server_state.work_db.transcript_path_for_execution(run_id) {
         Ok(path) => path,
         Err(err) => {
             tracing::debug!(
@@ -4313,4927 +4347,366 @@ async fn handle_frontend_connection(
         let request_id = envelope.request_id.clone();
         let request = envelope.payload;
 
+        let ctx = Dispatch::builder()
+            .server_state(server_state.clone())
+            .work_db(work_db.clone())
+            .sink(sink.clone())
+            .session_id(session_id.clone())
+            .request_id(request_id.clone())
+            .maybe_peer_pid(peer_pid)
+            .build();
         match request {
-            FrontendRequest::Subscribe { topics } => {
-                let topics = server_state
-                    .topic_broker
-                    .subscribe(&session_id, &topics)
-                    .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::Subscribed {
-                        topics,
-                        current_revision: server_state.current_work_revision(),
-                    },
-                );
-            }
-            FrontendRequest::Unsubscribe { topics } => {
-                let topics = server_state
-                    .topic_broker
-                    .unsubscribe(&session_id, &topics)
-                    .await;
-                send_response(&sink, &request_id, FrontendEvent::Unsubscribed { topics });
-            }
-            FrontendRequest::CreateProduct { input } => match work_db.create_product(input) {
-                Ok(product) => {
-                    let item = WorkItem::Product(product);
-                    let revision = publish_work_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        vec![
-                            TOPIC_WORK_PRODUCTS.to_owned(),
-                            work_product_topic(&work_item_id(&item)),
-                        ],
-                        "product_created",
-                        Some(work_item_product_id(&item)),
-                        vec![work_item_id(&item)],
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemCreated { item },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::ListProducts => match work_db.list_products() {
-                Ok(products) => {
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::ProductsList { products },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::ListProjects {
-                product_id,
-                dep_filter,
-            } => {
-                match work_db.list_projects(&product_id, dep_filter.as_ref()) {
-                    Ok(projects) => {
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            server_state.current_work_revision(),
-                            FrontendEvent::ProjectsList {
-                                product_id,
-                                projects,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ListTasks {
-                product_id,
-                project_id,
-                dep_filter,
-                include_deleted,
-            } => match work_db.list_tasks(
-                &product_id,
-                project_id.as_deref(),
-                dep_filter.as_ref(),
-                include_deleted,
-            ) {
-                Ok(tasks) => {
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::TasksList {
-                            product_id,
-                            project_id,
-                            tasks,
-                        },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::ListChores {
-                product_id,
-                dep_filter,
-                include_deleted,
-            } => match work_db.list_chores(&product_id, dep_filter.as_ref(), include_deleted) {
-                Ok(chores) => {
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::ChoresList { product_id, chores },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::GetWorkItem { id } => {
-                // Use resolving variant so callers can pass T-form short ids
-                // (e.g. `T688`) without knowing the product; the DB lookup is
-                // global and short ids are unique across all products.
-                let result = work_db
-                    .get_work_item_resolving_short_id(&id)
-                    .and_then(|opt| {
-                        opt.ok_or_else(|| anyhow::anyhow!("unknown work item: {id}"))
-                    });
-                match result {
-                    Ok(item) => {
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            server_state.current_work_revision(),
-                            FrontendEvent::WorkItemResult { item },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::GetWorkItemByShortId {
-                product_id,
-                short_id,
-            } => match work_db.get_work_item_by_short_id(&product_id, short_id) {
-                Ok(Some(item)) => {
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::WorkItemResult { item },
-                    );
-                }
-                Ok(None) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "no work item with id #{short_id} in product {product_id}"
-                            ),
-                        },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::FindWorkItemsByPr { pr_number } => {
-                match work_db.find_work_items_by_pr(pr_number) {
-                    Ok(matches) => {
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            server_state.current_work_revision(),
-                            FrontendEvent::WorkItemsByPrResult { pr_number, matches },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::CreateProject { input } => match work_db.create_project(input) {
-                Ok(project) => {
-                    let item = WorkItem::Project(project);
-                    let product_id = work_item_product_id(&item);
-                    let revision = publish_work_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        vec![work_product_topic(&product_id)],
-                        "project_created",
-                        Some(product_id),
-                        vec![work_item_id(&item)],
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemCreated { item },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::CreateTask { mut input } => {
-                if input.created_via.is_none() {
-                    input.created_via =
-                        Some(transport_default_created_via(&server_state, &session_id).await);
-                }
-                // A `--repo <slug>` override (e.g. `bduff`) names a
-                // registered cube repo, not a git URL. Resolve it to the
-                // canonical origin now so the durable row is dispatchable
-                // and `cube repo ensure` never sees a bare slug (#861).
-                repo_slug::resolve_repo_slugs(
-                    &server_state.cube_client,
-                    &mut [&mut input.repo_remote_url],
-                )
-                .await;
-                match work_db.create_task(input) {
-                Ok(task) => {
-                    let item = WorkItem::Task(task);
-                    let product_id = work_item_product_id(&item);
-                    let revision = publish_work_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        vec![work_product_topic(&product_id)],
-                        "task_created",
-                        Some(product_id),
-                        vec![work_item_id(&item)],
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemCreated { item },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        duplicate_or_work_error(err),
-                    );
-                }
-            }
-            }
-            FrontendRequest::CreateChore { mut input } => {
-                if input.created_via.is_none() {
-                    input.created_via =
-                        Some(transport_default_created_via(&server_state, &session_id).await);
-                }
-                // Resolve a `--repo <slug>` override to its canonical cube
-                // origin before persisting (#861); see the CreateTask arm.
-                repo_slug::resolve_repo_slugs(
-                    &server_state.cube_client,
-                    &mut [&mut input.repo_remote_url],
-                )
-                .await;
-                match work_db.create_chore(input) {
-                Ok(task) => {
-                    let item = WorkItem::Chore(task);
-                    let product_id = work_item_product_id(&item);
-                    let revision = publish_work_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        vec![work_product_topic(&product_id)],
-                        "chore_created",
-                        Some(product_id),
-                        vec![work_item_id(&item)],
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemCreated { item },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        duplicate_or_work_error(err),
-                    );
-                }
-            }
-            }
-            FrontendRequest::CreateManyTasks { mut input } => {
-                let fallback = transport_default_created_via(&server_state, &session_id).await;
-                for item in &mut input.items {
-                    if item.created_via.is_none() {
-                        item.created_via = Some(fallback.clone());
-                    }
-                }
-                // Resolve any `--repo <slug>` overrides in the batch to
-                // canonical cube origins in a single registry round-trip (#861).
-                {
-                    let mut fields: Vec<&mut Option<String>> =
-                        input.items.iter_mut().map(|i| &mut i.repo_remote_url).collect();
-                    repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut fields).await;
-                }
-                handle_create_many(
-                    work_db.create_many_tasks(input),
-                    "tasks_created",
-                    WorkItem::Task,
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    &sink,
-                )
-                .await;
-            }
-            FrontendRequest::CreateManyChores { mut input } => {
-                let fallback = transport_default_created_via(&server_state, &session_id).await;
-                for item in &mut input.items {
-                    if item.created_via.is_none() {
-                        item.created_via = Some(fallback.clone());
-                    }
-                }
-                // Resolve any `--repo <slug>` overrides in the batch to
-                // canonical cube origins in a single registry round-trip (#861).
-                {
-                    let mut fields: Vec<&mut Option<String>> =
-                        input.items.iter_mut().map(|i| &mut i.repo_remote_url).collect();
-                    repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut fields).await;
-                }
-                handle_create_many(
-                    work_db.create_many_chores(input),
-                    "chores_created",
-                    WorkItem::Chore,
-                    &server_state,
-                    &session_id,
-                    &request_id,
-                    &sink,
-                )
-                .await;
-            }
-            FrontendRequest::UpdateWorkItem { id, patch } => {
-                // Capture the task/chore status before the update so we
-                // can detect a transition into `active` after the patch
-                // applies. We only care about task/chore — products and
-                // projects have no execution lifecycle.
-                let previous_task_status = task_status_for_id(&work_db, &id);
-                // Capture name+description before the update so the
-                // chore-update worker notification can report old → new.
-                // Only read when the patch touches these fields to avoid
-                // an unconditional DB round-trip on status-only patches.
-                let previous_spec = if patch.name.is_some() || patch.description.is_some() {
-                    task_name_description_for_id(&work_db, &id)
-                } else {
-                    None
-                };
-                // Bug #679: when the patch is a kanban drag-to-Doing
-                // (a task/chore transitioning from non-active to
-                // `active`) and dispatch would deterministically fail
-                // because the row has no resolvable repo, reject the
-                // `UpdateWorkItem` outright instead of letting the
-                // status flip land and then swallowing the dispatch
-                // error in a `WARN`. The card stays in its previous
-                // column and the user sees a `WorkError` toast naming
-                // the missing repo. Skips when an existing non-terminal
-                // execution would already own the dispatch slot —
-                // there's no point validating a code path we won't run.
-                let intends_active_transition = patch.status.as_deref() == Some("active")
-                    && previous_task_status
-                        .as_deref()
-                        .is_some_and(|prev| prev != "active");
-                if intends_active_transition && work_item_needs_dispatch(&work_db, &id) {
-                    if let Err(err) = work_db.precheck_dispatch_repo(&id) {
-                        let work_item_id_for_event = id.clone();
-                        let from_status = previous_task_status.clone();
-                        let error_message = format!("{err:#}");
-                        let details = serde_json::json!({
-                            "from_status": from_status,
-                            "to_status": "active",
-                            "did_dispatch": false,
-                            "rejected": true,
-                            "reason_if_skipped": error_message,
-                            "dispatched_execution_id": serde_json::Value::Null,
-                        });
-                        server_state
-                            .dispatch_events
-                            .emit(
-                                crate::dispatch_events::DispatchEvent::new(
-                                    crate::dispatch_events::Stage::StatusTransition,
-                                    crate::dispatch_events::Outcome::Error,
-                                    work_item_id_for_event.clone(),
-                                )
-                                .with_work_item(work_item_id_for_event)
-                                .with_error(&err)
-                                .with_details(details),
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                }
-                let actor = resolve_status_actor(&server_state, peer_pid);
-                match work_db.update_work_item_as_actor(&id, patch, actor) {
-                    Ok(item) => {
-                        let product_id = work_item_product_id(&item);
-                        let mut topics = vec![work_product_topic(&product_id)];
-                        if matches!(item, WorkItem::Product(_)) {
-                            topics.push(TOPIC_WORK_PRODUCTS.to_owned());
-                        }
-                        // If the patch moved a task/chore into a
-                        // terminal status (`done`, `archived`, or
-                        // `cancelled`), tear down whatever resources
-                        // its latest execution still holds: the
-                        // libghostty pane and the cube workspace.
-                        // Idempotent — duplicate or no-op cases
-                        // (already released, never spawned, not a
-                        // task/chore) collapse inside force_release.
-                        if let Some(execution_id) = terminal_chore_execution(&work_db, &item) {
-                            let handler = server_state.completion_handler.clone();
-                            tokio::spawn(async move {
-                                handler.force_release(&execution_id).await;
-                            });
-                        }
-                        // If the patch moved a task/chore into
-                        // `in_review`, release pane + cube workspace
-                        // for the same reason — the worker is done
-                        // with the slot. The worker auto-transition
-                        // path (Stop hook → finalize_pr_transition)
-                        // handles its own release; this block covers
-                        // the human-drag path and any ghost panes left
-                        // behind by a failed or partial auto-release.
-                        // Idempotent for the same reasons as above.
-                        if let Some(execution_id) = in_review_chore_execution(&work_db, &item) {
-                            let handler = server_state.completion_handler.clone();
-                            tokio::spawn(async move {
-                                handler.force_release(&execution_id).await;
-                            });
-                        }
-                        // If the user dragged an active task/chore back
-                        // to Backlog (active → todo), stop the live
-                        // worker: cancel its execution row (so the orphan
-                        // sweep and reconciler won't re-dispatch it) and
-                        // release its pane + cube workspace. The task
-                        // status is already `todo` from the patch above;
-                        // autostart was cleared to 0 when the task first
-                        // entered Doing, so it will not be re-dispatched.
-                        if let Some(execution_id) =
-                            active_to_todo_execution(&work_db, &previous_task_status, &item)
-                        {
-                            let handler = server_state.completion_handler.clone();
-                            tokio::spawn(async move {
-                                handler.cancel_and_release(&execution_id).await;
-                            });
-                        }
-                        // Kanban drop-into-Doing (and any other human
-                        // path that flips a task/chore to `active` via
-                        // UpdateWorkItem) must dispatch a worker — see
-                        // `tools/boss/docs/designs/work-kanban.md` §
-                        // "Doing column = live or queued". The macOS
-                        // client also fires `RequestExecution` after
-                        // the status patch, but doing it server-side
-                        // closes the gap for older clients (or any
-                        // future client that forgets the follow-up
-                        // RPC), which is the failure shape the
-                        // motivating bug exposed for `autostart=false`
-                        // chores parked in `todo`: the autostart gate
-                        // blocks creation-time dispatch, so until the
-                        // human drags the card there is no execution
-                        // at all, and a status flip with no follow-up
-                        // RequestExecution leaves an `active` card
-                        // with no worker.
-                        //
-                        // We only create a fresh execution when the
-                        // work item has no live/queued one — an
-                        // existing non-terminal execution already owns
-                        // the dispatch slot, and replacing it would
-                        // race the auto-dispatcher (and would void the
-                        // execution id the client is already tracking).
-                        // The reconcile / rescan paths handle
-                        // re-dispatch of stale (worker-died) cases.
-                        if task_transitioned_to_active(&previous_task_status, &item) {
-                            let work_item_id_for_event = work_item_id(&item);
-                            let from_status = previous_task_status.clone();
-                            let needs_dispatch =
-                                work_item_needs_dispatch(&work_db, &work_item_id_for_event);
-                            let (dispatched_execution_id, did_dispatch, skip_reason) =
-                                if needs_dispatch {
-                                    let live_states = server_state.live_worker_states.clone();
-                                    let dispatch_input = RequestExecutionInput::builder()
-                                        .work_item_id(work_item_id_for_event.clone())
-                                        .build();
-                                    match work_db.request_execution_with_live_check(
-                                        dispatch_input,
-                                        |run_id| live_states.is_run_live(run_id),
-                                    ) {
-                                        Ok(execution) => {
-                                            server_state.execution_coordinator.kick();
-                                            (Some(execution.id), true, None)
-                                        }
-                                        Err(err) => {
-                                            // Deterministic preconditions (no
-                                            // resolvable repo, bug #679) are
-                                            // caught by the pre-update
-                                            // `precheck_dispatch_repo` gate above
-                                            // and reject the patch outright. This
-                                            // arm now only fires for non-
-                                            // deterministic races (e.g., a
-                                            // concurrent execution insert lost
-                                            // the unique-row gate). Keep the WARN
-                                            // so a residual silent skip is still
-                                            // observable in engine-trace.jsonl.
-                                            tracing::warn!(
-                                                work_item_id = %work_item_id_for_event,
-                                                ?err,
-                                                "UpdateWorkItem → active: auto-dispatch \
-                                                 failed; status update kept, no worker spawned",
-                                            );
-                                            (None, false, Some(format!("{err:#}")))
-                                        }
-                                    }
-                                } else {
-                                    // The auto-dispatch gate decided this transition
-                                    // already has an in-flight execution. Before this
-                                    // event existed the skip was silent — exactly the
-                                    // "I dragged it and nothing happened" shape.
-                                    (
-                                        None,
-                                        false,
-                                        Some(
-                                            "work_item_needs_dispatch=false (existing \
-                                             non-terminal execution owns dispatch slot)"
-                                                .to_owned(),
-                                        ),
-                                    )
-                                };
-                            // Pin the event's execution_id to the resolved exec id
-                            // when dispatch landed, falling back to the work item
-                            // id otherwise so the line stays correlatable with
-                            // anything the operator can grep for.
-                            let exec_for_event = dispatched_execution_id
-                                .clone()
-                                .unwrap_or_else(|| work_item_id_for_event.clone());
-                            let details = serde_json::json!({
-                                "from_status": from_status,
-                                "to_status": "active",
-                                "did_dispatch": did_dispatch,
-                                "reason_if_skipped": skip_reason,
-                                "dispatched_execution_id": dispatched_execution_id,
-                            });
-                            server_state
-                                .dispatch_events
-                                .emit(
-                                    crate::dispatch_events::DispatchEvent::new(
-                                        crate::dispatch_events::Stage::StatusTransition,
-                                        if did_dispatch {
-                                            crate::dispatch_events::Outcome::Ok
-                                        } else {
-                                            crate::dispatch_events::Outcome::Skipped
-                                        },
-                                        exec_for_event,
-                                    )
-                                    .with_work_item(work_item_id_for_event)
-                                    .with_details(details),
-                                )
-                                .await;
-                        }
-                        // If the name or description of an active chore
-                        // changed, notify the bound worker. The worker may
-                        // be mid-flight on the old spec; this notice lets it
-                        // adapt without a human manually sending the update.
-                        // Fire-and-forget: a failed send (worker pane gone,
-                        // app session not registered) must not roll back the
-                        // DB update. Two rapid edits may produce two notices
-                        // in sequence — that's acceptable per the acceptance
-                        // criteria.
-                        if let Some((old_name, old_description)) = previous_spec {
-                            if let Some(run_id) = active_chore_run_id(&server_state, &item) {
-                                let (new_name, new_description) = match &item {
-                                    WorkItem::Task(t) | WorkItem::Chore(t) => {
-                                        (t.name.clone(), t.description.clone())
-                                    }
-                                    _ => unreachable!(
-                                        "active_chore_run_id only returns Some for tasks/chores"
-                                    ),
-                                };
-                                if let Some(msg) = build_chore_update_message(
-                                    &old_name,
-                                    &new_name,
-                                    &old_description,
-                                    &new_description,
-                                ) {
-                                    let server_for_notify = server_state.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(err) = server_for_notify
-                                            .send_input_to_worker(&run_id, msg)
-                                            .await
-                                        {
-                                            tracing::warn!(
-                                                ?err,
-                                                %run_id,
-                                                "chore-update: failed to notify live worker",
-                                            );
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            topics,
-                            "work_item_updated",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::DeleteWorkItem { id } => match work_db.get_work_item(&id) {
-                Ok(item) => match work_db.delete_work_item(&id) {
-                    Ok(()) => {
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "work_item_deleted",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemDeleted { id },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                },
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::RestoreWorkItem { id } => match work_db.restore_work_item(&id) {
-                Ok(item) => {
-                    // Restore makes a tombstoned row live again, so the
-                    // kanban / list consumers need to reload exactly as
-                    // they would for any other mutation. Reuse the
-                    // `work_item_updated` invalidation rather than minting
-                    // a restore-specific topic event.
-                    let product_id = work_item_product_id(&item);
-                    let revision = publish_work_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        vec![work_product_topic(&product_id)],
-                        "work_item_updated",
-                        Some(product_id),
-                        vec![work_item_id(&item)],
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::WorkItemRestored { item },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::GetWorkTree { product_id } => match work_db.get_work_tree(&product_id)
-            {
-                Ok(tree) => {
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::WorkTree {
-                            product: tree.product,
-                            projects: tree.projects,
-                            tasks: tree.tasks,
-                            chores: tree.chores,
-                            task_runtimes: tree.task_runtimes,
-                            dependencies: tree.dependencies,
-                        },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::ReorderProjectTasks {
-                project_id,
-                task_ids,
-            } => match work_db.get_work_item(&project_id) {
-                Ok(project_item) => match work_db.reorder_project_tasks(&project_id, &task_ids) {
-                    Ok(()) => {
-                        let product_id = work_item_product_id(&project_item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "project_tasks_reordered",
-                            Some(product_id),
-                            task_ids.clone(),
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::ProjectTasksReordered {
-                                project_id,
-                                task_ids,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                },
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::CreateExecution { input } => match work_db.create_execution(input) {
-                Ok(execution) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ExecutionCreated { execution },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::RequestExecution { input } => {
-                // Live-worker awareness: when the work item already has
-                // a non-terminal execution, the engine reuses it only
-                // when the slot registry actually still has a live
-                // worker for that run id. Without this check, a chore
-                // whose previous worker died with the app gets stuck
-                // — the kanban drag fires RequestExecution, the engine
-                // says "still running," coordinator polls for `ready`
-                // and sees nothing, no new spawn ever happens.
-                //
-                // `force = true` is the `bossctl agents launch`
-                // entry point: same DB row creation, but we hand the
-                // ready execution straight to
-                // `ExecutionCoordinator::force_dispatch` instead of
-                // kicking the auto-dispatcher. force_dispatch grows
-                // the worker pool by one slot (bounded by the hard
-                // cap) when every configured slot is busy, so the
-                // launch verb skips the cap-deferral the normal
-                // request path would otherwise hit.
-                let force = input.force;
-                let live_states = server_state.live_worker_states.clone();
-                let result = work_db.request_execution_with_live_check(input, |run_id| {
-                    live_states.is_run_live(run_id)
-                });
-                match result {
-                    Ok(execution) => {
-                        if force {
-                            // If the request landed on an existing
-                            // non-terminal execution (idempotent path
-                            // when a live worker already runs the
-                            // item), just refresh the row and skip
-                            // force-dispatch — there's no second
-                            // worker to spawn.
-                            if execution.status == "ready" {
-                                let coordinator = server_state.execution_coordinator.clone();
-                                let execution_id = execution.id.clone();
-                                match coordinator.force_dispatch(&execution_id).await {
-                                    Ok(_worker_id) => {}
-                                    Err(err) => {
-                                        send_response(
-                                            &sink,
-                                            &request_id,
-                                            FrontendEvent::WorkError {
-                                                message: err.to_string(),
-                                            },
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            // Re-read the execution after force_dispatch
-                            // so the response carries the row's now-
-                            // running status (and worker / lease ids).
-                            let refreshed = match work_db.get_execution(&execution.id) {
-                                Ok(execution) => execution,
-                                Err(_) => execution,
-                            };
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::ExecutionRequested {
-                                    execution: refreshed,
-                                },
-                            );
-                        } else {
-                            // Log every queued request so an operator can pair
-                            // a `bossctl work start` call with the engine-side
-                            // outcome even when the scheduler races the row
-                            // (the kick-noop/lost-wakeup class of bug). The
-                            // structured `spawn_attempt` line lands in
-                            // `run_scheduler` once it picks the row up; this
-                            // line bookends the request itself.
-                            tracing::info!(
-                                execution_id = %execution.id,
-                                work_item_id = %execution.work_item_id,
-                                execution_status = %execution.status,
-                                "RequestExecution accepted -> kicking scheduler"
-                            );
-                            server_state.execution_coordinator.kick();
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::ExecutionRequested { execution },
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ListExecutions { work_item_id } => {
-                match work_db.list_executions(work_item_id.as_deref()) {
-                    Ok(executions) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ExecutionsList {
-                                work_item_id,
-                                executions,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::GetTaskRuntime { work_item_id } => {
-                match work_db.get_task_runtime(&work_item_id) {
-                    Ok(runtime) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::TaskRuntimeResult { runtime },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::GetExecution { id } => match work_db.get_execution(&id) {
-                Ok(execution) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ExecutionResult { execution },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::CreateRun { input } => match work_db.create_run(input) {
-                Ok(run) => {
-                    send_response(&sink, &request_id, FrontendEvent::RunCreated { run });
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::ListRuns { execution_id } => match work_db.list_runs(&execution_id) {
-                Ok(runs) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::RunsList { execution_id, runs },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::GetRun { id } => {
-                // Try the run_* namespace first, then fall back to the
-                // exec_* namespace. Callers such as `bossctl agents
-                // status` pass whatever id they have in hand — often an
-                // execution id (exec_*) — but `get_run` joins against
-                // `work_runs.id` (run_*), so the lookup silently fails
-                // with "unknown run". `list_runs(exec_id)` finds the
-                // run via `work_runs.execution_id` and returns the most
-                // recent one (the active or last-completed run for that
-                // execution).
-                let result = work_db.get_run(&id).ok().or_else(|| {
-                    work_db
-                        .list_runs(&id)
-                        .ok()
-                        .and_then(|mut runs| runs.pop())
-                });
-                match result {
-                    Some(run) => {
-                        send_response(&sink, &request_id, FrontendEvent::RunResult { run });
-                    }
-                    None => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("unknown run: {id}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::CreateAttentionItem { input } => {
-                match work_db.create_attention_item(input) {
-                    Ok(item) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionItemCreated { item },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ListAttentionItems { execution_id } => {
-                match work_db.list_attention_items(&execution_id) {
-                    Ok(items) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionItemsList {
-                                execution_id,
-                                items,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::GetAttentionItem { id } => match work_db.get_attention_item(&id) {
-                Ok(item) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AttentionItemResult { item },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::ListAttentionItemsForWorkItem { work_item_id } => {
-                match work_db.list_attention_items_for_work_item(&work_item_id) {
-                    Ok(items) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionItemsForWorkItemList {
-                                work_item_id,
-                                items,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            // --- Attentions (task 2: store + CRUD/RPC + events).
-            //     ActionAttentionGroup remains stubbed until task 3. ---
-            FrontendRequest::ListAttentionGroups {
-                product_id,
-                project_id,
-                task_id,
-                kind,
-                state,
-            } => {
-                let listed = work_db
-                    .list_attention_groups(
-                        &product_id,
-                        project_id.as_deref(),
-                        task_id.as_deref(),
-                        kind.as_deref(),
-                        state.as_deref(),
-                    )
-                    .and_then(|groups| {
-                        // Bundle every group's member rows in one reply so the
-                        // Notifications window renders inline controls without a
-                        // round-trip per group. Flattened across groups; the
-                        // client buckets by `group_id`.
-                        let mut members = Vec::new();
-                        for group in &groups {
-                            members.extend(work_db.list_attentions_for_group(&group.id)?);
-                        }
-                        Ok((groups, members))
-                    });
-                match listed {
-                    Ok((groups, members)) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionGroupsList {
-                                product_id,
-                                groups,
-                                members,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::GetAttentionGroup { id } => {
-                let fetched = work_db.get_attention_group(&id).and_then(|group| {
-                    let members = work_db.list_attentions_for_group(&group.id)?;
-                    Ok((group, members))
-                });
-                match fetched {
-                    Ok((group, members)) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionGroupResult { group, members },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::CreateAttention { input } => {
-                match work_db.create_attention(input) {
-                    Ok((attention, group)) => {
-                        // Live-update the Notifications window + doc viewer on
-                        // the owning product's work-tree topic.
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &group.product_id,
-                                FrontendEvent::AttentionCreated {
-                                    attention: attention.clone(),
-                                    group: group.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionCreated { attention, group },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::AnswerAttention {
-                id,
-                answer,
-                skip,
-                dismiss,
-            } => match work_db.answer_attention(&id, answer, skip, dismiss) {
-                Ok(group) => {
-                    let members = work_db
-                        .list_attentions_for_group(&group.id)
-                        .unwrap_or_default();
-                    server_state
-                        .publisher
-                        .publish_frontend_event_on_product(
-                            &group.product_id,
-                            FrontendEvent::AttentionGroupUpdated {
-                                group: group.clone(),
-                                members: members.clone(),
-                            },
-                        )
-                        .await;
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AttentionGroupUpdated { group, members },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::DismissAttention { id, reason } => {
-                match work_db.dismiss_attention(&id, reason) {
-                    Ok(group) => {
-                        let members = work_db
-                            .list_attentions_for_group(&group.id)
-                            .unwrap_or_default();
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &group.product_id,
-                                FrontendEvent::AttentionGroupUpdated {
-                                    group: group.clone(),
-                                    members: members.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AttentionGroupUpdated { group, members },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ActionAttentionGroup {
-                id,
-                skip_unanswered,
-            } => match work_db.action_attention_group(&id, skip_unanswered, &GhPrStateChecker) {
-                Ok(ActionedAttentionGroup {
-                    group,
-                    produced_work_item_ids,
-                }) => {
-                    let members = work_db
-                        .list_attentions_for_group(&group.id)
-                        .unwrap_or_default();
-                    // Live-update the Notifications window + inline doc surface.
-                    server_state
-                        .publisher
-                        .publish_frontend_event_on_product(
-                            &group.product_id,
-                            FrontendEvent::AttentionGroupActioned {
-                                group: group.clone(),
-                                members: members.clone(),
-                            },
-                        )
-                        .await;
-                    // Refresh the kanban / work tree so the produced revision
-                    // or tasks appear without a manual reload.
-                    if !produced_work_item_ids.is_empty() {
-                        publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&group.product_id)],
-                            "attention_group_actioned",
-                            Some(group.product_id.clone()),
-                            produced_work_item_ids,
-                        )
-                        .await;
-                    }
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AttentionGroupActioned { group, members },
-                    );
-                }
-                Err(err) => {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    );
-                }
-            },
-            FrontendRequest::RegisterAppSession => {
-                // Trust the peer if any of:
-                //   (a) it matches the declared app pid exactly. The
-                //       engine reads `BOSS_APP_PID` at startup; the
-                //       macOS app sets this before spawning the engine
-                //       (necessary because `bazel run` daemonizes,
-                //       which severs the engine's process tree from
-                //       the app and breaks ancestor-walk auth).
-                //   (b) the peer pid appears in the engine's ancestor
-                //       chain (covers direct-launch scenarios like
-                //       `swift run` where no daemonizing wrapper
-                //       exists).
-                //   (c) APP RESTART against a surviving engine: the
-                //       trusted app pid belongs to a now-dead process
-                //       and a fresh app instance is connecting. The
-                //       engine correctly stays up on a same-version
-                //       relaunch, so the relaunched app must be able to
-                //       re-attach its session — otherwise the stale pid
-                //       rejects `RegisterAppSession` forever, no
-                //       `app_session` is registered, and every
-                //       engine→app RPC (`SpawnWorkerPane`, reveal) dies
-                //       silently. This is the mirror of T351 (engine
-                //       restart re-attaching surviving panes): there the
-                //       app survives and the engine restarts; here the
-                //       engine survives and the app restarts. We require
-                //       the old pid to be genuinely dead so a second
-                //       live app can't hijack the trust root from the
-                //       real one.
-                let engine_pid = std::process::id() as libc::pid_t;
-                let current_app_pid = server_state.current_app_pid();
-                let trust_ok =
-                    register_app_session_trust_ok(current_app_pid, peer_pid, engine_pid);
-                if !trust_ok {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        engine_pid,
-                        expected_app_pid = ?current_app_pid,
-                        "register_app_session rejected: peer pid neither matches BOSS_APP_PID nor is an engine ancestor",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "register_app_session: peer pid does not match app_pid"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                // Re-pin the trust root to the (re)connecting app when it
-                // differs from the stale pid. Keeps RPC authorization
-                // (`SpawnWorkerPane`, BossOnly/AppOrBoss tiers) following
-                // the live app across restarts. Only when a real trust
-                // root was configured — test mode (`None`) stays
-                // permissive so unit tests aren't pinned to a live pid.
-                if let (Some(prior), Some(observed)) = (current_app_pid, peer_pid) {
-                    if prior != observed {
-                        server_state.set_app_pid(observed);
-                        tracing::info!(
-                            prior_app_pid = prior,
-                            new_app_pid = observed,
-                            "app session re-attached: trust root re-pinned to relaunched app",
-                        );
-                    }
-                }
-                server_state
-                    .register_app_session(session_id.clone(), sink.clone())
-                    .await;
-                tracing::info!(session_id = %session_id, "app session registered");
-                send_response(&sink, &request_id, FrontendEvent::AppSessionRegistered);
-            }
-            FrontendRequest::RegisterBossSession { shell_pid } => {
-                // Only the registered app session may install the
-                // Boss trust root.
-                let app_session_id = server_state
-                    .app_session
-                    .lock()
-                    .await
-                    .as_ref()
-                    .map(|h| h.session_id.clone());
-                if app_session_id.as_deref() != Some(session_id.as_str()) {
-                    tracing::warn!(
-                        session_id = %session_id,
-                        "register_boss_session rejected: caller is not the app session",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "register_boss_session: only the app session may install the Boss trust root"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                server_state.set_boss_pid(shell_pid as libc::pid_t);
-                tracing::info!(
-                    boss_pid = shell_pid,
-                    "boss session registered as second trust root",
-                );
-                send_response(&sink, &request_id, FrontendEvent::BossSessionRegistered);
-            }
-            FrontendRequest::EngineResponse {
-                request_id: response_request_id,
-                response,
-            } => {
-                server_state
-                    .deliver_app_response(&session_id, &response_request_id, response)
-                    .await;
-            }
-            FrontendRequest::ProbeRun { run_id, text, urgent } => {
-                // `bossctl probe` is a coordinator-essential verb (the
-                // coordinator contract names probing as the right tool
-                // for low-confidence handoffs). The earlier BossOnly
-                // gate rejected calls from worker (slot) panes, since
-                // BossOnly explicitly excludes callers descending from
-                // a registered worker shell pid. Same reasoning as the
-                // `stop_run` fix in PR #218: downgrade to AppOrBoss so
-                // any caller descending from the app or the Boss
-                // session is accepted, including worker panes.
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "probe_run rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "probe_run requires app or Boss authority".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
-                tracing::info!(run_id = %run_id, probe_id = %probe_id, urgent, "probe queued");
-                // Immediately deliver the probe if the worker is already idle
-                // (between turns). An idle worker has no Stop boundary coming
-                // — `dispatch_probe_on_stop` would never fire — so we push the
-                // text into the pane right now. If the worker is active the
-                // call is a no-op and the probe waits for the next Stop.
-                let server_for_idle = server_state.clone();
-                let run_id_for_idle = run_id.clone();
-                tokio::spawn(async move {
-                    dispatch_probe_if_idle(&server_for_idle, &run_id_for_idle).await;
-                });
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::ProbeQueued { run_id, probe_id, urgent },
-                );
-            }
-            FrontendRequest::StopRun { run_id } => {
-                // `bossctl agents stop` is the coordinator superset's
-                // imperative kill switch, and the human invokes it
-                // from wherever they happen to be — including the
-                // boss pane, the macOS app shell, or *inside a worker
-                // pane* (e.g. tab over to slot 1, type `bossctl
-                // agents stop <id>`). The earlier BossOnly gate
-                // rejected the worker-pane case because callers
-                // descending from a registered worker shell pid are
-                // explicitly excluded from BossOnly. Downgrade to
-                // AppOrBoss to match `cancel_execution`: any caller
-                // descending from the app or the Boss session is
-                // accepted, which covers worker panes too.
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "stop_run rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "stop_run requires app or Boss authority".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                tracing::info!(run_id = %run_id, "stop_run requested");
-                let handler = server_state.completion_handler.clone();
-                let run_id_for_release = run_id.clone();
-                tokio::spawn(async move {
-                    // Use `force_stop_execution` instead of plain
-                    // `force_release`: this additionally cancels the
-                    // execution row and demotes the task from `active`
-                    // back to `todo` so the orphan sweep and
-                    // `reconcile_active_dispatch` cannot immediately
-                    // re-dispatch the work item the moment the worker
-                    // pool slot is freed.
-                    handler.force_stop_execution(&run_id_for_release).await;
-                });
-                send_response(&sink, &request_id, FrontendEvent::RunStopped { run_id });
-            }
-            FrontendRequest::FocusWorkerPane { run_id } => {
-                // `bossctl agents focus` is a coordinator verb that
-                // raises a sibling worker pane to the front. The
-                // human invokes it from wherever they are — boss
-                // pane, app shell, or another worker pane — so the
-                // tier is `AppOrBoss`, matching `probe_run` /
-                // `stop_run` (which are also legal from inside a
-                // worker pane).
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "focus_worker_pane rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "focus_worker_pane requires app or Boss authority".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match server_state.focus_worker_pane(&run_id).await {
-                    Ok(slot_id) => {
-                        tracing::info!(
-                            run_id = %run_id,
-                            slot_id,
-                            "focus_worker_pane: pane raised",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkerPaneFocused { run_id, slot_id },
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, run_id = %run_id, "focus_worker_pane failed");
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("focus_worker_pane: {err}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::SendInputToWorker { run_id, text } => {
-                // `bossctl agents send` writes user-typed input into a
-                // sibling worker pane. Same authority story as
-                // `focus_worker_pane` / `probe_run` / `stop_run`: the
-                // human invokes this from wherever they are (boss
-                // pane, app shell, or another worker pane), so the
-                // tier is `AppOrBoss` — caller must descend from the
-                // app or the Boss session.
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "send_input_to_worker rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "send_input_to_worker requires app or Boss authority"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match server_state.send_input_to_worker(&run_id, text).await {
-                    Ok(slot_id) => {
-                        tracing::info!(
-                            run_id = %run_id,
-                            slot_id,
-                            "send_input_to_worker: text injected",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkerInputSent { run_id, slot_id },
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, run_id = %run_id, "send_input_to_worker failed");
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("send_input_to_worker: {err}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::InterruptWorkerPane { run_id } => {
-                // `bossctl agents interrupt` mirrors the keyboard Esc
-                // a human would press inside the worker pane. Same
-                // tier rationale as `focus_worker_pane`: the human
-                // may invoke it from the Boss pane, the app shell,
-                // or a sibling worker pane — `AppOrBoss` admits all
-                // three.
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "interrupt_worker_pane rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "interrupt_worker_pane requires app or Boss authority"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match server_state.interrupt_worker_pane(&run_id).await {
-                    Ok(slot_id) => {
-                        tracing::info!(
-                            run_id = %run_id,
-                            slot_id,
-                            "interrupt_worker_pane: esc delivered",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkerPaneInterrupted { run_id, slot_id },
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, run_id = %run_id, "interrupt_worker_pane failed");
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("interrupt_worker_pane: {err}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::RevealWorkItem { id } => {
-                // `bossctl reveal` is a coordinator verb for navigating
-                // the macOS app to a specific work item's card. Same
-                // authority tier as `focus_worker_pane` — it's a UI
-                // steering RPC invoked from the Boss pane or app shell.
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        id = %id,
-                        "reveal_work_item rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "reveal_work_item requires app or Boss authority".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match server_state.reveal_work_item(&id).await {
-                    Ok(canonical_id) => {
-                        tracing::info!(
-                            id = %id,
-                            canonical_id = %canonical_id,
-                            "reveal_work_item: card highlighted",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkItemRevealed { id: canonical_id },
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(?err, id = %id, "reveal_work_item failed");
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("reveal_work_item: {err}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ListWorkerLiveStates => {
-                let states = server_state.live_worker_states_snapshot();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkerLiveStatesList { states },
-                );
-            }
-            FrontendRequest::Shutdown { token } => {
-                // The token written to disk at startup is the auth
-                // credential — there is no pid-based tier check on
-                // purpose. The whole point of the token gate (issue
-                // #705) is that "same user / same machine" doesn't
-                // separate the legitimate caller (macOS app, boss CLI)
-                // from the accidental caller (a `bazel test` that
-                // resolved the production socket). The bazel sandbox
-                // already denies access to `~/Library/Application
-                // Support/`, so a test that lands here without the
-                // file in scope will fail with `token_missing` rather
-                // than killing a 9-hour-old engine.
-                let outcome = match server_state.control_token.as_deref() {
-                    None => {
-                        // In-process serve() without a control token —
-                        // shouldn't happen for any process that has a
-                        // dialable frontend socket, but the dispatcher
-                        // is the wrong place to assume that. Reject
-                        // explicitly rather than panic.
-                        "token_missing"
-                    }
-                    Some(expected) => {
-                        if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
-                            "accepted"
-                        } else {
-                            "token_mismatch"
-                        }
-                    }
-                };
-                crate::audit::record_shutdown_rpc(outcome, peer_pid.map(|p| p as i32));
-                if outcome == "accepted" {
-                    tracing::info!(
-                        peer_pid = ?peer_pid,
-                        "shutdown rpc: token accepted — graceful exit pending",
-                    );
-                    send_response(&sink, &request_id, FrontendEvent::ShutdownAccepted);
-                    // Defer the actual notify so the writer task has a
-                    // chance to drain the ShutdownAccepted frame into
-                    // the kernel socket buffer before the accept loop
-                    // breaks. 50 ms is well under the shutdown_workers
-                    // grace window and well over the time it takes the
-                    // dispatcher to enqueue + the writer task to flush.
-                    let trigger = server_state.shutdown_trigger.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        trigger.notify_one();
-                    });
-                } else {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        outcome,
-                        "shutdown rpc: rejected",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ShutdownRejected {
-                            reason: outcome.to_owned(),
-                        },
-                    );
-                }
-            }
-            FrontendRequest::CancelExecution { execution_id } => {
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        execution_id = %execution_id,
-                        "cancel_execution rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "cancel_execution requires app or Boss authority".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match server_state.work_db.cancel_execution(&execution_id) {
-                    Ok(execution) => {
-                        tracing::info!(
-                            execution_id = %execution_id,
-                            "cancel_execution: marked cancelled",
-                        );
-                        // Pane releases are keyed by run_id (the slot
-                        // registry's key), not by execution_id — so
-                        // walk the execution's still-active runs and
-                        // release each. Idempotent on the registry side.
-                        let active_runs = server_state
-                            .work_db
-                            .active_run_ids_for_execution(&execution_id)
-                            .unwrap_or_default();
-                        let handler = server_state.completion_handler.clone();
-                        let exec_for_release = execution_id.clone();
-                        tokio::spawn(async move {
-                            for run_id in active_runs {
-                                handler.force_release(&run_id).await;
-                            }
-                            // Final pass keyed by execution_id so the
-                            // cube workspace lease (which is recorded
-                            // on the execution row) is released even
-                            // when the execution had no active run.
-                            handler.force_release(&exec_for_release).await;
-                        });
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ExecutionCancelled { execution },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ReapRun { run_id } => {
-                // `bossctl agents reap` is the manual escape hatch for
-                // orphans the engine startup probe missed (e.g. the
-                // cube lease was still within its TTL on relaunch, so
-                // the probe said "Live" even though the libghostty
-                // pane is gone). Gate it `BossOnly`: this is a state
-                // mutation that should not be reachable from a worker
-                // pane subtree.
-                if !server_state.authorize_rpc(RpcTier::BossOnly, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "reap_run rejected: caller not in Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "reap_run requires Boss authority".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                let reason = "manual reap via bossctl agents reap";
-                match server_state
-                    .work_db
-                    .mark_execution_orphaned(&run_id, reason)
-                {
-                    Ok(execution) => {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            work_item_id = %execution.work_item_id,
-                            cube_workspace_id = ?execution.cube_workspace_id,
-                            "reap_run: marked execution orphaned (workspace preserved)",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::RunReaped { run_id, execution },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::TailRunTranscript { run_id, lines } => {
-                // `bossctl agents transcript` is a documented
-                // coordinator verb. The earlier strict subtree-only
-                // AppOrBoss check rejected the live coordinator when
-                // it ran from a shell that descended from neither the
-                // app nor the registered Boss session — see the
-                // `authorize_rpc` AppOrBoss docstring for the
-                // worker-exclusion fallback that fixed it. We still
-                // reject worker descendants so one worker can't
-                // tail another worker's transcript.
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        run_id = %run_id,
-                        "tail_run_transcript rejected: caller is a worker descendant",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "tail_run_transcript requires app or Boss authority"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match resolve_transcript_for_tail(&server_state, &run_id) {
-                    TranscriptResolution::Found { transcript_path } => {
-                        match read_transcript_tail(&transcript_path, lines).await {
-                            Ok((lines_out, truncated)) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::RunTranscriptTail {
-                                        run_id,
-                                        transcript_path,
-                                        lines: lines_out,
-                                        truncated,
-                                    },
-                                );
-                            }
-                            Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: format!(
-                                            "transcript read failed for {transcript_path}: {err}"
-                                        ),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    TranscriptResolution::Buffering => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "{TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX}{run_id}: engine has not yet received a hook event carrying transcript_path (retry in a few seconds)"
-                                ),
-                            },
-                        );
-                    }
-                    TranscriptResolution::KnownNoTranscript => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("run {run_id} has no transcript path recorded"),
-                            },
-                        );
-                    }
-                    TranscriptResolution::Unknown => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("unknown run: {run_id}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ExecutionTranscript { execution_id } => {
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "execution_transcript requires app or Boss authority"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                let execution = match work_db.get_execution(&execution_id) {
-                    Ok(exec) => exec,
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let is_live = execution.finished_at.is_none()
-                    && matches!(
-                        execution.status.as_str(),
-                        "running" | "waiting_human"
-                    );
-                let transcript_path = match work_db.transcript_path_for_execution(&execution_id) {
-                    Ok(Some(path)) => path,
-                    Ok(None) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ExecutionTranscriptUnavailable {
-                                execution_id,
-                                reason: "no transcript path recorded for this execution"
-                                    .to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "transcript lookup failed for {execution_id}: {err}"
-                                ),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                match tokio::fs::read_to_string(&transcript_path).await {
-                    Ok(content) => {
-                        let events =
-                            crate::transcript_markdown::parse_transcript(&content);
-                        let segments = crate::transcript_markdown::events_to_segments(
-                            &events,
-                            &Default::default(),
-                        );
-                        let wire_segments: Vec<boss_protocol::TranscriptSegment> =
-                            segments.into_iter().map(segment_to_wire).collect();
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ExecutionTranscriptResult {
-                                execution_id,
-                                segments: wire_segments,
-                                is_live,
-                                complete: !is_live,
-                            },
-                        );
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ExecutionTranscriptUnavailable {
-                                execution_id,
-                                reason: format!(
-                                    "transcript file not found: {transcript_path}"
-                                ),
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "transcript read failed for {transcript_path}: {err}"
-                                ),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::WorkspacePoolSummary => {
-                // Read-only view of `cube workspace list` plus engine
-                // annotations. The coordinator contract documents this
-                // as a bossctl verb, and any user who can run `cube
-                // workspace list` directly already has the same view
-                // — so an extra subtree gate buys no security and just
-                // breaks legitimate calls (the live coordinator
-                // session repro: bossctl invoked from a shell that's
-                // neither an app nor a Boss descendant fell through
-                // AppOrBoss). User tier is the right level.
-                if !server_state.authorize_rpc(RpcTier::User, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        "workspace_pool_summary rejected: caller failed user tier",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "workspace_pool_summary failed user-tier check".to_owned(),
-                        },
-                    );
-                    continue;
-                }
-                match server_state.cube_client.list_workspaces().await {
-                    Ok(rows) => {
-                        // Annotate each entry with the engine's view: which
-                        // execution row (if any) currently records this
-                        // workspace's lease. Drift (cube reports a lease the
-                        // engine has no execution for) shows as `None`.
-                        let lease_to_execution = match server_state.work_db.lease_to_execution_map()
-                        {
-                            Ok(map) => map,
-                            Err(err) => {
-                                tracing::warn!(
-                                    ?err,
-                                    "workspace_pool_summary: lease lookup failed; emitting cube view only",
-                                );
-                                std::collections::HashMap::new()
-                            }
-                        };
-                        let workspaces =
-                            rows.into_iter()
-                                .map(|w| {
-                                    let execution_id = w.lease_id.as_ref().and_then(|lease_id| {
-                                        lease_to_execution.get(lease_id).cloned()
-                                    });
-                                    crate::protocol::WorkspacePoolEntry {
-                                        workspace_id: w.workspace_id,
-                                        workspace_path: w.workspace_path.display().to_string(),
-                                        state: w.state,
-                                        lease_id: w.lease_id,
-                                        holder: w.holder,
-                                        task: w.task,
-                                        leased_at_epoch_s: w.leased_at_epoch_s,
-                                        lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
-                                        execution_id,
-                                    }
-                                })
-                                .collect();
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkspacePoolSummaryResult { workspaces },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("cube workspace list failed: {err}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::AddDependency { input } => {
-                match work_db.add_dependency(input) {
-                    Ok(edge) => {
-                        // Edge changes don't move any work item's status
-                        // in this PR (status mechanics arrive in the
-                        // follow-up phase), but we still publish a
-                        // work-invalidation so subscribers re-render the
-                        // dependency surfaces (kanban badge, show view).
-                        let product_id = match work_db.get_work_item(&edge.dependent_id) {
-                            Ok(item) => Some(work_item_product_id(&item)),
-                            Err(_) => None,
-                        };
-                        let revision = if let Some(pid) = product_id.as_deref() {
-                            publish_work_invalidation(
-                                &server_state,
-                                &session_id,
-                                &request_id,
-                                vec![work_product_topic(pid)],
-                                "dependency_added",
-                                Some(pid.to_owned()),
-                                vec![edge.dependent_id.clone(), edge.prerequisite_id.clone()],
-                            )
-                            .await
-                        } else {
-                            server_state.current_work_revision()
-                        };
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::DependencyAdded { edge },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::RemoveDependency { input } => {
-                let dependent_id = input.dependent.clone();
-                let prerequisite_id = input.prerequisite.clone();
-                let relation = input
-                    .relation
-                    .clone()
-                    .unwrap_or_else(|| "blocks".to_owned());
-                match work_db.remove_dependency(input) {
-                    Ok(removed) => {
-                        let product_id = match work_db.get_work_item(&dependent_id) {
-                            Ok(item) => Some(work_item_product_id(&item)),
-                            Err(_) => None,
-                        };
-                        let revision = if let Some(pid) = product_id.as_deref() {
-                            publish_work_invalidation(
-                                &server_state,
-                                &session_id,
-                                &request_id,
-                                vec![work_product_topic(pid)],
-                                "dependency_removed",
-                                Some(pid.to_owned()),
-                                vec![dependent_id.clone(), prerequisite_id.clone()],
-                            )
-                            .await
-                        } else {
-                            server_state.current_work_revision()
-                        };
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::DependencyRemoved {
-                                dependent_id,
-                                prerequisite_id,
-                                relation,
-                                removed,
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ListDependencies { input } => match work_db.list_dependencies(input) {
-                Ok(view) => {
-                    send_response(&sink, &request_id, FrontendEvent::DependencyList { view })
-                }
-                Err(err) => send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                ),
-            },
-            FrontendRequest::ListDependenciesDetailed { input } => {
-                match work_db.list_dependencies_detailed(input) {
-                    Ok(detail) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::DependencyDetail { detail },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::SetLiveStatusEnabled { slot_id, enabled } => {
-                server_state
-                    .live_status_manager
-                    .set_enabled(slot_id, enabled);
-                if let Err(err) = persist_live_status_disabled_slots(
-                    &work_db,
-                    &server_state.live_status_manager.disabled_snapshot(),
-                ) {
-                    tracing::warn!(
-                        slot_id,
-                        enabled,
-                        ?err,
-                        "live_status: failed to persist disabled-slot toggle",
-                    );
-                }
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::LiveStatusEnabledSet { slot_id, enabled },
-                );
-            }
-            FrontendRequest::ListLiveStatusDisabledSlots => {
-                let slot_ids = server_state.live_status_manager.disabled_snapshot();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::LiveStatusDisabledSlotsList { slot_ids },
-                );
-            }
-            FrontendRequest::DebugLiveStatusPipeline => {
-                let report = build_live_status_debug_report(&server_state, &work_db);
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::LiveStatusDebugReportEvent { report },
-                );
-            }
-            FrontendRequest::GetEngineVersion => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::EngineVersionResult {
-                        git_sha: crate::build_info::git_sha().to_owned(),
-                        build_time: crate::build_info::build_time().to_owned(),
-                        binary_fingerprint: crate::build_info::binary_fingerprint().to_owned(),
-                    },
-                );
-            }
-            FrontendRequest::GetEngineHealth => {
-                let report = build_engine_health_report(&server_state);
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::EngineHealthResult { report },
-                );
-            }
-            FrontendRequest::ListFeatureFlags => {
-                let flags = server_state
-                    .feature_flags
-                    .snapshot_all()
-                    .into_iter()
-                    .map(|snap| boss_protocol::FeatureFlagSnapshot {
-                        name: snap.name,
-                        description: snap.description,
-                        category: snap.category,
-                        default_enabled: snap.default_enabled,
-                        enabled: snap.enabled,
-                    })
-                    .collect();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::FeatureFlagsList { flags },
-                );
-            }
-            FrontendRequest::SetFeatureFlag { name, enabled } => {
-                match server_state.feature_flags.set(&name, enabled) {
-                    Ok(()) => {
-                        tracing::info!(
-                            flag = %name,
-                            enabled,
-                            "feature-flags: toggled via macOS debug pane",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::FeatureFlagSet { name, enabled },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GetSettings => {
-                let settings = server_state
-                    .settings
-                    .snapshot_all()
-                    .into_iter()
-                    .map(|snap| boss_protocol::SettingSnapshot {
-                        key: snap.key,
-                        description: snap.description,
-                        default_enabled: snap.default_enabled,
-                        enabled: snap.enabled,
-                    })
-                    .collect();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::SettingsList { settings },
-                );
-            }
-            FrontendRequest::SetSetting { key, enabled } => {
-                match server_state.settings.set(&key, enabled) {
-                    Ok(()) => {
-                        tracing::info!(
-                            %key,
-                            enabled,
-                            "settings: toggled via macOS Settings window",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::SettingSet { key, enabled },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::MetricsShowLive { name } => {
-                let counter = server_state.metrics.counter_snapshot_one(&name);
-                let gauge = server_state.metrics.gauge_snapshot_one(&name);
-                let entry = if let Some(snap) = counter {
-                    Some(boss_protocol::MetricLiveEntry {
-                        name: snap.name,
-                        description: snap.description,
-                        kind: "counter".into(),
-                        value: snap.value as i64,
-                        timestamp_ms: snap.updated_at_ms,
-                        stale: snap.stale,
-                    })
-                } else {
-                    gauge.map(|snap| boss_protocol::MetricLiveEntry {
-                        name: snap.name,
-                        description: snap.description,
-                        kind: "gauge".into(),
-                        value: snap.value,
-                        timestamp_ms: snap.observed_at_ms,
-                        stale: snap.stale,
-                    })
-                };
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MetricsShowLiveResult { entry },
-                );
-            }
-            FrontendRequest::MetricsListLive => {
-                let mut entries: Vec<boss_protocol::MetricLiveEntry> = Vec::new();
-                for snap in server_state.metrics.counter_snapshots() {
-                    entries.push(boss_protocol::MetricLiveEntry {
-                        name: snap.name,
-                        description: snap.description,
-                        kind: "counter".into(),
-                        value: snap.value as i64,
-                        timestamp_ms: snap.updated_at_ms,
-                        stale: snap.stale,
-                    });
-                }
-                for snap in server_state.metrics.gauge_snapshots() {
-                    entries.push(boss_protocol::MetricLiveEntry {
-                        name: snap.name,
-                        description: snap.description,
-                        kind: "gauge".into(),
-                        value: snap.value,
-                        timestamp_ms: snap.observed_at_ms,
-                        stale: snap.stale,
-                    });
-                }
-                entries.sort_by(|a, b| a.name.cmp(&b.name));
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MetricsListLiveResult { entries },
-                );
-            }
-            FrontendRequest::MetricsReset { name } => {
-                let now = crate::metrics::registry::now_ms();
-                let (counters_reset, gauges_reset) = match &name {
-                    Some(n) => {
-                        let (c, g) = server_state.metrics.reset_one(n);
-                        if let Err(err) = work_db.metrics_reset_one(n, now) {
-                            tracing::warn!(?err, metric = %n, "metrics reset: db update failed");
-                        }
-                        (c as u64, g as u64)
-                    }
-                    None => {
-                        let (c, g) = server_state.metrics.reset_all();
-                        if let Err(err) = work_db.metrics_reset_all(now) {
-                            tracing::warn!(?err, "metrics reset --all: db update failed");
-                        }
-                        (c, g)
-                    }
-                };
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MetricsResetDone { name, counters_reset, gauges_reset },
-                );
-            }
-            FrontendRequest::KickPrReconcilers => {
-                server_state.pr_reconciler_kick.notify_one();
-                tracing::debug!("merge poller: activation kick received from app");
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::PrReconcilersKicked { kicked: true },
-                );
-            }
-            FrontendRequest::CreateInvestigation { input } => {
-                match work_db.create_investigation(input) {
-                    Ok(task) => {
-                        let item = WorkItem::Task(task);
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "investigation_created",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemCreated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::CreateRevision { input } => {
-                match work_db.create_revision(input, &GhPrStateChecker) {
-                    Ok(task) => {
-                        let item = WorkItem::Task(task);
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "revision_created",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemCreated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::SetProjectDesignDoc { input } => {
-                match work_db.set_project_design_doc(input) {
-                    Ok(project) => {
-                        let item = WorkItem::Project(project);
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "project_design_doc_set",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::ResolveProjectDesignDoc { project_id } => {
-                // Build a (repo_remote_url -> workspace_path) lookup so the
-                // resolver can hand the open dispatcher an absolute
-                // workspace path for `$EDITOR` / renderer fast-path.
-                // First-match wins when multiple workspaces lease the
-                // same repo — any of them resolves the file equally well.
-                let leased_repo_paths: HashMap<String, String> = work_db
-                    .list_in_flight_executions()
-                    .map(|execs| {
-                        let mut map = HashMap::new();
-                        for exec in execs {
-                            if let Some(path) = exec.workspace_path
-                                && !map.contains_key(&exec.repo_remote_url)
-                            {
-                                map.insert(exec.repo_remote_url, path);
-                            }
-                        }
-                        map
-                    })
-                    .unwrap_or_default();
-                match work_db
-                    .resolve_project_design_doc(&project_id, |repo| {
-                        leased_repo_paths.get(repo).cloned()
-                    })
-                {
-                    Ok(output) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ProjectDesignDocResolved { output },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::ListConflictResolutions {
-                product_id,
-                status,
-                work_item_id,
-                limit,
-            } => {
-                // Read-only listing surface for `boss engine conflicts
-                // list`. No auth gate — the rows are diagnostic and the
-                // caller can already read the SQLite file.
-                match work_db.list_conflict_resolutions(
-                    product_id.as_deref(),
-                    &status,
-                    work_item_id.as_deref(),
-                    limit,
-                ) {
-                    Ok(attempts) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ConflictResolutionsList { attempts },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GetConflictResolution { attempt_id } => {
-                match work_db.get_conflict_resolution(&attempt_id) {
-                    Ok(Some(attempt)) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ConflictResolution { attempt },
-                    ),
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "conflict resolution attempt {attempt_id:?} is unknown",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::RetryConflictResolution { attempt_id } => {
-                match work_db.retry_conflict_resolution(&attempt_id) {
-                    Ok(Some(attempt)) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            pr_url = %attempt.pr_url,
-                            "retry_conflict_resolution: attempt reset to pending",
-                        );
-                        // Mirror the freshly-pending start so the macOS
-                        // app's activity feed shows the retry as a new
-                        // attempt. The wire shape is identical to the
-                        // detection-path's started event — the consumer
-                        // doesn't need to distinguish.
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &attempt.product_id,
-                                FrontendEvent::ConflictResolutionStarted {
-                                    product_id: attempt.product_id.clone(),
-                                    work_item_id: attempt.work_item_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: attempt.pr_url.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ConflictResolutionRetried { attempt },
-                        );
-                    }
-                    Ok(None) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "conflict resolution attempt {attempt_id:?} is unknown or not in a terminal-failure state (only failed/abandoned rows can be retried)",
-                                ),
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::AbandonConflictResolution { attempt_id, reason } => {
-                match work_db.mark_conflict_resolution_abandoned(&attempt_id, &reason) {
-                    Ok(Some(attempt)) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            pr_url = %attempt.pr_url,
-                            %reason,
-                            "abandon_conflict_resolution: attempt flipped to abandoned",
-                        );
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &attempt.product_id,
-                                FrontendEvent::ConflictResolutionAbandoned {
-                                    product_id: attempt.product_id.clone(),
-                                    work_item_id: attempt.work_item_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: attempt.pr_url.clone(),
-                                    failure_reason: reason.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ConflictResolutionMarkedAbandoned { attempt },
-                        );
-                    }
-                    Ok(None) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "conflict resolution attempt {attempt_id:?} is unknown or already terminal",
-                                ),
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::MarkConflictResolutionFailed { attempt_id, reason } => {
-                // Worker-facing stop-condition surface. `User` tier:
-                // the worker pane invokes `boss engine conflicts
-                // mark-failed`, which descends from a worker pane and
-                // therefore wouldn't pass `AppOrBoss`. The only state
-                // change is on a `conflict_resolutions` row keyed by
-                // an opaque id — a worker forging an attempt id has
-                // no row to clobber, so authority gates aren't
-                // load-bearing here.
-                match work_db.mark_conflict_resolution_failed(&attempt_id, &reason) {
-                    Ok(Some(attempt)) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            pr_url = %attempt.pr_url,
-                            %reason,
-                            "mark_conflict_resolution_failed: attempt flipped to failed",
-                        );
-                        // Phase 4 #12: broadcast the typed activity-feed
-                        // event so subscribers (the macOS app) can
-                        // render the failed-attempt entry without
-                        // round-tripping through the CLI's response.
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &attempt.product_id,
-                                FrontendEvent::ConflictResolutionFailed {
-                                    product_id: attempt.product_id.clone(),
-                                    work_item_id: attempt.work_item_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: attempt.pr_url.clone(),
-                                    failure_reason: reason.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::ConflictResolutionMarkedFailed { attempt },
-                        );
-                    }
-                    Ok(None) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "conflict resolution attempt {attempt_id:?} is unknown or already terminal",
-                                ),
-                            },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::ClassifyCiRemediation {
-                attempt_id,
-                triage_class,
-            } => {
-                // Worker-facing marker: stamp `triage_class` on a
-                // `ci_remediations` row. Pure metadata column, no
-                // authority gate — a forged attempt id has no row to
-                // clobber.
-                match work_db.set_ci_remediation_triage_class(&attempt_id, &triage_class) {
-                    Ok(Some(attempt)) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::CiRemediationClassified { attempt },
-                    ),
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "ci_remediation attempt {attempt_id:?} is unknown",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::MarkCiRemediationFailed { attempt_id, reason } => {
-                match work_db.mark_ci_remediation_failed(&attempt_id, &reason) {
-                    Ok(Some(attempt)) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            pr_url = %attempt.pr_url,
-                            %reason,
-                            "mark_ci_remediation_failed: attempt flipped to failed",
-                        );
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &attempt.product_id,
-                                FrontendEvent::CiRemediationFailed {
-                                    product_id: attempt.product_id.clone(),
-                                    work_item_id: attempt.work_item_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: attempt.pr_url.clone(),
-                                    failure_reason: reason.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::CiRemediationMarkedFailed { attempt },
-                        );
-                    }
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::MarkCiRemediationRetriggered { attempt_id, new_id } => {
-                // The retrigger marker doesn't change the row's status —
-                // the merge-poller observes the re-run's outcome on the
-                // next sweep. We just log + echo so the worker has a
-                // confirmation receipt.
-                match work_db.get_ci_remediation(&attempt_id) {
-                    Ok(Some(attempt)) => {
-                        tracing::info!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            new_id = %new_id,
-                            "mark_ci_remediation_retriggered: worker re-ran the failing build",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::CiRemediationRetriggered {
-                                attempt,
-                                new_id,
-                            },
-                        );
-                    }
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!("ci_remediation attempt {attempt_id:?} is unknown"),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::MarkCiRemediationSucceededViaRebase { attempt_id } => {
-                // Snapshot the pre-update row so we can report
-                // `budget_refunded` accurately (only fix-kind attempts
-                // with `consumes_budget = 1` get a counter decrement).
-                let pre = work_db.get_ci_remediation(&attempt_id).ok().flatten();
-                match work_db.mark_ci_remediation_succeeded_via_rebase(&attempt_id) {
-                    Ok(Some(attempt)) => {
-                        let budget_refunded = pre
-                            .as_ref()
-                            .map(|p| p.consumes_budget != 0)
-                            .unwrap_or(false);
-                        tracing::info!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            budget_refunded,
-                            "mark_ci_remediation_succeeded_via_rebase: rebase-only success recorded",
-                        );
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &attempt.product_id,
-                                FrontendEvent::CiRemediationSucceeded {
-                                    product_id: attempt.product_id.clone(),
-                                    work_item_id: attempt.work_item_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: attempt.pr_url.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::CiRemediationSucceededViaRebase {
-                                attempt,
-                                budget_refunded,
-                            },
-                        );
-                    }
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::ListCiRemediations {
-                product_id,
-                status,
-                work_item_id,
-                limit,
-            } => {
-                // Read-only listing surface for `boss engine ci list`
-                // (design Phase 11 #35). Mirror of
-                // `ListConflictResolutions`.
-                match work_db.list_ci_remediations(
-                    product_id.as_deref(),
-                    &status,
-                    work_item_id.as_deref(),
-                    limit,
-                ) {
-                    Ok(attempts) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::CiRemediationsList { attempts },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GetCiRemediation { attempt_id } => {
-                match work_db.get_ci_remediation(&attempt_id) {
-                    Ok(Some(attempt)) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::CiRemediation { attempt },
-                    ),
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "ci_remediation attempt {attempt_id:?} is unknown",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::RetryCiRemediation { selector } => {
-                // The CLI accepts either a `ci_remediations` attempt id
-                // or a work-item id (design Q11 "When invoked on an
-                // attempt id, the engine resolves the attempt to its
-                // work_item_id and acts on the parent."). Resolve the
-                // selector before invoking the engine path so the
-                // error messages stay grounded in what the caller
-                // typed.
-                let resolved: Result<Option<String>, anyhow::Error> = if selector
-                    .starts_with("cir_")
-                {
-                    work_db
-                        .get_ci_remediation(&selector)
-                        .map(|opt| opt.map(|a| a.work_item_id))
-                } else {
-                    Ok(Some(selector.clone()))
-                };
-                match resolved {
-                    Ok(Some(work_item_id)) => {
-                        match work_db.retry_ci_remediation_for_work_item(&work_item_id) {
-                            Ok(Some((budget, was_exhausted))) => {
-                                tracing::warn!(
-                                    %work_item_id,
-                                    was_exhausted,
-                                    "retry_ci_remediation: budget reset, parent unblocked={was_exhausted}",
-                                );
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::CiRemediationRetryDone {
-                                        work_item_id,
-                                        budget,
-                                        was_exhausted,
-                                    },
-                                );
-                            }
-                            Ok(None) => send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: format!(
-                                        "work item {work_item_id:?} is unknown",
-                                    ),
-                                },
-                            ),
-                            Err(err) => send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: err.to_string(),
-                                },
-                            ),
-                        }
-                    }
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "ci_remediation attempt {selector:?} is unknown",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::AbandonCiRemediation { attempt_id, reason } => {
-                match work_db.mark_ci_remediation_abandoned(&attempt_id, &reason) {
-                    Ok(Some(attempt)) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
-                            work_item_id = %attempt.work_item_id,
-                            pr_url = %attempt.pr_url,
-                            %reason,
-                            "abandon_ci_remediation: attempt flipped to abandoned",
-                        );
-                        server_state
-                            .publisher
-                            .publish_frontend_event_on_product(
-                                &attempt.product_id,
-                                FrontendEvent::CiRemediationAbandoned {
-                                    product_id: attempt.product_id.clone(),
-                                    work_item_id: attempt.work_item_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: attempt.pr_url.clone(),
-                                    failure_reason: reason.clone(),
-                                },
-                            )
-                            .await;
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::CiRemediationMarkedAbandoned { attempt },
-                        );
-                    }
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
-                            ),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GetCiBudget { work_item_id } => {
-                match work_db.ci_budget_snapshot(&work_item_id) {
-                    Ok(Some(budget)) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::CiBudget { budget },
-                    ),
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!("work item {work_item_id:?} is unknown"),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::SetCiBudget {
-                work_item_id,
-                budget,
-            } => {
-                match work_db.set_ci_attempt_budget(&work_item_id, budget) {
-                    Ok(Some(snapshot)) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::CiBudgetUpdated { budget: snapshot },
-                    ),
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!("work item {work_item_id:?} is unknown"),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::ListEngineAttempts {
-                kinds,
-                product_id,
-                status,
-                work_item_id,
-                limit,
-            } => {
-                match work_db.list_engine_attempts(
-                    &kinds,
-                    product_id.as_deref(),
-                    &status,
-                    work_item_id.as_deref(),
-                    limit,
-                ) {
-                    Ok(attempts) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::EngineAttemptsList { attempts },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::SetProductDefaultModel { product_id, model } => {
-                match work_db.set_product_default_model(&product_id, model.as_deref()) {
-                    Ok(product) => {
-                        let item = WorkItem::Product(product);
-                        let pid = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&pid)],
-                            "product_default_model_set",
-                            Some(pid),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::AuditProductEffort {
-                product_id,
-                window_days,
-            } => {
-                // Read-only diagnostic surface for `boss product
-                // audit-effort`. No auth gate — the rows are the
-                // chore corpus the caller can already enumerate
-                // via `boss chore list`, and the escalation events
-                // are coordinator-emitted facts about that corpus.
-                let result = build_effort_audit_report(
-                    &work_db,
-                    &product_id,
-                    window_days,
-                );
-                match result {
-                    Ok(report) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::EffortAuditReport { report },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::RecordEffortEscalation {
-                work_item_id,
-                original_level,
-                new_level,
-                markers,
-                rule_id,
-            } => {
-                // Coordinator-only RPC in practice (the sibling
-                // escalation-handler task is the only caller in
-                // v1), but the engine doesn't gate it — the row
-                // is opaque diagnostic data and a forged event is
-                // bounded to one false-positive in the audit
-                // report.
-                match work_db.record_effort_escalation(
-                    &work_item_id,
-                    original_level,
-                    new_level,
-                    &markers,
-                    rule_id.as_deref(),
-                ) {
-                    Ok(event) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::EffortEscalationRecorded { event },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::SetProductExternalTracker { input } => {
-                let validation_result = if input.unset {
-                    Ok(())
-                } else {
-                    match (input.kind.as_deref(), input.config.as_ref()) {
-                        (None, _) | (_, None) => Err("both kind and config must be provided when not using unset".to_owned()),
-                        (Some(kind), Some(config)) => validate_external_tracker_config(kind, config),
-                    }
-                };
-                match validation_result {
-                    Err(msg) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError { message: msg },
-                    ),
-                    Ok(()) => {
-                        let result = work_db.set_product_external_tracker(
-                            &input.product_id,
-                            input.kind.as_deref(),
-                            input.config.as_ref(),
-                            input.unset,
-                        );
-                        match result {
-                            Ok(product) => {
-                                let item = WorkItem::Product(product);
-                                let product_id = work_item_product_id(&item);
-                                let revision = publish_work_invalidation(
-                                    &server_state,
-                                    &session_id,
-                                    &request_id,
-                                    vec![work_product_topic(&product_id)],
-                                    "external_tracker_updated",
-                                    Some(product_id),
-                                    vec![work_item_id(&item)],
-                                )
-                                .await;
-                                send_response_with_revision(
-                                    &sink,
-                                    &request_id,
-                                    revision,
-                                    FrontendEvent::WorkItemUpdated { item },
-                                );
-                            }
-                            Err(err) => send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: err.to_string(),
-                                },
-                            ),
-                        }
-                    }
-                }
-            }
-            FrontendRequest::SyncProductExternalTracker { product_id } => {
-                let work_db = server_state.work_db.clone();
-                let registry = server_state.tracker_registry.clone();
-                let metrics = server_state.metrics.clone();
-                let publisher = server_state.clone();
-                let credential_resolver = server_state.tracker_credential_resolver.clone();
-                let sink2 = sink.clone();
-                let request_id2 = request_id.clone();
-                tokio::spawn(async move {
-                    match crate::external_tracker::reconcile::run_one_pass_for_product(
-                        work_db.as_ref(),
-                        registry.as_ref(),
-                        metrics.as_ref(),
-                        &product_id,
-                        publisher.as_ref(),
-                        credential_resolver.as_ref(),
-                    )
-                    .await
-                    {
-                        Some(outcome) => {
-                            tracing::info!(
-                                product_id,
-                                items_imported = outcome.items_imported,
-                                items_closed = outcome.items_closed,
-                                pr_attached = outcome.pr_attached,
-                                close_issue_succeeded = outcome.close_issue_succeeded,
-                                close_issue_failed = outcome.close_issue_failed,
-                                items_unbound = outcome.items_unbound,
-                                "on-demand external tracker sync complete",
-                            );
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::ExternalTrackerSyncStarted { product_id },
-                            );
-                        }
-                        None => {
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::WorkError {
-                                    message: format!(
-                                        "product '{product_id}' has no external tracker binding"
-                                    ),
-                                },
-                            );
-                        }
-                    }
-                });
-            }
-            FrontendRequest::LinkWorkItemExternalRef { input } => {
-                let result = work_db
-                    .set_external_ref(
-                        &input.work_item_id,
-                        &input.kind,
-                        &input.canonical_id,
-                        &serde_json::Value::Null,
-                    )
-                    .and_then(|()| work_db.get_task_with_external_ref(&input.work_item_id));
-                match result {
-                    Ok(item) => {
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "work_item_updated",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::UnlinkWorkItemExternalRef { work_item_id: target_id } => {
-                let result = work_db
-                    .clear_external_ref(&target_id)
-                    .and_then(|()| work_db.get_task_with_external_ref(&target_id));
-                match result {
-                    Ok(item) => {
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "work_item_updated",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemUpdated { item },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GitHubAuthStart => {
-                // Begin (or restart) the device flow. The controller transitions
-                // to `RequestingCode` synchronously and drives the rest in a
-                // background task; the forwarder pushes each subsequent state on
-                // the `github.auth` topic. Reply with the immediate state so the
-                // request completes.
-                server_state.github_auth.start_flow().await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::GitHubAuthState {
-                        state: server_state.github_auth.current_state().to_dto(),
-                    },
-                );
-            }
-            FrontendRequest::GitHubAuthCancel => {
-                server_state.github_auth.cancel().await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::GitHubAuthState {
-                        state: server_state.github_auth.current_state().to_dto(),
-                    },
-                );
-            }
-            FrontendRequest::GitHubAuthDisconnect => {
-                // Deletes the keychain token and drops to `Disconnected`.
-                server_state.github_auth.disconnect().await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::GitHubAuthState {
-                        state: server_state.github_auth.current_state().to_dto(),
-                    },
-                );
-            }
-            FrontendRequest::GitHubAuthStatus => {
-                let current = server_state.github_auth.current_state();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::GitHubAuthState {
-                        state: current.to_dto(),
-                    },
-                );
-                // "Re-check" (design §7): when connected, re-run the org/SSO
-                // probe so an org-approval / SSO banner clears on its own once
-                // the owner approves or the user SSO-authorizes — no full
-                // re-auth needed. `update_org_state` only notifies on a real
-                // change, which the forwarder then pushes on `github.auth`.
-                if let GitHubAuthState::Authorized { record, .. } = current {
-                    let server_state = server_state.clone();
-                    let token = record.token.clone();
-                    tokio::spawn(async move {
-                        let controller = server_state.github_auth.clone();
-                        let flow = controller.device_flow();
-                        let resolved = probe_and_record_org_state(
-                            server_state.work_db.as_ref(),
-                            flow.as_ref(),
-                            &token,
-                        )
-                        .await;
-                        controller.update_org_state(resolved);
-                    });
-                }
-            }
-            FrontendRequest::MergeWhenReady { work_item_id } => {
-                // Pre-flight: task must exist and be a Task/Chore.
-                let item = match work_db.get_work_item(&work_item_id) {
-                    Ok(item) => item,
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "merge_when_ready: unknown work item: {err}"
-                                ),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let (pr_url, task_status) = match &item {
-                    WorkItem::Task(task) | WorkItem::Chore(task) => {
-                        (task.pr_url.clone(), task.status.clone())
-                    }
-                    _ => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: "merge_when_ready: only supported for tasks/chores"
-                                    .to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                if task_status != "in_review" {
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!(
-                                "merge_when_ready: task is not in review (status: {task_status})"
-                            ),
-                        },
-                    );
-                    continue;
-                }
-                let pr_url = match pr_url.filter(|s| !s.is_empty()) {
-                    Some(u) => u,
-                    None => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: "merge_when_ready: task has no PR URL".to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                // Spawn the GitHub interaction so the main loop isn't blocked.
-                let sink2 = sink.clone();
-                let request_id2 = request_id.clone();
-                let work_item_id2 = work_item_id.clone();
-                let pr_url2 = pr_url.clone();
-                let kick = server_state.pr_reconciler_kick.clone();
-                tokio::spawn(async move {
-                    match merge_when_ready::gh_merge_when_ready(&pr_url2).await {
-                        Ok(action) => {
-                            // Kick the PR reconciler so the kanban state
-                            // reflects the new merge-queue / auto-merge
-                            // state promptly without waiting for the next
-                            // periodic sweep.
-                            kick.notify_one();
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::MergeWhenReadyAccepted {
-                                    work_item_id: work_item_id2,
-                                    pr_url: pr_url2,
-                                    action: action.as_str().to_owned(),
-                                },
-                            );
-                        }
-                        Err(err) => {
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::WorkError {
-                                    message: format!("merge_when_ready failed: {err:#}"),
-                                },
-                            );
-                        }
-                    }
-                });
-            }
-            FrontendRequest::OpenReviewTerminal { work_item_id } => {
-                let item = match work_db.get_work_item(&work_item_id) {
-                    Ok(item) => item,
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("open_review_terminal: unknown work item: {err}"),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let (pr_url, product_id, task_repo_url) = match &item {
-                    WorkItem::Task(task) | WorkItem::Chore(task) => (
-                        task.pr_url.clone(),
-                        task.product_id.clone(),
-                        task.repo_remote_url.clone(),
-                    ),
-                    _ => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: "open_review_terminal only supports tasks/chores"
-                                    .to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let pr_url = match pr_url.filter(|s| !s.is_empty()) {
-                    Some(u) => u,
-                    None => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: "open_review_terminal: task has no PR URL".to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let product = match work_db
-                    .get_product(&product_id)
-                    .ok()
-                    .flatten()
-                {
-                    Some(p) => p,
-                    None => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "open_review_terminal: unknown product: {product_id}"
-                                ),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let repo_remote_url = match task_repo_url
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| product.repo_remote_url.filter(|s| !s.is_empty()))
-                {
-                    Some(url) => url,
-                    None => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message:
-                                    "open_review_terminal: task has no repo URL".to_owned(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-                let cube_client = server_state.cube_client.clone();
-                let sink2 = sink.clone();
-                let request_id2 = request_id.clone();
-                let work_item_id2 = work_item_id.clone();
-                tokio::spawn(async move {
-                    match open_review_terminal_async(
-                        &cube_client,
-                        &repo_remote_url,
-                        &pr_url,
-                        &work_item_id2,
-                    )
-                    .await
-                    {
-                        Ok((workspace_path, lease_id)) => {
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::ReviewTerminalReady {
-                                    work_item_id: work_item_id2,
-                                    workspace_path,
-                                    lease_id,
-                                },
-                            );
-                        }
-                        Err(err) => {
-                            send_response(
-                                &sink2,
-                                &request_id2,
-                                FrontendEvent::WorkError {
-                                    message: format!("open_review_terminal failed: {err:#}"),
-                                },
-                            );
-                        }
-                    }
-                });
-            }
-            FrontendRequest::ReleaseReviewTerminal { lease_id } => {
-                let cube_client = server_state.cube_client.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = cube_client.release_workspace(&lease_id).await {
-                        tracing::warn!(
-                            %lease_id,
-                            ?err,
-                            "release_review_terminal: workspace release failed"
-                        );
-                    }
-                });
-                // fire-and-forget: no reply sent
-            }
-
-            // --- Comments in the markdown viewer (Phase 2). User-tier; no
-            // authorize_rpc gate (every local client may read/write). ---
-            FrontendRequest::CommentsCreate { input } => {
-                let artifact_kind = input.artifact_kind.clone();
-                let artifact_id = input.artifact_id.clone();
-                match work_db.create_comment(input) {
-                    Ok(comment) => {
-                        let revision = publish_comment_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            &artifact_kind,
-                            &artifact_id,
-                            "comment_created",
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::CommentResult { comment },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::CommentsList {
-                artifact_kind,
-                artifact_id,
-                include_resolved,
-            } => match work_db.list_comments(&artifact_kind, &artifact_id, include_resolved) {
-                Ok(comments) => send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    server_state.current_work_revision(),
-                    FrontendEvent::CommentsList {
-                        artifact_kind,
-                        artifact_id,
-                        comments,
-                    },
-                ),
-                Err(err) => send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                ),
-            },
-            FrontendRequest::CommentsResolve {
-                artifact_kind,
-                artifact_id,
-                plain_text,
-                plain_text_projection_version,
-            } => {
-                let config = crate::comments_anchor::CommentFuzzyConfig::from_env();
-                match work_db.resolve_comments(
-                    &artifact_kind,
-                    &artifact_id,
-                    &plain_text,
-                    plain_text_projection_version,
-                    &config,
-                ) {
-                    Ok(comments) => send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        server_state.current_work_revision(),
-                        FrontendEvent::CommentsResolved {
-                            artifact_kind,
-                            artifact_id,
-                            comments,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::CommentsDismiss { comment_id, actor } => {
-                match work_db.dismiss_comment(&comment_id, actor.as_deref()) {
-                    Ok(comment) => {
-                        let revision = publish_comment_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            &comment.artifact_kind,
-                            &comment.artifact_id,
-                            "comment_dismissed",
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::CommentResult { comment },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::CommentsSetStatus {
-                comment_id,
-                status,
-                actor,
-            } => match work_db.set_comment_status(&comment_id, &status, actor.as_deref()) {
-                Ok(comment) => {
-                    let revision = publish_comment_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        &comment.artifact_kind,
-                        &comment.artifact_id,
-                        "comment_status_changed",
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::CommentResult { comment },
-                    );
-                }
-                Err(err) => send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                ),
-            },
-            FrontendRequest::CommentsUpdateAnchor {
-                comment_id,
-                anchor,
-                new_doc_version,
-                plain_text_projection_version,
-            } => match work_db.update_comment_anchor(
-                &comment_id,
-                &anchor,
-                &new_doc_version,
-                plain_text_projection_version,
-            ) {
-                Ok(comment) => {
-                    let revision = publish_comment_invalidation(
-                        &server_state,
-                        &session_id,
-                        &request_id,
-                        &comment.artifact_kind,
-                        &comment.artifact_id,
-                        "comment_anchor_updated",
-                    )
-                    .await;
-                    send_response_with_revision(
-                        &sink,
-                        &request_id,
-                        revision,
-                        FrontendEvent::CommentResult { comment },
-                    );
-                }
-                Err(err) => send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                ),
-            },
-
-            // --- Magic wand (Phase 3: engine-owned docs) ---
-            // App-or-Boss-session tier: workers must not be able to trigger
-            // a new AI agent call.
-            FrontendRequest::CommentsDispatchMagicWand { comment_id } => {
-                if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
-                    tracing::warn!(
-                        peer_pid = ?peer_pid,
-                        comment_id = %comment_id,
-                        "comments_dispatch_magic_wand rejected: caller not in app/Boss subtree",
-                    );
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "comments_dispatch_magic_wand requires app or Boss authority"
-                                .to_owned(),
-                        },
-                    );
-                    continue;
-                }
-
-                // Resolve the comment to get the doc text and anchor.
-                let comment = match work_db.get_comment(&comment_id) {
-                    Ok(Some(c)) => c,
-                    Ok(None) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("unknown comment: {comment_id}"),
-                            },
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                match comment.artifact_kind.as_str() {
-                    "work_item" => {
-                        // Phase 3: engine-owned doc → specialised, isolated Claude instance.
-
-                        // Fetch the work-item description (the doc text).
-                        let doc_text = match work_db.get_work_item(&comment.artifact_id) {
-                            Ok(item) => {
-                                use boss_protocol::WorkItem;
-                                match item {
-                                    WorkItem::Task(t) | WorkItem::Chore(t) => t.description,
-                                    _ => {
-                                        send_response(
-                                            &sink,
-                                            &request_id,
-                                            FrontendEvent::WorkError {
-                                                message: format!(
-                                                    "magic-wand dispatch: work item '{}' is not a \
-                                                     Task/Chore",
-                                                    comment.artifact_id
-                                                ),
-                                            },
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: err.to_string(),
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Create the dispatch row (status = in_flight).
-                        let dispatch = match work_db.create_magic_wand_dispatch(
-                            &comment_id,
-                            &comment.artifact_kind,
-                            &comment.artifact_id,
-                            &comment.doc_version,
-                        ) {
-                            Ok(d) => d,
-                            Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: err.to_string(),
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Reply immediately so the macOS app can subscribe to the dispatch topic.
-                        let dispatch_id = dispatch.id.clone();
-                        let anchor_exact = comment.anchor.exact.clone();
-                        let comment_body = comment.body.clone();
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::MagicWandDispatched { dispatch: dispatch.clone() },
-                        );
-
-                        // Spawn the async Claude call.
-                        let work_db2 = work_db.clone();
-                        let server_state2 = server_state.clone();
-                        tokio::spawn(async move {
-                            let topic = magic_wand_dispatch_topic(&dispatch_id);
-                            let result = crate::magic_wand::dispatch(
-                                &doc_text,
-                                &anchor_exact,
-                                &comment_body,
-                            )
-                            .await;
-                            let final_dispatch = match result {
-                                Ok(mw) => {
-                                    match work_db2.complete_magic_wand_dispatch(
-                                        &dispatch_id,
-                                        "returned",
-                                        Some(&mw.result_md),
-                                        None,
-                                        Some(mw.input_tokens),
-                                        Some(mw.output_tokens),
-                                        mw.anchor_warning,
-                                    ) {
-                                        Ok(d) => d,
-                                        Err(err) => {
-                                            tracing::error!(
-                                                dispatch_id = %dispatch_id,
-                                                err = %err,
-                                                "failed to record magic_wand returned status",
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    let (error_msg, error_kind) = err;
-                                    tracing::warn!(
-                                        dispatch_id = %dispatch_id,
-                                        error_kind = %error_kind,
-                                        error = %error_msg,
-                                        "magic_wand dispatch failed",
-                                    );
-                                    match work_db2.complete_magic_wand_dispatch(
-                                        &dispatch_id,
-                                        "failed",
-                                        None,
-                                        Some(error_kind),
-                                        None,
-                                        None,
-                                        false,
-                                    ) {
-                                        Ok(d) => d,
-                                        Err(db_err) => {
-                                            tracing::error!(
-                                                dispatch_id = %dispatch_id,
-                                                err = %db_err,
-                                                "failed to record magic_wand failed status",
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                            };
-                            let envelope =
-                                FrontendEventEnvelope::push(FrontendEvent::MagicWandResult {
-                                    dispatch: final_dispatch,
-                                });
-                            server_state2.topic_broker.publish(&topic, envelope).await;
-                        });
-                    }
-
-                    "pr_doc" => {
-                        // Phase 4: PR-backed doc → Boss chore worker.
-                        // Parse the artifact_id: "pr_doc:<repo_remote_url>:<branch>:<path>".
-                        // repo_remote_url may itself contain ':' (SSH git@ URLs), so we
-                        // split from the right into exactly 3 parts (path, branch, repo).
-                        let artifact_id = &comment.artifact_id;
-                        let suffix = artifact_id.strip_prefix("pr_doc:").unwrap_or("");
-                        let parts: Vec<&str> = suffix.rsplitn(3, ':').collect();
-                        if parts.len() != 3 {
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: format!(
-                                        "magic-wand: malformed pr_doc artifact_id '{artifact_id}'; \
-                                         expected 'pr_doc:<repo>:<branch>:<path>'"
-                                    ),
-                                },
-                            );
-                            continue;
-                        }
-                        let (pr_path, pr_branch, pr_repo) =
-                            (parts[0], parts[1], parts[2]);
-
-                        // Find the product that owns this repo.
-                        let product_id = match work_db
-                            .find_product_id_by_repo_remote_url(pr_repo)
-                        {
-                            Ok(Some(id)) => id,
-                            Ok(None) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: format!(
-                                            "magic-wand: no product found for repo '{pr_repo}'; \
-                                             cannot spawn chore"
-                                        ),
-                                    },
-                                );
-                                continue;
-                            }
-                            Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: err.to_string(),
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Build the chore title: truncate the anchor quote to 60 chars.
-                        let short_quote = if comment.anchor.exact.len() > 60 {
-                            format!("{}…", &comment.anchor.exact[..60])
-                        } else {
-                            comment.anchor.exact.clone()
-                        };
-                        let chore_name =
-                            format!("Address comment on `{pr_path}`: `{short_quote}`");
-
-                        // Build the chore description (worker reads this as the directive).
-                        let chore_description = format!(
-                            "A reviewer left a comment on this PR's design doc.\n\n\
-                             File: {pr_path}\n\
-                             Branch: {pr_branch}\n\n\
-                             Quoted section:\n\
-                             > {anchor}\n\n\
-                             Comment:\n\
-                             > {body}\n\n\
-                             Please update the file accordingly and push to the existing PR \
-                             branch. Do not open a new PR; this branch already has one. \
-                             Use `git checkout {pr_branch}` (or `jj edit`) to land on the \
-                             branch before editing.",
-                            anchor = comment.anchor.exact,
-                            body = comment.body,
-                        );
-
-                        // Create the chore via the standard path.
-                        // `repo_remote_url` is inherited from the product
-                        // (which was resolved by `find_product_id_by_repo_remote_url`),
-                        // so we don't need to set it again here.
-                        let chore = match work_db.create_chore(CreateChoreInput {
-                            product_id: product_id.clone(),
-                            name: chore_name,
-                            description: Some(chore_description),
-                            autostart: true,
-                            priority: None,
-                            created_via: Some(format!(
-                                "comment_dispatch:{comment_id}"
-                            )),
-                            repo_remote_url: None,
-                            effort_level: None,
-                            model_override: None,
-                            force_duplicate: false,
-                        }) {
-                            Ok(c) => c,
-                            Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: format!(
-                                            "magic-wand: failed to create chore: {err}"
-                                        ),
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Create the dispatch row (status = chore_created).
-                        let dispatch = match work_db.create_pr_backed_magic_wand_dispatch(
-                            &comment_id,
-                            &comment.artifact_kind,
-                            &comment.artifact_id,
-                            &comment.doc_version,
-                            &chore.id,
-                        ) {
-                            Ok(d) => d,
-                            Err(err) => {
-                                send_response(
-                                    &sink,
-                                    &request_id,
-                                    FrontendEvent::WorkError {
-                                        message: err.to_string(),
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Transition the comment to `dispatched`.
-                        let actor = format!("comment_dispatch:{comment_id}");
-                        if let Err(err) = work_db.set_comment_status(
-                            &comment_id,
-                            COMMENT_STATUS_DISPATCHED,
-                            Some(actor.as_str()),
-                        ) {
-                            tracing::error!(
-                                comment_id = %comment_id,
-                                chore_id = %chore.id,
-                                err = %err,
-                                "magic-wand: failed to transition comment to dispatched",
-                            );
-                        }
-
-                        // Publish work invalidation so the kanban sees the new chore.
-                        publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "comment_dispatch_chore_created",
-                            Some(product_id),
-                            vec![chore.id.clone()],
-                        )
-                        .await;
-
-                        tracing::info!(
-                            comment_id = %comment_id,
-                            chore_id = %chore.id,
-                            pr_repo = %pr_repo,
-                            pr_branch = %pr_branch,
-                            pr_path = %pr_path,
-                            "magic-wand: spawned chore for PR-backed doc comment",
-                        );
-
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::MagicWandDispatched { dispatch },
-                        );
-                    }
-
-                    other => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "magic-wand dispatch: unsupported artifact_kind '{other}'"
-                                ),
-                            },
-                        );
-                    }
-                }
-            }
-
-            FrontendRequest::CommentsApplyMagicWand {
-                dispatch_id,
-                current_doc_version,
-            } => {
-                match work_db.apply_magic_wand_dispatch(
-                    &dispatch_id,
-                    &current_doc_version,
-                    "user",
-                ) {
-                    Ok((dispatch, conflict)) => {
-                        if !conflict {
-                            // Publish comment topic invalidation so the sidebar reloads.
-                            publish_comment_invalidation(
-                                &server_state,
-                                &session_id,
-                                &request_id,
-                                &dispatch.artifact_kind,
-                                &dispatch.artifact_id,
-                                "magic_wand_applied",
-                            )
-                            .await;
-                        }
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::MagicWandApplied { dispatch, conflict },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-
-            FrontendRequest::CommentsDiscardMagicWand { dispatch_id } => {
-                match work_db.discard_magic_wand_dispatch(&dispatch_id) {
-                    Ok(dispatch) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::MagicWandApplied {
-                            dispatch,
-                            conflict: false,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-
-            // --- Automation CRUD (maintenance-tasks.md T2) ---
-            FrontendRequest::CreateAutomation { input } => {
-                match work_db.create_automation(input) {
-                    Ok(automation) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AutomationCreated { automation },
-                        );
-                    }
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::ListAutomations { product_id } => {
-                match work_db.list_automations(&product_id) {
-                    Ok(automations) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationsList {
-                            product_id,
-                            automations,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GetAutomation { id } => {
-                match work_db.get_automation(&id) {
-                    Ok(Some(automation)) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationResult { automation },
-                    ),
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!("unknown automation: {id}"),
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::UpdateAutomation { id, patch } => {
-                match work_db.update_automation(&id, patch) {
-                    Ok(automation) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationUpdated { automation },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::EnableAutomation { id } => {
-                match work_db.enable_automation(&id) {
-                    Ok(automation) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationUpdated { automation },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::DisableAutomation { id } => {
-                match work_db.disable_automation(&id) {
-                    Ok(automation) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationUpdated { automation },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::DeleteAutomation { id } => {
-                match work_db.delete_automation(&id) {
-                    Ok(()) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationDeleted { automation_id: id },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::GetAutomationOpenTaskCount { automation_id } => {
-                match work_db.count_open_tasks_for_automation(&automation_id) {
-                    Ok(count) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationOpenTaskCount {
-                            automation_id,
-                            count,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-
-            // Editorial controls — protocol types only for SetProductEditorialRules; ListEditorialActions is live.
-            FrontendRequest::SetProductEditorialRules { .. } => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: "set-editorial-rules is not yet implemented".into(),
-                    },
-                );
-            }
-
-            FrontendRequest::ListEditorialActions { product_id, limit } => {
-                match work_db.list_editorial_actions(&product_id, limit, None) {
-                    Ok(actions) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::EditorialActionsList {
-                            product_id,
-                            actions,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-
-            FrontendRequest::ListAutomationRuns { automation_id } => {
-                match work_db.list_automation_runs(&automation_id) {
-                    Ok(runs) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationRunsList {
-                            automation_id,
-                            runs,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::ListAutomationTasks { automation_id } => {
-                match work_db.list_tasks_for_automation(&automation_id) {
-                    Ok(tasks) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::AutomationTasksList {
-                            automation_id,
-                            tasks,
-                        },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
-                }
-            }
-            FrontendRequest::RunAutomation { automation_id, force } => {
-                // Manual out-of-schedule triage fire (`boss automation run`).
-                // Respects the open-task cap unless `force`. Mirrors the
-                // scheduler's fire path: dispatch a triage execution, then
-                // record an `automation_runs` row for the occurrence (using
-                // `now` as `scheduled_for`) WITHOUT advancing the cron schedule
-                // (`next_due_at` is left untouched — this is out of band).
-                let automation = match work_db.get_automation(&automation_id) {
-                    Ok(Some(a)) => a,
-                    Ok(None) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("unknown automation: {automation_id}"),
-                            },
-                        );
-                        continue;
-                    }
-                    Err(err) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: err.to_string(),
-                            },
-                        );
-                        continue;
-                    }
-                };
-
-                if !force {
-                    match work_db.count_open_tasks_for_automation(&automation_id) {
-                        Ok(open) if open >= automation.open_task_limit => {
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: format!(
-                                        "automation {automation_id} is at its open-task limit \
-                                         ({open}/{}); pass --force to fire anyway",
-                                        automation.open_task_limit
-                                    ),
-                                },
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            send_response(
-                                &sink,
-                                &request_id,
-                                FrontendEvent::WorkError {
-                                    message: err.to_string(),
-                                },
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                let coord = server_state.execution_coordinator.clone();
-                let dispatcher = crate::automation_triage::EngineTriageDispatcher::new(
-                    work_db.clone(),
-                    Arc::new(move || coord.kick()),
-                );
-                let now_epoch = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                match dispatcher.fire(&automation) {
-                    crate::automation_scheduler::TriageDispatch::Dispatched { execution_id } => {
-                        if let Err(err) = work_db.record_automation_run_and_advance(
-                            crate::work::AutomationFireRecord::builder()
-                                .automation_id(automation_id.clone())
-                                .scheduled_for(now_epoch)
-                                .started_at(now_epoch)
-                                .outcome(boss_protocol::AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
-                                .triage_execution_id(execution_id)
-                                .build(),
-                        ) {
-                            tracing::warn!(
-                                automation_id = %automation_id,
-                                ?err,
-                                "manual automation run: triage dispatched but failed to record run row",
-                            );
-                        }
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::AutomationRunEnqueued { automation_id },
-                        );
-                    }
-                    crate::automation_scheduler::TriageDispatch::TransientFailure { detail } => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!("could not enqueue triage: {detail}"),
-                            },
-                        );
-                    }
-                }
-            }
-            FrontendRequest::CreateAutomationTask {
-                automation_id,
-                name,
-                description,
-            } => {
-                // The triage agent's `boss task create --automation`. Creates
-                // the single produced task (with a transactional open-task-cap
-                // re-check as the fan-out backstop), then — because the task is
-                // `autostart` — requests its execution, which the dispatcher
-                // routes to the automations pool on `source_automation_id`.
-                match work_db.create_automation_task(
-                    &automation_id,
-                    &name,
-                    description.as_deref(),
-                ) {
-                    Ok(task) => {
-                        let item = WorkItem::Chore(task);
-                        let work_item_id_for_dispatch = work_item_id(&item);
-                        let live_states = server_state.live_worker_states.clone();
-                        let dispatch_input = RequestExecutionInput::builder()
-                            .work_item_id(work_item_id_for_dispatch.clone())
-                            .build();
-                        match work_db.request_execution_with_live_check(dispatch_input, |run_id| {
-                            live_states.is_run_live(run_id)
-                        }) {
-                            Ok(_execution) => {
-                                server_state.execution_coordinator.kick();
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    work_item_id = %work_item_id_for_dispatch,
-                                    ?err,
-                                    "CreateAutomationTask: task created but auto-dispatch failed; \
-                                     task will start when re-scanned",
-                                );
-                            }
-                        }
-                        let product_id = work_item_product_id(&item);
-                        let revision = publish_work_invalidation(
-                            &server_state,
-                            &session_id,
-                            &request_id,
-                            vec![work_product_topic(&product_id)],
-                            "automation_task_created",
-                            Some(product_id),
-                            vec![work_item_id(&item)],
-                        )
-                        .await;
-                        send_response_with_revision(
-                            &sink,
-                            &request_id,
-                            revision,
-                            FrontendEvent::WorkItemCreated { item },
-                        );
-                    }
-                    Err(err) => {
-                        send_response(&sink, &request_id, duplicate_or_work_error(err));
-                    }
-                }
+            r @ FrontendRequest::AbandonCiRemediation { .. } => {
+                ci_remediation::handle_abandon_ci_remediation(ctx, r).await
+            }
+            r @ FrontendRequest::AbandonConflictResolution { .. } => {
+                conflict_resolution::handle_abandon_conflict_resolution(ctx, r).await
+            }
+            r @ FrontendRequest::ActionAttentionGroup { .. } => {
+                attentions::handle_action_attention_group(ctx, r).await
+            }
+            r @ FrontendRequest::AddDependency { .. } => {
+                dependencies::handle_add_dependency(ctx, r).await
+            }
+            r @ FrontendRequest::AnswerAttention { .. } => {
+                attentions::handle_answer_attention(ctx, r).await
+            }
+            r @ FrontendRequest::AuditProductEffort { .. } => {
+                effort::handle_audit_product_effort(ctx, r).await
+            }
+            r @ FrontendRequest::CancelExecution { .. } => {
+                executions::handle_cancel_execution(ctx, r).await
+            }
+            r @ FrontendRequest::ClassifyCiRemediation { .. } => {
+                ci_remediation::handle_classify_ci_remediation(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsApplyMagicWand { .. } => {
+                comments::handle_comments_apply_magic_wand(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsCreate { .. } => {
+                comments::handle_comments_create(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsDiscardMagicWand { .. } => {
+                comments::handle_comments_discard_magic_wand(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsDismiss { .. } => {
+                comments::handle_comments_dismiss(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsDispatchMagicWand { .. } => {
+                comments::handle_comments_dispatch_magic_wand(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsList { .. } => {
+                comments::handle_comments_list(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsResolve { .. } => {
+                comments::handle_comments_resolve(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsSetStatus { .. } => {
+                comments::handle_comments_set_status(ctx, r).await
+            }
+            r @ FrontendRequest::CommentsUpdateAnchor { .. } => {
+                comments::handle_comments_update_anchor(ctx, r).await
+            }
+            r @ FrontendRequest::CreateAttention { .. } => {
+                attentions::handle_create_attention(ctx, r).await
+            }
+            r @ FrontendRequest::CreateAttentionItem { .. } => {
+                attentions::handle_create_attention_item(ctx, r).await
+            }
+            r @ FrontendRequest::CreateAutomation { .. } => {
+                automations::handle_create_automation(ctx, r).await
+            }
+            r @ FrontendRequest::CreateAutomationTask { .. } => {
+                automations::handle_create_automation_task(ctx, r).await
+            }
+            r @ FrontendRequest::CreateChore { .. } => {
+                work_items::handle_create_chore(ctx, r).await
+            }
+            r @ FrontendRequest::CreateExecution { .. } => {
+                executions::handle_create_execution(ctx, r).await
+            }
+            r @ FrontendRequest::CreateInvestigation { .. } => {
+                work_items::handle_create_investigation(ctx, r).await
+            }
+            r @ FrontendRequest::CreateManyChores { .. } => {
+                work_items::handle_create_many_chores(ctx, r).await
+            }
+            r @ FrontendRequest::CreateManyTasks { .. } => {
+                work_items::handle_create_many_tasks(ctx, r).await
+            }
+            r @ FrontendRequest::CreateProduct { .. } => {
+                products::handle_create_product(ctx, r).await
+            }
+            r @ FrontendRequest::CreateProject { .. } => {
+                projects::handle_create_project(ctx, r).await
+            }
+            r @ FrontendRequest::CreateRevision { .. } => {
+                work_items::handle_create_revision(ctx, r).await
+            }
+            r @ FrontendRequest::CreateRun { .. } => executions::handle_create_run(ctx, r).await,
+            r @ FrontendRequest::CreateTask { .. } => work_items::handle_create_task(ctx, r).await,
+            r @ FrontendRequest::DebugLiveStatusPipeline => {
+                live_status::handle_debug_live_status_pipeline(ctx, r).await
+            }
+            r @ FrontendRequest::DeleteAutomation { .. } => {
+                automations::handle_delete_automation(ctx, r).await
+            }
+            r @ FrontendRequest::DeleteWorkItem { .. } => {
+                work_items::handle_delete_work_item(ctx, r).await
+            }
+            r @ FrontendRequest::DisableAutomation { .. } => {
+                automations::handle_disable_automation(ctx, r).await
+            }
+            r @ FrontendRequest::DismissAttention { .. } => {
+                attentions::handle_dismiss_attention(ctx, r).await
+            }
+            r @ FrontendRequest::EnableAutomation { .. } => {
+                automations::handle_enable_automation(ctx, r).await
+            }
+            r @ FrontendRequest::EngineResponse { .. } => {
+                sessions::handle_engine_response(ctx, r).await
+            }
+            r @ FrontendRequest::ExecutionTranscript { .. } => {
+                executions::handle_execution_transcript(ctx, r).await
+            }
+            r @ FrontendRequest::FindWorkItemsByPr { .. } => {
+                work_items::handle_find_work_items_by_pr(ctx, r).await
+            }
+            r @ FrontendRequest::FocusWorkerPane { .. } => {
+                panes::handle_focus_worker_pane(ctx, r).await
+            }
+            r @ FrontendRequest::GetAttentionGroup { .. } => {
+                attentions::handle_get_attention_group(ctx, r).await
+            }
+            r @ FrontendRequest::GetAttentionItem { .. } => {
+                attentions::handle_get_attention_item(ctx, r).await
+            }
+            r @ FrontendRequest::GetAutomation { .. } => {
+                automations::handle_get_automation(ctx, r).await
+            }
+            r @ FrontendRequest::GetAutomationOpenTaskCount { .. } => {
+                automations::handle_get_automation_open_task_count(ctx, r).await
+            }
+            r @ FrontendRequest::GetCiBudget { .. } => {
+                ci_remediation::handle_get_ci_budget(ctx, r).await
+            }
+            r @ FrontendRequest::GetCiRemediation { .. } => {
+                ci_remediation::handle_get_ci_remediation(ctx, r).await
+            }
+            r @ FrontendRequest::GetConflictResolution { .. } => {
+                conflict_resolution::handle_get_conflict_resolution(ctx, r).await
+            }
+            r @ FrontendRequest::GetEngineHealth => {
+                engine_meta::handle_get_engine_health(ctx, r).await
+            }
+            r @ FrontendRequest::GetEngineVersion => {
+                engine_meta::handle_get_engine_version(ctx, r).await
+            }
+            r @ FrontendRequest::GetExecution { .. } => {
+                executions::handle_get_execution(ctx, r).await
+            }
+            r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
+            r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
+            r @ FrontendRequest::GetTaskRuntime { .. } => {
+                executions::handle_get_task_runtime(ctx, r).await
+            }
+            r @ FrontendRequest::GetWorkItem { .. } => {
+                work_items::handle_get_work_item(ctx, r).await
+            }
+            r @ FrontendRequest::GetWorkItemByShortId { .. } => {
+                work_items::handle_get_work_item_by_short_id(ctx, r).await
+            }
+            r @ FrontendRequest::GetWorkTree { .. } => {
+                work_items::handle_get_work_tree(ctx, r).await
+            }
+            r @ FrontendRequest::GitHubAuthCancel => {
+                github_auth::handle_git_hub_auth_cancel(ctx, r).await
+            }
+            r @ FrontendRequest::GitHubAuthDisconnect => {
+                github_auth::handle_git_hub_auth_disconnect(ctx, r).await
+            }
+            r @ FrontendRequest::GitHubAuthStart => {
+                github_auth::handle_git_hub_auth_start(ctx, r).await
+            }
+            r @ FrontendRequest::GitHubAuthStatus => {
+                github_auth::handle_git_hub_auth_status(ctx, r).await
+            }
+            r @ FrontendRequest::InterruptWorkerPane { .. } => {
+                panes::handle_interrupt_worker_pane(ctx, r).await
+            }
+            r @ FrontendRequest::KickPrReconcilers => {
+                engine_meta::handle_kick_pr_reconcilers(ctx, r).await
+            }
+            r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
+                external_tracker::handle_link_work_item_external_ref(ctx, r).await
+            }
+            r @ FrontendRequest::ListAttentionGroups { .. } => {
+                attentions::handle_list_attention_groups(ctx, r).await
+            }
+            r @ FrontendRequest::ListAttentionItems { .. } => {
+                attentions::handle_list_attention_items(ctx, r).await
+            }
+            r @ FrontendRequest::ListAttentionItemsForWorkItem { .. } => {
+                attentions::handle_list_attention_items_for_work_item(ctx, r).await
+            }
+            r @ FrontendRequest::ListAutomationRuns { .. } => {
+                automations::handle_list_automation_runs(ctx, r).await
+            }
+            r @ FrontendRequest::ListAutomations { .. } => {
+                automations::handle_list_automations(ctx, r).await
+            }
+            r @ FrontendRequest::ListAutomationTasks { .. } => {
+                automations::handle_list_automation_tasks(ctx, r).await
+            }
+            r @ FrontendRequest::ListChores { .. } => work_items::handle_list_chores(ctx, r).await,
+            r @ FrontendRequest::ListCiRemediations { .. } => {
+                ci_remediation::handle_list_ci_remediations(ctx, r).await
+            }
+            r @ FrontendRequest::ListConflictResolutions { .. } => {
+                conflict_resolution::handle_list_conflict_resolutions(ctx, r).await
+            }
+            r @ FrontendRequest::ListDependencies { .. } => {
+                dependencies::handle_list_dependencies(ctx, r).await
+            }
+            r @ FrontendRequest::ListDependenciesDetailed { .. } => {
+                dependencies::handle_list_dependencies_detailed(ctx, r).await
+            }
+            r @ FrontendRequest::ListEditorialActions { .. } => {
+                automations::handle_list_editorial_actions(ctx, r).await
+            }
+            r @ FrontendRequest::ListEngineAttempts { .. } => {
+                executions::handle_list_engine_attempts(ctx, r).await
+            }
+            r @ FrontendRequest::ListExecutions { .. } => {
+                executions::handle_list_executions(ctx, r).await
+            }
+            r @ FrontendRequest::ListFeatureFlags => {
+                engine_meta::handle_list_feature_flags(ctx, r).await
+            }
+            r @ FrontendRequest::ListLiveStatusDisabledSlots => {
+                live_status::handle_list_live_status_disabled_slots(ctx, r).await
+            }
+            r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
+            r @ FrontendRequest::ListProjects { .. } => {
+                projects::handle_list_projects(ctx, r).await
+            }
+            r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
+            r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
+            r @ FrontendRequest::ListWorkerLiveStates => {
+                panes::handle_list_worker_live_states(ctx, r).await
+            }
+            r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
+                ci_remediation::handle_mark_ci_remediation_failed(ctx, r).await
+            }
+            r @ FrontendRequest::MarkCiRemediationRetriggered { .. } => {
+                ci_remediation::handle_mark_ci_remediation_retriggered(ctx, r).await
+            }
+            r @ FrontendRequest::MarkCiRemediationSucceededViaRebase { .. } => {
+                ci_remediation::handle_mark_ci_remediation_succeeded_via_rebase(ctx, r).await
+            }
+            r @ FrontendRequest::MarkConflictResolutionFailed { .. } => {
+                conflict_resolution::handle_mark_conflict_resolution_failed(ctx, r).await
+            }
+            r @ FrontendRequest::MergeWhenReady { .. } => {
+                review::handle_merge_when_ready(ctx, r).await
+            }
+            r @ FrontendRequest::MetricsListLive => metrics::handle_metrics_list_live(ctx, r).await,
+            r @ FrontendRequest::MetricsReset { .. } => metrics::handle_metrics_reset(ctx, r).await,
+            r @ FrontendRequest::MetricsShowLive { .. } => {
+                metrics::handle_metrics_show_live(ctx, r).await
+            }
+            r @ FrontendRequest::OpenReviewTerminal { .. } => {
+                review::handle_open_review_terminal(ctx, r).await
+            }
+            r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,
+            r @ FrontendRequest::ReapRun { .. } => executions::handle_reap_run(ctx, r).await,
+            r @ FrontendRequest::RecordEffortEscalation { .. } => {
+                effort::handle_record_effort_escalation(ctx, r).await
+            }
+            r @ FrontendRequest::RegisterAppSession => {
+                sessions::handle_register_app_session(ctx, r).await
+            }
+            r @ FrontendRequest::RegisterBossSession { .. } => {
+                sessions::handle_register_boss_session(ctx, r).await
+            }
+            r @ FrontendRequest::ReleaseReviewTerminal { .. } => {
+                review::handle_release_review_terminal(ctx, r).await
+            }
+            r @ FrontendRequest::RemoveDependency { .. } => {
+                dependencies::handle_remove_dependency(ctx, r).await
+            }
+            r @ FrontendRequest::ReorderProjectTasks { .. } => {
+                projects::handle_reorder_project_tasks(ctx, r).await
+            }
+            r @ FrontendRequest::RequestExecution { .. } => {
+                executions::handle_request_execution(ctx, r).await
+            }
+            r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
+                projects::handle_resolve_project_design_doc(ctx, r).await
+            }
+            r @ FrontendRequest::RestoreWorkItem { .. } => {
+                work_items::handle_restore_work_item(ctx, r).await
+            }
+            r @ FrontendRequest::RetryCiRemediation { .. } => {
+                ci_remediation::handle_retry_ci_remediation(ctx, r).await
+            }
+            r @ FrontendRequest::RetryConflictResolution { .. } => {
+                conflict_resolution::handle_retry_conflict_resolution(ctx, r).await
+            }
+            r @ FrontendRequest::RevealWorkItem { .. } => {
+                work_items::handle_reveal_work_item(ctx, r).await
+            }
+            r @ FrontendRequest::RunAutomation { .. } => {
+                automations::handle_run_automation(ctx, r).await
+            }
+            r @ FrontendRequest::SendInputToWorker { .. } => {
+                panes::handle_send_input_to_worker(ctx, r).await
+            }
+            r @ FrontendRequest::SetCiBudget { .. } => {
+                ci_remediation::handle_set_ci_budget(ctx, r).await
+            }
+            r @ FrontendRequest::SetFeatureFlag { .. } => {
+                engine_meta::handle_set_feature_flag(ctx, r).await
+            }
+            r @ FrontendRequest::SetLiveStatusEnabled { .. } => {
+                live_status::handle_set_live_status_enabled(ctx, r).await
+            }
+            r @ FrontendRequest::SetProductDefaultModel { .. } => {
+                products::handle_set_product_default_model(ctx, r).await
+            }
+            r @ FrontendRequest::SetProductEditorialRules { .. } => {
+                products::handle_set_product_editorial_rules(ctx, r).await
+            }
+            r @ FrontendRequest::SetProductExternalTracker { .. } => {
+                external_tracker::handle_set_product_external_tracker(ctx, r).await
+            }
+            r @ FrontendRequest::SetProjectDesignDoc { .. } => {
+                projects::handle_set_project_design_doc(ctx, r).await
+            }
+            r @ FrontendRequest::SetSetting { .. } => engine_meta::handle_set_setting(ctx, r).await,
+            r @ FrontendRequest::Shutdown { .. } => sessions::handle_shutdown(ctx, r).await,
+            r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
+            r @ FrontendRequest::Subscribe { .. } => subscriptions::handle_subscribe(ctx, r).await,
+            r @ FrontendRequest::SyncProductExternalTracker { .. } => {
+                external_tracker::handle_sync_product_external_tracker(ctx, r).await
+            }
+            r @ FrontendRequest::TailRunTranscript { .. } => {
+                executions::handle_tail_run_transcript(ctx, r).await
+            }
+            r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
+                external_tracker::handle_unlink_work_item_external_ref(ctx, r).await
+            }
+            r @ FrontendRequest::Unsubscribe { .. } => {
+                subscriptions::handle_unsubscribe(ctx, r).await
+            }
+            r @ FrontendRequest::UpdateAutomation { .. } => {
+                automations::handle_update_automation(ctx, r).await
+            }
+            r @ FrontendRequest::UpdateWorkItem { .. } => {
+                work_items::handle_update_work_item(ctx, r).await
+            }
+            r @ FrontendRequest::WorkspacePoolSummary => {
+                engine_meta::handle_workspace_pool_summary(ctx, r).await
             }
         }
     }
@@ -9264,8 +4737,7 @@ fn build_effort_audit_report(
         let span = (days as i64).saturating_mul(86_400);
         Some(now - span)
     });
-    let events =
-        work_db.list_effort_escalations_for_product(&product.id, since_epoch_secs)?;
+    let events = work_db.list_effort_escalations_for_product(&product.id, since_epoch_secs)?;
     let chores = work_db.list_chores_for_audit(&product.id)?;
     let generated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -9309,7 +4781,9 @@ fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u8]) -> Resu
 /// the shape is the list-of-issues form the chore brief asked for so
 /// subsequent missing-config surfaces (engine socket, cube binary,
 /// etc.) can be added without bumping the wire format.
-fn build_engine_health_report(server_state: &Arc<ServerState>) -> boss_protocol::EngineHealthReport {
+fn build_engine_health_report(
+    server_state: &Arc<ServerState>,
+) -> boss_protocol::EngineHealthReport {
     use boss_protocol::{EngineHealthIssue, EngineHealthReport};
 
     let anthropic_api_key_present = server_state.anthropic_api_key.is_some();
@@ -9415,16 +4889,13 @@ fn build_live_status_debug_report(
         // collapsed to `None`. That left `transcript_path: null` on the
         // slot snapshot even when the underlying `work_runs` row had
         // the column populated.
-        let transcript_path = snap
-            .transcript_path
-            .clone()
-            .or_else(|| {
-                let execution_id = live.map(|s| s.run_id.as_str())?;
-                work_db
-                    .transcript_path_for_execution(execution_id)
-                    .ok()
-                    .flatten()
-            });
+        let transcript_path = snap.transcript_path.clone().or_else(|| {
+            let execution_id = live.map(|s| s.run_id.as_str())?;
+            work_db
+                .transcript_path_for_execution(execution_id)
+                .ok()
+                .flatten()
+        });
         slots.push(LiveStatusSlotDebug {
             slot_id,
             task_running: active_slots.contains(&slot_id),
@@ -9432,9 +4903,7 @@ fn build_live_status_debug_report(
             last_trigger_kind: snap.last_trigger_kind.clone(),
             last_trigger_at: snap.last_trigger_at_epoch_s.map(format_epoch_iso8601),
             last_real_trigger_kind: snap.last_real_trigger_kind.clone(),
-            last_real_trigger_at: snap
-                .last_real_trigger_at_epoch_s
-                .map(format_epoch_iso8601),
+            last_real_trigger_at: snap.last_real_trigger_at_epoch_s.map(format_epoch_iso8601),
             last_synthetic_trigger_at: snap
                 .last_synthetic_trigger_at_epoch_s
                 .map(format_epoch_iso8601),
@@ -9463,7 +4932,10 @@ fn build_live_status_debug_report(
         transcript_path_persist_from_cache: stats.transcript_path_persist_from_cache,
         last_hook_run_id: stats.last_hook.as_ref().map(|h| h.run_id.clone()),
         last_hook_kind: stats.last_hook.as_ref().map(|h| h.kind.clone()),
-        last_hook_at: stats.last_hook.as_ref().map(|h| format_epoch_iso8601(h.epoch_s)),
+        last_hook_at: stats
+            .last_hook
+            .as_ref()
+            .map(|h| format_epoch_iso8601(h.epoch_s)),
     };
 
     LiveStatusDebugReport {
@@ -9486,9 +4958,7 @@ fn format_epoch_iso8601(epoch_secs: i64) -> String {
     let minute = (seconds_in_day % 3_600) / 60;
     let second = seconds_in_day % 60;
     let (year, month, day) = ymd_from_days_since_1970(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn ymd_from_days_since_1970(days: i64) -> (i64, u32, u32) {
@@ -9846,10 +5316,7 @@ async fn open_review_terminal_async(
         Err(e) => fail_with_release!(anyhow::anyhow!("failed to spawn jj git fetch: {e}")),
         Ok(o) if !o.status.success() => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            fail_with_release!(anyhow::anyhow!(
-                "jj git fetch failed: {}",
-                stderr.trim()
-            ))
+            fail_with_release!(anyhow::anyhow!("jj git fetch failed: {}", stderr.trim()))
         }
         Ok(_) => {}
     }
@@ -9869,10 +5336,7 @@ async fn open_review_terminal_async(
         Err(e) => fail_with_release!(anyhow::anyhow!("failed to spawn jj new: {e}")),
         Ok(o) if !o.status.success() => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            fail_with_release!(anyhow::anyhow!(
-                "jj new -r {rev} failed: {}",
-                stderr.trim()
-            ))
+            fail_with_release!(anyhow::anyhow!("jj new -r {rev} failed: {}", stderr.trim()))
         }
         Ok(_) => {}
     }
@@ -9885,7 +5349,15 @@ async fn open_review_terminal_async(
 /// `design_detector::do_scan_pr` but requests only the one field we need.
 async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
     let output = TokioCommand::new("gh")
-        .args(["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
+        .args([
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName",
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -9941,10 +5413,7 @@ fn work_item_id(item: &WorkItem) -> String {
 
 /// Validate a kind-specific external tracker config JSON.
 /// Returns `Err` with a human-readable message when validation fails.
-fn validate_external_tracker_config(
-    kind: &str,
-    config: &serde_json::Value,
-) -> Result<(), String> {
+fn validate_external_tracker_config(kind: &str, config: &serde_json::Value) -> Result<(), String> {
     match kind {
         "github" => {
             for field in ["org", "repo"] {
@@ -9956,8 +5425,14 @@ fn validate_external_tracker_config(
                 }
             }
             match config.get("project_number") {
-                None => return Err("missing required field 'project_number' for kind=github".to_owned()),
-                Some(v) if !v.is_number() => return Err("'project_number' must be a number for kind=github".to_owned()),
+                None => {
+                    return Err(
+                        "missing required field 'project_number' for kind=github".to_owned()
+                    );
+                }
+                Some(v) if !v.is_number() => {
+                    return Err("'project_number' must be a number for kind=github".to_owned());
+                }
                 _ => {}
             }
             Ok(())
@@ -10241,10 +5716,7 @@ enum TranscriptResolution {
 /// back to the live registry so a worker that's been registered but
 /// hasn't yet emitted a transcript-bearing hook surfaces as
 /// `Buffering` rather than `Unknown`.
-fn resolve_transcript_for_tail(
-    server_state: &ServerState,
-    run_id: &str,
-) -> TranscriptResolution {
+fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &str) -> TranscriptResolution {
     // Hot path: the dispatcher's in-memory cache, keyed on the same
     // execution-id namespace the live registry uses. Populated by
     // every hook event that carries `transcript_path`, so once the
@@ -10712,11 +6184,7 @@ mod tests {
 
         let server_state = test_server_state();
         let (engine_side, app_side) = tokio::net::UnixStream::pair().unwrap();
-        let conn = tokio::spawn(handle_frontend_connection(
-            engine_side,
-            server_state,
-            None,
-        ));
+        let conn = tokio::spawn(handle_frontend_connection(engine_side, server_state, None));
 
         let (read_half, mut write_half) = app_side.into_split();
         let mut reader = BufReader::new(read_half);
@@ -11391,9 +6859,7 @@ mod tests {
         // to the registered app session, and surfaces the slot id
         // once the app replies success.
         let server_state = test_server_state();
-        server_state
-            .worker_registry
-            .register_run_slot("run-int", 6);
+        server_state.worker_registry.register_run_slot("run-int", 6);
 
         let sink = make_session_sink();
         server_state
@@ -11401,16 +6867,18 @@ mod tests {
             .await;
 
         let server_clone = server_state.clone();
-        let interrupt = tokio::spawn(async move {
-            server_clone.interrupt_worker_pane("run-int").await
-        });
+        let interrupt =
+            tokio::spawn(async move { server_clone.interrupt_worker_pane("run-int").await });
 
         let envelope = sink
             .next()
             .await
             .expect("an EngineRequest event should be enqueued");
         let (request_id, request) = match envelope.payload {
-            FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+            FrontendEvent::EngineRequest {
+                request_id,
+                request,
+            } => (request_id, request),
             other => panic!("expected EngineRequest, got {other:?}"),
         };
         match request {
@@ -11440,9 +6908,7 @@ mod tests {
     #[tokio::test]
     async fn interrupt_worker_pane_surfaces_app_error() {
         let server_state = test_server_state();
-        server_state
-            .worker_registry
-            .register_run_slot("run-int", 2);
+        server_state.worker_registry.register_run_slot("run-int", 2);
 
         let sink = make_session_sink();
         server_state
@@ -11450,9 +6916,8 @@ mod tests {
             .await;
 
         let server_clone = server_state.clone();
-        let interrupt = tokio::spawn(async move {
-            server_clone.interrupt_worker_pane("run-int").await
-        });
+        let interrupt =
+            tokio::spawn(async move { server_clone.interrupt_worker_pane("run-int").await });
 
         let envelope = sink.next().await.expect("EngineRequest enqueued");
         let request_id = match envelope.payload {
@@ -11583,9 +7048,18 @@ mod tests {
     #[test]
     fn pid_is_alive_true_for_self_false_for_reaped_child() {
         let self_pid = std::process::id() as libc::pid_t;
-        assert!(pid_is_alive(self_pid), "the current process must read as alive");
-        assert!(!pid_is_alive(0), "pid 0 must never read as a live trust root");
-        assert!(!pid_is_alive(reaped_child_pid()), "a reaped child must read as dead");
+        assert!(
+            pid_is_alive(self_pid),
+            "the current process must read as alive"
+        );
+        assert!(
+            !pid_is_alive(0),
+            "pid 0 must never read as a live trust root"
+        );
+        assert!(
+            !pid_is_alive(reaped_child_pid()),
+            "a reaped child must read as dead"
+        );
     }
 
     #[test]
@@ -11620,7 +7094,11 @@ mod tests {
         ));
         // A connection with no observable peer pid against a real trust
         // root is rejected.
-        assert!(!register_app_session_trust_ok(Some(self_pid), None, engine_pid));
+        assert!(!register_app_session_trust_ok(
+            Some(self_pid),
+            None,
+            engine_pid
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -11875,9 +7353,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let transcript_dir = tempfile::tempdir().unwrap();
         let transcript_path = transcript_dir.path().join("transcript.jsonl");
@@ -11907,7 +7387,9 @@ mod tests {
         // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
         // has a target for `SendToPane`. In production BOSS_RUN_ID carries
         // execution.id (exec_*), not run.id (run_*).
-        server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
+        server_state
+            .worker_registry
+            .register_run_slot(execution.id.clone(), 1);
 
         // Subscribe a session to the per-run probe topic and pin the
         // ServerState so probe pushes have somewhere to land.
@@ -12076,9 +7558,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let run = server_state
             .work_db
@@ -12099,17 +7583,22 @@ mod tests {
         server_state
             .worker_registry
             .register_run_slot(run.id.clone(), 1);
-        server_state
-            .live_worker_states
-            .register_spawn(1, run.id.clone(), "claude-opus-4-7", 0, None);
+        server_state.live_worker_states.register_spawn(
+            1,
+            run.id.clone(),
+            "claude-opus-4-7",
+            0,
+            None,
+        );
         // Apply a Stop event to transition Spawning → Idle.
-        server_state
-            .live_worker_states
-            .apply_event(1, &WorkerEvent::Stop {
+        server_state.live_worker_states.apply_event(
+            1,
+            &WorkerEvent::Stop {
                 session_id: "sess-1".into(),
                 stop_hook_active: false,
                 stop_reason: crate::protocol::StopReason::Completed,
-            });
+            },
+        );
         assert_eq!(
             server_state.live_worker_states.get(1).unwrap().activity,
             WorkerActivity::Idle,
@@ -12200,9 +7689,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let run = server_state
             .work_db
@@ -12321,9 +7812,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let run = server_state
             .work_db
@@ -12435,9 +7928,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         // Drive the real `start_execution_run` path so the run is
         // minted with a `run_*` id — production-shaped. Asserting
@@ -12558,9 +8053,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         // Intentionally skip `start_execution_run` — the execution
         // exists but has no `work_runs` row yet, mirroring the
@@ -12621,7 +8118,7 @@ mod tests {
     /// Without the cache, step 3 leaves `transcript_path` NULL.
     #[tokio::test]
     async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
-        use crate::protocol::{WorkerEvent, SessionStartSource};
+        use crate::protocol::{SessionStartSource, WorkerEvent};
         use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
 
         let server_state = test_server_state();
@@ -12653,9 +8150,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let run = server_state
             .work_db
@@ -12781,9 +8280,7 @@ mod tests {
         use crate::live_status_loop::{LiveStatusBroadcaster, TranscriptPathResolver};
         use crate::protocol::WorkerEvent;
         use async_trait::async_trait;
-        use boss_protocol::{
-            CreateChoreInput, CreateProductInput, RequestExecutionInput,
-        };
+        use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
         use std::path::PathBuf;
 
         // The slot loop spawns and lives for the duration of the
@@ -12832,9 +8329,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let run = server_state
             .work_db
@@ -12871,8 +8370,7 @@ mod tests {
         // and never call the model — exactly what we want.
         let broadcaster: std::sync::Arc<dyn LiveStatusBroadcaster> =
             std::sync::Arc::new(NopBroadcaster);
-        let resolver: std::sync::Arc<dyn TranscriptPathResolver> =
-            std::sync::Arc::new(NopResolver);
+        let resolver: std::sync::Arc<dyn TranscriptPathResolver> = std::sync::Arc::new(NopResolver);
         server_state.live_status_manager.start_slot(
             slot_id,
             execution.id.clone(),
@@ -12981,9 +8479,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = server_state
             .work_db
@@ -13107,9 +8607,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = server_state
             .work_db
@@ -13128,12 +8630,9 @@ mod tests {
         // column; pin that as a precondition so the post-dispatch
         // assertion has bite.
         assert!(
-            <ServerState as TranscriptPathResolver>::transcript_path(
-                &server_state,
-                &execution.id,
-            )
-            .await
-            .is_none(),
+            <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &execution.id,)
+                .await
+                .is_none(),
             "precondition: resolver returns None when transcript_path on the latest run is NULL",
         );
 
@@ -13149,11 +8648,9 @@ mod tests {
         };
         dispatch_live_worker_state(&server_state, &event).await;
 
-        let resolved = <ServerState as TranscriptPathResolver>::transcript_path(
-            &server_state,
-            &execution.id,
-        )
-        .await;
+        let resolved =
+            <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &execution.id)
+                .await;
         assert_eq!(
             resolved.as_deref().map(|p| p.to_string_lossy().to_string()),
             Some(path.to_owned()),
@@ -13167,11 +8664,8 @@ mod tests {
         // namespace for this trait method; the resolver's job is to
         // refuse the wrong-namespace identifier rather than
         // accidentally satisfy it.
-        let wrong = <ServerState as TranscriptPathResolver>::transcript_path(
-            &server_state,
-            &run.id,
-        )
-        .await;
+        let wrong =
+            <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &run.id).await;
         assert!(
             wrong.is_none(),
             "resolver must not satisfy a work_runs.id lookup as if it were an execution id; got {wrong:?}",
@@ -13230,9 +8724,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let (execution, _run) = server_state
             .work_db
@@ -13251,9 +8747,13 @@ mod tests {
         // No hook events have fired yet, so transcript_path is NULL
         // on the work_runs row and absent from the cache.
         let slot_id = 6u8;
-        server_state
-            .live_worker_states
-            .register_spawn(slot_id, execution.id.clone(), "claude-opus-4-7", 0, None);
+        server_state.live_worker_states.register_spawn(
+            slot_id,
+            execution.id.clone(),
+            "claude-opus-4-7",
+            0,
+            None,
+        );
 
         // Pre-fix this returned `Unknown` (the `get_run(exec_*)`
         // call bailed) — the post-fix resolver must surface
@@ -13314,9 +8814,11 @@ mod tests {
             .unwrap();
         let execution = server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = server_state
             .work_db
@@ -13429,12 +8931,8 @@ mod tests {
         // live-state registry — exactly the shape `release_worker_pane`
         // walks (worker_registry → take_slot_for_run; live_states →
         // release_slot).
-        server_state
-            .worker_registry
-            .register_run_slot("run-a", 1);
-        server_state
-            .worker_registry
-            .register_run_slot("run-b", 2);
+        server_state.worker_registry.register_run_slot("run-a", 1);
+        server_state.worker_registry.register_run_slot("run-b", 2);
         server_state
             .live_worker_states
             .register_spawn(1, "run-a", "claude-opus-4-7", 0, None);
@@ -13465,7 +8963,10 @@ mod tests {
                     .await
                     .expect("ReleaseWorkerPane EngineRequest should be enqueued");
                 let (request_id, slot_id) = match &envelope.payload {
-                    FrontendEvent::EngineRequest { request_id, request } => match request {
+                    FrontendEvent::EngineRequest {
+                        request_id,
+                        request,
+                    } => match request {
                         EngineToAppRequest::ReleaseWorkerPane(input) => {
                             (request_id.clone(), input.slot_id)
                         }
@@ -13490,9 +8991,7 @@ mod tests {
             .shutdown_workers(Duration::from_secs(2), Duration::from_millis(0))
             .await;
 
-        app_responder
-            .await
-            .expect("app responder task panicked");
+        app_responder.await.expect("app responder task panicked");
 
         let mut slots = observed_slots.lock().unwrap().clone();
         slots.sort();
@@ -13628,7 +9127,13 @@ mod tests {
         );
         // Move to done — still not in_review.
         let done_item = db
-            .update_work_item(&chore_id, WorkItemPatch { status: Some("done".into()), ..Default::default() })
+            .update_work_item(
+                &chore_id,
+                WorkItemPatch {
+                    status: Some("done".into()),
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert!(
             in_review_chore_execution(&db, &done_item).is_none(),
@@ -13643,7 +9148,10 @@ mod tests {
         let item = db
             .update_work_item(
                 &chore_id,
-                WorkItemPatch { status: Some("in_review".into()), ..Default::default() },
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert!(
@@ -13654,21 +9162,26 @@ mod tests {
 
     #[test]
     fn in_review_chore_execution_returns_execution_id_when_in_review() {
+        use crate::work::CreateExecutionInput;
         use boss_protocol::WorkItemPatch;
-        use crate::work::{CreateExecutionInput};
         let (db, _, chore_id) = make_work_db_with_chore();
         // Create an execution for the chore.
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore_id.clone())
-                .kind("chore_implementation")
-                .status("ready")
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind("chore_implementation")
+                    .status("ready")
+                    .build(),
+            )
             .unwrap();
         let item = db
             .update_work_item(
                 &chore_id,
-                WorkItemPatch { status: Some("in_review".into()), ..Default::default() },
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         let found = in_review_chore_execution(&db, &item);
@@ -13712,7 +9225,10 @@ mod tests {
         let item = db
             .update_work_item(
                 &chore_id,
-                WorkItemPatch { status: Some("active".into()), ..Default::default() },
+                WorkItemPatch {
+                    status: Some("active".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert!(
@@ -13728,7 +9244,10 @@ mod tests {
         let item = db
             .update_work_item(
                 &chore_id,
-                WorkItemPatch { status: Some("todo".into()), ..Default::default() },
+                WorkItemPatch {
+                    status: Some("todo".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert!(
@@ -13748,7 +9267,10 @@ mod tests {
         let item = db
             .update_work_item(
                 &chore_id,
-                WorkItemPatch { status: Some("todo".into()), ..Default::default() },
+                WorkItemPatch {
+                    status: Some("todo".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert!(
@@ -13759,20 +9281,25 @@ mod tests {
 
     #[test]
     fn active_to_todo_execution_returns_execution_id() {
-        use boss_protocol::WorkItemPatch;
         use crate::work::CreateExecutionInput;
+        use boss_protocol::WorkItemPatch;
         let (db, _, chore_id) = make_work_db_with_chore();
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore_id.clone())
-                .kind("chore_implementation")
-                .status("running")
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind("chore_implementation")
+                    .status("running")
+                    .build(),
+            )
             .unwrap();
         let item = db
             .update_work_item(
                 &chore_id,
-                WorkItemPatch { status: Some("todo".into()), ..Default::default() },
+                WorkItemPatch {
+                    status: Some("todo".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         let found = active_to_todo_execution(&db, &Some("active".into()), &item);
@@ -13832,9 +9359,8 @@ mod tests {
 
     #[test]
     fn build_chore_update_message_includes_description_diff() {
-        let msg =
-            build_chore_update_message("name", "name", "old description", "new description")
-                .expect("should produce a message");
+        let msg = build_chore_update_message("name", "name", "old description", "new description")
+            .expect("should produce a message");
         assert!(msg.contains("[chore-update]"));
         assert!(msg.contains("old description"));
         assert!(msg.contains("new description"));
@@ -13842,9 +9368,8 @@ mod tests {
 
     #[test]
     fn build_chore_update_message_includes_both_when_both_change() {
-        let msg =
-            build_chore_update_message("old name", "new name", "old desc", "new desc")
-                .expect("should produce a message when both fields change");
+        let msg = build_chore_update_message("old name", "new name", "old desc", "new desc")
+            .expect("should produce a message when both fields change");
         assert!(msg.contains("old name"));
         assert!(msg.contains("new name"));
         assert!(msg.contains("old desc"));
@@ -13919,9 +9444,7 @@ mod tests {
 
         // Register a live worker slot for this chore.
         let run_id = "exec-notify-test";
-        server_state
-            .worker_registry
-            .register_run_slot(run_id, 4);
+        server_state.worker_registry.register_run_slot(run_id, 4);
         server_state.live_worker_states.register_spawn(
             4,
             run_id,
@@ -13964,13 +9487,9 @@ mod tests {
             WorkItem::Task(t) | WorkItem::Chore(t) => (t.name.clone(), t.description.clone()),
             _ => panic!("expected task/chore"),
         };
-        let msg = build_chore_update_message(
-            &old_name,
-            &new_name,
-            &old_description,
-            &new_description,
-        )
-        .expect("name changed — message should be produced");
+        let msg =
+            build_chore_update_message(&old_name, &new_name, &old_description, &new_description)
+                .expect("name changed — message should be produced");
 
         let resolved_run = active_chore_run_id(&server_state, &updated_item)
             .expect("active chore with live worker should resolve a run_id");
@@ -14028,9 +9547,7 @@ mod tests {
     // ── executions.transcript tests ──────────────────────────────────────────
 
     /// Helper: create a product + chore + execution (in `ready` status).
-    fn make_execution_for_test(
-        server_state: &Arc<ServerState>,
-    ) -> boss_protocol::WorkExecution {
+    fn make_execution_for_test(server_state: &Arc<ServerState>) -> boss_protocol::WorkExecution {
         let product = server_state
             .work_db
             .create_product(boss_protocol::CreateProductInput {
@@ -14059,15 +9576,17 @@ mod tests {
             .unwrap();
         server_state
             .work_db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .build(),
+            )
             .unwrap()
     }
 
     #[test]
     fn segment_to_wire_maps_all_roles() {
-        use crate::transcript_markdown::{SegmentRole, TruncationInfo, TranscriptSegment};
+        use crate::transcript_markdown::{SegmentRole, TranscriptSegment, TruncationInfo};
         let seg = TranscriptSegment::builder()
             .seq(1u64)
             .role(SegmentRole::Assistant)
@@ -14077,7 +9596,10 @@ mod tests {
             .model("claude-opus-4")
             .collapsible(false)
             .default_collapsed(false)
-            .truncated(TruncationInfo { shown_bytes: 10, total_bytes: 100 })
+            .truncated(TruncationInfo {
+                shown_bytes: 10,
+                total_bytes: 100,
+            })
             .build();
         let wire = segment_to_wire(seg);
         assert_eq!(wire.seq, 1);
@@ -14098,7 +9620,10 @@ mod tests {
         use crate::transcript_markdown::SegmentRole;
         let roles = [
             (SegmentRole::User, boss_protocol::SegmentRole::User),
-            (SegmentRole::Assistant, boss_protocol::SegmentRole::Assistant),
+            (
+                SegmentRole::Assistant,
+                boss_protocol::SegmentRole::Assistant,
+            ),
             (SegmentRole::Thinking, boss_protocol::SegmentRole::Thinking),
             (SegmentRole::Tool, boss_protocol::SegmentRole::Tool),
             (SegmentRole::System, boss_protocol::SegmentRole::System),
@@ -14211,20 +9736,19 @@ mod tests {
         let events = crate::transcript_markdown::parse_transcript(&content);
         assert!(!events.is_empty(), "must parse at least one event");
 
-        let segments = crate::transcript_markdown::events_to_segments(
-            &events,
-            &Default::default(),
-        );
+        let segments = crate::transcript_markdown::events_to_segments(&events, &Default::default());
         assert!(!segments.is_empty(), "must produce at least one segment");
 
         let wire: Vec<boss_protocol::TranscriptSegment> =
             segments.into_iter().map(segment_to_wire).collect();
         assert!(
-            wire.iter().any(|s| s.role == boss_protocol::SegmentRole::User),
+            wire.iter()
+                .any(|s| s.role == boss_protocol::SegmentRole::User),
             "must have a User segment"
         );
         assert!(
-            wire.iter().any(|s| s.role == boss_protocol::SegmentRole::Assistant),
+            wire.iter()
+                .any(|s| s.role == boss_protocol::SegmentRole::Assistant),
             "must have an Assistant segment"
         );
     }
