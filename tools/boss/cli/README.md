@@ -1,6 +1,45 @@
 # boss CLI
 
-Command-line interface for the Boss task-management system.
+`boss` is the end-user command-line interface to the Boss automation
+system. It is the human (and agent) entry point for filing and managing
+work — products, projects, tasks, chores, automations, and attentions —
+and for driving the engine that schedules and runs autonomous coding
+workers. Almost every command is a thin, typed wrapper over an engine
+RPC; the engine, not the CLI, is the system of record for all work.
+
+## How it fits
+
+The CLI owns argument parsing, input/output formatting, and user
+ergonomics — nothing more. Commands resolve a target socket, connect to
+the engine through `boss-client`'s `BossClient`, issue one or more RPCs
+defined in `boss-protocol`, and render the result either as a human
+table/summary or as machine JSON (`--json`). For agent callers the
+`boss reference` command prints the authoritative, self-describing CLI
+surface so tools never have to scrape `--help`.
+
+Because the engine is the system of record, most commands transparently
+start the engine on demand when its socket is unreachable. This is
+distinct from *worker dispatch*: `--no-autostart` suppresses the engine
+auto-dispatching a worker for newly created work, while
+`--no-engine-autostart` forbids the CLI from spawning the engine at all
+(the command then fails unless an engine is already running). The
+`boss engine` subcommands manage the daemon's lifecycle and inspect its
+CI/conflict-remediation state directly.
+
+Conceptually the dependency chain is `boss` → `boss-client` →
+`boss-protocol`, with the engine reached over a Unix socket. `boss` does
+not link the engine in production; it only depends on `boss-engine` as a
+dev-dependency for integration tests.
+
+A handful of commands are self-contained and bypass the engine entirely,
+talking directly to external services instead:
+
+- `boss shake` files bug/feature reports against the upstream repo via an
+  embedded GitHub App (see below).
+- `boss release` triggers a Boss release build on Buildkite.
+- `boss github auth` manages the Boss ↔ GitHub OAuth connection used for
+  issue sync.
+- `boss uninstall` removes an installed `Boss.app` bundle.
 
 ## boss shake — one-time developer setup
 

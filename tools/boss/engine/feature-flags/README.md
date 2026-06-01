@@ -1,24 +1,44 @@
 # Engine feature flags
 
-Toggleable on/off switches for optional or risk-bearing engine
-behaviours. Surfaced in the macOS app under **Debug → Feature Flags**;
-toggling a flag there sends a `set_feature_flag` RPC and the engine
-honours the new value on every subsequent consumer-side check — no
-rebuild needed.
+`boss-feature-flags` provides toggleable on/off switches for optional or
+risk-bearing engine behaviours. Each flag is a human-flippable kill switch:
+the engine consults it on every consumer-side check, so flipping a flag
+changes behaviour live with no rebuild and no redeploy. Flags surface in the
+macOS app under **Debug → Feature Flags**; toggling one there sends a
+`set_feature_flag` RPC to the engine, which honours the new value immediately.
 
 This system is the implementation of incident 001 action item #5; see
 `tools/boss/docs/postmortems/incident-001-pr-fan-out.md` §5 for the
-motivation. In short: any engine behaviour that is
-(a) optional-for-correctness, (b) has non-trivial blast radius when
-wrong, and (c) is hard to reason about should be gated behind a flag
-the human can flip the moment they see it misbehaving.
+motivation. In short: any engine behaviour that is (a) optional-for-correctness,
+(b) has non-trivial blast radius when wrong, and (c) is hard to reason about
+should be gated behind a flag the human can flip the moment they see it
+misbehaving.
+
+## Architecture
+
+There are three pieces. A `const` **registry** is the single source of truth
+for which flags exist, their human-readable descriptions, their grouping
+category for the debug pane, and their defaults. A thread-safe **store**
+holds an in-memory map of human overrides keyed by flag name, falling back
+to the registry default for any flag the human has not touched, and mirrors
+that map to a TOML file. Consumers call one method — `is_enabled("name")` —
+at the site they want to gate.
+
+`boss-feature-flags` is a leaf crate with no internal dependencies. It is
+consumed by `boss-engine`, which re-exports it as `crate::feature_flags`,
+constructs the store at boot from the Boss state root, and shares an
+`Arc<FeatureFlagsStore>` across the subsystems that need it (the completion
+handler, the runner, and the `ServerState` that backs the RPC handlers). The
+debug-pane `list_feature_flags` / `set_feature_flag` RPCs operate against the
+registry generically — they never name individual flags, so adding a flag
+needs no protocol or UI change.
 
 ## Adding a flag
 
 Two edits. Both are one line.
 
 **1. Register the flag.** Append a `FeatureFlagSpec` to the `REGISTRY`
-slice in `tools/boss/engine/src/feature_flags.rs`:
+slice in this crate's `src/lib.rs`:
 
 ```rust
 pub const REGISTRY: &[FeatureFlagSpec] = &[
@@ -75,9 +95,9 @@ that doesn't work yet).
 ## File format and race semantics
 
 The store writes its state to
-`~/Library/Application Support/Boss/feature-flags.toml`. The file is a
-flat `flag_name = bool` mapping; flags that are absent fall back to
-the registry default. Example:
+`~/Library/Application Support/Boss/feature-flags.toml` (a temp dir in
+tests). The file is a flat `flag_name = bool` mapping; flags that are
+absent fall back to the registry default. Example:
 
 ```toml
 detect_pr_cold_fallback = false
@@ -91,14 +111,6 @@ the new value the instant the RPC returns.
 
 Stale entries in the file (names that no longer match any registered
 flag) are dropped on load. Unknown flags are forward-compat: an older
-engine binary loading a file with a future flag silently ignores it.
-
-## The first flag
-
-`detect_pr_cold_fallback` (default ON, category `completion`). When
-OFF, the engine skips the `detect_pr` cold-path fallback in
-`on_stop_inner` and `recheck_for_pr` — empty-staging falls through
-to "no PR pushed" and the chore stays in `waiting_human` for the
-human to resolve. This is the kill switch for the misbehaviour
-documented in incident 001. Pair with action item #6 (the structural
-fix to `detect_pr` itself) once that lands.
+engine binary loading a file with a future flag silently ignores it. A
+malformed file makes `load` return an error rather than panic, so the
+engine can log and continue on its existing in-memory state.

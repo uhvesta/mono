@@ -4,9 +4,50 @@ Status: experimental / under active development. Not yet recommended for
 general use. The CLI behavior, built-in checks, and library API may change
 without notice.
 
-`checkleft` is a repository convention checker. It runs built-in and external
-checks against the files in a source tree and reports findings as human-readable
-output or JSON.
+`checkleft` is a repository convention checker. It exists to enforce a
+repository's house rules — naming conventions, forbidden imports, file-size
+limits, doc-link integrity, and similar policies — at change-review time. It
+runs a configured set of checks against the files in a source tree and reports
+findings as human-readable output or JSON, so the same rules can guard a CI step
+and a local pre-push run. It ships as both a standalone CLI (`checkleft`) and a
+library, and is a standalone developer tool independent of the Boss automation
+system.
+
+## Architecture
+
+`checkleft` is organized around a small set of cooperating abstractions:
+
+- **Change detection.** Rather than scanning the whole tree, a run normally
+  evaluates only what changed. The change-detection layer classifies the
+  environment (PR build, merge-queue build, push-to-main, or a local branch),
+  resolves the default/integration branch, computes the correct base commit, and
+  produces a `ChangePlan` (a scoped diff, an "all files" plan, or an empty plan).
+  It shells out to `git`/`jj` to inspect repository state and fetch history when
+  a shallow clone lacks the needed commits.
+
+- **Configuration.** `CHECKS.yaml` / `CHECKS.toml` files are discovered from the
+  repository root down to each evaluated file; a config resolver merges them so
+  child directories can extend or override the root. A root config (or a CLI
+  flag) may also pull in an externally hosted config before local overrides
+  apply.
+
+- **Checks.** Every check implements a small `Check` / `ConfiguredCheck` trait
+  pair and is keyed by id in a registry. **Built-in checks** are compiled in
+  (the Rust/Bazel/workflow/docs conventions). **External checks** are resolved
+  from packages — referenced by file path or as generated/exec implementations —
+  letting a repo (or a shared, remotely hosted config) define checks that aren't
+  baked into the binary. JS/TS external checks compile to WebAssembly and run in
+  a `wasmtime` sandbox.
+
+- **Runner and output.** The runner takes the change plan, the resolved config,
+  and the registry, schedules each applicable check, applies per-check policy
+  (severity overrides, bypasses), and collects `Finding`s into a `CheckResult`.
+  Findings carry a location, message, remediation, and optional suggested fix,
+  and serialize to the same JSON shape whether produced by a built-in or
+  external check.
+
+The crate is consumed both as the `checkleft` binary and as a library; external
+check packages are an extension point rather than a compile-time dependency.
 
 ## Install
 

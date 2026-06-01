@@ -1,10 +1,43 @@
 # repobin
 
+`repobin` is a standalone command dispatcher that lets a repository expose its
+Bazel-built binaries as ordinary commands on your `PATH`. You install one small
+shim per tool; invoking a shim from inside the repo finds the repo-declared
+Bazel target, builds it, and `exec`s the freshly built binary — so you always
+run head-of-tree without remembering target labels or `bazel run` incantations.
+
 Status: experimental / under active development. The CLI behavior and config
 format may change without notice.
 
-`repobin` installs lightweight commands onto your `PATH` that dispatch to
-repo-defined Bazel binaries in the current working directory.
+## Architecture
+
+A single `repobin` binary plays two roles, chosen by `argv[0]`. Installed as a
+symlink named after a configured tool (`boss`, `cube`, …) it acts as a
+dispatcher; invoked as `repobin` it exposes the `install`, `doctor`, `list`,
+and `exec` subcommands.
+
+Dispatch resolves a tool in layers. First it walks up from the working
+directory looking for a repo-root `REPOBIN.toml`; a matching tool entry names a
+Bazel target, which is built and resolved to a runnable executable via a
+`BazelAdapter` (the production impl shells out to `bazel build` and `cquery`).
+When no `REPOBIN.toml` matches — or it does not declare the requested tool —
+dispatch falls back to *default mode*: a `repobin.yaml` peer to the installed
+binary maps the tool to a remote repo (optionally pinned to a SHA), which is
+cloned into a local cache and built from the `REPOBIN.toml` inside that
+checkout. The canonical target therefore always lives in the source repo, never
+duplicated in the yaml.
+
+Two caches keep repeated invocations cheap. A *dispatch cache* records the
+resolved executable path keyed by repo root and target, witnessed by the
+mtimes of the target's `BUILD` file, sources, and the built binary; on a warm
+hit it skips `bazel build`/`cquery` entirely and re-execs the cached path,
+falling back to the slow path on any mismatch or corruption. A *repo cache*
+backs default mode: HEAD-tracking and pinned checkouts live in separate slots,
+refreshes are gated by a fetch stamp and `git ls-remote`, and concurrent
+invocations serialise on a per-cache `flock`.
+
+This crate is standalone — it is not part of the Boss system, though Boss's
+own CLIs (`boss`, `cube`) are typical tools dispatched through it.
 
 ## Install
 
