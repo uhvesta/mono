@@ -27,6 +27,28 @@ checkleft run --external-checks-url https://example.com/CHECKS.yaml
 checkleft list
 ```
 
+### Change detection is automatic
+
+`checkleft run` (no flags) detects which files changed on its own. It
+classifies the environment — PR build, merge-queue build, push-to-main, or
+local branch — and computes the correct base commit without any help from the
+caller. **No SHA or base-ref plumbing is needed in the CI step or repo
+integration.**
+
+For a repo using Buildkite or a similar CI system the entire CI step is:
+
+```bash
+bin/checkleft run
+```
+
+The flags below exist as **escape hatches** for unusual situations:
+
+| Flag | When to use |
+|------|------------|
+| `--base-ref=<sha>` | Override the auto-detected base (e.g. a custom merge strategy that produces a non-standard HEAD layout). |
+| `--all` | Scan the entire repository regardless of what changed. Manual use only — catching and fixing pre-existing violations that per-diff runs would miss. Never run `--all` automatically in CI. |
+| `--default-branch=<name>` | Tell checkleft the default branch name when it differs from `main` (e.g. `master`, `trunk`). |
+
 `checkleft` looks for `CHECKS.yaml` or `CHECKS.toml` files from the repository
 root down to the file being evaluated.
 

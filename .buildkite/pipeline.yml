@@ -46,20 +46,6 @@ steps:
       - github_commit_status:
           context: "buildkite/mono/checks"
 
-  # TEMPORARY: bake-period parity check (P844 migration step 2).
-  # Runs change-detection both ways and asserts the resolved base SHA is equal.
-  # Remove this step (and checks-bake.sh) once checks.sh scoping is retired.
-  - label: ":scales: checks-bake (TEMP)"
-    key: "checks-bake"
-    command: ".buildkite/steps/checks-bake.sh"
-    soft_fail: true
-    depends_on: "bootstrap"
-    agents:
-      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
-    notify:
-      - github_commit_status:
-          context: "buildkite/mono/checks-bake"
-
   - wait: ~
     continue_on_failure: false
 
