@@ -456,6 +456,25 @@ struct ContentView: View {
                         model.clearProjectFilters()
                     }
 
+                    let choresUnblocked = model.unblockedChoreCount
+                    let choresBlocked = model.blockedChoreCount
+                    WorkSidebarFilterRow(
+                        title: "No Project (Chores)",
+                        subtitle: nil,
+                        systemImage: "tray",
+                        isSelected: model.filterToChoresOnly,
+                        trailing: nil,
+                        showsCheckbox: false,
+                        unblockedCount: choresUnblocked > 0 ? choresUnblocked : nil,
+                        blockedCount: choresBlocked > 0 ? choresBlocked : nil
+                    )
+                    .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                    .listRowBackground(Color.clear)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        model.setFilterToChoresOnly(!model.filterToChoresOnly)
+                    }
+
                     ForEach(model.projectsForSelectedProduct) { project in
                         let isOn = model.selectedProjectFilterIDs.contains(project.id)
                         let isArchived = project.status == "archived"

@@ -110,6 +110,11 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedProjectFilterIDs: Set<String> = [] {
         didSet { invalidateWorkCache() }
     }
+    /// When true, the board shows only chores (project-less tasks and their
+    /// revisions). Mutually exclusive with `selectedProjectFilterIDs`.
+    @Published var filterToChoresOnly: Bool = false {
+        didSet { invalidateWorkCache() }
+    }
     @Published var includeChores: Bool = true {
         didSet { invalidateWorkCache() }
     }
@@ -609,6 +614,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     var projectFilterDescription: String {
+        if filterToChoresOnly { return "Chores only" }
         let visibleSelected = visibleSelectedProjectFilterIDs
         switch visibleSelected.count {
         case 0:
@@ -624,7 +630,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     var hasProjectFilters: Bool {
-        !visibleSelectedProjectFilterIDs.isEmpty
+        !visibleSelectedProjectFilterIDs.isEmpty || filterToChoresOnly
     }
 
     /// Subset of `selectedProjectFilterIDs` whose projects are currently
@@ -686,28 +692,33 @@ final class ChatViewModel: ObservableObject {
         guard let productID = currentSelectedProductID else { return [] }
 
         let query = workSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let projectFilter = visibleSelectedProjectFilterIDs
 
         var items: [WorkTask] = []
-        for project in projectsForSelectedProduct {
-            guard projectFilter.isEmpty || projectFilter.contains(project.id) else { continue }
-            items.append(contentsOf: (tasksByProjectID[project.id] ?? []).sorted(by: taskSort))
-        }
-        // Product-level work items (investigations, etc.) have no project, so a
-        // project filter legitimately excludes them; otherwise they always
-        // render. They are first-class work — not gated by the chores toggle,
-        // which would otherwise hide an investigation a live worker is
-        // producing against (issue #886).
-        if projectFilter.isEmpty {
-            items.append(contentsOf: (productLevelTasksByProductID[productID] ?? []).sorted(by: taskSort))
-        }
-        if includeChores && projectFilter.isEmpty {
+        if filterToChoresOnly {
             items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
-            // Chore-parented revisions have no project of their own; surface
-            // them with the chores so their Backlog/Doing cards appear. The
-            // in-review ones are rolled up under the parent and filtered out
-            // of the Review column by `workItems(in:)`.
             items.append(contentsOf: (productLevelRevisionsByProductID[productID] ?? []).sorted(by: taskSort))
+        } else {
+            let projectFilter = visibleSelectedProjectFilterIDs
+            for project in projectsForSelectedProduct {
+                guard projectFilter.isEmpty || projectFilter.contains(project.id) else { continue }
+                items.append(contentsOf: (tasksByProjectID[project.id] ?? []).sorted(by: taskSort))
+            }
+            // Product-level work items (investigations, etc.) have no project, so a
+            // project filter legitimately excludes them; otherwise they always
+            // render. They are first-class work — not gated by the chores toggle,
+            // which would otherwise hide an investigation a live worker is
+            // producing against (issue #886).
+            if projectFilter.isEmpty {
+                items.append(contentsOf: (productLevelTasksByProductID[productID] ?? []).sorted(by: taskSort))
+            }
+            if includeChores && projectFilter.isEmpty {
+                items.append(contentsOf: (choresByProductID[productID] ?? []).sorted(by: taskSort))
+                // Chore-parented revisions have no project of their own; surface
+                // them with the chores so their Backlog/Doing cards appear. The
+                // in-review ones are rolled up under the parent and filtered out
+                // of the Review column by `workItems(in:)`.
+                items.append(contentsOf: (productLevelRevisionsByProductID[productID] ?? []).sorted(by: taskSort))
+            }
         }
 
         // Automation-sourced tasks are managed exclusively through the
@@ -773,6 +784,7 @@ final class ChatViewModel: ObservableObject {
     private let navigationModeDefaultsKey = "boss.navigationMode"
     private let selectedWorkProductDefaultsKey = "boss.work.selectedProductID"
     private let selectedProjectFilterIDsDefaultsKey = "boss.work.projectFilterIDs"
+    private let filterToChoresOnlyDefaultsKey = "boss.work.filterToChoresOnly"
     private let includeChoresDefaultsKey = "boss.work.includeChores"
     private let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     private let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
@@ -818,6 +830,7 @@ final class ChatViewModel: ObservableObject {
         if let storedFilters = defaults.array(forKey: selectedProjectFilterIDsDefaultsKey) as? [String] {
             selectedProjectFilterIDs = Set(storedFilters)
         }
+        filterToChoresOnly = defaults.bool(forKey: filterToChoresOnlyDefaultsKey)
         if defaults.object(forKey: includeChoresDefaultsKey) != nil {
             includeChores = defaults.bool(forKey: includeChoresDefaultsKey)
         }
@@ -924,6 +937,10 @@ final class ChatViewModel: ObservableObject {
     }
 
     func toggleProjectFilter(_ projectID: String) {
+        if filterToChoresOnly {
+            filterToChoresOnly = false
+            defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
+        }
         if selectedProjectFilterIDs.contains(projectID) {
             selectedProjectFilterIDs.remove(projectID)
         } else {
@@ -934,10 +951,23 @@ final class ChatViewModel: ObservableObject {
     }
 
     func clearProjectFilters() {
-        guard !selectedProjectFilterIDs.isEmpty else { return }
+        guard !selectedProjectFilterIDs.isEmpty || filterToChoresOnly else { return }
         selectedProjectFilterIDs = []
+        filterToChoresOnly = false
+        defaults.set(false, forKey: filterToChoresOnlyDefaultsKey)
         selectedWorkCardID = nil
         persistProjectFilterIDs()
+    }
+
+    func setFilterToChoresOnly(_ value: Bool) {
+        guard filterToChoresOnly != value else { return }
+        filterToChoresOnly = value
+        defaults.set(value, forKey: filterToChoresOnlyDefaultsKey)
+        if value {
+            selectedProjectFilterIDs = []
+            persistProjectFilterIDs()
+        }
+        selectedWorkCardID = nil
     }
 
     func archiveProject(id: String) {
@@ -2384,6 +2414,18 @@ final class ChatViewModel: ObservableObject {
     /// least one unsatisfied prerequisite edge.
     func blockedTaskCount(forProjectID projectID: String) -> Int {
         (tasksByProjectID[projectID] ?? []).filter {
+            $0.status == "blocked" && $0.blockedReason == "dependency"
+        }.count
+    }
+
+    var unblockedChoreCount: Int {
+        guard let productID = currentSelectedProductID else { return 0 }
+        return (choresByProductID[productID] ?? []).filter { $0.status == "todo" }.count
+    }
+
+    var blockedChoreCount: Int {
+        guard let productID = currentSelectedProductID else { return 0 }
+        return (choresByProductID[productID] ?? []).filter {
             $0.status == "blocked" && $0.blockedReason == "dependency"
         }.count
     }
