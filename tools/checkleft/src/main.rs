@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use checkleft::change_detection::environment::CiEnvironment;
+use checkleft::change_detection::{ChangePlan, ChangeOverrides, base_revision_from_plan, resolve_change_plan};
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
@@ -19,7 +21,7 @@ use checkleft::input::ChangeSet;
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::runner::Runner;
 use checkleft::source_tree::LocalSourceTree;
-use checkleft::vcs::{Vcs, github_pull_request_description};
+use checkleft::vcs::{BaseRevision, Vcs, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
@@ -44,6 +46,8 @@ enum Commands {
         all: bool,
         #[arg(long)]
         base_ref: Option<String>,
+        #[arg(long)]
+        default_branch: Option<String>,
         #[arg(long, default_value = "human")]
         format: OutputFormat,
     },
@@ -54,6 +58,8 @@ enum Commands {
         all: bool,
         #[arg(long)]
         base_ref: Option<String>,
+        #[arg(long)]
+        default_branch: Option<String>,
     },
 }
 
@@ -106,26 +112,31 @@ async fn run_cli() -> Result<ExitCode> {
 
     let vcs = Vcs::detect(&root)?;
     info!(kind = ?vcs.kind(), "detected repository");
+    let env = CiEnvironment::from_env();
+
     match cli.command {
         Commands::Run {
             config,
             all,
             base_ref,
+            default_branch,
             format,
         } => {
+            let overrides = ChangeOverrides { all, base_ref, default_branch };
+            info!("resolving change plan");
+            let plan = resolve_change_plan(&env, &vcs, &overrides)?;
             info!("building runner for run");
             let runner = build_runner(
                 &root,
                 &vcs,
-                all,
-                base_ref.as_deref(),
+                base_revision_from_plan(&vcs, &plan),
                 config.external_checks_file,
                 config.external_checks_url,
             )
             .await?;
             info!("resolving changeset for run");
             let changeset = attach_description_context(
-                resolve_changeset(&vcs, all, base_ref.as_deref())?,
+                changeset_from_plan(&vcs, &plan)?,
                 &vcs,
             )
             .await;
@@ -159,19 +170,22 @@ async fn run_cli() -> Result<ExitCode> {
             config,
             all,
             base_ref,
+            default_branch,
         } => {
+            let overrides = ChangeOverrides { all, base_ref, default_branch };
+            info!("resolving change plan");
+            let plan = resolve_change_plan(&env, &vcs, &overrides)?;
             info!("building runner for list");
             let runner = build_runner(
                 &root,
                 &vcs,
-                all,
-                base_ref.as_deref(),
+                base_revision_from_plan(&vcs, &plan),
                 config.external_checks_file,
                 config.external_checks_url,
             )
             .await?;
             info!("resolving changeset for list");
-            let changeset = resolve_changeset(&vcs, all, base_ref.as_deref())?;
+            let changeset = changeset_from_plan(&vcs, &plan)?;
             info!(
                 changed_files = changeset.changed_files.len(),
                 "resolved changeset for list"
@@ -191,9 +205,8 @@ async fn run_cli() -> Result<ExitCode> {
 
 async fn build_runner(
     root: &Path,
-    vcs: &Vcs,
-    all: bool,
-    base_ref: Option<&str>,
+    _vcs: &Vcs,
+    base_revision: Option<BaseRevision>,
     external_checks_file: Option<String>,
     external_checks_url: Option<String>,
 ) -> Result<Runner> {
@@ -212,10 +225,7 @@ async fn build_runner(
         .await?,
     );
     info!("initializing source tree");
-    let source_tree = Arc::new(LocalSourceTree::with_base_revision(
-        root,
-        vcs.base_revision(all, base_ref)?,
-    )?);
+    let source_tree = Arc::new(LocalSourceTree::with_base_revision(root, base_revision)?);
     info!("initializing external package provider");
     let external_provider = build_external_package_provider(root)?;
     info!("initializing external executor");
@@ -228,6 +238,14 @@ async fn build_runner(
         external_provider,
         external_executor,
     ))
+}
+
+fn changeset_from_plan(vcs: &Vcs, plan: &ChangePlan) -> Result<ChangeSet> {
+    match plan {
+        ChangePlan::All => vcs.all_files_changeset(),
+        ChangePlan::Scoped { base_sha, .. } => vcs.changeset_since(base_sha),
+        ChangePlan::Empty { .. } => Ok(ChangeSet::default()),
+    }
 }
 
 fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckPackageProvider>> {
@@ -297,25 +315,6 @@ fn parse_external_provider_mode(raw: Option<String>) -> Result<ExternalProviderM
             "invalid `{CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV}` value `{other}` (expected one of: auto, file-only, generated-only, off)"
         ),
     }
-}
-
-fn resolve_changeset(vcs: &Vcs, all: bool, base_ref: Option<&str>) -> Result<ChangeSet> {
-    if all {
-        info!("resolving all tracked files");
-        return vcs.all_files_changeset();
-    }
-
-    if let Some(base_ref) = base_ref {
-        if !base_ref.trim().is_empty() {
-            info!(base_ref, "resolving changes since base ref");
-            return vcs.changeset_since(base_ref);
-        }
-        info!("base ref was empty; resolving current changeset");
-        return vcs.current_changeset();
-    }
-
-    info!("resolving current changeset");
-    vcs.current_changeset()
 }
 
 async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs) -> ChangeSet {

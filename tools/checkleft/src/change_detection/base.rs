@@ -1,7 +1,3 @@
-// Orchestration wiring is a later task; suppress dead_code for the public
-// surface that isn't yet called outside this module.
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::process::Command;
 
@@ -49,8 +45,6 @@ pub(crate) trait HeadProber {
 }
 
 /// Production [`HeadProber`] that shells out to `git`.
-// Used by the orchestration layer (resolve_change_plan) in a later task.
-#[allow(dead_code)]
 pub(crate) struct GitHeadProber<'a> {
     root: &'a Path,
 }

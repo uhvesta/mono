@@ -1,7 +1,3 @@
-// Orchestration wiring is a later task; suppress dead_code for the public
-// surface that isn't yet called outside this module.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -65,6 +65,10 @@ impl Vcs {
         self.kind
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn current_changeset(&self) -> Result<ChangeSet> {
         match self.kind {
             VcsKind::Jujutsu => {
