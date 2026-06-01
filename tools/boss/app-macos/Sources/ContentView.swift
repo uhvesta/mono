@@ -1757,7 +1757,7 @@ struct WorkBoardCardView: View {
                         EngineRevisionBadge(origin: origin)
                     }
                     if let parentID = parentShortID {
-                        Text("revises T\(parentID)")
+                        Text("revises T" + String(parentID))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
