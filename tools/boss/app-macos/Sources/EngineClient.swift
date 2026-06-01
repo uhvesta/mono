@@ -103,6 +103,7 @@ enum EngineEvent {
     case disconnected
     case workInvalidated(topic: String, productId: String?, itemIds: [String])
     case appSessionRegistered
+    case bossSessionRegistered
     case engineRequest(requestId: String, request: EngineRequestKind)
     case productsList(products: [WorkProduct])
     case projectsList(productId: String, projects: [WorkProject])
@@ -715,6 +716,13 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    func sendRegisterBossSession(shellPid: Int32) {
+        sendLine([
+            "type": "register_boss_session",
+            "shell_pid": Int(shellPid),
+        ])
+    }
+
     /// Ask the engine for all historical executions of `taskId`, newest-first.
     /// The engine replies with `executions_list`. The wire field is
     /// `work_item_id` — the engine's `ListExecutions` request and
@@ -1210,6 +1218,8 @@ final class EngineClient: @unchecked Sendable {
                 emit(.error(message: message))
             case "app_session_registered":
                 emit(.appSessionRegistered)
+            case "boss_session_registered":
+                emit(.bossSessionRegistered)
             case "engine_request":
                 guard
                     let requestId = payload["request_id"] as? String,

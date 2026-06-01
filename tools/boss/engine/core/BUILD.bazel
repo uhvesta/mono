@@ -31,6 +31,7 @@ rust_library(
         "src/app/tests.rs",
         "src/app/tests/t01.rs",
         "src/app/tests/t02.rs",
+        "src/app/tests/t03.rs",
         "src/app/work_items.rs",
         "src/app/worker_events.rs",
         "src/attentions_detector.rs",

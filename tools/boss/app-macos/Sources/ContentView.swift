@@ -114,6 +114,23 @@ struct ContentView: View {
             model.paneInterruptHandler = { [workspace = workersWorkspace] slotId in
                 workspace.interruptWorkerPane(slotId: slotId)
             }
+            // Install the Boss-pane shell-pid provider so the engine can
+            // authenticate Boss-tier RPCs (e.g. `bossctl agents reap`).
+            // The closure is re-evaluated on every call, so it picks up
+            // the current surface pid after a Boss-pane restart.
+            model.bossPaneShellPidProvider = { [boss = bossPane] in
+                boss.session.shellPid
+            }
+            // Fire whenever the surface is (re-)attached — covers initial
+            // creation and restarts after the coordinator session exits.
+            bossPane.session.onSurfaceAttached = { [model] in
+                model.bossPaneShellPidAvailable()
+            }
+            // Handle the race where the surface was attached before this
+            // task ran (most common at startup).
+            if bossPane.session.terminalReady {
+                model.bossPaneShellPidAvailable()
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)

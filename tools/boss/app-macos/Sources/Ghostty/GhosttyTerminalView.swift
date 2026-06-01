@@ -691,6 +691,17 @@ final class GhosttyTerminalHostView: NSView {
         session.statusMessage = "Initial size \(size.width)x\(size.height)"
     }
 
+    /// The foreground pid of the PTY from `ghostty_surface_foreground_pid`,
+    /// clamped to `Int32` range. Returns 0 when the surface is nil or the
+    /// pid is unavailable. Used by the Boss-session trust-root registration
+    /// path to obtain the coordinator pane's shell pid.
+    var foregroundPid: Int32 {
+        guard let surface else { return 0 }
+        let raw = ghostty_surface_foreground_pid(surface)
+        guard raw > 0, raw <= UInt64(Int32.max) else { return 0 }
+        return Int32(raw)
+    }
+
     /// Type `text` into the surface and submit it, as if the user had
     /// pasted the body and then pressed Return. Used by engine→app
     /// `SendToPane` requests (probe injection, `bossctl agents send`,

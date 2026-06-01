@@ -1661,6 +1661,22 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Boss Session Registration
+
+    /// Called by ContentView when the Boss pane's libghostty surface attaches
+    /// (initial creation or after a restart). Sends RegisterBossSession if the
+    /// app session is already confirmed; otherwise the registration fires when
+    /// appSessionRegistered arrives.
+    func bossPaneShellPidAvailable() {
+        maybeRegisterBossSession()
+    }
+
+    private func maybeRegisterBossSession() {
+        guard isAppSessionRegistered else { return }
+        guard let pid = bossPaneShellPidProvider?(), pid > 0 else { return }
+        engine.sendRegisterBossSession(shellPid: pid)
+    }
+
     // MARK: - Event Handling
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?
@@ -1668,6 +1684,14 @@ final class ChatViewModel: ObservableObject {
     var paneSendHandler: ((Int, String) -> EngineSendResult)?
     var paneFocusHandler: ((Int) -> EngineFocusResult)?
     var paneInterruptHandler: ((Int) -> EngineInterruptResult)?
+
+    /// Whether the engine has confirmed this client is the registered app session.
+    /// Reset on disconnect; set when `appSessionRegistered` is received.
+    private var isAppSessionRegistered = false
+    /// Returns the Boss pane's current shell pid from
+    /// `ghostty_surface_foreground_pid`. Injected by ContentView (GhosttyKit
+    /// build only). Returns 0 when the surface is not yet live.
+    var bossPaneShellPidProvider: (() -> Int32)?
 
     private func handle(_ event: EngineEvent) {
         switch event {
@@ -1694,8 +1718,9 @@ final class ChatViewModel: ObservableObject {
                 loadDismissedAttentionGroups(for: productID)
             }
         case .appSessionRegistered:
-            // No additional state for now; the engine has confirmed
-            // this client is the registered app session.
+            isAppSessionRegistered = true
+            maybeRegisterBossSession()
+        case .bossSessionRegistered:
             break
         case .engineRequest(let requestId, let request):
             switch request {
@@ -1755,6 +1780,7 @@ final class ChatViewModel: ObservableObject {
             }
         case .disconnected:
             isConnected = false
+            isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
         case .workInvalidated(let topic, let productId, _):
             if topic == "work.products" {

@@ -159,10 +159,19 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     @Published var claudeState: ClaudeMonitorState = .unavailable
 
     weak var hostView: GhosttyTerminalHostView?
+    /// The foreground pid of this pane's PTY, or 0 when the surface is not
+    /// yet live. Delegates to `GhosttyTerminalHostView.foregroundPid`.
+    var shellPid: Int32 { hostView?.foregroundPid ?? 0 }
     private var claudeMonitorTracker = ClaudeMonitorTracker()
     /// Called on the main actor when the pane's child process exits.
     /// Boss pane sets this to a restart closure; worker panes leave it nil.
     var onChildExited: (() -> Void)?
+    /// Called on the main actor each time a libghostty surface is
+    /// successfully attached to this session. Fires on initial creation
+    /// and on every restart (the surface is torn down and re-created
+    /// when the child exits). Boss pane uses this to re-register the
+    /// Boss trust root after a restart produces a new shell pid.
+    var onSurfaceAttached: (() -> Void)?
 
     init(id: String, role: PaneRole, launchSpec: TerminalLaunchSpec) {
         self.id = id
@@ -179,6 +188,7 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     func attach(hostView: GhosttyTerminalHostView) {
         self.hostView = hostView
         terminalReady = true
+        onSurfaceAttached?()
     }
 
     func updateClaudeMonitor(snapshot: ClaudeMonitorSnapshot?) {
