@@ -60,7 +60,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use boss_protocol::{WorkItemPatch, WorkerActivity};
 
-use crate::coordinator::{ExecutionCoordinator, WorkerPool};
+use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::work::WorkDb;
@@ -281,10 +281,13 @@ pub async fn run_one_pass(
 
         // Release the worker pool slot so the orphan sweep detects the
         // chore and creates a fresh ready execution for redispatch.
-        let worker_id = WorkerPool::worker_id_for_slot(state.slot_id);
+        // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
+        // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
+        // "auto-worker-N" prefix and release_worker_and_kick routes to the
+        // correct pool via pool_for_worker_id.
+        let worker_id = worker_id_for_slot(state.slot_id);
         coordinator
-            .worker_pool()
-            .release_worker(&worker_id, None)
+            .release_worker_and_kick(&worker_id, None)
             .await;
 
         // Structured event for bossctl dispatch tail.
@@ -302,10 +305,6 @@ pub async fn run_one_pass(
                     })),
             )
             .await;
-
-        // Wake the scheduler so it finds the newly-freed slot and the
-        // chore's orphaned execution on the next tick.
-        coordinator.kick();
 
         outcome.reaped += 1;
     }

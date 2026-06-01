@@ -80,7 +80,7 @@ use serde_json::Value;
 
 use boss_protocol::{WorkItemPatch, WorkerActivity};
 
-use crate::coordinator::{ExecutionCoordinator, WorkerPool};
+use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transient_error::{
@@ -489,10 +489,13 @@ fn should_inspect(activity: WorkerActivity) -> bool {
 }
 
 async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, slot_id: u8) {
-    let worker_id = WorkerPool::worker_id_for_slot(slot_id);
+    // Use worker_id_for_slot (not WorkerPool::worker_id_for_slot) so
+    // automation-pool slots (> MAX_WORKER_POOL_SIZE) produce the
+    // "auto-worker-N" prefix and release_worker_and_kick routes to
+    // the correct pool via pool_for_worker_id.
+    let worker_id = worker_id_for_slot(slot_id);
     coordinator
-        .worker_pool()
-        .release_worker(&worker_id, None)
+        .release_worker_and_kick(&worker_id, None)
         .await;
 }
 

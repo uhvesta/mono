@@ -821,19 +821,47 @@ impl WorkerPool {
 }
 
 /// Parse the trailing 1-indexed slot number out of a worker id.
-/// Accepts both the main-pool `worker-{N}` form and the automation-pool
-/// `auto-worker-{N}` form — both refer to the same physical pane slot N
-/// at the engine→app boundary.
+/// Regular-pool `worker-{N}` ids map directly to slot N.
+/// Automation-pool `auto-worker-{N}` ids map to slot
+/// `N + MAX_WORKER_POOL_SIZE` so the two pools occupy disjoint
+/// slot ranges (1..=8 for regular, 9..=11 for automation). This
+/// means "auto-worker-1" → slot 9 (Kira), "auto-worker-2" → 10
+/// (Dax), "auto-worker-3" → 11 (Bashir), never colliding with the
+/// regular-pool range.
 ///
 /// Returns `None` for ids that don't match either recognised shape
 /// or whose suffix isn't a positive `u8`. Callers should treat
 /// `None` as a programming error — the only producer is
 /// [`WorkerPool::claim_worker`].
 pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
-    let suffix = worker_id
-        .strip_prefix("worker-")
-        .or_else(|| worker_id.strip_prefix(AUTOMATION_WORKER_ID_PREFIX))?;
-    suffix.parse::<u8>().ok().filter(|n| *n >= 1)
+    if let Some(suffix) = worker_id.strip_prefix("worker-") {
+        return suffix.parse::<u8>().ok().filter(|n| *n >= 1);
+    }
+    if let Some(suffix) = worker_id.strip_prefix(AUTOMATION_WORKER_ID_PREFIX) {
+        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
+        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE).ok();
+    }
+    None
+}
+
+/// Derive the canonical worker-id string for a pane slot id.
+/// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
+/// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`;
+/// automation-pool slots (> MAX_WORKER_POOL_SIZE) produce
+/// `"auto-worker-{M}"` where M = slot_id − MAX_WORKER_POOL_SIZE.
+/// Callers that release a pane slot must use this instead of
+/// [`WorkerPool::worker_id_for_slot`] to ensure the release is
+/// routed to the correct pool.
+pub fn worker_id_for_slot(slot_id: u8) -> String {
+    if (slot_id as usize) <= MAX_WORKER_POOL_SIZE {
+        format!("worker-{}", slot_id)
+    } else {
+        format!(
+            "{}{}",
+            AUTOMATION_WORKER_ID_PREFIX,
+            slot_id as usize - MAX_WORKER_POOL_SIZE
+        )
+    }
 }
 
 /// Sink for `executions.<id>` topic invalidations. The engine wires this
@@ -2669,7 +2697,7 @@ impl ExecutionCoordinator {
                 // worker-pool placeholder (worker_id) stays as the
                 // agent_id.
                 let run = if let Some(slot_id) = outcome.slot_id {
-                    let agent_id = format!("worker-{}", slot_id);
+                    let agent_id = worker_id_for_slot(slot_id);
                     match self.work_db.set_run_agent_id(&run.id, &agent_id) {
                         Ok(updated) => updated,
                         Err(err) => {
@@ -3319,9 +3347,10 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionCoordinator, ExecutionPublisher, FrontendEvent,
-        MAX_WORKER_POOL_SIZE, WorkerPool, pick_worst_failing_check, slot_id_from_worker_id,
+        AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle,
+        CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, ExecutionCoordinator,
+        ExecutionPublisher, FrontendEvent, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
+        WorkerPool, pick_worst_failing_check, slot_id_from_worker_id, worker_id_for_slot,
     };
 
     #[test]
@@ -5864,17 +5893,57 @@ mod tests {
 
     #[test]
     fn slot_id_from_worker_id_accepts_automation_pool_format() {
-        for slot in 1u8..=4 {
-            let auto_worker_id = format!("auto-worker-{slot}");
+        // Automation-pool ordinals are offset by MAX_WORKER_POOL_SIZE (8) so the
+        // two pools occupy disjoint slot ranges: regular 1..=8, automation 9..=11.
+        for ordinal in 1u8..=3 {
+            let auto_worker_id = format!("auto-worker-{ordinal}");
+            let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8;
             assert_eq!(
                 slot_id_from_worker_id(&auto_worker_id),
-                Some(slot),
-                "expected Some({slot}) for {auto_worker_id:?}"
+                Some(expected_slot),
+                "expected Some({expected_slot}) for {auto_worker_id:?}"
             );
         }
         assert_eq!(slot_id_from_worker_id("auto-worker-0"), None);
         assert_eq!(slot_id_from_worker_id("auto-worker-"), None);
         assert_eq!(slot_id_from_worker_id("auto-worker-abc"), None);
+    }
+
+    #[test]
+    fn worker_id_for_slot_round_trips_with_slot_id_from_worker_id() {
+        // Regular pool: slots 1..=8 → "worker-N" → back to the same slot.
+        for slot in 1u8..=8 {
+            let wid = worker_id_for_slot(slot);
+            assert_eq!(wid, format!("worker-{slot}"));
+            assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
+        }
+        // Automation pool: slots 9..=11 → "auto-worker-M" → back to the same slot.
+        for slot in 9u8..=11 {
+            let wid = worker_id_for_slot(slot);
+            let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE;
+            assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
+            assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
+        }
+    }
+
+    #[test]
+    fn automation_pool_slots_are_disjoint_from_regular_pool() {
+        // The slot IDs produced by auto-worker-N (9, 10, 11) must not
+        // overlap with any regular-pool slot (1..=8).
+        for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
+            let auto_wid = format!("auto-worker-{ordinal}");
+            let slot = slot_id_from_worker_id(&auto_wid).unwrap();
+            assert!(
+                slot as usize > MAX_WORKER_POOL_SIZE,
+                "auto-worker-{ordinal} must map to slot > {MAX_WORKER_POOL_SIZE}, got {slot}"
+            );
+            // Verify the reverse also works: the slot maps back to an auto-worker- id.
+            let back = worker_id_for_slot(slot);
+            assert!(
+                back.starts_with(AUTOMATION_WORKER_ID_PREFIX),
+                "slot {slot} must produce an automation-pool worker_id, got {back:?}"
+            );
+        }
     }
 
     #[test]
@@ -7525,6 +7594,113 @@ mod tests {
 
         let _ = auto_chore;
         let _ = main_chore;
+    }
+
+    /// When the coordinator dispatches an automation-pool execution the
+    /// `worker_id` passed to the runner must carry the `"auto-worker-"`
+    /// prefix and decode (via `slot_id_from_worker_id`) to a slot id
+    /// that is strictly greater than `MAX_WORKER_POOL_SIZE` — i.e. it
+    /// must land in the automation-pool slot range (Kira/Dax/Bashir),
+    /// not the regular-pool range (Riker … O'Brien). This is the pane-
+    /// spawn correctness regression test for the T1104 incident where
+    /// `auto-worker-1` was decoded as slot 1 (Riker) instead of slot
+    /// 9 (Kira).
+    #[tokio::test]
+    async fn automation_dispatch_worker_id_maps_to_automation_pool_slot() {
+        use crate::work::CreateAutomationInput;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Slot-range test".to_owned(),
+                repo_remote_url: None,
+                trigger: boss_protocol::AutomationTrigger::Schedule {
+                    cron: "0 14 * * 1-5".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "do it".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+
+        let auto_chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Slot-range chore".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+                rusqlite::params![automation.id, auto_chore.id],
+            )
+            .unwrap();
+        }
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let mut coord =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(0), cube.clone(), runner.clone());
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+
+        // Wait for the execution to reach running.
+        for _ in 0..200 {
+            let execs = db.list_executions(None).unwrap();
+            if execs.iter().any(|e| e.status == "running") {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let calls = runner.calls.lock().await;
+        assert_eq!(calls.len(), 1, "exactly one run should have been dispatched");
+        let (worker_id, _, _, _) = &calls[0];
+
+        // The worker_id must carry the automation-pool prefix.
+        assert!(
+            worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX),
+            "automation-pool execution must receive an auto-worker-N worker_id, got {worker_id:?}"
+        );
+
+        // Decoded slot must be in the automation-pool range (> MAX_WORKER_POOL_SIZE).
+        let slot = slot_id_from_worker_id(worker_id)
+            .unwrap_or_else(|| panic!("slot_id_from_worker_id failed for {worker_id:?}"));
+        assert!(
+            slot as usize > MAX_WORKER_POOL_SIZE,
+            "automation slot_id {slot} must be > {MAX_WORKER_POOL_SIZE} (the regular-pool ceiling); \
+             got slot {slot} — automation pane would land on a regular-pool pane (T1104 regression)"
+        );
     }
 
     /// Automation pool exhaustion must not block main-pool dispatch.

@@ -1202,7 +1202,7 @@ impl ServerState {
         // scheduler. `WorkerPool::release_worker` is a find-or-skip
         // no-op for already-idle slots, so this is safe even if the
         // pane was a non-pool spawn (e.g. legacy or test path).
-        let worker_id = WorkerPool::worker_id_for_slot(slot_id);
+        let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
         self.execution_coordinator
             .release_worker_and_kick(&worker_id, None)
             .await;
