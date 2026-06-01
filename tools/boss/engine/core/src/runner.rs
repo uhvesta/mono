@@ -946,6 +946,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
             prompt.push_str(
                 "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
             );
+            prompt.push_str(check_bypass_prohibition_text());
         }
         _ => {
             prompt.push_str(
@@ -1088,6 +1089,19 @@ pub(crate) fn bazel_prepush_gate_text() -> String {
          \n\
          If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
         .to_string()
+}
+
+/// Hard constraint text forbidding check/CI bypasses. Injected into every
+/// prompt surface where a worker might encounter a failing check or CI failure.
+fn check_bypass_prohibition_text() -> &'static str {
+    "\n**Hard constraint — fix failing checks at the root cause; never bypass them.**\n\n\
+     Forbidden moves (each is a bypass, not a fix — do NOT do any of them):\n\
+     - Adding a file to a check exclusion or allowlist (`CHECKS.yaml` `exclude_files`, checkleft excludes, lint-disable comments, etc.) to suppress the failure.\n\
+     - Setting `allow_bypass`, using an override flag, or invoking any bypass/override mechanism on a check.\n\
+     - Passing `--no-verify` / skipping git hooks; adding broad `#[allow(...)]` / `// swiftlint:disable` / `# noqa` annotations solely to suppress a warning or error.\n\
+     - Deleting, `#[ignore]`-ing, `xfail`-ing, skipping, or weakening assertions in a failing test to make it pass.\n\
+     - Raising a threshold or limit (e.g. `max_lines` in a file-size check) solely to accommodate the offending file without reducing its size.\n\n\
+     Required behavior: fix the real problem — split the oversized file, fix the lint/compile error, fix the test failure, resolve the root cause. If a check genuinely SHOULD be relaxed (a legitimately needed exclusion or threshold change), that is a human decision — STOP and surface it for operator approval with full justification. Do not decide this autonomously.\n"
 }
 
 /// Render the `[editorial-rules]` block for the worker prompt (chore #5).
@@ -1463,6 +1477,8 @@ fn compose_revision_directive(
     out.push_str("- Do NOT create a `boss/exec_*` bookmark — push to the existing parent branch.\n");
     out.push_str("- Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and this is NOT a rebase-only revision, stop and explain.\n");
     out.push('\n');
+    out.push_str(check_bypass_prohibition_text());
+    out.push('\n');
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 6 above). Do NOT open a new PR.\n\
@@ -1582,6 +1598,8 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
             was extending. Reason: `architectural_mismatch`.\n\n\
          Do NOT close the PR yourself. Closing is the human's call.\n\n",
     );
+    out.push_str(check_bypass_prohibition_text());
+    out.push('\n');
     out.push_str("### Post-resolution PR comment template\n\n");
     out.push_str(
         "```\n\
@@ -1803,6 +1821,8 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
          - **Always pass `-m \"…\"` to `jj describe` / `jj squash`.** The worker \
          environment has no usable `$EDITOR`.\n\n",
     );
+    out.push_str(check_bypass_prohibition_text());
+    out.push('\n');
     out
 }
 
