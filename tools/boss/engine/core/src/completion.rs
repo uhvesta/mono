@@ -3014,7 +3014,7 @@ must not be asked to open one",
 
         // --- CI signal check ---
         if let Some(ref attempt) = ci_attempt {
-            if open_status.ci == OpenPrCiStatus::Clean {
+            if ci_attempt_signal_cleared(&attempt.failed_checks, &open_status.ci) {
                 tracing::info!(
                     execution_id,
                     attempt_id = %attempt.id,
@@ -3265,6 +3265,71 @@ pub const NUDGE_BREAKER_ATTENTION_KIND: &str = "nudge_breaker_tripped";
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
 If the work is complete, push your branch and open the PR with `gh pr create`. \
 If you're blocked, explain what you need.";
+
+/// Extract the set of required-check names a `ci_remediations` attempt
+/// was opened to fix, parsed from its `failed_checks` JSON snapshot
+/// (each entry carries a `"name"` field; see `ci_watch::FailedCheckRecord`).
+/// An empty array, malformed JSON, or entries without a name yield an
+/// empty list — callers treat that as "no targeted-check information"
+/// and fall back to requiring whole-PR `Clean`.
+fn targeted_check_names(failed_checks_json: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(failed_checks_json)
+        .ok()
+        .and_then(|v| match v {
+            serde_json::Value::Array(arr) => Some(arr),
+            _ => None,
+        })
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("name").and_then(|n| n.as_str()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the CI blocking signal *this attempt was opened for* is now
+/// cleared on the bound PR.
+///
+/// The original heuristic keyed solely on whole-PR `Clean` (every
+/// required check terminal-green). That misses a legitimate completion:
+/// a remediation opened for one specific failing check (e.g. the "Pull
+/// Request Description" check, often fixed by a metadata-only
+/// `gh pr edit` with no commit) whose own check has gone green while
+/// *other, unrelated* required checks remain red or pending. Such an
+/// attempt has done its job and must be retired — not nudged forever to
+/// "push your commits".
+///
+/// Decision table:
+/// - `Clean`   → cleared (all required green; trivially clears any attempt).
+/// - `Failing` → cleared iff none of the attempt's targeted checks are
+///   among the currently-failing set. Remaining failures belong to other
+///   checks and will drive their own remediation once the parent snaps
+///   back to `in_review`.
+/// - `InFlight`→ never cleared: at least one required check is still
+///   non-terminal and we cannot tell from this aggregate whether the
+///   targeted check specifically has reached terminal-green yet. Stay
+///   conservative; the next sweep re-evaluates once checks terminalize.
+///
+/// When the attempt carries no parseable targeted-check names, only the
+/// `Clean` case clears it — preserving the pre-change behaviour.
+fn ci_attempt_signal_cleared(attempt_failed_checks: &str, ci: &OpenPrCiStatus) -> bool {
+    match ci {
+        OpenPrCiStatus::Clean => true,
+        OpenPrCiStatus::InFlight => false,
+        OpenPrCiStatus::Failing { failures } => {
+            let targeted = targeted_check_names(attempt_failed_checks);
+            if targeted.is_empty() {
+                return false;
+            }
+            let failing_names: std::collections::HashSet<&str> =
+                failures.iter().map(|f| f.name.as_str()).collect();
+            !targeted
+                .iter()
+                .any(|name| failing_names.contains(name.as_str()))
+        }
+    }
+}
 
 /// Probe text dispatched when a PR is already bound to the worker's
 /// chore (a resume, or a `ci_remediation` exec whose sibling
@@ -7905,6 +7970,455 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             1,
             "exactly one nudge probe must be queued; got {queued:?}",
         );
+    }
+
+    /// Build a CI-remediation revision fixture. The parent chore is
+    /// `blocked: ci_failure` with a bound `pr_url`. A `ci_remediations` row
+    /// is inserted (`running`) carrying `failed_checks` (the JSON list of
+    /// checks this attempt was opened to fix). A revision task is created
+    /// for the fix (`created_via = "ci-fix:<attempt_id>"`) and its id stamped
+    /// back onto the attempt. A `revision_implementation` execution is left
+    /// in `waiting_human` with `pr_head_before = head` (the SHA-delta
+    /// snapshot, so the gate returns NoContribution on an unmoved head).
+    ///
+    /// Returns `(db, product_id, parent_chore_id, revision_id, execution_id, attempt_id)`.
+    fn ci_revision_fixture(
+        workspace_path: &Path,
+        parent_pr_url: &str,
+        head: &str,
+        failed_checks: &str,
+    ) -> (Arc<WorkDb>, String, String, String, String, String) {
+        use boss_protocol::CreateRevisionInput;
+        use crate::work::{FakePrStateChecker, PrOpenState};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(
+                CreateProductInput::builder()
+                    .name("Boss-ci-rev-test")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let parent = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Fix failing CI: Pull Request Description")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        db.update_work_item(
+            &parent.id,
+            crate::work::WorkItemPatch {
+                status: Some("in_review".into()),
+                pr_url: Some(parent_pr_url.into()),
+                ..crate::work::WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let attempt = db
+            .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+                product_id: product.id.clone(),
+                work_item_id: parent.id.clone(),
+                pr_url: parent_pr_url.into(),
+                pr_number: 440,
+                head_branch: "my-feature".into(),
+                head_sha_at_trigger: head.into(),
+                attempt_kind: "fix".into(),
+                consumes_budget: 1,
+                failed_checks: failed_checks.into(),
+                failure_kind: "pr_branch_ci".into(),
+                before_commit_sha: None,
+            })
+            .unwrap()
+            .unwrap();
+        db.mark_chore_blocked_ci_failure(&parent.id, parent_pr_url, Some(&attempt.id))
+            .unwrap();
+        db.mark_ci_remediation_running(&attempt.id, "lease-1", "ws-1", "worker-1")
+            .unwrap();
+
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+        let revision = db
+            .create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(parent.id.clone())
+                    .description("Add the required PR description sections")
+                    .created_via(format!("ci-fix:{}", attempt.id))
+                    .build(),
+                &checker,
+            )
+            .unwrap();
+        db.set_ci_remediation_revision_task_id(&attempt.id, &revision.id)
+            .unwrap();
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision.id.clone())
+                    .kind("revision_implementation")
+                    .status("ready")
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .prefer_is_soft(true)
+                    .pr_url(parent_pr_url)
+                    .build(),
+            )
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-1",
+                "mono-agent-001",
+                workspace_path.to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                "waiting_human",
+                "completed",
+                Some("spawned CI-fix revision worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        db.set_execution_pr_head_before(&execution.id, head)
+            .unwrap();
+        (
+            db,
+            product.id,
+            parent.id,
+            revision.id,
+            execution.id,
+            attempt.id,
+        )
+    }
+
+    /// Build a `PrLifecycleProbe` for an open PR with the given CI status.
+    fn ci_probe(ci: crate::merge_poller::OpenPrCiStatus) -> PrLifecycleProbe {
+        PrLifecycleProbe {
+            url: String::new(),
+            state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus {
+                mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+                ci,
+            }),
+            base_ref_oid: None,
+            head_ref_oid: None,
+            head_ref_name: None,
+            base_ref_name: None,
+            labels: Vec::new(),
+            review: crate::merge_poller::PrReviewState::Unknown,
+            in_merge_queue: false,
+        }
+    }
+
+    fn failing_check(name: &str) -> crate::merge_poller::RequiredCheckFailure {
+        crate::merge_poller::RequiredCheckFailure {
+            name: name.to_owned(),
+            conclusion: "FAILURE".to_owned(),
+            target_url: String::new(),
+            provider: crate::merge_poller::CiProvider::Other,
+            provider_job_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ci_revision_target_check_cleared_retires_despite_other_failing() {
+        // T57 / linkedin-multiproduct/rdev-base-image#440 regression: a
+        // CI-remediation revision worker fixed the "Pull Request Description"
+        // check via a metadata-only `gh pr edit` (NO commit → SHA-delta gate
+        // returns NoContribution). The target check is now green, but the PR
+        // has an UNRELATED failing required check. The old heuristic required
+        // whole-PR `Clean`, so it re-nudged the worker forever. The fix: the
+        // attempt's own targeted check is no longer failing, so it must be
+        // retired as succeeded and the parent snapped back to in_review.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let failed_checks = r#"[{"name":"Pull Request Description","conclusion":"FAILURE","target_url":"","provider":"other","provider_job_id":null}]"#;
+        let (db, product_id, parent_chore_id, _revision_id, execution_id, attempt_id) =
+            ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // The target check ("Pull Request Description") is green now; only an
+        // unrelated check ("build") is failing.
+        struct OtherFailingProbe;
+        #[async_trait]
+        impl MergeProbe for OtherFailingProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                let mut p = ci_probe(crate::merge_poller::OpenPrCiStatus::Failing {
+                    failures: vec![failing_check("build")],
+                });
+                p.url = url.to_owned();
+                Ok(p)
+            }
+        }
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(OtherFailingProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::SignalAlreadyCleared { ref pr_url } if pr_url == parent_pr_url),
+            "targeted check cleared must retire the attempt; got {outcome:?}",
+        );
+
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "succeeded",
+            "ci_remediations attempt must be retired as succeeded",
+        );
+
+        let parent = match db.get_work_item(&parent_chore_id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            parent.status, "in_review",
+            "parent chore must be snapped back to in_review",
+        );
+
+        assert!(
+            probes.snapshot().is_empty(),
+            "no nudge probe must fire when the targeted check is cleared; got {:?}",
+            probes.snapshot(),
+        );
+
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(pid, ev)| {
+                pid == &product_id
+                    && matches!(
+                        ev,
+                        FrontendEvent::CiRemediationSucceeded { work_item_id, .. }
+                            if work_item_id == &parent_chore_id
+                    )
+            }),
+            "CiRemediationSucceeded must be published; typed events: {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_revision_target_check_still_failing_nudges_as_before() {
+        // Regression guard: when the attempt's OWN targeted check is still
+        // failing, the signal is NOT cleared — the normal nudge path must
+        // still fire and the attempt must remain active.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let failed_checks = r#"[{"name":"Pull Request Description","conclusion":"FAILURE","target_url":"","provider":"other","provider_job_id":null}]"#;
+        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        // The target check is STILL failing.
+        struct TargetFailingProbe;
+        #[async_trait]
+        impl MergeProbe for TargetFailingProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                let mut p = ci_probe(crate::merge_poller::OpenPrCiStatus::Failing {
+                    failures: vec![failing_check("Pull Request Description")],
+                });
+                p.url = url.to_owned();
+                Ok(p)
+            }
+        }
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(TargetFailingProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "target check still failing must fall through to the normal nudge; got {outcome:?}",
+        );
+
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_ne!(
+            attempt.status, "succeeded",
+            "attempt must NOT be retired while its targeted check is still failing",
+        );
+
+        assert_eq!(
+            probes.snapshot().len(),
+            1,
+            "exactly one nudge probe must be queued; got {:?}",
+            probes.snapshot(),
+        );
+    }
+
+    #[tokio::test]
+    async fn ci_revision_target_check_inflight_does_not_retire() {
+        // When CI is InFlight (some required check still non-terminal) we
+        // cannot tell whether the targeted check specifically went green, so
+        // we must stay conservative and NOT retire — the next sweep
+        // re-evaluates once checks terminalize.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/440";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let failed_checks = r#"[{"name":"Pull Request Description","conclusion":"FAILURE","target_url":"","provider":"other","provider_job_id":null}]"#;
+        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            ci_revision_fixture(workspace.path(), parent_pr_url, head, failed_checks);
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+
+        struct InFlightProbe;
+        #[async_trait]
+        impl MergeProbe for InFlightProbe {
+            async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+                let mut p = ci_probe(crate::merge_poller::OpenPrCiStatus::InFlight);
+                p.url = url.to_owned();
+                Ok(p)
+            }
+        }
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(InFlightProbe));
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "InFlight CI must not retire; got {outcome:?}",
+        );
+        let attempt = db.get_ci_remediation(&attempt_id).unwrap().unwrap();
+        assert_ne!(attempt.status, "succeeded");
+    }
+
+    // ── ci_attempt_signal_cleared: predicate decision-table tests ────────────
+
+    #[test]
+    fn ci_signal_cleared_clean_always_clears() {
+        // Clean clears any attempt, including one with no targeted-check info.
+        assert!(ci_attempt_signal_cleared("[]", &OpenPrCiStatus::Clean));
+        assert!(ci_attempt_signal_cleared(
+            r#"[{"name":"x"}]"#,
+            &OpenPrCiStatus::Clean
+        ));
+    }
+
+    #[test]
+    fn ci_signal_cleared_inflight_never_clears() {
+        assert!(!ci_attempt_signal_cleared("[]", &OpenPrCiStatus::InFlight));
+        assert!(!ci_attempt_signal_cleared(
+            r#"[{"name":"x"}]"#,
+            &OpenPrCiStatus::InFlight
+        ));
+    }
+
+    #[test]
+    fn ci_signal_cleared_failing_clears_when_target_not_among_failures() {
+        // Targeted "Pull Request Description" is green; only "build" fails.
+        let ci = OpenPrCiStatus::Failing {
+            failures: vec![failing_check("build")],
+        };
+        assert!(ci_attempt_signal_cleared(
+            r#"[{"name":"Pull Request Description"}]"#,
+            &ci
+        ));
+    }
+
+    #[test]
+    fn ci_signal_cleared_failing_does_not_clear_when_target_still_failing() {
+        let ci = OpenPrCiStatus::Failing {
+            failures: vec![failing_check("Pull Request Description"), failing_check("build")],
+        };
+        assert!(!ci_attempt_signal_cleared(
+            r#"[{"name":"Pull Request Description"}]"#,
+            &ci
+        ));
+    }
+
+    #[test]
+    fn ci_signal_cleared_failing_with_no_targeted_names_stays_conservative() {
+        // No parseable targeted names → only Clean would clear; a Failing
+        // status must not retire (preserves pre-change behaviour).
+        let ci = OpenPrCiStatus::Failing {
+            failures: vec![failing_check("build")],
+        };
+        assert!(!ci_attempt_signal_cleared("[]", &ci));
+        assert!(!ci_attempt_signal_cleared("not json", &ci));
+    }
+
+    #[test]
+    fn ci_signal_cleared_multi_target_requires_all_targets_clear() {
+        // An attempt targeting two checks clears only when BOTH are green.
+        let targets = r#"[{"name":"a"},{"name":"b"}]"#;
+        let one_left = OpenPrCiStatus::Failing {
+            failures: vec![failing_check("b")],
+        };
+        assert!(!ci_attempt_signal_cleared(targets, &one_left));
+        let unrelated = OpenPrCiStatus::Failing {
+            failures: vec![failing_check("c")],
+        };
+        assert!(ci_attempt_signal_cleared(targets, &unrelated));
+    }
+
+    #[test]
+    fn targeted_check_names_parses_names() {
+        assert_eq!(
+            targeted_check_names(r#"[{"name":"a"},{"name":"b"}]"#),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert!(targeted_check_names("[]").is_empty());
+        assert!(targeted_check_names("garbage").is_empty());
+        assert!(targeted_check_names(r#"{"name":"a"}"#).is_empty());
     }
 
     // ── expected_branch_name: BranchNaming strategy tests ────────────────────
