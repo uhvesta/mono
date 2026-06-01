@@ -260,6 +260,39 @@ fn opaque_hash(execution_id: &str) -> String {
     digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The work-item-identifying suffix of a branch name: everything after
+/// the final `/` (or the whole string when there is no `/`).
+///
+/// Every engine-supplied branch name has the shape
+/// `<prefix>/<work-item-suffix>` (see [`expected_branch_name`]), where the
+/// suffix is what uniquely binds the branch to one execution — the
+/// `exec_<id>` under [`BranchNaming::BossExecPrefix`], or the opaque hash
+/// under [`BranchNaming::OpaqueHash`] / [`BranchNaming::CustomPrefix`].
+/// The prefix (`boss/`, `bduff/`, …) is cosmetic and product-configurable
+/// (`worker_branch_prefix`), so PR↔work-item association keys on the
+/// suffix, never on the prefix.
+pub(crate) fn branch_work_item_suffix(branch: &str) -> &str {
+    branch.rsplit('/').next().unwrap_or(branch)
+}
+
+/// Whether two branch names identify the same work item, **ignoring their
+/// prefixes**. A worker that honours a product's `worker_branch_prefix`
+/// (e.g. `bduff/`) opens its PR on `bduff/<suffix>` while the engine
+/// reconstructs `boss/<suffix>` as the expected branch; those must
+/// associate so the worker is not forced to abandon a compliant PR and
+/// recreate it under `boss/` (see issue #1145).
+///
+/// The work-item suffix is unique per execution within a repo (it is the
+/// execution id or a hash of it), so matching on the suffix alone is just
+/// as safe against cross-execution mis-binding as the exact-branch match
+/// it replaces — a sibling worker's branch cannot share this execution's
+/// suffix. An empty suffix never matches (defensive: a malformed `…/`
+/// branch must not collide with another).
+pub(crate) fn branches_identify_same_work_item(a: &str, b: &str) -> bool {
+    let suffix_a = branch_work_item_suffix(a);
+    !suffix_a.is_empty() && suffix_a == branch_work_item_suffix(b)
+}
+
 /// Probes GitHub for the PR opened against an engine-supplied branch
 /// name and reports whether the PR is open / merged / closed / absent.
 ///
@@ -314,12 +347,33 @@ impl PrDetector for CommandPrDetector {
         let api_pr = match query_pr_for_branch(&repo_slug, expected_branch).await? {
             Some(pr) => pr,
             None => {
-                tracing::debug!(
-                    repo = %repo_slug,
-                    branch = %expected_branch,
-                    "pr_detect: no PR found for expected branch; returning None",
-                );
-                return Ok(PrStatus::None);
+                // Prefix-agnostic fallback (issue #1145): the worker may
+                // have honoured a product `worker_branch_prefix` and
+                // pushed its PR to `<prefix>/<suffix>` (e.g. `bduff/…`)
+                // rather than the engine-reconstructed `boss/<suffix>`.
+                // The exact `--head` query above misses that PR, so
+                // re-query by the work-item suffix (unique per execution
+                // within the repo) and accept any prefix.
+                let suffix = branch_work_item_suffix(expected_branch);
+                match query_pr_by_branch_suffix(&repo_slug, suffix).await? {
+                    Some(pr) => {
+                        tracing::info!(
+                            repo = %repo_slug,
+                            expected_branch = %expected_branch,
+                            pr_url = %pr.url,
+                            "pr_detect: no PR on the exact expected branch, but found one whose work-item suffix matches under a different prefix; associating (prefix-agnostic match)",
+                        );
+                        pr
+                    }
+                    None => {
+                        tracing::debug!(
+                            repo = %repo_slug,
+                            branch = %expected_branch,
+                            "pr_detect: no PR found for expected branch (exact or suffix match); returning None",
+                        );
+                        return Ok(PrStatus::None);
+                    }
+                }
             }
         };
         let status = classify_pr(api_pr);
@@ -599,6 +653,107 @@ async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<Api
         additions,
         deletions,
     }))
+}
+
+/// Prefix-agnostic cold-path fallback (issue #1145): find a PR whose head
+/// branch *ends in* `suffix` — i.e. `<any-prefix>/<suffix>` — in
+/// `repo_slug`. Used when the exact `--head <boss/suffix>` query in
+/// [`query_pr_for_branch`] finds nothing because the worker honoured a
+/// product `worker_branch_prefix` and opened its PR under a different
+/// prefix.
+///
+/// `gh pr list --head` only matches a full branch name, so there is no
+/// server-side suffix filter; we list candidate PRs and filter in Rust by
+/// [`branch_work_item_suffix`]. The work-item suffix is unique per
+/// execution within a repo (the execution id or a hash of it), so at most
+/// one PR can match — this preserves the incident-001 cross-execution
+/// safety property (the query is still scoped to the product's repo and
+/// keyed on an execution-unique token, never a shared SHA).
+///
+/// We scan open PRs first (the freshly-opened PR we are racing to
+/// associate is open), bounded by `--limit`. If the page fills without a
+/// match we emit a `warn!` rather than silently giving up, so a truncated
+/// scan is visible.
+async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Option<ApiPr>> {
+    if suffix.is_empty() {
+        return Ok(None);
+    }
+    const SCAN_LIMIT: usize = 100;
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "-R",
+            repo_slug,
+            "--state",
+            "all",
+            "--limit",
+            "100",
+            "--json",
+            "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
+            "--jq",
+            r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| {
+            format!("failed to spawn `gh pr list -R {repo_slug} --state all` (suffix scan)")
+        })?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`gh pr list -R {repo_slug} --state all` (suffix scan) failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rows = 0usize;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        rows += 1;
+        let mut parts = line.split('\t');
+        let url = parts.next().unwrap_or("").trim().to_owned();
+        let state = parts.next().unwrap_or("").trim().to_owned();
+        let merged_at_raw = parts.next().unwrap_or("").trim();
+        let changed_files_raw = parts.next().unwrap_or("0").trim();
+        let additions_raw = parts.next().unwrap_or("0").trim();
+        let deletions_raw = parts.next().unwrap_or("0").trim();
+        let head_ref = parts.next().unwrap_or("").trim();
+        if url.is_empty() || head_ref.is_empty() {
+            continue;
+        }
+        if branch_work_item_suffix(head_ref) != suffix {
+            continue;
+        }
+        let merged_at = if merged_at_raw.is_empty() || merged_at_raw.eq_ignore_ascii_case("null") {
+            None
+        } else {
+            Some(merged_at_raw.to_owned())
+        };
+        return Ok(Some(ApiPr {
+            url,
+            state,
+            merged_at,
+            changed_files: changed_files_raw.parse::<i64>().unwrap_or(0),
+            additions: additions_raw.parse::<i64>().unwrap_or(0),
+            deletions: deletions_raw.parse::<i64>().unwrap_or(0),
+        }));
+    }
+    if rows >= SCAN_LIMIT {
+        tracing::warn!(
+            repo = %repo_slug,
+            suffix,
+            scanned = rows,
+            "pr_detect: suffix scan hit the {SCAN_LIMIT}-PR limit without a match; a PR on a non-`boss/` prefix may exist beyond the scanned page",
+        );
+    }
+    Ok(None)
 }
 
 /// Secondary diff-stat verification via the full PR endpoint.
@@ -962,14 +1117,30 @@ impl WorkerCompletionHandler {
                     match pr_number_from_url(&staged_url) {
                         Some(pr_num) => {
                             match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                                Ok(ref head_ref) if head_ref == &expected_branch => true,
+                                Ok(ref head_ref)
+                                    if branches_identify_same_work_item(
+                                        head_ref,
+                                        &expected_branch,
+                                    ) =>
+                                {
+                                    if head_ref.as_str() != expected_branch.as_str() {
+                                        tracing::info!(
+                                            execution_id,
+                                            staged_pr_url = %staged_url,
+                                            staged_pr_branch = %head_ref,
+                                            %expected_branch,
+                                            "stop event: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                        );
+                                    }
+                                    true
+                                }
                                 Ok(head_ref) => {
                                     tracing::warn!(
                                         execution_id,
                                         staged_pr_url = %staged_url,
                                         staged_pr_branch = %head_ref,
                                         %expected_branch,
-                                        "pr_recheck_staged_branch_mismatch: staged PR branch does not match expected; dropping staged URL",
+                                        "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
                                     );
                                     PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
                                     self.staged_pr_urls.forget(execution_id);
@@ -1348,14 +1519,30 @@ must not be asked to open one",
                     match pr_number_from_url(&staged_url) {
                         Some(pr_num) => {
                             match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                                Ok(ref head_ref) if head_ref == &expected_branch => true,
+                                Ok(ref head_ref)
+                                    if branches_identify_same_work_item(
+                                        head_ref,
+                                        &expected_branch,
+                                    ) =>
+                                {
+                                    if head_ref.as_str() != expected_branch.as_str() {
+                                        tracing::info!(
+                                            execution_id,
+                                            staged_pr_url = %staged_url,
+                                            staged_pr_branch = %head_ref,
+                                            %expected_branch,
+                                            "pr-recheck: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                        );
+                                    }
+                                    true
+                                }
                                 Ok(head_ref) => {
                                     tracing::warn!(
                                         execution_id,
                                         staged_pr_url = %staged_url,
                                         staged_pr_branch = %head_ref,
                                         %expected_branch,
-                                        "pr_recheck_staged_branch_mismatch: staged PR branch does not match expected; dropping staged URL",
+                                        "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
                                     );
                                     PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
                                     self.staged_pr_urls.forget(execution_id);
@@ -4037,6 +4224,76 @@ mod tests {
             staged_pr_urls.get(&execution_id).is_none(),
             "mismatched staged URL must be cleared from the cache",
         );
+    }
+
+    #[tokio::test]
+    async fn on_stop_staged_url_associates_prefix_divergent_branch() {
+        // Issue #1145 regression: a worker that honoured a product
+        // `worker_branch_prefix` (e.g. `bduff/`) opened its PR on
+        // `bduff/<exec-id>`, while the engine reconstructs
+        // `boss/<exec-id>` as the expected branch. The work-item suffix
+        // (`exec_<id>`) is identical, so the staged URL MUST associate —
+        // the whole point of the fix is that the worker no longer has to
+        // close a compliant `bduff/` PR and recreate it under `boss/`.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // Cold-path detector wired with a wrong URL: any fall-through
+        // would surface as a wrong pr_url, proving the staged URL was
+        // (incorrectly) dropped.
+        let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
+        staged_pr_urls.record_if_unset(
+            &execution_id,
+            "https://github.com/spinyfin/mono/pull/458",
+        );
+
+        // The expected branch is `boss/<exec-id>` (BossExecPrefix), but
+        // the PR's head branch is `bduff/<exec-id>` — same suffix, only
+        // the prefix differs.
+        let expected = expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix);
+        let suffix = branch_work_item_suffix(&expected);
+        let divergent_branch = format!("bduff/{suffix}");
+        assert_ne!(divergent_branch, expected, "test must exercise a real prefix divergence");
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector.clone(),
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_staged_pr_urls(staged_pr_urls.clone())
+        .with_branch_verifier(StubBranchVerifier::ok(&divergent_branch));
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+                if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+            "prefix-divergent but suffix-matching PR must associate; got {outcome:?}",
+        );
+        assert_eq!(
+            detector.call_count(),
+            0,
+            "the staged URL must be accepted (suffix match) and the detector skipped",
+        );
+        let item = db.get_work_item(&chore_id).unwrap();
+        match item {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert_eq!(
+                    t.pr_url.as_deref(),
+                    Some("https://github.com/spinyfin/mono/pull/458"),
+                    "the chore must bind to the staged `bduff/` PR URL",
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -7723,6 +7980,54 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let opaque_hash = opaque.strip_prefix("boss/").unwrap();
         let custom_hash = custom.strip_prefix("bduff/").unwrap();
         assert_eq!(opaque_hash, custom_hash, "same execution id → same hash suffix");
+    }
+
+    #[test]
+    fn branch_work_item_suffix_strips_the_prefix() {
+        // `boss/` prefix → the execution id is the suffix.
+        assert_eq!(
+            branch_work_item_suffix("boss/exec_18b5023342a35418_18"),
+            "exec_18b5023342a35418_18",
+        );
+        // A product `worker_branch_prefix` like `bduff/` → same suffix.
+        assert_eq!(
+            branch_work_item_suffix("bduff/exec_18b5023342a35418_18"),
+            "exec_18b5023342a35418_18",
+        );
+        // OpaqueHash / CustomPrefix → the hash is the suffix.
+        assert_eq!(branch_work_item_suffix("boss/a7f3e9c2"), "a7f3e9c2");
+        assert_eq!(branch_work_item_suffix("bduff/a7f3e9c2"), "a7f3e9c2");
+        // No slash → the whole string is the suffix.
+        assert_eq!(branch_work_item_suffix("exec_x"), "exec_x");
+        // Multi-segment → only the final segment counts.
+        assert_eq!(branch_work_item_suffix("feature/x/exec_y"), "exec_y");
+    }
+
+    #[test]
+    fn branches_identify_same_work_item_is_prefix_agnostic() {
+        // The core of issue #1145: a `bduff/<suffix>` PR must associate
+        // with the engine's `boss/<suffix>` expected branch.
+        assert!(branches_identify_same_work_item(
+            "bduff/exec_18b5023342a35418_18",
+            "boss/exec_18b5023342a35418_18",
+        ));
+        // Identical branches still match.
+        assert!(branches_identify_same_work_item(
+            "boss/exec_x",
+            "boss/exec_x",
+        ));
+        // Hash-suffix strategies match across prefixes too.
+        assert!(branches_identify_same_work_item("bduff/a7f3e9c2", "boss/a7f3e9c2"));
+        // Different suffixes (the incident's #1004 case:
+        // `bduff/go-lib-publish-idempotent-v2` vs the work item's
+        // `exec_…` suffix) correctly do NOT match.
+        assert!(!branches_identify_same_work_item(
+            "bduff/go-lib-publish-idempotent-v2",
+            "boss/exec_18b5023342a35418_18",
+        ));
+        // Defensive: empty suffixes (malformed `…/` branches) never match,
+        // even each other.
+        assert!(!branches_identify_same_work_item("boss/", "bduff/"));
     }
 
     /// R6 invariant: the cold-path detector scopes its `gh pr list --head`
