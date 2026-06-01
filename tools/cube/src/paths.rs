@@ -36,3 +36,19 @@ pub fn audit_dir() -> Result<PathBuf, CubeError> {
 pub fn audit_dir_in(data_dir: &std::path::Path) -> PathBuf {
     data_dir.join("audit")
 }
+
+pub fn workspace_logs_dir() -> Result<PathBuf, CubeError> {
+    Ok(workspace_logs_dir_in(&data_dir()?))
+}
+
+pub fn workspace_logs_dir_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("workspace-logs")
+}
+
+pub fn workspace_logs_path(workspace_id: &str) -> Result<PathBuf, CubeError> {
+    Ok(workspace_logs_dir()?.join(workspace_id))
+}
+
+pub fn workspace_logs_path_in(data_dir: &std::path::Path, workspace_id: &str) -> PathBuf {
+    workspace_logs_dir_in(data_dir).join(workspace_id)
+}

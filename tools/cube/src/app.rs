@@ -1730,6 +1730,13 @@ fn run_workspace(
                 }
             }
 
+            if let Err(e) = cleanup_workspace_logs(&record.workspace_id) {
+                eprintln!(
+                    "warning: failed to clean up workspace logs for {}: {e}",
+                    record.workspace_id
+                );
+            }
+
             audit!(
                 database_path,
                 "workspace.removed",
@@ -2700,6 +2707,54 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
             );
         }
     }
+    gc_stale_workspace_logs(&store);
+}
+
+fn gc_stale_workspace_logs(store: &Store) {
+    let data_dir = match paths::data_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let logs_dir = paths::workspace_logs_dir_in(&data_dir);
+    if !logs_dir.exists() {
+        return;
+    }
+    let entries = match fs::read_dir(&logs_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("cube: workspace logs gc: failed to read {}: {e}", logs_dir.display());
+            return;
+        }
+    };
+    let active_workspaces = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
+        Ok(w) => {
+            w.iter()
+                .map(|r| r.workspace_id.clone())
+                .collect::<std::collections::HashSet<_>>()
+        }
+        Err(e) => {
+            eprintln!("cube: workspace logs gc: failed to list workspaces: {e}");
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let workspace_id = match path.file_name().and_then(|n| n.to_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        if !active_workspaces.contains(&workspace_id) {
+            if let Err(e) = fs::remove_dir_all(&path) {
+                eprintln!(
+                    "cube: workspace logs gc: failed to remove {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 /// Markers delimiting the cube-managed block inside a workspace's local
@@ -3304,6 +3359,17 @@ fn current_change_identity(
 
 fn workspace_path_exists(record: &crate::metadata::WorkspaceRecord) -> bool {
     record.workspace_path.is_dir()
+}
+
+fn cleanup_workspace_logs(workspace_id: &str) -> Result<()> {
+    if let Ok(logs_path) = paths::workspace_logs_path(workspace_id) {
+        match fs::remove_dir_all(&logs_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(CubeError::Io(err)),
+        }
+    }
+    Ok(())
 }
 
 /// Summary of a workspace row touched by the missing-directory reconciler.
