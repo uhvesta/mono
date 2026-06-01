@@ -76,6 +76,10 @@ final class ChatViewModel: ObservableObject {
     /// Attention group *members* keyed by `AttentionGroup.id`, in display
     /// order. Populated alongside [[attentionGroupsByProductID]].
     @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
+    /// Product IDs for which a dismissed-groups list response is currently
+    /// in flight. Used by `applyAttentionGroupsList` to route the response
+    /// to the dismissed-merge path rather than the open-replace path.
+    private var pendingDismissedGroupLoads: Set<String> = []
     /// Historical execution rows keyed by task id. Populated on demand when
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
@@ -907,6 +911,7 @@ final class ChatViewModel: ObservableObject {
             engine.sendGetWorkTree(productId: productID)
             engine.sendListAttentionItemsForWorkItem(workItemID: productID)
             engine.sendListAttentionGroups(productId: productID)
+            loadDismissedAttentionGroups(for: productID)
         }
     }
 
@@ -1686,6 +1691,7 @@ final class ChatViewModel: ObservableObject {
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
                 engine.sendListAttentionGroups(productId: productID)
+                loadDismissedAttentionGroups(for: productID)
             }
         case .appSessionRegistered:
             // No additional state for now; the engine has confirmed
@@ -1836,6 +1842,7 @@ final class ChatViewModel: ObservableObject {
             refreshDesignDocStates(for: projects)
             engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
             engine.sendListAttentionGroups(productId: product.id)
+            loadDismissedAttentionGroups(for: product.id)
             workErrorMessage = nil
             if let pending = pendingRevealScrollID {
                 let allIDs = Set(tasks.map(\.id) + chores.map(\.id))
@@ -2128,16 +2135,21 @@ final class ChatViewModel: ObservableObject {
     /// Replace the product's group set from a full `list_attention_groups`
     /// reply, bucketing the flat member list by group id and pruning member
     /// entries for groups that dropped out of the (open) list.
+    ///
+    /// Handles two response kinds:
+    /// - Open-list (default): replaces open/partially_answered groups while
+    ///   preserving dismissed groups so the "Rejected" section survives reloads.
+    /// - Dismissed-list (fired when `pendingDismissedGroupLoads` contains the
+    ///   product id): merges dismissed groups into the stored open list.
     private func applyAttentionGroupsList(
         productID: String,
         groups: [AttentionGroup],
         members: [Attention]
     ) {
-        let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
-        let nextIDs = Set(groups.map(\.id))
-        for goneID in priorIDs.subtracting(nextIDs) {
-            attentionMembersByGroupID.removeValue(forKey: goneID)
-        }
+        let isDismissedBatch = pendingDismissedGroupLoads.remove(productID) != nil
+        let prior = attentionGroupsByProductID[productID] ?? []
+        let incomingIDs = Set(groups.map(\.id))
+
         var bucketed: [String: [Attention]] = [:]
         for member in members {
             bucketed[member.groupID, default: []].append(member)
@@ -2146,7 +2158,26 @@ final class ChatViewModel: ObservableObject {
             attentionMembersByGroupID[group.id] =
                 (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
         }
-        attentionGroupsByProductID[productID] = groups
+
+        if isDismissedBatch {
+            // Dismissed-only response: upsert dismissed groups, keep open ones.
+            // Remove member data for dismissed groups that are no longer present.
+            let priorDismissedIDs = Set(prior.filter(\.isDismissed).map(\.id))
+            for goneID in priorDismissedIDs.subtracting(incomingIDs) {
+                attentionMembersByGroupID.removeValue(forKey: goneID)
+            }
+            let keptOpen = prior.filter { !$0.isDismissed && !incomingIDs.contains($0.id) }
+            attentionGroupsByProductID[productID] = keptOpen + groups
+        } else {
+            // Open-list response: replace open groups, keep dismissed ones so
+            // the "Rejected" restore UI survives full reloads.
+            let keptDismissed = prior.filter { $0.isDismissed && !incomingIDs.contains($0.id) }
+            let openPriorIDs = Set(prior.filter { !$0.isDismissed }.map(\.id))
+            for goneID in openPriorIDs.subtracting(incomingIDs) {
+                attentionMembersByGroupID.removeValue(forKey: goneID)
+            }
+            attentionGroupsByProductID[productID] = groups + keptDismissed
+        }
     }
 
     /// Insert or replace a group within its product bucket (live-update path).
@@ -2199,11 +2230,26 @@ final class ChatViewModel: ObservableObject {
         engine.sendDismissAttention(id: groupID, reason: nil)
     }
 
+    /// Restore a dismissed group back to open so the human can re-evaluate it.
+    /// The engine resets all skipped/dismissed members to open and replies
+    /// with `attention_group_updated`, which `upsertAttentionGroup` picks up.
+    func restoreAttentionGroup(_ groupID: String) {
+        engine.sendRestoreAttentionGroup(id: groupID)
+    }
+
     /// Action a group — produce its downstream artifact (one revision /
     /// design task, or a batch task-create) and close it. Open members are
     /// skipped first ("skip remaining") so the human needn't touch every row.
     func actionAttentionGroup(_ groupID: String) {
         engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
+    }
+
+    /// Load dismissed groups for a product and merge them into the stored list.
+    /// Called alongside `sendListAttentionGroups` so the "Rejected" section
+    /// is populated on product select and app reconnect.
+    private func loadDismissedAttentionGroups(for productID: String) {
+        pendingDismissedGroupLoads.insert(productID)
+        engine.sendListAttentionGroups(productId: productID, state: "dismissed")
     }
 
     /// Jump a group's association into view: a task association reveals its

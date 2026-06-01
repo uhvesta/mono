@@ -798,3 +798,69 @@ fn reconcile_followups_dedupe_on_proposed_name() {
     assert_eq!(group2.id, group.id);
     assert!(created2.is_empty());
 }
+
+#[test]
+fn restore_dismissed_group_returns_to_open() {
+    let (db, product_id, _project_id, task_id) = fixture();
+    let (_f, fg) = db.create_attention(followup(&task_id, "do something")).unwrap();
+
+    // Dismiss the group.
+    db.dismiss_attention(&fg.id, None).unwrap();
+    let dismissed = db
+        .list_attention_groups(&product_id, None, None, None, Some("dismissed"))
+        .unwrap();
+    assert_eq!(dismissed.len(), 1);
+    assert_eq!(dismissed[0].state, "dismissed");
+
+    // Restore it.
+    let restored = db.restore_attention_group(&fg.id).unwrap();
+    assert_eq!(restored.state, "open");
+    assert!(restored.dismissed_at.is_none());
+
+    // Now visible in the default (open) list.
+    let open = db
+        .list_attention_groups(&product_id, None, None, None, None)
+        .unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].id, fg.id);
+
+    // No longer in the dismissed list.
+    let still_dismissed = db
+        .list_attention_groups(&product_id, None, None, None, Some("dismissed"))
+        .unwrap();
+    assert!(still_dismissed.is_empty());
+
+    // Members were reset to open.
+    let members = db.list_attentions_for_group(&fg.id).unwrap();
+    assert!(
+        members.iter().all(|m| m.answer_state == "open"),
+        "all members should be open after restore"
+    );
+}
+
+#[test]
+fn restore_already_open_group_is_idempotent() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let (_f, fg) = db.create_attention(followup(&task_id, "do something")).unwrap();
+    // Restoring an already-open group should succeed as a no-op.
+    let g = db.restore_attention_group(&fg.id).unwrap();
+    assert_eq!(g.state, "open");
+}
+
+#[test]
+fn restore_actioned_group_is_an_error() {
+    let (db, _product, _project_id, task_id) = fixture();
+    let (_f, fg) = db.create_attention(followup(&task_id, "do something")).unwrap();
+    let members = db.list_attentions_for_group(&fg.id).unwrap();
+    // Accept the member and action the group.
+    db.answer_attention(&members[0].id, None, false, false)
+        .unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    db.action_attention_group(&fg.id, false, &checker).unwrap();
+    // Cannot restore an actioned group.
+    let err = db.restore_attention_group(&fg.id).unwrap_err();
+    assert!(
+        err.to_string().contains("actioned"),
+        "expected error mentioning actioned, got: {err}"
+    );
+}

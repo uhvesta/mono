@@ -2270,6 +2270,10 @@ extension AttentionGroup {
     /// `true` once the group has produced its downstream artifact.
     var isActioned: Bool { state == "actioned" }
 
+    /// `true` when the group was rejected/dismissed by the human and is
+    /// awaiting possible restore.
+    var isDismissed: Bool { state == "dismissed" }
+
     /// Human-readable kind chip label.
     var kindLabel: String {
         switch kind {

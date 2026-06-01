@@ -2571,6 +2571,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
                 projects::handle_resolve_project_design_doc(ctx, r).await
             }
+            r @ FrontendRequest::RestoreAttentionGroup { .. } => {
+                attentions::handle_restore_attention_group(ctx, r).await
+            }
             r @ FrontendRequest::RestoreWorkItem { .. } => {
                 work_items::handle_restore_work_item(ctx, r).await
             }

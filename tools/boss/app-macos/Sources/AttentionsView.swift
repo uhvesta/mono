@@ -54,7 +54,7 @@ struct AttentionsView: View {
                 title: "No product selected",
                 message: "Pick a product in the main window to see its notifications."
             )
-        } else if openGroups.isEmpty && resolvedGroups.isEmpty {
+        } else if openGroups.isEmpty && resolvedGroups.isEmpty && dismissedGroups.isEmpty {
             emptyState(
                 icon: "checkmark.circle",
                 title: "All caught up",
@@ -75,6 +75,15 @@ struct AttentionsView: View {
                             AttentionResolvedCard(group: group)
                         }
                     }
+                    if !dismissedGroups.isEmpty {
+                        Text("Rejected")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 4)
+                        ForEach(dismissedGroups) { group in
+                            AttentionRejectedCard(group: group)
+                        }
+                    }
                 }
                 .padding(16)
             }
@@ -89,6 +98,12 @@ struct AttentionsView: View {
     /// the produced-artifact link is reachable until the next full reload.
     private var resolvedGroups: [AttentionGroup] {
         model.selectedProductAttentionGroups.filter { $0.isActioned && !$0.producedArtifacts.isEmpty }
+    }
+
+    /// Dismissed groups — shown persistently so accidental rejects can be
+    /// undone via the Restore button.
+    private var dismissedGroups: [AttentionGroup] {
+        model.selectedProductAttentionGroups.filter(\.isDismissed)
     }
 
     private func emptyState(icon: String, title: String, message: String) -> some View {
@@ -532,6 +547,51 @@ private struct AttentionResolvedCard: View {
             return "\(prefix) \(ref.kind == "chore" ? "C" : "T")\(shortID)"
         }
         return prefix
+    }
+}
+
+/// A dismissed (rejected) group that can be restored. Shown in the "Rejected"
+/// section with a Restore button that moves the group back to open.
+private struct AttentionRejectedCard: View {
+    @EnvironmentObject private var model: ChatViewModel
+    let group: AttentionGroup
+
+    private var members: [Attention] { model.attentionMembers(forGroup: group.id) }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "xmark.circle")
+                .foregroundStyle(.secondary)
+                .font(.subheadline)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(summary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Text(model.attentionAssociationLabel(group))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+            Button("Restore") {
+                model.restoreAttentionGroup(group.id)
+            }
+            .controlSize(.small)
+            .buttonStyle(.bordered)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.4))
+        )
+    }
+
+    private var summary: String {
+        let names = members.compactMap(\.proposedName)
+        if names.count == 1 { return names[0] }
+        if names.count > 1 { return "\(names[0]) +\(names.count - 1) more" }
+        let n = members.count
+        return "\(n) rejected \(n == 1 ? "suggestion" : "suggestions")"
     }
 }
 

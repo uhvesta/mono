@@ -523,6 +523,13 @@ final class EngineClient: @unchecked Sendable {
         sendLine(payload)
     }
 
+    /// Restore a dismissed attention group (`atg_…` or `A<n>`) back to open
+    /// so the human can re-evaluate and accept it. Replies with
+    /// `attention_group_updated`.
+    func sendRestoreAttentionGroup(id: String) {
+        sendLine(["type": "restore_attention_group", "id": id])
+    }
+
     /// Ask the engine to lease a workspace for the given Review-column
     /// work item, check out the PR head branch, and return the workspace
     /// path for opening a Ghostty terminal. The engine replies with
