@@ -30,7 +30,7 @@ exclude_files = [
   "**/Package.resolved",
   "pnpm-lock.yaml",
   "**/*.pb.rs",
-  # Grandfathered oversized files — TODO: split each below 3000
+  # Files currently over the 3000-line limit — TODO: split each below 3000
   "tools/boss/engine/core/src/completion.rs",
   "tools/boss/engine/core/src/coordinator.rs",
   "tools/boss/engine/core/src/merge_poller.rs",

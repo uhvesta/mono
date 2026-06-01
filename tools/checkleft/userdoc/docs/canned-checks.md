@@ -249,17 +249,18 @@ Notes:
 
 Purpose:
 
-- Flags files exceeding a max line count.
+- Flags files exceeding a max line count. Only triggers when the file grew in the current change — pre-existing oversized files that did not grow are not flagged.
 
 Config keys:
 
 - `max_lines` (optional integer, default `500`)
-- `exclude_globs` (optional array of glob strings)
+- `exclude_files` (optional array of glob strings; `exclude_globs` is a supported alias)
 
 Notes:
 
 - Findings default to `warning`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
+- There is only one built-in check for file size. The `check: file-size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
 
 ## `forbidden-imports-deps`
 
