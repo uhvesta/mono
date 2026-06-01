@@ -1971,14 +1971,6 @@ struct WorkBoardCardView: View {
                     if let repoChip {
                         RepoChipView(presentation: repoChip)
                     }
-                    if let id = task.shortID {
-                        Text("T" + String(id))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("T" + String(id))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
                     if task.sourceAutomationId != nil {
                         Image(systemName: "wand.and.stars")
                             .font(.caption2.weight(.semibold))
@@ -2089,6 +2081,18 @@ struct WorkBoardCardView: View {
                 ForEach(inReviewRevisions) { revision in
                     RevisionRollupLine(revision: revision)
                 }
+            }
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if let id = task.shortID {
+                Text("T" + String(id))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("T" + String(id))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.trailing, 12)
+                    .padding(.bottom, 10)
             }
         }
         .padding(.horizontal, 12)
