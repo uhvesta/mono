@@ -257,6 +257,8 @@ enum EngineEvent {
     case automationDeleted(automationID: String)
     /// Response to `get_automation_open_task_count`.
     case automationOpenTaskCount(automationID: String, count: Int)
+    /// Response to `list_automation_runs` — the run history for one automation.
+    case automationRunsList(automationID: String, runs: [AppAutomationRun])
     // MARK: Attention events (attentions.md — Notifications toolbar + window)
     /// Reply to `list_attention_groups` — the groups for a product plus
     /// every group's member rows (flattened; bucketed client-side by
@@ -815,6 +817,12 @@ final class EngineClient: @unchecked Sendable {
     /// with `automation_open_task_count`.
     func sendGetAutomationOpenTaskCount(automationId: String) {
         sendLine(["type": "get_automation_open_task_count", "automation_id": automationId])
+    }
+
+    /// List the run history for an automation (newest first). Engine replies
+    /// with `automation_runs_list`.
+    func sendListAutomationRuns(automationId: String) {
+        sendLine(["type": "list_automation_runs", "automation_id": automationId])
     }
 
     /// Resolve a project's design-doc pointer. Engine replies with
@@ -1584,6 +1592,13 @@ final class EngineClient: @unchecked Sendable {
                 let count = (payload["count"] as? NSNumber)?.intValue ?? 0
                 if !automationID.isEmpty {
                     emit(.automationOpenTaskCount(automationID: automationID, count: count))
+                }
+            case "automation_runs_list":
+                let automationID = payload["automation_id"] as? String ?? ""
+                let rawRuns = payload["runs"] as? [[String: Any]] ?? []
+                let runs = rawRuns.compactMap(parseAutomationRun)
+                if !automationID.isEmpty {
+                    emit(.automationRunsList(automationID: automationID, runs: runs))
                 }
             default:
                 break

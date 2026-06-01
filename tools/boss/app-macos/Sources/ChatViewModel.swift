@@ -94,6 +94,9 @@ final class ChatViewModel: ObservableObject {
     @Published var automationsByProductID: [String: [AppAutomation]] = [:]
     /// Open-task counts keyed by automation id. Refreshed alongside the list.
     @Published var openTaskCountByAutomationID: [String: Int] = [:]
+    /// Run history keyed by automation id. Fetched on selection and refreshed
+    /// when the automation's state changes (outcome updated, etc.).
+    @Published var automationRunsByID: [String: [AppAutomationRun]] = [:]
     /// The automation currently selected in the Automations tab detail pane.
     @Published var selectedAutomationID: String?
     @Published var selectedWorkProductID: String? {
@@ -2122,23 +2125,30 @@ final class ChatViewModel: ObservableObject {
             automationsByProductID[productID] = automations
             for automation in automations {
                 engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
+                engine.sendListAutomationRuns(automationId: automation.id)
             }
         case .automationCreated(let automation):
             upsertAutomation(automation)
             selectedAutomationID = automation.id
             engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
+            engine.sendListAutomationRuns(automationId: automation.id)
         case .automationResult(let automation):
             upsertAutomation(automation)
+            engine.sendListAutomationRuns(automationId: automation.id)
         case .automationUpdated(let automation):
             upsertAutomation(automation)
             engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
+            engine.sendListAutomationRuns(automationId: automation.id)
         case .automationDeleted(let automationID):
             for productID in automationsByProductID.keys {
                 automationsByProductID[productID]?.removeAll { $0.id == automationID }
             }
             openTaskCountByAutomationID.removeValue(forKey: automationID)
+            automationRunsByID.removeValue(forKey: automationID)
         case .automationOpenTaskCount(let automationID, let count):
             openTaskCountByAutomationID[automationID] = count
+        case .automationRunsList(let automationID, let runs):
+            automationRunsByID[automationID] = runs
         }
     }
 

@@ -668,6 +668,31 @@ impl WorkDb {
         Ok(true)
     }
 
+    /// Stamp a human-readable reason onto the `automation_runs` row for a
+    /// triage execution that has been deferred (e.g. pool exhausted) but not
+    /// yet finalised. Only writes when the existing `detail` is NULL or empty
+    /// so that a later `finalize_automation_triage_run` call carrying a more
+    /// specific reason always wins.
+    ///
+    /// Returns `true` when a row was updated, `false` when no matching row
+    /// exists yet (the scheduler records the row at fire time, but there is a
+    /// brief window before that write completes).
+    pub fn update_automation_run_detail_for_triage_execution(
+        &self,
+        triage_execution_id: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let rows_changed = conn.execute(
+            "UPDATE automation_runs
+                SET detail = ?2
+              WHERE triage_execution_id = ?1
+                AND (detail IS NULL OR detail = '')",
+            params![triage_execution_id, detail],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
     /// Create the single maintenance task produced by an automation's triage
     /// phase (`boss task create --automation`). Maint task 6.
     ///

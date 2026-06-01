@@ -1480,6 +1480,28 @@ impl ExecutionCoordinator {
 
                 if is_automation {
                     auto_pool_exhausted = true;
+                    // For automation triage executions, write the pool-exhausted
+                    // reason into automation_runs.detail so the UI can explain
+                    // "failed, retrying" rather than showing a bare badge.
+                    if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                        let detail = format!(
+                            "automation pool exhausted ({pool_capacity}/{pool_capacity} busy); \
+                             triage deferred, will retry when a slot frees"
+                        );
+                        if let Err(err) = self
+                            .work_db
+                            .update_automation_run_detail_for_triage_execution(
+                                &execution.id,
+                                &detail,
+                            )
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?err,
+                                "failed to record pool-exhausted detail on automation_runs row",
+                            );
+                        }
+                    }
                 } else {
                     main_pool_exhausted = true;
                 }

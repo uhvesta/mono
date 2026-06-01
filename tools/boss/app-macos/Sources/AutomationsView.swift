@@ -40,7 +40,8 @@ private struct AutomationsSidebar: View {
                     ForEach(model.automationsForSelectedProduct) { automation in
                         AutomationRowView(
                             automation: automation,
-                            openCount: model.openTaskCountByAutomationID[automation.id]
+                            openCount: model.openTaskCountByAutomationID[automation.id],
+                            latestRun: model.automationRunsByID[automation.id]?.first
                         )
                         .tag(automation.id)
                     }
@@ -100,6 +101,7 @@ private struct AutomationsSidebar: View {
 private struct AutomationRowView: View {
     let automation: AppAutomation
     let openCount: Int?
+    let latestRun: AppAutomationRun?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -138,6 +140,14 @@ private struct AutomationRowView: View {
                         .help("Open tasks / limit")
                 }
             }
+
+            // Level 2: one-liner reason from the most recent run's detail.
+            if let detail = latestRun?.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -147,7 +157,8 @@ private struct AutomationRowView: View {
         case "produced_task": return .green
         case "skipped": return .secondary
         case "suppressed_at_limit": return .orange
-        case "failed_will_retry", "failed_gave_up": return .red
+        case "failed_will_retry": return .orange
+        case "failed_gave_up": return .red
         default: return .secondary
         }
     }
@@ -194,6 +205,10 @@ private struct AutomationsEmptyState: View {
 private struct AutomationDetailView: View {
     @ObservedObject var model: ChatViewModel
     let automation: AppAutomation
+
+    private var runs: [AppAutomationRun] {
+        model.automationRunsByID[automation.id] ?? []
+    }
 
     @State private var isEditing = false
     @State private var showDeleteConfirmation = false
@@ -244,6 +259,14 @@ private struct AutomationDetailView: View {
                     if let outcome = automation.lastOutcomeLabel {
                         LabeledContent("Last outcome", value: outcome)
                     }
+                    // Level 2: show the why from the most recent run's detail.
+                    if let detail = runs.first?.detail, !detail.isEmpty {
+                        LabeledContent("Reason") {
+                            Text(detail)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
                     if let nextDue = automation.nextDueAt {
                         LabeledContent("Next fire") {
                             Text(AutomationTime.relative(nextDue, now: Date()))
@@ -260,6 +283,15 @@ private struct AutomationDetailView: View {
                     }
                     let openCount = model.openTaskCountByAutomationID[automation.id] ?? 0
                     LabeledContent("Open tasks", value: "\(openCount) / \(automation.openTaskLimit)")
+                }
+
+                // Level 3: run history (newest first).
+                if !runs.isEmpty {
+                    AutomationDetailSection(title: "Recent Runs") {
+                        ForEach(runs) { run in
+                            AutomationRunRow(run: run)
+                        }
+                    }
                 }
 
                 // Instruction
@@ -397,6 +429,45 @@ private struct AutomationDetailSection<Content: View>: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
             content()
+        }
+    }
+}
+
+// MARK: - Run history row
+
+private struct AutomationRunRow: View {
+    let run: AppAutomationRun
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(run.outcomeLabel)
+                    .font(.caption)
+                    .foregroundStyle(runOutcomeColor(for: run.outcome))
+                Spacer(minLength: 0)
+                Text(AutomationTime.relative(run.scheduledFor, now: Date()))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help(AutomationTime.absolute(run.scheduledFor) ?? run.scheduledFor)
+            }
+            if let detail = run.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func runOutcomeColor(for outcome: String) -> Color {
+        switch outcome {
+        case "produced_task": return .green
+        case "skipped": return .secondary
+        case "suppressed_at_limit": return .orange
+        case "failed_will_retry": return .orange
+        case "failed_gave_up": return .red
+        default: return .secondary
         }
     }
 }
