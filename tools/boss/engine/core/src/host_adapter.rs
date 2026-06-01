@@ -8,28 +8,52 @@
 //! connection, and the wrapper-distribution path keeps
 //! `~/.boss-remote/bin/boss-remote-run` current on every host.
 //!
-//! `spawn_worker` for the SSH adapter is partially wired in this
-//! phase: it ensures the wrapper is current and surfaces
-//! `host_wrapper_push_failed` as a run-failure reason when push fails,
-//! but the full SSH-forwarded events-socket + transcript-readback
-//! pipeline is finished out under a follow-up tracked in the design
-//! doc Phase 3 risks section. The trait stays stable across the two.
+//! `spawn_worker` for the SSH adapter is fully wired (dispatch-stack
+//! PR 2): it ensures the wrapper is current, composes the worker prompt
+//! via the shared `runner::compose_worker_spawn`, ships the worker's
+//! `.claude` hook settings + initial prompt to the remote, opens the
+//! reverse events-socket forward, and launches the detached worker — then
+//! returns `WaitingHuman` so `completion::on_stop` drives the in_review /
+//! PR-URL transition over the forwarded socket. Coordinator host-selection
+//! / routing (PR 3) and live-status + transcript readback (PR 4) build on
+//! top. The trait stays stable across local and remote.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use crate::config::RuntimeConfig;
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
     CubeWorkspaceStatus,
 };
-use crate::runner::{ExecutionRunner, RunOutcome};
+use crate::remote_wrapper::remote_wrapper_path;
+use crate::runner::{
+    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, bazel_prepush_gate_text,
+    compose_worker_spawn, work_item_name, work_item_task_kind,
+};
+use crate::ssh_spawn::{
+    REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
+};
 use crate::ssh_transport::SshTransport;
-use crate::work::{WorkExecution, WorkItem};
+use crate::work::{WorkDb, WorkExecution, WorkItem};
+use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
+
+/// Remote dir (under `$HOME`) that holds rendered worker `--settings`
+/// files. Outside any workspace tree so the worker's `jj`/`git` never
+/// sees them — the same invariant the local runner keeps by writing
+/// settings under the system temp dir.
+const REMOTE_SETTINGS_DIR: &str = ".boss-remote/settings";
+
+/// Remote shim binary name. Cube's standard install puts `boss-event` on
+/// the worker's PATH (see the wrapper's note), so the hook command
+/// resolves it by name rather than an engine-local absolute path.
+const REMOTE_BOSS_EVENT_BIN: &str = "boss-event";
 
 /// Abstracts all host-specific operations: workspace lifecycle and
 /// worker spawn. Later phases extend this with control-channel
@@ -197,21 +221,46 @@ impl HostAdapter for LocalHostAdapter {
 /// persistent `ControlMaster` connection.
 ///
 /// Workspace-lifecycle operations parse the same `cube … --json`
-/// payloads as the local `CommandCubeClient`. `spawn_worker` ensures
-/// the wrapper is current (re-pushing on version drift) and surfaces
-/// `host_wrapper_push_failed` as a run-failure when the push fails;
-/// the end-to-end remote-spawn pipeline (events-socket remote-forward,
-/// transcript readback, signal channel) lands in a follow-up.
+/// payloads as the local `CommandCubeClient`. `spawn_worker` ensures the
+/// wrapper is current, composes the worker prompt via the shared path,
+/// ships the worker's `.claude` settings + initial prompt to the remote,
+/// opens the reverse events-socket forward, and launches the detached
+/// remote worker — returning `WaitingHuman` so `completion::on_stop`
+/// drives the in_review / PR-URL transition over the forwarded socket.
 pub struct SshHostAdapter {
     transport: SshTransport,
     push_locks: WrapperPushLocks,
+    /// Backing store for the shared prompt-composition path
+    /// (`compose_worker_spawn`): parent-project / conflict / CI-attempt
+    /// lookups, effort + model resolution.
+    work_db: Arc<WorkDb>,
+    /// Engine runtime config, injected for parity with `PaneSpawnRunner`
+    /// and the dispatch-stack DI contract. Not yet read in this PR — the
+    /// remote worker authenticates via the host's own out-of-band claude
+    /// credentials and the model/effort knobs ride the prompt; cross-host
+    /// model routing (PR3) and the live-status surface (PR4) consume it.
+    #[allow(dead_code)]
+    cfg: Arc<RuntimeConfig>,
+    /// Absolute path of the engine's LOCAL events socket — the target of
+    /// the reverse `ssh -R <remote sock>:<this>` forward, so the remote
+    /// worker's hook events tunnel back to the same socket local workers
+    /// write to.
+    events_socket_path: PathBuf,
 }
 
 impl SshHostAdapter {
-    pub fn new(transport: SshTransport) -> Self {
+    pub fn new(
+        transport: SshTransport,
+        work_db: Arc<WorkDb>,
+        cfg: Arc<RuntimeConfig>,
+        events_socket_path: PathBuf,
+    ) -> Self {
         Self {
             transport,
             push_locks: WrapperPushLocks::new(),
+            work_db,
+            cfg,
+            events_socket_path,
         }
     }
 
@@ -241,6 +290,140 @@ impl SshHostAdapter {
         }
         serde_json::from_str(&output.stdout)
             .with_context(|| format!("decoding cube JSON output from host {}", self.transport.host_id))
+    }
+
+    /// Append the Bazel pre-push build gate to the worker prompt when the
+    /// remote workspace is a Bazel workspace.
+    ///
+    /// The shared `compose_execution_prompt` injects this gate only when
+    /// `is_bazel_workspace` matches — but that probes the *local*
+    /// filesystem, and the workspace lives on the remote, so it never
+    /// fires for a remote worker. Probe the remote for the marker files
+    /// over the master and append the gate for the same execution kinds
+    /// the local runner gates (`task_implementation` / `chore_implementation`).
+    /// A probe failure logs and leaves the prompt unchanged rather than
+    /// blocking the spawn.
+    async fn append_remote_bazel_gate(
+        &self,
+        execution: &WorkExecution,
+        workspace: &str,
+        prompt_text: String,
+    ) -> String {
+        if !matches!(
+            execution.kind.as_str(),
+            "task_implementation" | "chore_implementation"
+        ) {
+            return prompt_text;
+        }
+        // Single-string command so the remote shell evaluates the whole
+        // `test … -o …` expression (a multi-token argv would be
+        // space-joined by ssh and mis-parsed). Workspace paths come from
+        // cube and contain no shell metacharacters.
+        let probe = format!(
+            "test -f '{ws}/MODULE.bazel' -o -f '{ws}/WORKSPACE' -o -f '{ws}/WORKSPACE.bazel'",
+            ws = workspace
+        );
+        match self.transport.run(&[probe.as_str()]).await {
+            Ok(out) if out.success() => {
+                let mut prompt_text = prompt_text;
+                prompt_text.push_str(&bazel_prepush_gate_text());
+                prompt_text
+            }
+            Ok(_) => prompt_text,
+            Err(err) => {
+                tracing::warn!(
+                    host_id = %self.transport.host_id,
+                    error = %format!("{err:#}"),
+                    "remote bazel-marker probe failed; worker prompt omits the pre-push gate",
+                );
+                prompt_text
+            }
+        }
+    }
+
+    /// `mkdir -p` the parent dir on the remote, stage `contents` to a
+    /// local temp file, and `scp` it to `remote_path`. `label` only feeds
+    /// the staging filename + error context.
+    async fn ship_file(
+        &self,
+        remote_dir: &str,
+        remote_path: &str,
+        contents: &str,
+        label: &str,
+    ) -> Result<()> {
+        let host = &self.transport.host_id;
+        let mkdir = self
+            .transport
+            .run(&["mkdir", "-p", remote_dir])
+            .await
+            .with_context(|| format!("mkdir {remote_dir} on host {host}"))?;
+        if !mkdir.success() {
+            bail!(
+                "failed to create remote {label} dir {remote_dir} on host {host}: {}",
+                non_empty(&mkdir.stderr, mkdir.status)
+            );
+        }
+        let staged = stage_local_file(label, contents)
+            .with_context(|| format!("staging remote {label} for host {host}"))?;
+        let push = self
+            .transport
+            .scp_push(staged.path(), remote_path)
+            .await
+            .with_context(|| format!("scp {label} to host {host}"))?;
+        if !push.success() {
+            bail!(
+                "failed to scp {label} to {remote_path} on host {host}: {}",
+                non_empty(&push.stderr, push.status)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Prefer a command's trimmed stderr for a failure detail, falling back
+/// to a synthetic `exit N` so the message is never empty.
+fn non_empty(stderr: &str, status: i32) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        format!("exit {status}")
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Write `contents` to a unique local staging file so `scp` has a real
+/// on-disk path to push, returning an RAII guard that unlinks it on drop.
+/// Mirrors `wrapper_distribution`'s staging pattern.
+fn stage_local_file(label: &str, contents: &str) -> Result<StagedFile> {
+    let dir = std::env::temp_dir();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!(
+        "boss-remote-{label}.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::write(&path, contents)
+        .with_context(|| format!("writing staging file {path:?}"))?;
+    Ok(StagedFile(path))
+}
+
+/// RAII guard that unlinks a local staging file on drop. Unlink errors
+/// are swallowed — leaking a temp file is strictly better than masking
+/// the real ship error.
+struct StagedFile(PathBuf);
+
+impl StagedFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -484,34 +667,139 @@ impl HostAdapter for SshHostAdapter {
     async fn spawn_worker(
         &self,
         _worker_id: &str,
-        _execution: &WorkExecution,
-        _work_item: &WorkItem,
-        _workspace_path: &Path,
-        _cube_change_id: Option<&str>,
+        execution: &WorkExecution,
+        work_item: &WorkItem,
+        workspace_path: &Path,
+        cube_change_id: Option<&str>,
     ) -> Result<RunOutcome> {
-        // Verify the wrapper before any other work — drifted versions
-        // turn into `host_wrapper_push_failed` early so we don't try
-        // to invoke a stale wrapper contract.
+        let host = self.transport.host_id.clone();
+
+        // 1. Verify the wrapper before any other work — drifted versions
+        //    turn into `host_wrapper_push_failed` early so we don't try
+        //    to invoke a stale wrapper contract.
         match ensure_wrapper_current(&self.transport, &self.push_locks).await? {
             WrapperPushOutcome::Ok => {}
             WrapperPushOutcome::Failed(_kind, detail) => {
-                bail!(
-                    "host_wrapper_push_failed on host {}: {detail}",
-                    self.transport.host_id
-                );
+                bail!("host_wrapper_push_failed on host {host}: {detail}");
             }
         }
-        // The remaining pipeline — opening the SSH-forwarded events
-        // socket, exec'ing the wrapper, threading stdio back into the
-        // engine's live-state surface, and wiring the
-        // transcript-readback channel — is implementation-deferred to
-        // a follow-up. The trait surface and the workspace-lifecycle
-        // half land in this phase so the scheduler / wrapper
-        // distribution / migration work can be merged independently.
-        bail!(
-            "SshHostAdapter::spawn_worker not yet wired end-to-end on host {}; \
-             see Phase 3 PR description for the deferred-implementation note",
-            self.transport.host_id
+
+        // 2. The coordinator leased the workspace + created the change on
+        //    the remote before calling spawn; the lease id rides the
+        //    execution row, and `workspace_path` is the REMOTE path.
+        let lease_id = execution.cube_lease_id.clone().context(
+            "execution missing cube_lease_id; coordinator must lease before remote spawn",
+        )?;
+        let run_id = execution.id.clone();
+        let workspace = workspace_path.display().to_string();
+
+        // 3. Compose the worker prompt + spawn config via the SHARED
+        //    path so the remote worker gets a byte-identical brief to a
+        //    local one (same task framing, branch name, acceptance
+        //    criterion, effort addendum, product preamble).
+        let ComposedWorkerSpawn {
+            prompt_text,
+            spawn_config,
+        } = compose_worker_spawn(&self.work_db, execution, work_item, workspace_path, cube_change_id);
+        // `compose_execution_prompt` decides the Bazel pre-push gate by
+        // probing the LOCAL filesystem, which never matches a remote
+        // workspace path — so probe the remote and append it ourselves.
+        let prompt_text = self
+            .append_remote_bazel_gate(execution, &workspace, prompt_text)
+            .await;
+
+        // 4. Render the remote worker settings: the same boss-event hooks
+        //    as a local worker, but pointed at the FORWARDED events
+        //    socket and the remote shim, and without the engine-data-dir
+        //    sandbox (there is no Boss engine on the remote). Shipped
+        //    outside the workspace tree and loaded via `--settings`,
+        //    mirroring the local runner.
+        let remote_socket = remote_events_socket_path(&run_id);
+        let settings_input = WorkerSetupInput {
+            run_id: run_id.clone(),
+            lease_id: lease_id.clone(),
+            workspace_path: PathBuf::from(&workspace),
+            events_socket_path: PathBuf::from(&remote_socket),
+            boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
+            draft_pr_mode: false,
+            execution_kind: execution.kind.clone(),
+            task_kind: work_item_task_kind(work_item).map(str::to_owned),
+        };
+        let settings_json = render_remote_settings_json(&settings_input);
+
+        // 5. Ship the prompt + settings to the remote. The prompt lives
+        //    under `<workspace>/.boss/` (read by the wrapper via
+        //    BOSS_INITIAL_INPUT_FILE); the settings live outside the tree
+        //    under `~/.boss-remote/settings/`.
+        let remote_prompt_dir = format!("{workspace}/.boss");
+        let remote_prompt_path = format!("{remote_prompt_dir}/initial-input.txt");
+        let remote_settings_dir = format!("~/{REMOTE_SETTINGS_DIR}");
+        let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
+        self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
+            .await?;
+        self.ship_file(
+            &remote_settings_dir,
+            &remote_settings_path,
+            &settings_json,
+            "settings",
         )
+        .await?;
+
+        // 6. Open the reverse events tunnel and launch the detached
+        //    remote worker (PR1 orchestration over the one master
+        //    multiplex).
+        let plan = RemoteSpawnPlan::builder()
+            .run_id(run_id.clone())
+            .lease_id(lease_id)
+            .workspace_path(workspace)
+            .maybe_repo_remote_url(
+                (!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()),
+            )
+            .events_socket_path(remote_socket)
+            .initial_input_file(remote_prompt_path)
+            .settings_file(remote_settings_path)
+            .wrapper_path(remote_wrapper_path())
+            .build();
+
+        let engine_socket = self.events_socket_path.display().to_string();
+        let outcome = perform_remote_launch(&self.transport, &plan, &engine_socket).await?;
+
+        if !outcome.launched {
+            let reason = outcome.failure_reason.unwrap_or(REASON_WORKER_LAUNCH_FAILED);
+            let detail = outcome.detail.unwrap_or_default();
+            bail!("{reason} on host {host}: {detail}");
+        }
+
+        tracing::info!(
+            host_id = %host,
+            run_id = %run_id,
+            remote_pid = ?outcome.remote_pid,
+            model = %spawn_config.model,
+            "remote worker launched; awaiting Stop over the forwarded events socket",
+        );
+
+        // WaitingHuman: the lease + workspace are retained and
+        // `completion::on_stop` drives the in_review / PR-URL transition
+        // when the worker's Stop event tunnels back over the forwarded
+        // socket (it keys purely on the run id we stamped into
+        // BOSS_RUN_ID, so the completion path is transport-agnostic).
+        // `slot_id` is `None` — a remote worker holds no local libghostty
+        // pane slot, so the coordinator releases the worker-pool slot
+        // inline. Cross-host pool accounting lands with routing in PR3.
+        let pid_suffix = outcome
+            .remote_pid
+            .map(|p| format!(" (remote pid {p})"))
+            .unwrap_or_default();
+        Ok(RunOutcome {
+            wait_state: RunWaitState::WaitingHuman,
+            result_summary: Some(format!(
+                "Launched remote worker '{}' on host {host}{pid_suffix}. \
+                 Hook events tunnel back over the forwarded events socket.",
+                work_item_name(work_item),
+            )),
+            attention: None,
+            slot_id: None,
+            spawn_config: Some(spawn_config),
+        })
     }
 }

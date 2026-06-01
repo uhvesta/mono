@@ -314,213 +314,23 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Going through a file (rather than embedding the prompt in
         // the typed command) avoids shell quoting hell on multi-line,
         // backtick-bearing markdown.
-        // For any project-scoped task (the synthetic `kind = 'design'`
-        // task and ordinary `project_task` rows alike), the richer
-        // brief — what the project is for, what its goal is — lives
-        // on the parent project rather than on the task row. Look it
-        // up at spawn time so the worker prompt is always anchored on
-        // the current project state, not whatever was copied at
-        // create time.
-        let parent_project = match work_item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => task
-                .project_id
-                .as_deref()
-                .and_then(|project_id| self.work_db.get_project(project_id).ok()),
-            _ => None,
-        };
-        // For revision_implementation executions with a merge-conflict
-        // provenance, look up the linked attempt by the id embedded in
-        // created_via (format: "merge-conflict:<crz_id>") so
-        // compose_revision_directive can inject the conflict fragment.
-        let conflict_attempt = if execution.kind == "revision_implementation" {
-            work_item_created_via(work_item)
-                .and_then(|cv| cv.strip_prefix("merge-conflict:"))
-                .and_then(|id| self.work_db.get_conflict_resolution(id).ok().flatten())
-        } else {
-            None
-        };
-        // Detect whether this is a respawn after a crash: if the work item has
-        // no task-level pr_url (handled by the existing RESUME EXISTING PR path)
-        // but has a prior orphaned execution with no pr_url, derive its expected
-        // branch so the new worker can attempt to resume it.
-        let recovery_branch: Option<String> = if work_item_pr_url(work_item).is_none() {
-            match self.work_db.get_prior_orphaned_execution(
-                &execution.work_item_id,
-                &execution.id,
-            ) {
-                Ok(Some(prior)) => {
-                    let branch = crate::completion::expected_branch_name(
-                        &prior.id,
-                        &prior.branch_naming,
-                    );
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        prior_execution_id = %prior.id,
-                        recovery_branch = %branch,
-                        "startup recovery: prior orphaned execution found; directing worker to attempt branch resume",
-                    );
-                    Some(branch)
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        execution_id = %execution.id,
-                        "startup recovery: no prior orphaned execution found; worker will start from main",
-                    );
-                    None
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        error = %format!("{err:#}"),
-                        "startup recovery: failed to query prior orphaned execution; worker will start from main",
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // For ci_remediation executions (retrigger-kind only after Phase 5),
-        // look up the active attempt so the prompt can show the failing checks.
         //
-        // For revision_implementation executions with a ci-fix provenance,
-        // look up the linked attempt by the id embedded in created_via
-        // (format: "ci-fix:<crm_id>") so compose_revision_directive can
-        // inject the CI remediation fragment.
-        let ci_attempt = if execution.kind == "ci_remediation" {
-            self.work_db
-                .active_ci_remediation_for_work_item(&execution.work_item_id)
-                .ok()
-                .flatten()
-        } else if execution.kind == "revision_implementation" {
-            work_item_created_via(work_item)
-                .and_then(|cv| cv.strip_prefix("ci-fix:"))
-                .and_then(|id| self.work_db.get_ci_remediation(id).ok().flatten())
-        } else {
-            None
-        };
-        // Fetch the product before composing the prompt so we can pass
-        // editorial_rules and the PR template set into compose_execution_prompt.
-        let (product_editorial_rules, row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
-            match work_item {
-                WorkItem::Task(task) | WorkItem::Chore(task) => {
-                    let product = self
-                        .work_db
-                        .get_product(&task.product_id)
-                        .ok()
-                        .flatten();
-                    let editorial_rules =
-                        product.as_ref().and_then(|p| p.editorial_rules.clone());
-                    let product_default_model =
-                        product.as_ref().and_then(|p| p.default_model.clone());
-                    let dispatch_preamble =
-                        product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
-                    (
-                        editorial_rules,
-                        task.effort_level,
-                        task.model_override.clone(),
-                        product_default_model,
-                        dispatch_preamble,
-                    )
-                }
-                _ => (None, None, None, None, None),
-            };
-        // Load the PR template for editorial-rules prompt injection (chore #5).
-        let pr_template_product_id = match work_item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.as_str(),
-            _ => "",
-        };
-        let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
-        let pr_template_set = crate::pr_template::load(
-            pr_template_product_id,
-            pr_template_lease_id,
+        // Prompt composition + effort/model resolution live in the
+        // shared `compose_worker_spawn` so the SSH-remote adapter
+        // (`SshHostAdapter::spawn_worker`) launches workers with a
+        // byte-identical prompt; see that function for the per-execution
+        // collaborator lookups (parent project, conflict / CI attempt,
+        // crash-recovery branch, automation-triage preamble).
+        let ComposedWorkerSpawn {
+            prompt_text,
+            spawn_config,
+        } = compose_worker_spawn(
+            &self.work_db,
+            execution,
+            work_item,
             workspace_path,
+            cube_change_id,
         );
-
-        // Maint task 6: an `automation_triage` execution renders the triage
-        // preamble (decision-marker contract + "do not do the work / do not
-        // open a PR" guardrails) instead of the ordinary implementer prompt.
-        // Its `work_item_id` is the automation id, so we read the automation
-        // directly. If the automation vanished mid-flight, fall back to the
-        // generic prompt so the worker at least has workspace context.
-        let prompt_text = if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
-            match self.work_db.get_automation(&execution.work_item_id) {
-                Ok(Some(automation)) => {
-                    let product_name = self
-                        .work_db
-                        .get_product(&automation.product_id)
-                        .ok()
-                        .flatten()
-                        .map(|p| p.name)
-                        .unwrap_or_else(|| automation.product_id.clone());
-                    crate::automation_triage::render_triage_preamble(&automation, &product_name)
-                }
-                other => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        automation_id = %execution.work_item_id,
-                        resolved = ?other.as_ref().map(|o| o.is_some()),
-                        "automation_triage execution could not resolve its automation; \
-                         falling back to generic prompt",
-                    );
-                    compose_execution_prompt(
-                        ExecutionPromptParams::builder()
-                            .execution(execution)
-                            .work_item(work_item)
-                            .workspace_path(workspace_path)
-                            .maybe_parent_project(parent_project.as_ref())
-                            .maybe_cube_change_id(cube_change_id)
-                            .maybe_conflict_attempt(conflict_attempt.as_ref())
-                            .maybe_recovery_branch(recovery_branch.as_deref())
-                            .maybe_ci_attempt(ci_attempt.as_ref())
-                            .maybe_editorial_rules(product_editorial_rules.as_ref())
-                            .pr_template_set(&pr_template_set)
-                            .build(),
-                    )
-                }
-            }
-        } else {
-            compose_execution_prompt(
-                ExecutionPromptParams::builder()
-                    .execution(execution)
-                    .work_item(work_item)
-                    .workspace_path(workspace_path)
-                    .maybe_parent_project(parent_project.as_ref())
-                    .maybe_cube_change_id(cube_change_id)
-                    .maybe_conflict_attempt(conflict_attempt.as_ref())
-                    .maybe_recovery_branch(recovery_branch.as_deref())
-                    .maybe_ci_attempt(ci_attempt.as_ref())
-                    .maybe_editorial_rules(product_editorial_rules.as_ref())
-                    .pr_template_set(&pr_template_set)
-                    .build(),
-            )
-        };
-        let spawn_config = resolve_spawn_config(
-            row_effort,
-            row_model_override.as_deref(),
-            product_default_model.as_deref(),
-        );
-        // Per-level prompt addendum lands at the very top of the file
-        // (design §Q2: "concatenated to .claude/initial-prompt.txt
-        // BEFORE the existing prompt body"). The existing task /
-        // design / conflict-resolution framing must stay byte-identical
-        // when the addendum is `None`.
-        let prompt_text = match spawn_config.prompt_addendum {
-            Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
-            None => prompt_text,
-        };
-
-        // Product dispatch preamble is prepended before the effort
-        // addendum, with visible bracket markers so humans reading
-        // transcripts know what was injected by the engine.
-        // Empty / null preamble → today's behaviour, no change.
-        let prompt_text = match product_dispatch_preamble {
-            Some(preamble) => {
-                format!("[product-preamble]\n{}\n[/product-preamble]\n\n{}", preamble, prompt_text)
-            }
-            None => prompt_text,
-        };
 
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
         if let Some(parent) = prompt_path.parent() {
@@ -621,6 +431,238 @@ impl ExecutionRunner for PaneSpawnRunner {
             slot_id: Some(started.slot_id),
             spawn_config: Some(spawn_config),
         })
+    }
+}
+
+/// Composed worker prompt + resolved effort/model config, the output of
+/// [`compose_worker_spawn`].
+pub(crate) struct ComposedWorkerSpawn {
+    pub prompt_text: String,
+    pub spawn_config: SpawnConfig,
+}
+
+/// Per-execution prompt + spawn-config composition shared by every
+/// worker transport.
+///
+/// [`PaneSpawnRunner`] (local libghostty panes) and
+/// [`crate::host_adapter::SshHostAdapter`] (remote SSH workers) both call
+/// this so the two launch paths hand the worker a byte-identical prompt
+/// and resolve the same effort/model knobs (design §Q3). It gathers the
+/// per-execution collaborator context (parent project, merge-conflict /
+/// CI-remediation attempt, crash-recovery branch, automation-triage
+/// preamble), composes the prompt via [`compose_execution_prompt`], then
+/// prepends the effort addendum and the product dispatch preamble exactly
+/// as the local runner historically did.
+///
+/// Transport-agnostic: it reads only from `work_db`, so the SSH adapter
+/// reuses it without a libghostty pane or a `WorkerSpawner`.
+pub(crate) fn compose_worker_spawn(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    work_item: &WorkItem,
+    workspace_path: &Path,
+    cube_change_id: Option<&str>,
+) -> ComposedWorkerSpawn {
+    // For any project-scoped task (the synthetic `kind = 'design'`
+    // task and ordinary `project_task` rows alike), the richer
+    // brief — what the project is for, what its goal is — lives
+    // on the parent project rather than on the task row. Look it
+    // up at spawn time so the worker prompt is always anchored on
+    // the current project state, not whatever was copied at
+    // create time.
+    let parent_project = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task
+            .project_id
+            .as_deref()
+            .and_then(|project_id| work_db.get_project(project_id).ok()),
+        _ => None,
+    };
+    // For revision_implementation executions with a merge-conflict
+    // provenance, look up the linked attempt by the id embedded in
+    // created_via (format: "merge-conflict:<crz_id>") so
+    // compose_revision_directive can inject the conflict fragment.
+    let conflict_attempt = if execution.kind == "revision_implementation" {
+        work_item_created_via(work_item)
+            .and_then(|cv| cv.strip_prefix("merge-conflict:"))
+            .and_then(|id| work_db.get_conflict_resolution(id).ok().flatten())
+    } else {
+        None
+    };
+    // Detect whether this is a respawn after a crash: if the work item has
+    // no task-level pr_url (handled by the existing RESUME EXISTING PR path)
+    // but has a prior orphaned execution with no pr_url, derive its expected
+    // branch so the new worker can attempt to resume it.
+    let recovery_branch: Option<String> = if work_item_pr_url(work_item).is_none() {
+        match work_db.get_prior_orphaned_execution(&execution.work_item_id, &execution.id) {
+            Ok(Some(prior)) => {
+                let branch =
+                    crate::completion::expected_branch_name(&prior.id, &prior.branch_naming);
+                tracing::info!(
+                    execution_id = %execution.id,
+                    prior_execution_id = %prior.id,
+                    recovery_branch = %branch,
+                    "startup recovery: prior orphaned execution found; directing worker to attempt branch resume",
+                );
+                Some(branch)
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    "startup recovery: no prior orphaned execution found; worker will start from main",
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %format!("{err:#}"),
+                    "startup recovery: failed to query prior orphaned execution; worker will start from main",
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // For ci_remediation executions (retrigger-kind only after Phase 5),
+    // look up the active attempt so the prompt can show the failing checks.
+    //
+    // For revision_implementation executions with a ci-fix provenance,
+    // look up the linked attempt by the id embedded in created_via
+    // (format: "ci-fix:<crm_id>") so compose_revision_directive can
+    // inject the CI remediation fragment.
+    let ci_attempt = if execution.kind == "ci_remediation" {
+        work_db
+            .active_ci_remediation_for_work_item(&execution.work_item_id)
+            .ok()
+            .flatten()
+    } else if execution.kind == "revision_implementation" {
+        work_item_created_via(work_item)
+            .and_then(|cv| cv.strip_prefix("ci-fix:"))
+            .and_then(|id| work_db.get_ci_remediation(id).ok().flatten())
+    } else {
+        None
+    };
+    // Fetch the product before composing the prompt so we can pass
+    // editorial_rules and the PR template set into compose_execution_prompt.
+    let (product_editorial_rules, row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
+        match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => {
+                let product = work_db.get_product(&task.product_id).ok().flatten();
+                let editorial_rules =
+                    product.as_ref().and_then(|p| p.editorial_rules.clone());
+                let product_default_model =
+                    product.as_ref().and_then(|p| p.default_model.clone());
+                let dispatch_preamble =
+                    product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
+                (
+                    editorial_rules,
+                    task.effort_level,
+                    task.model_override.clone(),
+                    product_default_model,
+                    dispatch_preamble,
+                )
+            }
+            _ => (None, None, None, None, None),
+        };
+    // Load the PR template for editorial-rules prompt injection.
+    let pr_template_product_id = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.as_str(),
+        _ => "",
+    };
+    let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
+    let pr_template_set = crate::pr_template::load(
+        pr_template_product_id,
+        pr_template_lease_id,
+        workspace_path,
+    );
+    // Maint task 6: an `automation_triage` execution renders the triage
+    // preamble (decision-marker contract + "do not do the work / do not
+    // open a PR" guardrails) instead of the ordinary implementer prompt.
+    // Its `work_item_id` is the automation id, so we read the automation
+    // directly. If the automation vanished mid-flight, fall back to the
+    // generic prompt so the worker at least has workspace context.
+    let prompt_text = if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
+        match work_db.get_automation(&execution.work_item_id) {
+            Ok(Some(automation)) => {
+                let product_name = work_db
+                    .get_product(&automation.product_id)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| automation.product_id.clone());
+                crate::automation_triage::render_triage_preamble(&automation, &product_name)
+            }
+            other => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    automation_id = %execution.work_item_id,
+                    resolved = ?other.as_ref().map(|o| o.is_some()),
+                    "automation_triage execution could not resolve its automation; \
+                     falling back to generic prompt",
+                );
+                compose_execution_prompt(
+                    ExecutionPromptParams::builder()
+                        .execution(execution)
+                        .work_item(work_item)
+                        .workspace_path(workspace_path)
+                        .maybe_parent_project(parent_project.as_ref())
+                        .maybe_cube_change_id(cube_change_id)
+                        .maybe_conflict_attempt(conflict_attempt.as_ref())
+                        .maybe_recovery_branch(recovery_branch.as_deref())
+                        .maybe_ci_attempt(ci_attempt.as_ref())
+                        .maybe_editorial_rules(product_editorial_rules.as_ref())
+                        .pr_template_set(&pr_template_set)
+                        .build(),
+                )
+            }
+        }
+    } else {
+        compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(execution)
+                .work_item(work_item)
+                .workspace_path(workspace_path)
+                .maybe_parent_project(parent_project.as_ref())
+                .maybe_cube_change_id(cube_change_id)
+                .maybe_conflict_attempt(conflict_attempt.as_ref())
+                .maybe_recovery_branch(recovery_branch.as_deref())
+                .maybe_ci_attempt(ci_attempt.as_ref())
+                .maybe_editorial_rules(product_editorial_rules.as_ref())
+                .pr_template_set(&pr_template_set)
+                .build(),
+        )
+    };
+    let spawn_config = resolve_spawn_config(
+        row_effort,
+        row_model_override.as_deref(),
+        product_default_model.as_deref(),
+    );
+    // Per-level prompt addendum lands at the very top of the file
+    // (design §Q2: "concatenated to .claude/initial-prompt.txt
+    // BEFORE the existing prompt body"). The existing task /
+    // design / conflict-resolution framing must stay byte-identical
+    // when the addendum is `None`.
+    let prompt_text = match spawn_config.prompt_addendum {
+        Some(addendum) => format!("{}\n\n{}", addendum, prompt_text),
+        None => prompt_text,
+    };
+
+    // Product dispatch preamble is prepended before the effort
+    // addendum, with visible bracket markers so humans reading
+    // transcripts know what was injected by the engine.
+    // Empty / null preamble → today's behaviour, no change.
+    let prompt_text = match product_dispatch_preamble {
+        Some(preamble) => {
+            format!("[product-preamble]\n{}\n[/product-preamble]\n\n{}", preamble, prompt_text)
+        }
+        None => prompt_text,
+    };
+
+    ComposedWorkerSpawn {
+        prompt_text,
+        spawn_config,
     }
 }
 
@@ -906,8 +948,17 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
     if !is_bazel_workspace(workspace_path) {
         return None;
     }
-    Some(
-        "\n## Pre-push build gate (Bazel workspace)\n\
+    Some(bazel_prepush_gate_text())
+}
+
+/// The Bazel pre-push build-gate prompt block, independent of any
+/// filesystem probe. Extracted so the SSH remote adapter can append it
+/// when a *remote* workspace is a Bazel workspace: [`is_bazel_workspace`]
+/// only probes the local filesystem, so a remote workspace path never
+/// matches and the gate has to be injected from the result of an
+/// over-SSH marker probe instead.
+pub(crate) fn bazel_prepush_gate_text() -> String {
+    "\n## Pre-push build gate (Bazel workspace)\n\
          \n\
          This repository is a Bazel workspace (a `MODULE.bazel`/`WORKSPACE` marker was found at the workspace root). Before you push a branch or update a PR with code changes, you MUST run a clean local build and test of what you touched and confirm both pass. \"I think it should work\" or \"the change looks correct\" is NOT a substitute for running the build — repeated rounds of CI breakage have come from workers skipping this step.\n\
          \n\
@@ -920,8 +971,7 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
          Run the build gate in the FOREGROUND and read its exit code directly. Do NOT background bazel (no `&`, no `run_in_background`, no redirecting to a log file you then poll) and then idle in a self-paced wait-loop \"until the gate is green\". If the bazel server wedges (host contention, a hung toolchain), those log files may never appear and the completion notification never arrives — you will wait forever with no way out, stranding your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle.\n\
          \n\
          If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
-            .to_string(),
-    )
+        .to_string()
 }
 
 /// Render the `[editorial-rules]` block for the worker prompt (chore #5).
@@ -1804,7 +1854,7 @@ fn render_diagnosis_markdown(diagnosis: &ConflictDiagnosis) -> String {
     out
 }
 
-fn work_item_name(work_item: &WorkItem) -> &str {
+pub(crate) fn work_item_name(work_item: &WorkItem) -> &str {
     match work_item {
         WorkItem::Product(product) => &product.name,
         WorkItem::Project(project) => &project.name,
@@ -1823,7 +1873,7 @@ fn work_item_id(work_item: &WorkItem) -> &str {
 /// Return the task `kind` string (e.g. `"revision"`, `"chore"`) for task
 /// work items. Returns `None` for products and projects, which have no
 /// task-kind concept.
-fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
+pub(crate) fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
     match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.kind),
         WorkItem::Product(_) | WorkItem::Project(_) => None,

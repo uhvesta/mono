@@ -127,6 +127,15 @@ pub struct RemoteSpawnPlan {
     /// shipped one. Preferred over an inline env var so a multi-KB
     /// prompt never has to survive ssh-argv re-quoting.
     pub initial_input_file: Option<String>,
+    /// Remote path of the worker's `--settings` JSON file — rendered by
+    /// [`crate::worker_setup::render_remote_settings_json`] and shipped
+    /// outside the workspace tree (mirroring the local runner, which
+    /// keeps the settings file out of the repo so it never lands in a
+    /// worker's PR). When present the wrapper passes `--settings <file>`
+    /// to claude so the `boss-event` hooks fire and the Stop event
+    /// tunnels back over the forwarded socket. `None` falls back to
+    /// claude's own project/user settings discovery.
+    pub settings_file: Option<String>,
     /// Absolute remote path of the wrapper (`~/.boss-remote/bin/boss-remote-run`).
     pub wrapper_path: String,
 }
@@ -148,6 +157,9 @@ pub fn build_remote_command(plan: &RemoteSpawnPlan) -> Vec<String> {
     }
     if let Some(file) = &plan.initial_input_file {
         argv.push(format!("BOSS_INITIAL_INPUT_FILE={file}"));
+    }
+    if let Some(file) = &plan.settings_file {
+        argv.push(format!("BOSS_SETTINGS_FILE={file}"));
     }
     argv.push(plan.wrapper_path.clone());
     argv
@@ -324,10 +336,12 @@ mod tests {
             remote_events_socket_path("exec_18b4_8a"),
             "/tmp/boss-events-exec_18b4_8a.sock",
         );
-        // Unsafe chars are mapped so the path is unambiguous.
+        // Every char outside [A-Za-z0-9_-] is mapped to `_`, so a `..`
+        // path-traversal attempt is neutralised (both the slashes AND the
+        // dots collapse to underscores) and the socket path is unambiguous.
         assert_eq!(
             remote_events_socket_path("run/../etc"),
-            "/tmp/boss-events-run_.._etc.sock",
+            "/tmp/boss-events-run____etc.sock",
         );
     }
 
@@ -369,6 +383,7 @@ mod tests {
             repo_remote_url: Some("git@example.com:me/mono.git".into()),
             events_socket_path: "/tmp/boss-events-run-1.sock".into(),
             initial_input_file: Some("/ws/mono-agent-007/.boss/initial-input.txt".into()),
+            settings_file: Some("/ws/mono-agent-007/.boss/settings.json".into()),
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
         };
         let argv = build_remote_command(&plan);
@@ -380,6 +395,9 @@ mod tests {
         assert!(argv.contains(&"BOSS_REPO_REMOTE_URL=git@example.com:me/mono.git".to_owned()));
         assert!(argv.contains(
             &"BOSS_INITIAL_INPUT_FILE=/ws/mono-agent-007/.boss/initial-input.txt".to_owned()
+        ));
+        assert!(argv.contains(
+            &"BOSS_SETTINGS_FILE=/ws/mono-agent-007/.boss/settings.json".to_owned()
         ));
         // The wrapper path is always the final token.
         assert_eq!(argv.last().unwrap(), "~/.boss-remote/bin/boss-remote-run");
@@ -394,11 +412,13 @@ mod tests {
             repo_remote_url: None,
             events_socket_path: "/tmp/s.sock".into(),
             initial_input_file: None,
+            settings_file: None,
             wrapper_path: "wrapper".into(),
         };
         let argv = build_remote_command(&plan);
         assert!(!argv.iter().any(|a| a.starts_with("BOSS_REPO_REMOTE_URL=")));
         assert!(!argv.iter().any(|a| a.starts_with("BOSS_INITIAL_INPUT_FILE=")));
+        assert!(!argv.iter().any(|a| a.starts_with("BOSS_SETTINGS_FILE=")));
     }
 
     #[test]
@@ -511,6 +531,7 @@ mod tests {
             repo_remote_url: None,
             events_socket_path: remote_events_socket_path("run-1"),
             initial_input_file: None,
+            settings_file: None,
             wrapper_path: "~/.boss-remote/bin/boss-remote-run".into(),
         }
     }

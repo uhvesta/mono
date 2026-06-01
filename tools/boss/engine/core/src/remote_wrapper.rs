@@ -112,6 +112,23 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_passes_settings_file_through_to_claude() {
+        // The engine ships the worker's `--settings` JSON outside the
+        // workspace tree and points claude at it via BOSS_SETTINGS_FILE;
+        // the wrapper must consume that env var and forward `--settings`.
+        // A refactor that dropped either side would silently strip the
+        // boss-event hooks from remote workers, pinning their lifecycle.
+        assert!(
+            WRAPPER_SOURCE.contains("BOSS_SETTINGS_FILE"),
+            "wrapper must read BOSS_SETTINGS_FILE so the engine can wire boss-event hooks remotely"
+        );
+        assert!(
+            WRAPPER_SOURCE.contains("--settings"),
+            "wrapper must pass `--settings` to claude when BOSS_SETTINGS_FILE is set"
+        );
+    }
+
+    #[test]
     fn wrapper_source_has_shebang() {
         // The remote ends up running the file directly via
         // `~/.boss-remote/bin/boss-remote-run`, so the shebang is

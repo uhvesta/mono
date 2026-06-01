@@ -23,6 +23,16 @@
 #                            argv re-quoting. Read as claude's first
 #                            positional arg (its initial user message).
 #   BOSS_INITIAL_INPUT     — inline fallback for the initial prompt.
+#   BOSS_SETTINGS_FILE     — optional path to a claude `--settings` JSON
+#                            file (the boss-event hooks + sandbox guards
+#                            the engine renders). Shipped OUTSIDE the
+#                            workspace tree, mirroring the local runner so
+#                            the file never lands in a worker's PR. When
+#                            set and the file exists it is passed as
+#                            `claude --settings <file>`, so every hook
+#                            event tunnels back over BOSS_EVENTS_SOCKET.
+#                            Unset/missing → claude's own settings
+#                            discovery (no boss-event hooks).
 #
 # Contract (output): the worker is launched DETACHED (`nohup` +
 # background) so it survives the engine restarting and the launching
@@ -126,6 +136,19 @@ elif [ -n "${BOSS_INITIAL_INPUT:-}" ]; then
     initial_input="$BOSS_INITIAL_INPUT"
 fi
 
+# Resolve the claude session settings. The engine renders a settings
+# file (boss-event hooks wiring every event to BOSS_EVENTS_SOCKET, plus
+# the sandbox guards) and ships it OUTSIDE the workspace tree, then
+# points claude at it here — mirroring the local runner's `--settings`
+# so the file never gets snapshotted into a worker's PR. We accumulate
+# the flag into the positional params so a settings path with spaces is
+# passed as a single argument. Unset/missing → no flag, and claude falls
+# back to its own project/user settings discovery (no boss-event hooks).
+set --
+if [ -n "${BOSS_SETTINGS_FILE:-}" ] && [ -f "$BOSS_SETTINGS_FILE" ]; then
+    set -- --settings "$BOSS_SETTINGS_FILE"
+fi
+
 # Launch DETACHED so the worker survives the engine restarting and the
 # launching SSH session closing: `nohup` makes it ignore the SIGHUP the
 # remote sshd sends on session teardown, and backgrounding reparents it
@@ -133,10 +156,10 @@ fi
 # positional arg) and stdout+stderr are teed to the per-run log. The
 # wrapper returns immediately; the worker keeps running.
 if [ -n "$initial_input" ]; then
-    nohup claude --dangerously-skip-permissions "$initial_input" \
+    nohup claude --dangerously-skip-permissions "$@" "$initial_input" \
         >"$worker_log" 2>&1 </dev/null &
 else
-    nohup claude --dangerously-skip-permissions \
+    nohup claude --dangerously-skip-permissions "$@" \
         >"$worker_log" 2>&1 </dev/null &
 fi
 worker_pid=$!

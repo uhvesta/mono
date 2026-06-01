@@ -227,12 +227,31 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     )
 }
 
+/// Whether the worker settings should install the engine-data-dir
+/// sandbox: the `deny` globs over the Boss support dir plus the
+/// deterministic [`PATH_GUARD_SCRIPT`] `PreToolUse` hook.
+///
+/// Local workers run on the same machine as the engine and MUST be
+/// fenced off its `state.db` / events socket / dispatch log. A remote
+/// SSH worker runs on a host with no Boss engine, so there is nothing to
+/// fence — and the "data dir" derived from the forwarded events socket's
+/// parent (`/tmp` on the remote) is not a Boss dir at all, so installing
+/// the sandbox there would deny the worker all of `/tmp` and invoke a
+/// path-guard script that was never shipped to the remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineDataDirSandbox {
+    /// Install the data-dir deny globs + path-guard hook (local workers).
+    Enabled,
+    /// Omit them (remote SSH workers).
+    Disabled,
+}
+
 /// Render the worker settings file. Wires every claude hook event to
 /// the `boss-event` shim with absolute paths so the hook fires
 /// regardless of `PATH`. The engine points the session at this via
 /// `claude --settings`; it is written outside the workspace tree.
 pub fn render_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input);
+    let value = settings_value(input, EngineDataDirSandbox::Enabled);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
@@ -292,7 +311,21 @@ const REVISION_PR_GUARD_COMMAND: &str = concat!(
     "\""
 );
 
-fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
+/// Render worker settings for a *remote* (SSH-dispatched) worker.
+///
+/// Identical to [`render_settings_json`] — the same `boss-event` hooks
+/// wired for every event and the same static Boss-launch / revision
+/// guards — but without the engine-data-dir sandbox (see
+/// [`EngineDataDirSandbox`]). The caller fills `events_socket_path` with
+/// the worker-visible *forwarded* socket path on the remote (e.g.
+/// `/tmp/boss-events-<run>.sock`) and `boss_event_path` with the remote
+/// shim (typically the bare `boss-event` resolved on the remote PATH).
+pub fn render_remote_settings_json(input: &WorkerSetupInput) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Disabled);
+    serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
+}
+
+fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
     // Inline-prefix all env vars the shim needs. `BOSS_RUN_ID` is the
     // load-bearing one for live-worker-state correlation: if it's
     // missing from the shim's env, the splice that adds `_boss_run_id`
@@ -352,21 +385,27 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
     // path is covered without a settings change; the script fast-paths
     // tools it doesn't inspect. The Boss data dir is derived from
     // `events_socket_path`'s parent — same source as `deny_rules`.
-    if let Some(state_dir) = input.events_socket_path.parent() {
-        let guard_command = format!(
-            "BOSS_DATA_DIR={dir} python3 {script}",
-            dir = shell_escape(&state_dir.display().to_string()),
-            script = shell_escape(&path_guard_script_path().display().to_string()),
-        );
-        pre_tool_use_hooks.push(serde_json::json!({
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": guard_command,
-                }
-            ],
-        }));
+    //
+    // Remote SSH workers skip this entirely (see `EngineDataDirSandbox`):
+    // their `events_socket_path` is the forwarded `/tmp` socket, not a
+    // Boss data dir, and the python guard script is never shipped there.
+    if sandbox == EngineDataDirSandbox::Enabled {
+        if let Some(state_dir) = input.events_socket_path.parent() {
+            let guard_command = format!(
+                "BOSS_DATA_DIR={dir} python3 {script}",
+                dir = shell_escape(&state_dir.display().to_string()),
+                script = shell_escape(&path_guard_script_path().display().to_string()),
+            );
+            pre_tool_use_hooks.push(serde_json::json!({
+                "matcher": "*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": guard_command,
+                    }
+                ],
+            }));
+        }
     }
 
     // Block a worker from *launching Boss itself* — the macOS app or its
@@ -456,7 +495,7 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
         // call through.
         "permissions": {
             "defaultMode": "auto",
-            "deny": deny_rules(input),
+            "deny": deny_rules(input, sandbox),
         },
         "hooks": {
             "SessionStart":     [hook.clone()],
@@ -477,18 +516,25 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
 /// parent — both live under `~/Library/Application Support/Boss/` in
 /// production, but tests / future relocations get the same treatment
 /// without a hardcoded path.
-fn deny_rules(input: &WorkerSetupInput) -> Vec<String> {
+fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<String> {
     let mut rules = Vec::new();
 
-    if let Some(state_dir) = input.events_socket_path.parent() {
-        let dir = state_dir.display().to_string();
-        // Both the bare directory and the `**` subtree are listed
-        // explicitly: glob `**` doesn't match the directory itself in
-        // every harness, and we want a `Read("…/Boss")` ls attempt to
-        // be denied just like a `Read("…/Boss/state.db")`.
-        for prefix in ["Read", "Edit", "Write"] {
-            rules.push(format!("{prefix}({dir})"));
-            rules.push(format!("{prefix}({dir}/**)"));
+    // The engine-data-dir globs only make sense for a local worker (the
+    // events socket's parent is the Boss support dir). A remote worker's
+    // `events_socket_path` is the forwarded `/tmp` socket, so these would
+    // wrongly fence the worker off all of `/tmp`; skip them there. The
+    // static `bossctl` / `boss engine` guards below still apply to both.
+    if sandbox == EngineDataDirSandbox::Enabled {
+        if let Some(state_dir) = input.events_socket_path.parent() {
+            let dir = state_dir.display().to_string();
+            // Both the bare directory and the `**` subtree are listed
+            // explicitly: glob `**` doesn't match the directory itself in
+            // every harness, and we want a `Read("…/Boss")` ls attempt to
+            // be denied just like a `Read("…/Boss/state.db")`.
+            for prefix in ["Read", "Edit", "Write"] {
+                rules.push(format!("{prefix}({dir})"));
+                rules.push(format!("{prefix}({dir}/**)"));
+            }
         }
     }
 
@@ -1109,6 +1155,75 @@ mod tests {
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
         }
+    }
+
+    #[test]
+    fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
+        // A remote worker's events socket is the forwarded /tmp socket and
+        // its shim is resolved by name on the remote PATH.
+        let input = WorkerSetupInput {
+            run_id: "exec_remote_1".into(),
+            lease_id: "lease-remote".into(),
+            workspace_path: PathBuf::from("/Users/zak/Documents/dev/workspaces/mono-agent-003"),
+            events_socket_path: PathBuf::from("/tmp/boss-events-exec_remote_1.sock"),
+            boss_event_path: PathBuf::from("boss-event"),
+            draft_pr_mode: false,
+            execution_kind: "task_implementation".into(),
+            task_kind: Some("task".into()),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_remote_settings_json(&input)).unwrap();
+
+        // All seven boss-event hook events are still wired.
+        let hooks = parsed.get("hooks").unwrap().as_object().unwrap();
+        for name in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "SessionEnd",
+        ] {
+            assert!(hooks.contains_key(name), "missing hook: {name}");
+        }
+
+        // The boss-event command points at the FORWARDED socket + remote
+        // shim resolved by name.
+        let stop_cmd = hooks["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(stop_cmd.contains("/tmp/boss-events-exec_remote_1.sock"));
+        assert!(stop_cmd.contains("BOSS_RUN_ID='exec_remote_1'"));
+        assert!(stop_cmd.trim_end().ends_with("'boss-event'"));
+
+        // No engine-data-dir sandbox: the deny list must NOT fence the
+        // worker off the forwarded socket's parent (/tmp), and there is
+        // no python path-guard hook (the script is never shipped remote).
+        let deny = parsed["permissions"]["deny"].as_array().unwrap();
+        assert!(
+            !deny.iter().any(|r| {
+                let s = r.as_str().unwrap();
+                s.starts_with("Read(/tmp")
+                    || s.starts_with("Write(/tmp")
+                    || s.starts_with("Edit(/tmp")
+            }),
+            "remote settings must not fence the worker off /tmp: {deny:?}"
+        );
+        let pre = serde_json::to_string(&hooks["PreToolUse"]).unwrap();
+        assert!(
+            !pre.contains("boss-path-guard.py") && !pre.contains("BOSS_DATA_DIR="),
+            "remote settings must not install the data-dir path-guard hook"
+        );
+
+        // The static guards survive: bossctl deny + the boss-launch guard.
+        assert!(deny.iter().any(|r| r.as_str() == Some("Bash(bossctl)")));
+        assert!(
+            pre.contains("Workers must not launch or run Boss itself"),
+            "boss-launch guard must remain on remote workers"
+        );
+
+        // Sanity: the LOCAL renderer DOES install the path guard, proving
+        // the remote variant is the one dropping it.
+        assert!(render_settings_json(&input).contains("boss-path-guard.py"));
     }
 
     #[test]
