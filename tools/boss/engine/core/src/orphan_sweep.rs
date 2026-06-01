@@ -16,10 +16,15 @@
 //!    not, returns early — a `ready` execution created now would just
 //!    queue behind the full pool and can wait for the next sweep.
 //! 2. Queries `active` work items whose `updated_at` is older than
-//!    [`ORPHAN_MIN_AGE_SECS`] and that have no `ready` execution.
+//!    [`ORPHAN_MIN_AGE_SECS`] and that have no `ready` or `waiting_human`
+//!    execution. `waiting_human` is a live state where the worker has parked
+//!    for human input and may have released its pool slot — it must never
+//!    be treated as orphaned.
 //! 3. For each candidate, checks whether its latest non-terminal
 //!    execution (if any) is claimed by a live worker slot. If it is,
 //!    the execution is genuinely live and the candidate is skipped.
+//!    As a defense-in-depth guard, any candidate whose live execution is
+//!    still `waiting_human` at this point is also skipped unconditionally.
 //! 4. Applies the churn guard: if the work item has already had
 //!    [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal executions
 //!    in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`], it
@@ -55,11 +60,15 @@ pub struct OrphanSweepOutcome {
     pub redispatched: usize,
     pub churn_skipped: usize,
     pub no_worker_skipped: usize,
+    /// Items skipped because their live execution is in `waiting_human`
+    /// state. These should already be filtered by the DB query; a non-zero
+    /// count here indicates a data-consistency gap worth investigating.
+    pub waiting_human_skipped: usize,
 }
 
 impl OrphanSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.redispatched > 0 || self.churn_skipped > 0
+        self.redispatched > 0 || self.churn_skipped > 0 || self.waiting_human_skipped > 0
     }
 }
 
@@ -85,6 +94,7 @@ pub fn spawn_loop(
                     redispatched = outcome.redispatched,
                     churn_skipped = outcome.churn_skipped,
                     no_worker_skipped = outcome.no_worker_skipped,
+                    waiting_human_skipped = outcome.waiting_human_skipped,
                     "orphan sweep: pass complete",
                 );
             }
@@ -200,6 +210,25 @@ pub async fn run_one_pass(
                         })),
                 )
                 .await;
+        }
+
+        // Defense-in-depth: never re-dispatch a waiting_human execution even
+        // if the DB exclusion above somehow let it through. waiting_human is a
+        // legitimate live state — the worker parked for human input and may have
+        // released its pool slot, but the execution is alive. Abandoning it would
+        // clobber a live in-flight workspace and create a duplicate worker on the
+        // same row.
+        if let Some(live) = &live_execution {
+            if live.status == "waiting_human" {
+                tracing::warn!(
+                    work_item_id = %work_item_id,
+                    execution_id = %live.id,
+                    "orphan sweep: candidate has a waiting_human execution; skipping \
+                     (should have been excluded by DB query — investigate)",
+                );
+                outcome.waiting_human_skipped += 1;
+                continue;
+            }
         }
 
         // Request a fresh execution. The `is_live` closure treats an
@@ -542,5 +571,60 @@ mod tests {
 
         assert_eq!(outcome.redispatched, 0, "should skip recently activated item");
         assert!(sink.events().await.is_empty());
+    }
+
+    /// Regression: a waiting_human execution must never be abandoned and
+    /// re-dispatched by the orphan sweep. The worker parks for human input
+    /// and then exits (releasing its pool slot), so the execution is not
+    /// claimed — but it is still alive and waiting for a response.
+    ///
+    /// Previously the sweep treated unclaimed + non-terminal as "dead worker"
+    /// and double-dispatched a second worker onto the same row (T1104 /
+    /// exec_18b508391244f798_34 → exec_18b508565e3b6e30_39).
+    #[tokio::test]
+    async fn skips_item_with_waiting_human_execution() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        make_old(&db, &work_item_id);
+
+        // Create a ready execution then force it to waiting_human to simulate
+        // a worker that parked for human input and then released its slot.
+        let execution = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+        db.force_execution_status_for_test(&work_item_id, "waiting_human")
+            .unwrap();
+
+        let db = Arc::new(db);
+        // Deliberately do NOT claim the execution — simulates the worker
+        // process having exited after entering waiting_human.
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "sweep must not re-dispatch a waiting_human execution"
+        );
+        let events = sink.events().await;
+        assert!(
+            events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+            "no orphan_active_redispatch event should fire for waiting_human"
+        );
+
+        // The waiting_human execution must remain intact — not abandoned.
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|e| e.id == execution.id && e.status == "waiting_human"),
+            "waiting_human execution must not be abandoned by the sweep"
+        );
     }
 }
