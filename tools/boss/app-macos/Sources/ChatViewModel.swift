@@ -1187,7 +1187,8 @@ final class ChatViewModel: ObservableObject {
         goal: String = "",
         priority: String = "",
         prURL: String = "",
-        workerBranchPrefix: String = ""
+        workerBranchPrefix: String = "",
+        docsRepo: String = ""
     ) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
@@ -1204,6 +1205,7 @@ final class ChatViewModel: ObservableObject {
             id = product.id
             patch["repo_remote_url"] = repoRemoteURL
             patch["worker_branch_prefix"] = workerBranchPrefix
+            patch["docs_repo"] = docsRepo
         case .project(let project):
             id = project.id
             patch["goal"] = goal

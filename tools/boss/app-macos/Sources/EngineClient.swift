@@ -1743,7 +1743,8 @@ final class EngineClient: @unchecked Sendable {
             externalTrackerKind: payload["external_tracker_kind"] as? String,
             externalTrackerConfig: externalTrackerConfigString,
             workerBranchPrefix: payload["worker_branch_prefix"] as? String,
-            editorialRules: editorialRules
+            editorialRules: editorialRules,
+            docsRepo: payload["docs_repo"] as? String
         )
     }
 

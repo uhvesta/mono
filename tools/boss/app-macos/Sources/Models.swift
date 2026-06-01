@@ -324,6 +324,10 @@ struct WorkProduct: Identifiable, Hashable {
     /// Per-product editorial rules. `nil` when no rules are configured.
     /// Mirrors `Product.editorial_rules`.
     var editorialRules: EditorialRules? = nil
+    /// Preferred repo for investigation/design doc PRs. `nil` → fall through
+    /// to the user-level `BOSS_USER_DOCS_REPO` default.
+    /// Mirrors `Product.docs_repo`.
+    var docsRepo: String? = nil
 }
 
 /// Swift mirror of `boss_protocol::WorkItemExternalRef`. Stable upstream
