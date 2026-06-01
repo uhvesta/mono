@@ -462,6 +462,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "syn",
  "tempfile",
  "tokio",
  "toml",
