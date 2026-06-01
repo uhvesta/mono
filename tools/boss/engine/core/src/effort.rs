@@ -44,15 +44,23 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// Default model slug for a given effort level, used when the row
 /// has no explicit `model_override` (design §Q3 step 2).
 ///
-/// Family aliases (`"haiku"`, `"sonnet"`, `"opus"`) are used so the
-/// engine auto-tracks the latest snapshot per family without requiring
-/// a code change on each model release. Direct-API summarization
+/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine
+/// auto-tracks the latest snapshot per family without requiring a
+/// code change on each model release. Direct-API summarization
 /// (see [`crate::live_status::SUMMARY_MODEL`]) still uses a pinned
 /// model — that path doesn't go through the worker CLI.
+///
+/// `Trivial` maps to `sonnet`, NOT `haiku`. Per issue #746 ("don't
+/// use haiku") boss must never dispatch a worker on Haiku: on the
+/// user's work machine Haiku supports neither auto mode nor
+/// `--dangerously-skip-permissions`, so it prompts for every edit.
+/// Trivial work still runs at `--effort low` (see
+/// [`claude_effort_for_level`]); only the model floor is raised to
+/// Sonnet. This is the same resolution #746 closed with — do not
+/// lower it back to Haiku.
 pub fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
-        EffortLevel::Trivial => "haiku",
-        EffortLevel::Small | EffortLevel::Medium => "sonnet",
+        EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
         EffortLevel::Large | EffortLevel::Max => "opus",
     }
 }
@@ -397,8 +405,10 @@ mod tests {
 
     #[test]
     fn effort_level_alone_picks_level_default_model() {
+        // #746: Trivial maps to Sonnet, not Haiku — only the effort
+        // value stays `low`.
         let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
-        assert_eq!(trivial.model, "haiku");
+        assert_eq!(trivial.model, "sonnet");
         assert_eq!(trivial.claude_effort, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
@@ -425,6 +435,27 @@ mod tests {
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
+    }
+
+    #[test]
+    fn no_effort_level_ever_defaults_to_haiku() {
+        // Regression guard for #746 ("don't use haiku"): no effort
+        // level may select Haiku as its default model. Boss must never
+        // dispatch a worker on Haiku — it supports neither auto mode nor
+        // --dangerously-skip-permissions on the user's work machine.
+        for level in [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ] {
+            let model = default_model_for_level(level);
+            assert!(
+                !model.to_ascii_lowercase().contains("haiku"),
+                "effort level {level:?} must not default to a Haiku model, got {model:?}",
+            );
+        }
     }
 
     #[test]
@@ -495,11 +526,12 @@ mod tests {
 
     #[test]
     fn trivial_invocation_includes_both_flags() {
+        // #746: Trivial spawns Sonnet (never Haiku) at --effort low.
         // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
         let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
-            "claude --model haiku --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
+            "claude --model sonnet --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
         );
     }
 

@@ -186,7 +186,7 @@ The effort value and the prompt addendum follow `effort_level` *only*; `model_ov
 | `model_override` | `tasks` | CLI `--model` at create / edit. The coordinator does **not** set this from the heuristic. |
 | `default_model` | `products` | CLI `boss product set-default-model <slug>`. |
 
-The coordinator does not write `model_override` because the model decision is a *property of the level*, and the coordinator's job is to estimate the level. Writing both would couple them. If a chore should run on Haiku, that is because it is `trivial`; the heuristic should reach that conclusion via the level, not by also setting `model_override = 'haiku'`.
+The coordinator does not write `model_override` because the model decision is a *property of the level*, and the coordinator's job is to estimate the level. Writing both would couple them. If a chore should run on a cheaper model, that is because it is `trivial` or `small` (both floor to Sonnet — see #746, no worker dispatches on Haiku); the heuristic should reach that conclusion via the level, not by setting `model_override` directly.
 
 ---
 
@@ -303,7 +303,7 @@ These are deliberately *not* answered in v1, to keep the implementation tasks na
 
 **R3 — Effort-level mistuning under-scopes legitimate work.** Claude's effort parameter is a behavioural signal, not a strict cap, but a worker spawned at `--effort low` will systematically explore less than the same chore at `--effort high`. If our `trivial → low` and `small → medium` defaults are too aggressive for some chore shape, the worker stops short. Mitigation: the dispatcher logs the effort value it set; the existing dispatch instrumentation ([`engine-dispatch-instrumentation`](engine-dispatch-instrumentation.md)) surfaces this on the live-status pane. If we see workers stalling at lower effort levels, retune the Q2 table or escalate via Q5.
 
-**R4 — Haiku is not capable enough for a "trivial" we labelled wrong.** A misclassified `trivial` running on Haiku produces a worse result than the same chore on Sonnet would. Mitigation: the Stop-boundary escalation path (Q5) covers this; the worker stops short, the coordinator re-classifies, the next dispatch uses Sonnet.
+**R4 — A "trivial" we labelled wrong is under-modelled.** A misclassified `trivial` runs at `--effort low`, which explores less than the same chore would at a higher effort. (The model floor is no longer a factor here: per #746 `trivial` runs on Sonnet, not Haiku — see Q2/Q3 — so the only mis-tuning lever left at the trivial tier is the effort value.) Mitigation: the Stop-boundary escalation path (Q5) covers this; the worker stops short, the coordinator re-classifies, the next dispatch uses a higher effort level.
 
 **R5 — Coordinator-side estimation is non-deterministic.** Because the heuristic runs inside an LLM session (this one), the same chore could in principle get a different level on different days. Mitigation: the *rules* in Q4 are explicit and the coordinator commits to following them as the *minimum*; the reasons string makes the decision auditable. A human who disagrees overrides with `--effort`.
 
