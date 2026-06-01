@@ -1414,6 +1414,13 @@ fn run_workspace(
                 head_commit = workspace.head_commit,
             );
 
+            // Defense-in-depth (issue #1174): keep Boss/host infra files —
+            // an empty `logs/<workspace>.log`, the engine's `.boss/` scratch
+            // dir — out of the worker's jj snapshot so they never get
+            // committed into a PR. Done before setup runs, so a setup step
+            // that drops such a file is already covered.
+            ensure_boss_infra_excluded(&workspace.workspace_path, &workspace.workspace_id);
+
             let setup_report = run_setup_for_workspace(&store, runner, &workspace)?;
 
             let lease_message = format!(
@@ -2695,6 +2702,110 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
     }
 }
 
+/// Markers delimiting the cube-managed block inside a workspace's local
+/// `.git/info/exclude`. We rewrite only the region between them, leaving
+/// any operator-added excludes untouched, and they make the provenance
+/// of the patterns obvious to anyone reading the file.
+const BOSS_INFRA_EXCLUDE_BEGIN: &str = "# >>> boss-internal infra (managed by cube) >>>";
+const BOSS_INFRA_EXCLUDE_END: &str = "# <<< boss-internal infra (managed by cube) <<<";
+
+/// Render the cube-managed exclude block for a workspace.
+///
+/// `/logs/<workspace-id>.log` is anchored to the single empty infra log
+/// some host tooling drops at workspace-setup time (issue #1174) — named
+/// exactly after the cube workspace — rather than blanket-ignoring
+/// `logs/`, which a repo may legitimately track. `.boss/` is the engine's
+/// own per-run scratch/log dir (e.g. the remote runner's `worker.log`),
+/// which is never part of a deliverable.
+fn render_boss_infra_exclude_block(workspace_id: &str) -> String {
+    format!(
+        "{BOSS_INFRA_EXCLUDE_BEGIN}\n\
+         # Keeps Boss/host infra files out of the worker's jj snapshot so they\n\
+         # never land in a PR (issue #1174). cube rewrites this block on every\n\
+         # lease; edit patterns above/below it, not inside.\n\
+         .boss/\n\
+         /logs/{workspace_id}.log\n\
+         {BOSS_INFRA_EXCLUDE_END}\n"
+    )
+}
+
+/// Insert or replace the cube-managed block in an exclude-file body,
+/// preserving everything outside the markers. Idempotent: a body already
+/// carrying an identical block is returned byte-for-byte unchanged.
+fn upsert_managed_exclude(existing: &str, block: &str) -> String {
+    if let (Some(start), Some(end_marker)) = (
+        existing.find(BOSS_INFRA_EXCLUDE_BEGIN),
+        existing.find(BOSS_INFRA_EXCLUDE_END),
+    ) {
+        let end = end_marker + BOSS_INFRA_EXCLUDE_END.len();
+        // Swallow the newline after the END marker so repeated rewrites
+        // don't accumulate blank lines between the block and any tail.
+        let tail_start = if existing[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
+        format!("{}{block}{}", &existing[..start], &existing[tail_start..])
+    } else {
+        let mut out = String::from(existing);
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(block);
+        out
+    }
+}
+
+/// Ensure the colocated workspace's local git exclude file carries the
+/// cube-managed Boss-infra ignore block, so jj never auto-snapshots those
+/// infra files into the worker's working-copy commit (and thus its PR) —
+/// defense-in-depth for issue #1174.
+///
+/// `.git/info/exclude` is the right home: it lives under `.git/` (never
+/// committed, never shipped in a PR), is local to this one workspace, and
+/// jj honors it for git-backed/colocated repos exactly like a tracked
+/// `.gitignore`. Best-effort by design — a workspace without a colocated
+/// `.git/` directory, or an unreadable/unwritable exclude file, is left
+/// untouched rather than failing the lease.
+fn ensure_boss_infra_excluded(workspace_path: &Path, workspace_id: &str) {
+    let git_dir = workspace_path.join(".git");
+    if !git_dir.is_dir() {
+        // Non-colocated layout: no `info/exclude` jj would read. The guard
+        // is defense-in-depth, so skip silently rather than warn.
+        return;
+    }
+    let info_dir = git_dir.join("info");
+    if let Err(e) = fs::create_dir_all(&info_dir) {
+        eprintln!(
+            "warning: cube could not create {} for the Boss-infra exclude guard: {e}",
+            info_dir.display()
+        );
+        return;
+    }
+    let exclude_path = info_dir.join("exclude");
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            eprintln!(
+                "warning: cube could not read {} for the Boss-infra exclude guard: {e}",
+                exclude_path.display()
+            );
+            return;
+        }
+    };
+    let next = upsert_managed_exclude(&existing, &render_boss_infra_exclude_block(workspace_id));
+    if next == existing {
+        return;
+    }
+    if let Err(e) = fs::write(&exclude_path, &next) {
+        eprintln!(
+            "warning: cube could not write {} for the Boss-infra exclude guard: {e}",
+            exclude_path.display()
+        );
+    }
+}
+
 fn reset_workspace(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -3729,10 +3840,12 @@ mod tests {
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
     use super::{
-        CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result, current_epoch_s,
+        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY,
+        RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
         is_bare_repo_slug, is_stdin_path, origin_path_matches_slug, origin_urls_equivalent,
         parse_github_owner_repo, parse_github_remote, parse_github_slug, parse_origin,
-        resolve_body_file, run_with_context, run_with_dependencies,
+        render_boss_infra_exclude_block, resolve_body_file, run_with_context,
+        run_with_dependencies, upsert_managed_exclude,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -11120,5 +11233,85 @@ github\tssh://org-1@github.com/spinyfin/mono.git
             super::pr_number_from_url("https://github.com/owner/repo/pull/"),
             None
         );
+    }
+
+    #[test]
+    fn boss_infra_exclude_block_names_the_per_workspace_log() {
+        let block = render_boss_infra_exclude_block("rdev-base-image-agent-001");
+        assert!(block.contains("/logs/rdev-base-image-agent-001.log"));
+        assert!(block.contains(".boss/"));
+        assert!(block.starts_with(BOSS_INFRA_EXCLUDE_BEGIN));
+        assert!(block.trim_end().ends_with(BOSS_INFRA_EXCLUDE_END));
+    }
+
+    #[test]
+    fn upsert_managed_exclude_appends_to_empty_body() {
+        let block = render_boss_infra_exclude_block("mono-agent-004");
+        assert_eq!(upsert_managed_exclude("", &block), block);
+    }
+
+    #[test]
+    fn upsert_managed_exclude_preserves_operator_excludes() {
+        let block = render_boss_infra_exclude_block("mono-agent-004");
+        let existing = "# operator-added\n*.tmp\n";
+        let result = upsert_managed_exclude(existing, &block);
+        assert!(result.starts_with("# operator-added\n*.tmp\n"));
+        assert!(result.contains("/logs/mono-agent-004.log"));
+    }
+
+    #[test]
+    fn upsert_managed_exclude_is_idempotent() {
+        let block = render_boss_infra_exclude_block("mono-agent-004");
+        let once = upsert_managed_exclude("*.tmp\n", &block);
+        let twice = upsert_managed_exclude(&once, &block);
+        assert_eq!(once, twice);
+        // The managed marker appears exactly once after repeated rewrites.
+        assert_eq!(twice.matches(BOSS_INFRA_EXCLUDE_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn upsert_managed_exclude_rewrites_stale_block_in_place() {
+        let stale = render_boss_infra_exclude_block("old-workspace-id");
+        let existing = format!("*.tmp\n{stale}# trailing operator line\n");
+        let fresh = render_boss_infra_exclude_block("new-workspace-id");
+        let result = upsert_managed_exclude(&existing, &fresh);
+        assert!(result.contains("/logs/new-workspace-id.log"));
+        assert!(!result.contains("old-workspace-id"));
+        // Operator content on both sides of the block survives.
+        assert!(result.starts_with("*.tmp\n"));
+        assert!(result.contains("# trailing operator line\n"));
+        assert_eq!(result.matches(BOSS_INFRA_EXCLUDE_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn ensure_boss_infra_excluded_writes_git_info_exclude() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let workspace = tempdir.path().join("mono-agent-004");
+        std::fs::create_dir_all(workspace.join(".git")).expect("colocated .git dir");
+
+        ensure_boss_infra_excluded(&workspace, "mono-agent-004");
+
+        let exclude = std::fs::read_to_string(workspace.join(".git/info/exclude"))
+            .expect("exclude written");
+        assert!(exclude.contains("/logs/mono-agent-004.log"));
+        assert!(exclude.contains(".boss/"));
+
+        // Second call is a no-op: same bytes, single managed block.
+        ensure_boss_infra_excluded(&workspace, "mono-agent-004");
+        let again = std::fs::read_to_string(workspace.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude, again);
+        assert_eq!(again.matches(BOSS_INFRA_EXCLUDE_BEGIN).count(), 1);
+    }
+
+    #[test]
+    fn ensure_boss_infra_excluded_skips_when_not_colocated() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let workspace = tempdir.path().join("mono-agent-004");
+        // Secondary jj workspace: `.jj` but no colocated `.git` directory.
+        std::fs::create_dir_all(workspace.join(".jj")).expect("jj dir");
+
+        ensure_boss_infra_excluded(&workspace, "mono-agent-004");
+
+        assert!(!workspace.join(".git").exists());
     }
 }
