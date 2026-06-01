@@ -14,7 +14,7 @@ use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
-use boss_protocol::WorkItemBinding;
+use boss_protocol::{EditorialRules, TemplatePolicy, WorkItemBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {
@@ -400,6 +400,44 @@ impl ExecutionRunner for PaneSpawnRunner {
         } else {
             None
         };
+        // Fetch the product before composing the prompt so we can pass
+        // editorial_rules and the PR template set into compose_execution_prompt.
+        let (product_editorial_rules, row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
+            match work_item {
+                WorkItem::Task(task) | WorkItem::Chore(task) => {
+                    let product = self
+                        .work_db
+                        .get_product(&task.product_id)
+                        .ok()
+                        .flatten();
+                    let editorial_rules =
+                        product.as_ref().and_then(|p| p.editorial_rules.clone());
+                    let product_default_model =
+                        product.as_ref().and_then(|p| p.default_model.clone());
+                    let dispatch_preamble =
+                        product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
+                    (
+                        editorial_rules,
+                        task.effort_level,
+                        task.model_override.clone(),
+                        product_default_model,
+                        dispatch_preamble,
+                    )
+                }
+                _ => (None, None, None, None, None),
+            };
+        // Load the PR template for editorial-rules prompt injection (chore #5).
+        let pr_template_product_id = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.as_str(),
+            _ => "",
+        };
+        let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
+        let pr_template_set = crate::pr_template::load(
+            pr_template_product_id,
+            pr_template_lease_id,
+            workspace_path,
+        );
+
         // Maint task 6: an `automation_triage` execution renders the triage
         // preamble (decision-marker contract + "do not do the work / do not
         // open a PR" guardrails) instead of the ordinary implementer prompt.
@@ -435,6 +473,8 @@ impl ExecutionRunner for PaneSpawnRunner {
                         conflict_attempt.as_ref(),
                         recovery_branch.as_deref(),
                         ci_attempt.as_ref(),
+                        product_editorial_rules.as_ref(),
+                        &pr_template_set,
                     )
                 }
             }
@@ -448,37 +488,10 @@ impl ExecutionRunner for PaneSpawnRunner {
                 conflict_attempt.as_ref(),
                 recovery_branch.as_deref(),
                 ci_attempt.as_ref(),
+                product_editorial_rules.as_ref(),
+                &pr_template_set,
             )
         };
-
-        // Resolve the per-execution effort + model knobs (design §Q3
-        // precedence). Read both columns off the row, the parent
-        // product's `default_model`, and let the resolver pick the
-        // first non-empty value. The resolver also derives the
-        // `--effort` value and the optional prompt addendum from the
-        // row's `effort_level` (model_override never changes those —
-        // design §Q3).
-        let (row_effort, row_model_override, product_default_model, product_dispatch_preamble) =
-            match work_item {
-                WorkItem::Task(task) | WorkItem::Chore(task) => {
-                    let product = self
-                        .work_db
-                        .get_product(&task.product_id)
-                        .ok()
-                        .flatten();
-                    let product_default_model =
-                        product.as_ref().and_then(|p| p.default_model.clone());
-                    let dispatch_preamble =
-                        product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
-                    (
-                        task.effort_level,
-                        task.model_override.clone(),
-                        product_default_model,
-                        dispatch_preamble,
-                    )
-                }
-                _ => (None, None, None, None),
-            };
         let spawn_config = resolve_spawn_config(
             row_effort,
             row_model_override.as_deref(),
@@ -616,6 +629,8 @@ fn compose_execution_prompt(
     conflict_attempt: Option<&ConflictResolution>,
     recovery_branch: Option<&str>,
     ci_attempt: Option<&CiRemediation>,
+    editorial_rules: Option<&EditorialRules>,
+    pr_template_set: &crate::pr_template::PrTemplateSet,
 ) -> String {
     // Phase 9 #29: ci_remediation has its own templated prompt — embed
     // the engine-collected log excerpt, the failing-check set, and the
@@ -746,6 +761,12 @@ fn compose_execution_prompt(
         prompt.push_str(details.trim_end());
         prompt.push('\n');
     }
+    prompt.push('\n');
+    // Inject [editorial-rules] block between execution context and per-kind directive
+    // so identifier-redaction guidance is top-of-mind without overriding the
+    // higher-priority "resume existing PR" directive (R11: after [product-preamble],
+    // before the per-kind block).
+    prompt.push_str(&render_editorial_rules_block(editorial_rules, pr_template_set));
     prompt.push('\n');
     match execution.kind.as_str() {
         "project_design" => {
@@ -882,6 +903,119 @@ fn bazel_prepush_gate_block(workspace_path: &Path) -> Option<String> {
          If the build or tests fail, time out, or you cannot make them pass within this run, do NOT push red code and do NOT idle waiting on them. Emit an `[effort-escalation]` marker in your final response with the failing/timed-out command and its output, and stop. Escalating a blocker is correct; pushing a known-broken branch — or hanging on a wedged build — is not.\n"
             .to_string(),
     )
+}
+
+/// Render the `[editorial-rules]` block for the worker prompt (chore #5).
+///
+/// Always rendered — even for default-config products — because the baked-in
+/// identifier-redaction rules apply to every execution. The optional
+/// instructions / template / enforcement sections are only included when the
+/// product has non-default editorial configuration (instructions set or
+/// template_policy != Off). This matches the acceptance criterion: default-config
+/// products get baked-in rules only; configured products get instructions +
+/// template + enforcement banner.
+fn render_editorial_rules_block(
+    editorial_rules: Option<&EditorialRules>,
+    pr_template_set: &crate::pr_template::PrTemplateSet,
+) -> String {
+    let instructions = editorial_rules
+        .and_then(|r| r.instructions.as_deref())
+        .filter(|s| !s.is_empty());
+    let template_policy = editorial_rules
+        .map(|r| r.template_policy.clone())
+        .unwrap_or_default();
+    let is_configured = instructions.is_some() || !matches!(template_policy, TemplatePolicy::Off);
+
+    let mut out = String::new();
+    out.push_str("[editorial-rules]\n");
+    out.push_str("**Editorial rules for PRs / GitHub comments in this product.**\n");
+    out.push_str(
+        "Apply these rules to every PR title, PR body, PR / issue comment, \
+         commit-message body, and merge-conflict note you write for this run.\n\n",
+    );
+    out.push_str("Baked-in rules (always apply):\n");
+    out.push_str(
+        "- Do not mention Boss execution / project / task / chore identifiers \
+         in user-facing text. The shapes are `exec_…`, `proj_…`, `task_…`, \
+         `chg_…`. They are internal vocabulary that humans on this repo have no \
+         context for.\n",
+    );
+    out.push_str(
+        "- Do not refer to \"Boss worker\", \"the engine\", \"the coordinator\", \
+         \"cube workspace\", or \"work item\" in user-facing text — these are \
+         internal Boss vocabulary.\n",
+    );
+    out.push_str(
+        "- When referring to your branch in PR text, say \"this branch\" rather \
+         than its full name — the branch name is engine bookkeeping (it associates \
+         the PR with its originating execution) and is not meaningful to human \
+         reviewers.\n",
+    );
+
+    if is_configured {
+        if let Some(instr) = instructions {
+            out.push_str("\nProduct-specific rules (configured on this product):\n");
+            out.push_str(instr.trim_end());
+            out.push('\n');
+        }
+
+        let policy_label = match template_policy {
+            TemplatePolicy::Off => None,
+            TemplatePolicy::Advise => Some("Advise"),
+            TemplatePolicy::Enforce => Some("Enforce"),
+        };
+        if let Some(label) = policy_label {
+            let template_path = pr_template_set
+                .default_template
+                .as_ref()
+                .map(|t| t.source_path.display().to_string())
+                .or_else(|| {
+                    let mut stems: Vec<&str> = pr_template_set
+                        .named_templates
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
+                    stems.sort();
+                    stems
+                        .first()
+                        .map(|stem| format!(".github/PULL_REQUEST_TEMPLATE/{stem}.md"))
+                })
+                .unwrap_or_else(|| ".github/PULL_REQUEST_TEMPLATE.md".to_string());
+            out.push_str(&format!("\nTemplate policy: {label}: see {template_path}\n"));
+            if !pr_template_set.is_empty() {
+                out.push_str(
+                    "The PR body must follow the structure of the template (rendered below), \
+                     regardless of the final-response sectioning rules.\n",
+                );
+                let has_multiple = pr_template_set.named_templates.len() > 1
+                    || (pr_template_set.default_template.is_some()
+                        && !pr_template_set.named_templates.is_empty());
+                for tmpl in pr_template_set.all_templates() {
+                    if has_multiple {
+                        out.push_str(&format!(
+                            "\nTemplate (`{}`):\n",
+                            tmpl.source_path.display()
+                        ));
+                    }
+                    out.push_str("\n```\n");
+                    out.push_str(tmpl.text.trim_end());
+                    out.push_str("\n```\n");
+                }
+            }
+        }
+
+        out.push_str("\nEnforcement:\n");
+        out.push_str(
+            "The engine's PreToolUse hook intercepts `gh pr create`, `gh pr edit`, \
+             `gh pr comment`, `gh pr review`, and `gh issue comment` invocations. \
+             If your body / title violates a rule, the call is denied or rewritten and \
+             you will see feedback. Comply on the first try when you can — denials cost \
+             a worker turn.\n",
+        );
+    }
+
+    out.push_str("[/editorial-rules]\n");
+    out
 }
 
 /// Directive that warns workers PR creation is terminal: the engine reaps
@@ -1891,6 +2025,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -1910,6 +2046,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("RESUME EXISTING PR"),
@@ -1929,6 +2067,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("## RESUME EXISTING PR"),
@@ -1956,6 +2096,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         let resume_pos = prompt.find("## RESUME EXISTING PR").expect("missing resume block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -1977,6 +2119,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("expected branch name"),
@@ -1995,6 +2139,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("expected branch name"),
@@ -2014,6 +2160,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("Do NOT open a new PR"),
@@ -2036,6 +2184,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("jj bookmark create"),
@@ -2058,6 +2208,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("STARTUP RECOVERY"),
@@ -2076,6 +2228,8 @@ mod compose_prompt_tests {
             None,
             Some("boss/exec_prior123_09"),
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("## STARTUP RECOVERY"),
@@ -2106,6 +2260,8 @@ mod compose_prompt_tests {
             None,
             Some("boss/exec_prior123_09"),
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("STARTUP RECOVERY"),
@@ -2128,6 +2284,8 @@ mod compose_prompt_tests {
             None,
             Some("boss/exec_prior123_09"),
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         let recovery_pos = prompt.find("## STARTUP RECOVERY").expect("missing recovery block");
         let exec_pos = prompt.find("Execution context:").expect("missing execution context");
@@ -2150,6 +2308,8 @@ mod compose_prompt_tests {
             None,
             Some("boss/exec_prior123_09"),
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         // "boss/exec_abc123_01" is the new expected branch
         assert!(
@@ -2186,6 +2346,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("do not babysit CI"),
@@ -2212,6 +2374,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("Owner Approval"),
@@ -2236,6 +2400,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("do not babysit CI"),
@@ -2423,6 +2589,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("## RESUME EXISTING PR"),
@@ -2443,6 +2611,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("## RESUME EXISTING PR"),
@@ -2491,6 +2661,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("## Pre-push build gate (Bazel workspace)"),
@@ -2523,6 +2695,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("Pre-push build gate"),
@@ -2542,6 +2716,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("## Pre-push build gate (Bazel workspace)"),
@@ -2566,6 +2742,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("expected branch name"),
@@ -2594,6 +2772,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             prompt.contains("expected branch name"),
@@ -2714,6 +2894,8 @@ mod compose_prompt_tests {
             Some(&attempt),
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         // Must contain the conflict-resolution section header.
         assert!(
@@ -2758,6 +2940,8 @@ mod compose_prompt_tests {
             None,
             None,
             Some(&attempt),
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         // Must contain the CI remediation section header.
         assert!(
@@ -2808,6 +2992,8 @@ mod compose_prompt_tests {
             None,
             None,
             None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
         );
         assert!(
             !prompt.contains("## Conflict resolution context"),
@@ -2820,6 +3006,204 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
             "base revision directive must still be present:\n{prompt}",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // editorial-rules block rendering (chore #5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn editorial_rules_block_always_rendered_with_baked_in_rules() {
+        // Default config: block always appears with baked-in rules.
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
+        );
+        assert!(
+            prompt.contains("[editorial-rules]"),
+            "editorial-rules block must always be present:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("[/editorial-rules]"),
+            "editorial-rules closing tag must be present:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("exec_\u{2026}"),
+            "baked-in identifier rule must be present:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Boss worker"),
+            "baked-in phrase rule must be present:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_rules_block_default_config_has_no_instructions_section() {
+        // Default config: no instructions, no template, no enforcement banner.
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
+        );
+        assert!(
+            !prompt.contains("Product-specific rules"),
+            "default config must not render instructions section:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("Template policy"),
+            "default config must not render template section:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("Enforcement:"),
+            "default config must not render enforcement banner:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_rules_block_with_instructions_renders_full_configured_sections() {
+        let rules = boss_protocol::EditorialRules {
+            instructions: Some("No emoji in PR titles.".to_owned()),
+            ..Default::default()
+        };
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            Some(&rules),
+            &crate::pr_template::PrTemplateSet::default(),
+        );
+        assert!(
+            prompt.contains("Product-specific rules"),
+            "configured product must render instructions section:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("No emoji in PR titles."),
+            "configured product must include verbatim instructions:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Enforcement:"),
+            "configured product must render enforcement banner:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_rules_block_with_enforce_template_includes_template_text() {
+        let tmpl = crate::pr_template::PrTemplate {
+            text: "## Summary\n\n## Test plan\n".to_owned(),
+            required_headings: vec!["Summary".to_owned(), "Test plan".to_owned()],
+            source_path: std::path::PathBuf::from(".github/PULL_REQUEST_TEMPLATE.md"),
+        };
+        let pr_template_set = crate::pr_template::PrTemplateSet {
+            default_template: Some(tmpl),
+            named_templates: std::collections::HashMap::new(),
+        };
+        let rules = boss_protocol::EditorialRules {
+            template_policy: boss_protocol::TemplatePolicy::Enforce,
+            ..Default::default()
+        };
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            Some(&rules),
+            &pr_template_set,
+        );
+        assert!(
+            prompt.contains("Template policy: Enforce"),
+            "enforce policy must appear in prompt:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("## Summary"),
+            "template content must be rendered verbatim:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("## Test plan"),
+            "template content must be rendered verbatim:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Enforcement:"),
+            "enforcement banner must be present for configured product:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_rules_block_appears_before_per_kind_directive() {
+        // [editorial-rules] must appear before "Expected outcome for this run:"
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::pr_template::PrTemplateSet::default(),
+        );
+        let editorial_pos = prompt
+            .find("[editorial-rules]")
+            .expect("editorial-rules block missing");
+        let directive_pos = prompt
+            .find("Expected outcome for this run:")
+            .expect("per-kind directive missing");
+        assert!(
+            editorial_pos < directive_pos,
+            "editorial-rules block must appear before the per-kind directive:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn editorial_rules_block_advise_template_policy_rendered() {
+        let rules = boss_protocol::EditorialRules {
+            template_policy: boss_protocol::TemplatePolicy::Advise,
+            ..Default::default()
+        };
+        let prompt = compose_execution_prompt(
+            &base_execution(),
+            &chore_without_pr(),
+            None,
+            std::path::Path::new("/tmp/workspace"),
+            None,
+            None,
+            None,
+            None,
+            Some(&rules),
+            &crate::pr_template::PrTemplateSet::default(),
+        );
+        assert!(
+            prompt.contains("Template policy: Advise"),
+            "advise policy must appear in prompt:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Enforcement:"),
+            "enforcement banner must be present when template policy is set:\n{prompt}",
         );
     }
 }
