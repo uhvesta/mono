@@ -3,7 +3,10 @@ load("@mono_crates//:defs.bzl", "all_crate_deps")
 
 rust_binary(
     name = "bossctl",
-    srcs = ["src/main.rs"],
+    srcs = [
+        "src/logs.rs",
+        "src/main.rs",
+    ],
     edition = "2024",
     compile_data = [
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).

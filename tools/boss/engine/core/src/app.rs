@@ -97,7 +97,9 @@ use worker_events::{
 use handler_helpers::{
     build_effort_audit_report, persist_live_status_disabled_slots,
     build_engine_health_report, build_live_status_debug_report,
-    load_live_status_disabled_slots, duplicate_or_work_error,
+    load_live_status_disabled_slots, load_dispatch_paused_state,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+    duplicate_or_work_error,
     send_response, send_response_with_revision, send_push,
     publish_work_invalidation, publish_comment_invalidation,
     handle_create_many, open_review_terminal_async,
@@ -1059,6 +1061,23 @@ impl ServerState {
         server_state
             .live_status_manager
             .set_initial_disabled_slots(persisted);
+
+        // Seed the dispatch-pause flag from the engine metadata KV.
+        // A persisted pause survives an engine restart — the flag is set
+        // here before any scheduler kicks so no executions slip through
+        // the gap between boot and pause restoration.
+        let (dispatch_paused, dispatch_paused_since) =
+            load_dispatch_paused_state(&server_state.work_db);
+        if dispatch_paused {
+            server_state
+                .execution_coordinator
+                .set_dispatch_paused(true, dispatch_paused_since);
+            tracing::info!(
+                paused_since_epoch_s = dispatch_paused_since,
+                "dispatch: restoring persisted pause state — dispatch remains \
+                 globally paused until `bossctl dispatch resume` is called",
+            );
+        }
 
         Ok(server_state)
     }
@@ -2423,6 +2442,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::GetDispatchState => {
+                engine_meta::handle_get_dispatch_state(ctx, r).await
+            }
             r @ FrontendRequest::GetEngineHealth => {
                 engine_meta::handle_get_engine_health(ctx, r).await
             }
@@ -2594,6 +2616,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::SetCiBudget { .. } => {
                 ci_remediation::handle_set_ci_budget(ctx, r).await
+            }
+            r @ FrontendRequest::SetDispatchPaused { .. } => {
+                engine_meta::handle_set_dispatch_paused(ctx, r).await
             }
             r @ FrontendRequest::SetFeatureFlag { .. } => {
                 engine_meta::handle_set_feature_flag(ctx, r).await

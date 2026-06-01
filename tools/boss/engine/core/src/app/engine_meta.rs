@@ -284,3 +284,104 @@ pub(super) async fn handle_kick_pr_reconcilers(ctx: Dispatch, req: FrontendReque
         );
     }
 }
+
+pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetDispatchPaused { paused } = req else {
+        unreachable!()
+    };
+    {
+        let coordinator = &server_state.execution_coordinator;
+        let already = coordinator.is_dispatch_paused();
+        if already == paused {
+            // Idempotent: no-op but still respond with the current state.
+            let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
+            tracing::debug!(paused, "set_dispatch_paused: idempotent no-op");
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::DispatchStateResult {
+                    paused,
+                    paused_since_epoch_s,
+                },
+            );
+            return;
+        }
+        let now_epoch_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        coordinator.set_dispatch_paused(paused, now_epoch_s);
+        // Persist the new state to the metadata table so it survives a restart.
+        let db_result = if paused {
+            work_db
+                .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
+                .and_then(|()| {
+                    work_db.set_metadata(
+                        METADATA_KEY_DISPATCH_PAUSED_SINCE,
+                        &now_epoch_s.to_string(),
+                    )
+                })
+        } else {
+            work_db
+                .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "0"))
+        };
+        if let Err(err) = db_result {
+            tracing::warn!(
+                paused,
+                ?err,
+                "dispatch_pause: failed to persist to state.db — state is \
+                 applied in-memory but will revert on engine restart",
+            );
+        }
+        if paused {
+            tracing::info!("dispatch: globally paused — no new executions will be dispatched");
+        } else {
+            // Re-kick the scheduler so anything that queued while paused is
+            // drained immediately without waiting for the next external event.
+            coordinator.kick();
+            tracing::info!("dispatch: resumed — scheduler kicked to drain queued executions");
+        }
+        let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::DispatchStateResult {
+                paused,
+                paused_since_epoch_s,
+            },
+        );
+    }
+}
+
+pub(super) async fn handle_get_dispatch_state(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetDispatchState = req else {
+        unreachable!()
+    };
+    {
+        let coordinator = &server_state.execution_coordinator;
+        let paused = coordinator.is_dispatch_paused();
+        let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::DispatchStateResult {
+                paused,
+                paused_since_epoch_s,
+            },
+        );
+    }
+}

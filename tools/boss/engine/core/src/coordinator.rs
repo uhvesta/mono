@@ -1086,6 +1086,14 @@ pub struct ExecutionCoordinator {
     /// [`Self::set_execution_started_hook`] so the SHA-delta gate
     /// can snapshot the bound chore PR's head SHA at run start.
     execution_started_hook: Arc<dyn ExecutionStartedHook>,
+    /// Global dispatch-pause flag. When `true`, `drain_ready_queue` exits
+    /// immediately without claiming any slots. Seeded from the `dispatch_paused`
+    /// metadata key at engine startup; persisted there on every toggle so the
+    /// pause survives an engine restart.
+    dispatch_paused: AtomicBool,
+    /// Epoch seconds when dispatch was last paused. Zero means "not paused".
+    /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
+    dispatch_paused_since_epoch_s: AtomicU64,
 }
 
 impl ExecutionCoordinator {
@@ -1148,6 +1156,8 @@ impl ExecutionCoordinator {
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
             metrics: local_metrics,
             execution_started_hook: Arc::new(NoopExecutionStartedHook),
+            dispatch_paused: AtomicBool::new(false),
+            dispatch_paused_since_epoch_s: AtomicU64::new(0),
         }
     }
 
@@ -1206,6 +1216,34 @@ impl ExecutionCoordinator {
 
     pub fn worker_pool(&self) -> WorkerPool {
         self.worker_pool.clone()
+    }
+
+    /// Pause or resume global dispatch. When `paused = true` the scheduler
+    /// drain stops claiming worker slots for new executions; already-running
+    /// executions are unaffected. Pass `paused_since_epoch_s = 0` when
+    /// resuming (it is ignored).
+    ///
+    /// The caller is responsible for persisting the new state to `state.db`
+    /// so it survives an engine restart — see the `handle_set_dispatch_paused`
+    /// handler in `app/engine_meta.rs`.
+    pub fn set_dispatch_paused(&self, paused: bool, paused_since_epoch_s: u64) {
+        self.dispatch_paused.store(paused, Ordering::Release);
+        self.dispatch_paused_since_epoch_s.store(
+            if paused { paused_since_epoch_s } else { 0 },
+            Ordering::Release,
+        );
+    }
+
+    /// `true` when dispatch is globally paused.
+    pub fn is_dispatch_paused(&self) -> bool {
+        self.dispatch_paused.load(Ordering::Acquire)
+    }
+
+    /// The epoch-seconds timestamp at which dispatch was last paused, or
+    /// `None` when not currently paused.
+    pub fn dispatch_paused_since_epoch_s(&self) -> Option<u64> {
+        let v = self.dispatch_paused_since_epoch_s.load(Ordering::Acquire);
+        if v == 0 { None } else { Some(v) }
     }
 
     /// Return the pool that should handle `execution`.
@@ -1485,6 +1523,14 @@ impl ExecutionCoordinator {
     /// for this pass; they remain `ready` and will be picked up on the
     /// next `kick()` triggered by `release_worker_and_kick`.
     async fn drain_ready_queue(self: &Arc<Self>) -> DrainOutcome {
+        // Global pause gate: when dispatch is paused, skip the drain entirely.
+        // Ready executions remain in the queue and will be picked up on the
+        // first drain after dispatch is resumed.
+        if self.dispatch_paused.load(Ordering::Acquire) {
+            tracing::debug!("drain_ready_queue: dispatch is globally paused — skipping");
+            return DrainOutcome::QueueEmpty;
+        }
+
         let executions = match self.work_db.list_ready_executions() {
             Ok(e) => e,
             Err(err) => {

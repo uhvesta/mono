@@ -548,6 +548,10 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] when the id is unknown.
     GetConflictResolution { attempt_id: String },
 
+    /// Query the current dispatch-pause state without changing it.
+    /// Replies with [`FrontendEvent::DispatchStateResult`].
+    GetDispatchState,
+
     /// One-shot snapshot of the engine's user-visible configuration
     /// health — currently a single ANTHROPIC_API_KEY presence bit plus
     /// any rendered [`EngineHealthIssue`]s the UI should surface as a
@@ -1136,6 +1140,18 @@ pub enum FrontendRequest {
         work_item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<i64>,
+    },
+
+    /// Pause or resume global dispatch. When `paused = true` the engine
+    /// stops dispatching new executions from every source (auto-dispatch,
+    /// reconciliation, dependency-gate-clear, manual start) until a
+    /// subsequent `SetDispatchPaused { paused: false }` call. Already-running
+    /// executions are NOT interrupted — they complete normally. The flag is
+    /// persisted to `state.db` so it survives an engine restart. Idempotent:
+    /// pausing while already paused (or resuming while already running) is a
+    /// no-op. Replies with [`FrontendEvent::DispatchStateResult`].
+    SetDispatchPaused {
+        paused: bool,
     },
 
     /// Toggle one feature flag on or off. The engine updates the
@@ -1964,6 +1980,15 @@ pub enum FrontendEvent {
     /// has not yet started the poller (race at startup — treat as a
     /// no-op).
     PrReconcilersKicked { kicked: bool },
+    /// Response to [`FrontendRequest::SetDispatchPaused`] and
+    /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
+    /// and, when paused, the epoch-seconds timestamp at which it was set.
+    DispatchStateResult {
+        paused: bool,
+        /// Epoch seconds when dispatch was paused. `None` when `paused = false`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        paused_since_epoch_s: Option<u64>,
+    },
     /// Response to [`FrontendRequest::SyncProductExternalTracker`].
     /// Emitted when the engine begins the on-demand reconcile pass
     /// for the named product. The pass runs synchronously; this event
@@ -2211,6 +2236,13 @@ pub struct EngineHealthReport {
     /// gets a single boolean without having to grep through the issues
     /// array.
     pub anthropic_api_key_present: bool,
+    /// True when dispatch is globally paused. A paused engine will not
+    /// dispatch new executions from any source until explicitly resumed via
+    /// `SetDispatchPaused { paused: false }`. Surfaced as a top-level field
+    /// (in addition to the `issues` list entry) so CLI consumers can check
+    /// it with a simple `jq .dispatch_paused`.
+    #[serde(default)]
+    pub dispatch_paused: bool,
     /// Issues the UI should render, in display order (highest priority
     /// first). Empty when the engine is healthy.
     pub issues: Vec<EngineHealthIssue>,
@@ -2713,6 +2745,7 @@ mod feature_flags_wire_tests {
         let original = FrontendEvent::EngineHealthResult {
             report: EngineHealthReport {
                 anthropic_api_key_present: true,
+                dispatch_paused: false,
                 issues: Vec::new(),
             },
         };
@@ -2747,6 +2780,7 @@ mod feature_flags_wire_tests {
         let original = FrontendEvent::EngineHealthResult {
             report: EngineHealthReport {
                 anthropic_api_key_present: false,
+                dispatch_paused: false,
                 issues: vec![issue.clone()],
             },
         };

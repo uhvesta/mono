@@ -45,6 +45,14 @@ pub(super) fn build_effort_audit_report(
 /// most 8 entries, so we don't bother with JSON.
 const META_LIVE_STATUS_DISABLED_SLOTS: &str = "live_status_disabled_slots";
 
+/// Metadata key for the global dispatch-pause flag. `"1"` = paused, `"0"` or
+/// absent = running. Persisted at every toggle so the pause survives an engine
+/// restart.
+pub(super) const METADATA_KEY_DISPATCH_PAUSED: &str = "dispatch_paused";
+/// Metadata key storing the epoch-seconds timestamp at which dispatch was last
+/// paused. Zero (or absent) means not paused.
+pub(super) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_since_epoch_s";
+
 /// Persist the disabled-slot snapshot to the metadata KV. Called
 /// from the toggle handler. Errors bubble up so the caller can log
 /// them — persistence failure is non-fatal (the in-memory set still
@@ -74,6 +82,7 @@ pub(super) fn build_engine_health_report(
     use boss_protocol::{EngineHealthIssue, EngineHealthReport};
 
     let anthropic_api_key_present = server_state.anthropic_api_key.is_some();
+    let dispatch_paused = server_state.execution_coordinator.is_dispatch_paused();
     let mut issues: Vec<EngineHealthIssue> = Vec::new();
 
     if !anthropic_api_key_present {
@@ -86,6 +95,18 @@ pub(super) fn build_engine_health_report(
                    environment Boss launches its engine from. Set the \
                    variable in your shell startup file, then quit and \
                    relaunch Boss to pick it up."
+                .to_owned(),
+        });
+    }
+
+    if dispatch_paused {
+        issues.push(EngineHealthIssue {
+            kind: "dispatch_paused".to_owned(),
+            severity: "warning".to_owned(),
+            title: "Dispatch is globally paused".to_owned(),
+            body: "The engine is not dispatching new executions from any source. \
+                   Currently-running workers continue to completion. Run \
+                   `bossctl dispatch resume` to restore normal dispatch."
                 .to_owned(),
         });
     }
@@ -127,6 +148,7 @@ pub(super) fn build_engine_health_report(
 
     EngineHealthReport {
         anthropic_api_key_present,
+        dispatch_paused,
         issues,
     }
 }
@@ -273,6 +295,25 @@ pub(super) fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
     raw.split(',')
         .filter_map(|s| s.trim().parse::<u8>().ok())
         .collect()
+}
+
+/// Read the persisted dispatch-pause state from the metadata KV. Returns
+/// `(paused, paused_since_epoch_s)`. On first boot or if absent/malformed
+/// defaults to `(false, 0)`.
+pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64) {
+    let paused = work_db
+        .get_metadata(METADATA_KEY_DISPATCH_PAUSED)
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let since_epoch_s = work_db
+        .get_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    (paused, since_epoch_s)
 }
 
 /// Downcast `err` to `DuplicateTaskError` and return a structured
