@@ -9,6 +9,7 @@ use super::*;
 
 pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -20,6 +21,7 @@ pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest
     {
         match work_db.create_automation(input) {
             Ok(automation) => {
+                server_state.automation_scheduler_kick.notify_one();
                 send_response(
                     &sink,
                     &request_id,
@@ -105,6 +107,7 @@ pub(super) async fn handle_get_automation(ctx: Dispatch, req: FrontendRequest) {
 
 pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -115,11 +118,14 @@ pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest
     };
     {
         match work_db.update_automation(&id, patch) {
-            Ok(automation) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AutomationUpdated { automation },
-            ),
+            Ok(automation) => {
+                server_state.automation_scheduler_kick.notify_one();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::AutomationUpdated { automation },
+                )
+            }
             Err(err) => send_response(
                 &sink,
                 &request_id,
@@ -133,6 +139,7 @@ pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest
 
 pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -143,11 +150,14 @@ pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest
     };
     {
         match work_db.enable_automation(&id) {
-            Ok(automation) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AutomationUpdated { automation },
-            ),
+            Ok(automation) => {
+                server_state.automation_scheduler_kick.notify_one();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::AutomationUpdated { automation },
+                )
+            }
             Err(err) => send_response(
                 &sink,
                 &request_id,
@@ -161,6 +171,7 @@ pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest
 
 pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -171,11 +182,14 @@ pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendReques
     };
     {
         match work_db.disable_automation(&id) {
-            Ok(automation) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AutomationUpdated { automation },
-            ),
+            Ok(automation) => {
+                server_state.automation_scheduler_kick.notify_one();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::AutomationUpdated { automation },
+                )
+            }
             Err(err) => send_response(
                 &sink,
                 &request_id,
@@ -189,6 +203,7 @@ pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendReques
 
 pub(super) async fn handle_delete_automation(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
+        server_state,
         work_db,
         sink,
         request_id,
@@ -199,11 +214,14 @@ pub(super) async fn handle_delete_automation(ctx: Dispatch, req: FrontendRequest
     };
     {
         match work_db.delete_automation(&id) {
-            Ok(()) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AutomationDeleted { automation_id: id },
-            ),
+            Ok(()) => {
+                server_state.automation_scheduler_kick.notify_one();
+                send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::AutomationDeleted { automation_id: id },
+                )
+            }
             Err(err) => send_response(
                 &sink,
                 &request_id,

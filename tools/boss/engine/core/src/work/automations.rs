@@ -165,6 +165,10 @@ impl WorkDb {
             sets.push(format!("trigger_config = ?{idx}"));
             params_raw.push(Box::new(trigger_config.unwrap()));
             idx += 1;
+            // Reset next_due_at so the scheduler recomputes the first occurrence
+            // from the new cron expression instead of using a stale value from
+            // the old schedule.
+            sets.push("next_due_at = NULL".to_owned());
         }
         push_opt!("standing_instruction", patch.standing_instruction.clone());
         push_opt!("open_task_limit", patch.open_task_limit);
@@ -340,6 +344,32 @@ impl WorkDb {
             params![id, next_due_epoch.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Return scheduling data for the automation scheduler's sleep computation:
+    /// the minimum `next_due_at` epoch across all enabled `schedule` automations
+    /// whose `next_due_at` has been initialized, and whether any enabled
+    /// `schedule` automations are still uninitialized (`next_due_at IS NULL`).
+    ///
+    /// Used by the scheduler after each pass to compute how long to sleep before
+    /// the next evaluation: sleep until `min_next_due`, capped at a maximum,
+    /// but use a short poll interval when uninitialized automations are present.
+    pub fn list_min_next_due_at_for_scheduler(&self) -> Result<(Option<i64>, bool)> {
+        let conn = self.connect()?;
+        let min_next_due: Option<i64> = conn.query_row(
+            "SELECT MIN(CAST(next_due_at AS INTEGER))
+               FROM automations
+              WHERE enabled = 1 AND trigger_kind = 'schedule' AND next_due_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let uninitialized_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automations
+              WHERE enabled = 1 AND trigger_kind = 'schedule' AND next_due_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((min_next_due, uninitialized_count > 0))
     }
 
     /// Fetch the `automation_runs` row for a specific occurrence, if one

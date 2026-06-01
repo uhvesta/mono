@@ -43,6 +43,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::Notify;
+
 use async_trait::async_trait;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED,
@@ -52,9 +54,17 @@ use boss_protocol::{
 use crate::automation_schedule::{next_occurrence_after, parse_cron, parse_timezone};
 use crate::work::{AutomationFireRecord, WorkDb};
 
-/// Default scheduler tick interval. Matches the design's
-/// `spawn_loop(... Duration::from_secs(30) ...)`.
-pub const AUTOMATION_SCHEDULER_INTERVAL: Duration = Duration::from_secs(30);
+/// Maximum time the scheduler sleeps between passes. Caps the sleep so
+/// the loop wakes at least hourly as a safety net, even with no automations
+/// or all automations scheduled far in the future.
+pub const AUTOMATION_SCHEDULER_MAX_SLEEP_SECS: u64 = 3600;
+
+/// Sleep interval used when enabled automations have an uninitialized
+/// `next_due_at` (i.e., created/updated but not yet seen by a scheduler
+/// pass). Short so a freshly-created automation's first occurrence is
+/// computed promptly even when no kick arrives before the scheduler's
+/// current sleep expires.
+pub const AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS: u64 = 5;
 
 /// Default catch-up window: an occurrence missed by more than this is
 /// considered stale and skipped. 15 minutes per the design — long enough
@@ -151,11 +161,24 @@ pub struct AutomationSchedulerPass {
 
 /// Spawn the scheduler loop. Fires immediately on boot (so a daily job whose
 /// occurrence elapsed while the engine was down is caught up without waiting
-/// a full interval) then ticks every `interval`.
+/// a full interval) then sleeps until the earliest of:
+///
+/// - The minimum `next_due_at` across all enabled automations (event-driven
+///   wake: the loop wakes exactly when the next automation is due rather than
+///   polling on a fixed coarse interval).
+/// - [`AUTOMATION_SCHEDULER_MAX_SLEEP_SECS`] (safety-net heartbeat for the
+///   no-automations and far-future-fire cases).
+/// - [`AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS`] when any enabled
+///   automation still has `next_due_at IS NULL` (bootstrap case: initialise
+///   the first occurrence promptly).
+/// - Immediate wake via `kick.notify_one()`, called by automation mutation
+///   handlers (create, update, enable, disable, delete) so the scheduler
+///   recomputes its sleep on every state change without waiting out the
+///   current interval.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     dispatcher: Arc<dyn TriageDispatcher>,
-    interval: Duration,
+    kick: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -173,9 +196,36 @@ pub fn spawn_loop(
                     "automation scheduler: pass complete",
                 );
             }
-            tokio::time::sleep(interval).await;
+            let sleep_secs = next_sleep_secs(work_db.as_ref(), now);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+                _ = kick.notified() => {}
+            }
         }
     })
+}
+
+/// Compute how many seconds the scheduler should sleep before its next pass.
+///
+/// Returns the number of seconds until the earliest `next_due_at` among all
+/// enabled `schedule` automations, clamped to
+/// `[1, AUTOMATION_SCHEDULER_MAX_SLEEP_SECS]`. Falls back to
+/// `AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS` when any automation is
+/// still uninitialized, and to `AUTOMATION_SCHEDULER_MAX_SLEEP_SECS` when
+/// no enabled automations exist.
+pub(crate) fn next_sleep_secs(work_db: &WorkDb, now: i64) -> u64 {
+    match work_db.list_min_next_due_at_for_scheduler() {
+        Err(_) => AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS,
+        Ok((_, true)) => AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS,
+        Ok((None, false)) => AUTOMATION_SCHEDULER_MAX_SLEEP_SECS,
+        Ok((Some(min_next_due), _)) => {
+            if min_next_due <= now {
+                1
+            } else {
+                (min_next_due - now).clamp(1, AUTOMATION_SCHEDULER_MAX_SLEEP_SECS as i64) as u64
+            }
+        }
+    }
 }
 
 fn now_epoch() -> i64 {
@@ -400,7 +450,8 @@ mod tests {
     use crate::work::{CreateChoreInput, CreateProductInput, WorkDb};
     use boss_protocol::{
         AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED,
-        AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT, AutomationTrigger, CreateAutomationInput,
+        AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT, AutomationPatch, AutomationTrigger,
+        CreateAutomationInput,
     };
 
     /// A dispatcher with a fixed verdict, recording every call.
@@ -748,5 +799,224 @@ mod tests {
         let expected_following = next_occurrence_after_str("0 14 * * *", "UTC", occ).unwrap().unwrap();
         let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
         assert_eq!(reloaded.next_due_at.unwrap().parse::<i64>().unwrap(), expected_following);
+    }
+
+    /// next_sleep_secs targets the earliest automation's next_due_at, not a
+    /// fixed coarse interval.
+    #[tokio::test]
+    async fn min_next_fire_sleep_targets_earliest_automation() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+
+        // Two automations: one due at 2pm, one at 3pm.
+        let early = create_daily_automation(&db, &product);
+        let late = db
+            .create_automation(
+                CreateAutomationInput::builder()
+                    .product_id(product.clone())
+                    .name("3pm")
+                    .trigger(AutomationTrigger::Schedule {
+                        cron: "0 15 * * *".to_owned(),
+                        timezone: "UTC".to_owned(),
+                    })
+                    .standing_instruction("x")
+                    .build(),
+            )
+            .unwrap();
+
+        let t2pm = utc_epoch(2026, 5, 28, 14, 0);
+        let t3pm = utc_epoch(2026, 5, 28, 15, 0);
+        db.initialize_automation_next_due_at(&early.id, t2pm).unwrap();
+        db.initialize_automation_next_due_at(&late.id, t3pm).unwrap();
+
+        // At 1pm, sleep should target 2pm (earliest).
+        let t1pm = utc_epoch(2026, 5, 28, 13, 0);
+        let sleep = next_sleep_secs(&db, t1pm);
+        assert_eq!(sleep as i64, t2pm - t1pm, "should sleep exactly until 2pm");
+
+        // After advancing early's next_due to tomorrow 2pm (simulating it fired),
+        // sleep should target today 3pm.
+        db.initialize_automation_next_due_at(&early.id, utc_epoch(2026, 5, 29, 14, 0))
+            .unwrap();
+        let t2pm_plus_5 = t2pm + 5;
+        let sleep2 = next_sleep_secs(&db, t2pm_plus_5);
+        assert_eq!(
+            sleep2 as i64,
+            t3pm - t2pm_plus_5,
+            "should target 3pm after 2pm fires"
+        );
+    }
+
+    /// With no enabled automations, next_sleep_secs falls back to the maximum.
+    #[test]
+    fn no_automations_sleep_is_max() {
+        let (_d, db) = open_db();
+        let sleep = next_sleep_secs(&db, utc_epoch(2026, 5, 28, 14, 0));
+        assert_eq!(sleep, AUTOMATION_SCHEDULER_MAX_SLEEP_SECS);
+    }
+
+    /// Uninitialized automation (next_due_at IS NULL) triggers the short poll.
+    #[tokio::test]
+    async fn uninitialized_automation_uses_short_poll() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        // Created but never seen by a scheduler pass → next_due_at IS NULL.
+        let _automation = create_daily_automation(&db, &product);
+        let sleep = next_sleep_secs(&db, utc_epoch(2026, 5, 28, 14, 0));
+        assert_eq!(sleep, AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS);
+    }
+
+    /// Two automations with distinct cron-minute fields each fire on their
+    /// correct minute; the scheduler does not wake between them (verified by
+    /// run_one_pass returning evaluated=0 between the two fire times).
+    #[tokio::test]
+    async fn two_automations_each_fire_on_correct_cron_minute() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+
+        // A fires at minute 21, B fires at minute 45, both in UTC.
+        let auto_a = db
+            .create_automation(
+                CreateAutomationInput::builder()
+                    .product_id(product.clone())
+                    .name("minute-21")
+                    .trigger(AutomationTrigger::Schedule {
+                        cron: "21 * * * *".to_owned(),
+                        timezone: "UTC".to_owned(),
+                    })
+                    .standing_instruction("x")
+                    .build(),
+            )
+            .unwrap();
+        let auto_b = db
+            .create_automation(
+                CreateAutomationInput::builder()
+                    .product_id(product.clone())
+                    .name("minute-45")
+                    .trigger(AutomationTrigger::Schedule {
+                        cron: "45 * * * *".to_owned(),
+                        timezone: "UTC".to_owned(),
+                    })
+                    .standing_instruction("y")
+                    .build(),
+            )
+            .unwrap();
+
+        // Initialise at 23:00; both automations pick up their correct minutes.
+        let t_23_00 = utc_epoch(2026, 5, 28, 23, 0);
+        let dispatcher = FakeDispatcher::dispatched();
+        let init_pass = run_one_pass(&db, t_23_00, &dispatcher).await;
+        assert_eq!(init_pass.initialized, 2);
+        assert_eq!(init_pass.fired, 0);
+
+        let a_next: i64 = db
+            .get_automation(&auto_a.id)
+            .unwrap()
+            .unwrap()
+            .next_due_at
+            .unwrap()
+            .parse()
+            .unwrap();
+        let b_next: i64 = db
+            .get_automation(&auto_b.id)
+            .unwrap()
+            .unwrap()
+            .next_due_at
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(a_next, utc_epoch(2026, 5, 28, 23, 21), "A must target minute 21");
+        assert_eq!(b_next, utc_epoch(2026, 5, 28, 23, 45), "B must target minute 45");
+
+        // Sleep should target A (earliest).
+        let sleep_after_init = next_sleep_secs(&db, t_23_00);
+        assert_eq!(sleep_after_init as i64, a_next - t_23_00);
+
+        // No evaluation between 23:00 and 23:21.
+        let t_23_10 = utc_epoch(2026, 5, 28, 23, 10);
+        let pass_between = run_one_pass(&db, t_23_10, &dispatcher).await;
+        assert_eq!(pass_between.evaluated, 0, "no automation due at 23:10");
+
+        // A fires at 23:21+5s; B must not fire yet.
+        let t_a_fire = a_next + 5;
+        let pass_a = run_one_pass(&db, t_a_fire, &dispatcher).await;
+        assert_eq!(pass_a.fired, 1, "only A should fire at 23:21");
+        assert_eq!(pass_a.evaluated, 1, "only A in the due list");
+        let a_calls: Vec<_> = dispatcher.calls.lock().unwrap().clone();
+        assert_eq!(a_calls.len(), 1);
+        assert_eq!(a_calls[0].1, a_next, "A must be dispatched for its cron minute");
+
+        // After A fires, sleep targets B.
+        let sleep_after_a = next_sleep_secs(&db, t_a_fire);
+        assert_eq!(sleep_after_a as i64, b_next - t_a_fire);
+
+        // B fires at 23:45+5s.
+        let t_b_fire = b_next + 5;
+        let pass_b = run_one_pass(&db, t_b_fire, &dispatcher).await;
+        assert_eq!(pass_b.fired, 1, "B fires at 23:45");
+        assert_eq!(pass_b.evaluated, 1, "only B in the due list");
+        let all_calls = dispatcher.calls.lock().unwrap().clone();
+        assert_eq!(all_calls[1].1, b_next, "B dispatched for its cron minute");
+    }
+
+    /// Updating a trigger resets next_due_at so the scheduler recomputes from
+    /// the new cron expression on the next pass (fixes the stale-schedule bug).
+    #[test]
+    fn update_trigger_resets_next_due_at() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_daily_automation(&db, &product); // 0 14 * * *
+        db.initialize_automation_next_due_at(&automation.id, utc_epoch(2026, 5, 28, 14, 0))
+            .unwrap();
+
+        // Confirm it is set.
+        let before = db.get_automation(&automation.id).unwrap().unwrap();
+        assert!(before.next_due_at.is_some());
+
+        // Change the trigger to a different cron.
+        db.update_automation(
+            &automation.id,
+            AutomationPatch {
+                trigger: Some(AutomationTrigger::Schedule {
+                    cron: "21 * * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // next_due_at must be NULL so the scheduler initialises from the new cron.
+        let after = db.get_automation(&automation.id).unwrap().unwrap();
+        assert!(
+            after.next_due_at.is_none(),
+            "next_due_at must be reset to NULL after trigger update"
+        );
+    }
+
+    /// Updating fields other than the trigger must NOT reset next_due_at.
+    #[test]
+    fn update_non_trigger_fields_preserve_next_due_at() {
+        let (_d, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_daily_automation(&db, &product);
+        let due = utc_epoch(2026, 5, 28, 14, 0);
+        db.initialize_automation_next_due_at(&automation.id, due).unwrap();
+
+        db.update_automation(
+            &automation.id,
+            AutomationPatch {
+                name: Some("renamed".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let after = db.get_automation(&automation.id).unwrap().unwrap();
+        assert_eq!(
+            after.next_due_at.unwrap().parse::<i64>().unwrap(),
+            due,
+            "non-trigger update must not touch next_due_at"
+        );
     }
 }

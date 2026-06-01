@@ -711,7 +711,7 @@ pub async fn serve(
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),
         automation_triage_dispatcher,
-        crate::automation_scheduler::AUTOMATION_SCHEDULER_INTERVAL,
+        server_state.automation_scheduler_kick.clone(),
     );
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
