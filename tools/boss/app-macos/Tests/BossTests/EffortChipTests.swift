@@ -83,7 +83,43 @@ final class EffortChipTests: XCTestCase {
         XCTAssertEqual(effortLetter(for: "large").count, 1)
     }
 
+    // MARK: - Empty / Blank Effort (must not render an empty pill)
+
+    /// A blank or whitespace-only effort_level on the wire must be treated as
+    /// unset so the card does not render an empty gray pill in the leftmost
+    /// metadata slot. Mirrors the call-site guard in ContentView and the
+    /// parse-time normalization in EngineClient.
+    func testEmptyEffortIsTreatedAsUnset() {
+        XCTAssertFalse(shouldRenderEffortChip(for: ""))
+    }
+
+    func testWhitespaceOnlyEffortIsTreatedAsUnset() {
+        XCTAssertFalse(shouldRenderEffortChip(for: "   "))
+        XCTAssertFalse(shouldRenderEffortChip(for: "\n\t"))
+    }
+
+    func testNilEffortIsTreatedAsUnset() {
+        XCTAssertFalse(shouldRenderEffortChip(for: nil))
+    }
+
+    func testKnownEffortLevelsRender() {
+        for level in ["trivial", "small", "medium", "large", "max"] {
+            XCTAssertTrue(shouldRenderEffortChip(for: level), "expected \(level) to render")
+        }
+    }
+
     // MARK: - Helpers (mirrors EffortChip private functions)
+
+    /// Returns whether an effort chip should be rendered for a wire-supplied
+    /// effort_level value. Mirrors the guard in ContentView's card footer and
+    /// the normalization in EngineClient.parseTask.
+    private func shouldRenderEffortChip(for effortLevel: String?) -> Bool {
+        guard let effortLevel,
+              !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return true
+    }
 
     /// Returns the badge display text for an effort level.
     /// Mirrors the EffortChip.letter computed property.

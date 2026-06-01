@@ -1834,7 +1834,8 @@ struct WorkBoardCardView: View {
                         if parsedPriority == .high {
                             PriorityChip(priority: parsedPriority)
                         }
-                        if let effortLevel = task.effortLevel {
+                        if let effortLevel = task.effortLevel,
+                           !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             EffortChip(effortLevel: effortLevel)
                         }
                         if let projectName, !projectName.isEmpty {
