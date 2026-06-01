@@ -108,6 +108,10 @@ final class ChatViewModel: ObservableObject {
     /// leaves the badge. Views observe this to apply a transient
     /// amber border on every frontier card.
     @Published private(set) var depFrontierHighlightIDs: Set<String> = []
+    /// Set of revision task IDs to highlight when the pointer is over an
+    /// "In revision" badge. Computed by `setRevisionBadgeHover`; cleared
+    /// on pointer exit. Uses the same green-border overlay as dep frontier.
+    @Published private(set) var revisionHighlightIDs: Set<String> = []
     /// Task id that scroll views should bring into the visible area.
     /// Set by `revealWorkCard`; cleared after a short delay once the
     /// scroll has been triggered. Views observe this via `.onChange`
@@ -2841,6 +2845,30 @@ final class ChatViewModel: ObservableObject {
             return
         }
         depFrontierHighlightIDs = actionablePrereqFrontier(for: taskID)
+    }
+
+    /// Called when the pointer enters or leaves an "In revision" badge on a
+    /// kanban card. On enter, collects all active (todo/active) revision tasks
+    /// whose `parentTaskId` matches `taskID` and highlights them with the same
+    /// green-border overlay used by the dep frontier. On leave (`nil`), clears.
+    func setRevisionBadgeHover(_ taskID: String?) {
+        guard let taskID else {
+            revisionHighlightIDs = []
+            return
+        }
+        let matches: (WorkTask) -> Bool = {
+            $0.kind == "revision"
+                && $0.parentTaskId == taskID
+                && ($0.status == "todo" || $0.status == "active")
+        }
+        var ids: Set<String> = []
+        for tasks in tasksByProjectID.values {
+            ids.formUnion(tasks.filter(matches).map(\.id))
+        }
+        for revisions in productLevelRevisionsByProductID.values {
+            ids.formUnion(revisions.filter(matches).map(\.id))
+        }
+        revisionHighlightIDs = ids
     }
 
     /// Transitively walks the prerequisite DAG from `taskID` and

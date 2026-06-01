@@ -855,11 +855,12 @@ struct ContentView: View {
         let selectedID = model.selectedTask?.id
         let highlightID = model.revealHighlightID
         let frontierIDs = model.depFrontierHighlightIDs
+        let revisionIDs = model.revisionHighlightIDs
         VStack(alignment: .leading, spacing: 10) {
             ForEach(items) { task in
                 let isSelected = selectedID == task.id
                 let isRevealed = highlightID == task.id
-                let isFrontierHighlighted = frontierIDs.contains(task.id)
+                let isFrontierHighlighted = frontierIDs.contains(task.id) || revisionIDs.contains(task.id)
                 WorkBoardCardItem(
                     task: task,
                     projectName: model.cardProjectBadge(for: task),
@@ -1493,6 +1494,9 @@ private struct WorkBoardCardItem: View {
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
                     },
+                    onRevisionBadgeHover: { hovering in
+                        model.setRevisionBadgeHover(hovering ? task.id : nil)
+                    },
                     onOpenReviewTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
                         ? { model.openReviewTerminal(for: task) }
                         : nil,
@@ -1724,6 +1728,9 @@ struct WorkBoardCardView: View {
     /// `nil` when the card doesn't need to report badge hover (e.g.
     /// in the Designs viewer).
     var onDepBadgeHover: ((Bool) -> Void)? = nil
+    /// Called with `true` when the pointer enters the "In revision" badge;
+    /// `false` on exit. Same hover-highlight protocol as `onDepBadgeHover`.
+    var onRevisionBadgeHover: ((Bool) -> Void)? = nil
     /// Invoked when the user taps the terminal icon on a Review-column
     /// card. `nil` hides the button — callers only pass a closure when
     /// `column == .review && task.prURL != nil`.
@@ -1960,6 +1967,9 @@ struct WorkBoardCardView: View {
                     )
                     if task.hasInProgressRevision {
                         PrInRevisionIndicator()
+                            .onHover { hovering in
+                                onRevisionBadgeHover?(hovering)
+                            }
                     }
                     Spacer(minLength: 0)
                 }
