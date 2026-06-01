@@ -1,4 +1,5 @@
 use super::*;
+use super::server::{current_parent_pid, pid_is_alive};
 use crate::protocol::TopicEventPayload;
 
 fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {

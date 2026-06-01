@@ -1,4 +1,6 @@
 use super::*;
+use super::super::server::process_group_signal_target;
+use super::super::worker_events::extract_last_assistant_text;
 
 #[test]
 fn process_group_signal_target_negates_pgid_for_live_pid() {
