@@ -8,10 +8,10 @@ use boss_client::{
     stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
-    CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
-    CreateAutomationInput, CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateRevisionInput,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
+    AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
+    CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateRevisionInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
     DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
     FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
@@ -122,6 +122,18 @@ enum Commands {
     Automation {
         #[command(subcommand)]
         command: AutomationCommand,
+    },
+    /// Manage attentions: actionable notifications agents raise to pull the
+    /// human into the loop (questions and followups).
+    ///
+    /// Attentions group into attention groups (`A<n>` or `atg_…` ids); the
+    /// group is the unit the human reads and acts on, producing a single
+    /// downstream artifact when actioned.
+    ///
+    /// See `tools/boss/docs/designs/attentions.md` for the full design.
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommand,
     },
     Engine {
         #[command(subcommand)]
@@ -522,6 +534,178 @@ enum AutomationCommand {
     Runs(AutomationSelectorArgs),
     /// List the tasks produced by an automation and their current status.
     Tasks(AutomationSelectorArgs),
+}
+
+/// Subcommands under `boss attention …`.
+///
+/// An attention group collects related questions or followups raised by an
+/// agent. Group selectors accept `A<n>` (requires `--product`) or the
+/// canonical `atg_…` id. Individual attention members are referenced by
+/// their `atn_…` id.
+#[derive(Debug, Subcommand)]
+enum AttentionCommand {
+    /// List attention groups for a product.
+    ///
+    /// Defaults to open and partially-answered groups.
+    List(AttentionListArgs),
+    /// Show a single attention group.
+    ///
+    /// Note: `A<n>` selectors only resolve active (open / partially-answered)
+    /// groups. Use the `atg_…` primary id to show actioned or dismissed groups.
+    Show(AttentionGroupSelectorArgs),
+    /// Create a new attention member (question or followup).
+    ///
+    /// The engine finds or creates the owning group based on the association
+    /// and source fields.
+    Create(AttentionCreateArgs),
+    /// Record an answer for one attention member (`atn_…`).
+    Answer(AttentionAnswerArgs),
+    /// Dismiss an attention group or member without producing an artifact.
+    ///
+    /// Accepts `A<n>`, `atg_…` (group), or `atn_…` (member).
+    Dismiss(AttentionDismissArgs),
+    /// Finalize a group: produce the downstream artifact and close the group.
+    ///
+    /// For question groups: creates a revision task (open PR) or fresh design
+    /// task (merged doc). For followup groups: batch-creates accepted followups
+    /// as tasks. Requires all members to be in a terminal answer-state; use
+    /// `--skip-unanswered` to automatically skip any remaining open members.
+    Action(AttentionActionArgs),
+}
+
+#[derive(Debug, Args)]
+struct AttentionListArgs {
+    /// Product whose attention groups to list.
+    #[arg(long)]
+    product: Option<String>,
+    /// Filter to groups associated with this project (`P<n>` or `proj_…`).
+    #[arg(long)]
+    project: Option<String>,
+    /// Filter to groups associated with this task (`T<n>` or `task_…`).
+    #[arg(long)]
+    task: Option<String>,
+    /// Filter by kind: `question` or `followup`.
+    #[arg(long)]
+    kind: Option<String>,
+    /// Filter by state: `open`, `partially_answered`, `actioned`, `dismissed`.
+    /// Defaults to `open` + `partially_answered` when omitted.
+    #[arg(long)]
+    state: Option<String>,
+    /// Also expand individual attention members for each group.
+    ///
+    /// Member data is not yet available via the current protocol; this flag
+    /// is reserved for a future protocol update.
+    #[arg(long)]
+    members: bool,
+}
+
+#[derive(Debug, Args)]
+struct AttentionGroupSelectorArgs {
+    /// Attention group selector: `A<n>` (e.g. `A3`) or canonical `atg_…` id.
+    selector: String,
+    /// Product context for `A<n>` selectors. Not needed for `atg_…` ids.
+    #[arg(long)]
+    product: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AttentionCreateArgs {
+    /// Kind of attention to create: `question` or `followup`.
+    #[arg(long)]
+    kind: String,
+    /// Associated project (`P<n>` or `proj_…`). Exactly one of
+    /// `--project` / `--task` is required.
+    #[arg(long)]
+    project: Option<String>,
+    /// Associated task (`T<n>` or `task_…`). Exactly one of
+    /// `--project` / `--task` is required.
+    #[arg(long)]
+    task: Option<String>,
+    /// Join an existing open group (`A<n>` or `atg_…`) rather than letting
+    /// the engine derive the group from the association and source fields.
+    #[arg(long)]
+    group: Option<String>,
+    /// Explicit grouping-key override. Ignored when `--group` is set.
+    #[arg(long)]
+    group_key: Option<String>,
+    // --- question fields ---
+    /// Question type: `yes_no`, `multiple_choice`, or `prompt` (free text).
+    #[arg(long)]
+    question_type: Option<String>,
+    /// The question text shown to the human.
+    #[arg(long)]
+    prompt: Option<String>,
+    /// Choice option for `multiple_choice` questions. Pass multiple times.
+    #[arg(long = "choice")]
+    choices: Vec<String>,
+    // --- followup fields ---
+    /// Proposed task name (for `followup` kind).
+    #[arg(long)]
+    name: Option<String>,
+    /// Proposed task description (for `followup` kind).
+    #[arg(long)]
+    description: Option<String>,
+    /// Effort hint: `trivial`, `small`, `medium`, `large`, `max`.
+    #[arg(long)]
+    effort: Option<String>,
+    /// Proposed work kind: `task`, `chore`, or `project`.
+    #[arg(long)]
+    work_kind: Option<String>,
+    /// Why the agent suggested this followup.
+    #[arg(long)]
+    rationale: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AttentionAnswerArgs {
+    /// Attention member id (`atn_…`).
+    id: String,
+    /// Answer `yes` (for `yes_no` questions).
+    #[arg(long)]
+    yes: bool,
+    /// Answer `no` (for `yes_no` questions).
+    #[arg(long)]
+    no: bool,
+    /// Chosen value or index (for `multiple_choice` questions).
+    #[arg(long)]
+    choice: Option<String>,
+    /// Free-text answer (for `prompt` questions).
+    #[arg(long)]
+    answer: Option<String>,
+    /// Mark the member `skipped` without providing an answer.
+    #[arg(long)]
+    skip: bool,
+}
+
+#[derive(Debug, Args)]
+struct AttentionDismissArgs {
+    /// What to dismiss: `A<n>` or `atg_…` (whole group) or `atn_…` (one member).
+    id: String,
+    /// Product context for `A<n>` group selectors.
+    #[arg(long)]
+    product: Option<String>,
+    /// Optional reason for the dismissal.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AttentionActionArgs {
+    /// Attention group selector: `A<n>` (e.g. `A3`) or canonical `atg_…` id.
+    selector: String,
+    /// Product context for `A<n>` selectors. Not needed for `atg_…` ids.
+    #[arg(long)]
+    product: Option<String>,
+    /// Automatically skip any unanswered members before actioning.
+    ///
+    /// Without this flag every member must be in a terminal answer-state
+    /// (`answered`, `skipped`, or `dismissed`) before the group can be
+    /// actioned.
+    #[arg(long)]
+    skip_unanswered: bool,
+    /// Proceed without the interactive confirmation prompt.
+    #[arg(long)]
+    confirm: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2275,6 +2459,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Automation { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_automation_command(command, &ctx).await
+        }
+        Commands::Attention { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_attention_command(command, &ctx).await
         }
         Commands::Engine { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
@@ -4235,6 +4423,531 @@ async fn run_automation_command(
                     print_tasks_table(&tasks, false);
                 }
             })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attention group selector parsing
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum AttentionGroupSelector {
+    /// `atg_…` primary id.
+    PrimaryId(String),
+    /// `A<n>` per-product short id (requires product context at resolution time).
+    ShortId(i64),
+}
+
+fn parse_attention_group_selector(s: &str) -> Result<AttentionGroupSelector, CliError> {
+    let s = s.trim();
+    if s.starts_with("atg_") {
+        return Ok(AttentionGroupSelector::PrimaryId(s.to_owned()));
+    }
+    if s.len() >= 2 {
+        let first = s.as_bytes()[0];
+        if first == b'A' || first == b'a' {
+            if let Ok(n) = s[1..].parse::<i64>() {
+                if n > 0 {
+                    return Ok(AttentionGroupSelector::ShortId(n));
+                }
+            }
+        }
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        if n > 0 {
+            return Ok(AttentionGroupSelector::ShortId(n));
+        }
+    }
+    Err(CliError::usage(format!(
+        "attention group selector must be A<n> (e.g. A1) or an atg_… id; got {s:?}"
+    )))
+}
+
+/// Resolve an attention group selector to a full `AttentionGroup` row.
+///
+/// For `atg_…` ids the product is not needed. For `A<n>` selectors, a
+/// `product` must be provided (resolved by the caller beforehand).
+///
+/// Note: `A<n>` resolution lists only open/partially-answered groups. Use
+/// the `atg_…` primary id to reference actioned or dismissed groups.
+async fn resolve_attention_group(
+    client: &mut BossClient,
+    selector: &str,
+    product: Option<&Product>,
+) -> Result<AttentionGroup, CliError> {
+    match parse_attention_group_selector(selector)? {
+        AttentionGroupSelector::PrimaryId(id) => get_attention_group(client, &id).await,
+        AttentionGroupSelector::ShortId(n) => {
+            let product = product.ok_or_else(|| {
+                CliError::usage(
+                    "A<n> selectors require --product to identify the attention group namespace",
+                )
+            })?;
+            let groups =
+                list_attention_groups(client, &product.id, None, None, None, None).await?;
+            groups
+                .into_iter()
+                .find(|g| g.short_id == Some(n))
+                .ok_or_else(|| {
+                    CliError::not_found(format!(
+                        "no active attention group A{n} found in product '{}' \
+                         (use the atg_… id to reference actioned or dismissed groups)",
+                        product.slug
+                    ))
+                })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attention RPC helpers
+// ---------------------------------------------------------------------------
+
+async fn list_attention_groups(
+    client: &mut BossClient,
+    product_id: &str,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    kind: Option<String>,
+    state: Option<String>,
+) -> Result<Vec<AttentionGroup>, CliError> {
+    match client
+        .send_request(&FrontendRequest::ListAttentionGroups {
+            product_id: product_id.to_owned(),
+            project_id,
+            task_id,
+            kind,
+            state,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionGroupsList { groups, .. } => Ok(groups),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention list", &other)),
+    }
+}
+
+async fn get_attention_group(
+    client: &mut BossClient,
+    id: &str,
+) -> Result<AttentionGroup, CliError> {
+    match client
+        .send_request(&FrontendRequest::GetAttentionGroup { id: id.to_owned() })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionGroupResult { group } => Ok(group),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention show", &other)),
+    }
+}
+
+async fn create_attention_rpc(
+    client: &mut BossClient,
+    input: CreateAttentionInput,
+) -> Result<(Attention, AttentionGroup), CliError> {
+    match client
+        .send_request(&FrontendRequest::CreateAttention { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionCreated { attention, group } => Ok((attention, group)),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention create", &other)),
+    }
+}
+
+async fn answer_attention_rpc(
+    client: &mut BossClient,
+    id: &str,
+    answer: Option<String>,
+    skip: bool,
+    dismiss: bool,
+) -> Result<AttentionGroup, CliError> {
+    match client
+        .send_request(&FrontendRequest::AnswerAttention {
+            id: id.to_owned(),
+            answer,
+            skip,
+            dismiss,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionGroupUpdated { group } => Ok(group),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention answer", &other)),
+    }
+}
+
+async fn action_attention_group_rpc(
+    client: &mut BossClient,
+    id: &str,
+    skip_unanswered: bool,
+) -> Result<AttentionGroup, CliError> {
+    match client
+        .send_request(&FrontendRequest::ActionAttentionGroup {
+            id: id.to_owned(),
+            skip_unanswered,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionGroupActioned { group } => Ok(group),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention action", &other)),
+    }
+}
+
+async fn dismiss_attention_rpc(
+    client: &mut BossClient,
+    id: &str,
+    reason: Option<String>,
+) -> Result<AttentionGroup, CliError> {
+    match client
+        .send_request(&FrontendRequest::DismissAttention {
+            id: id.to_owned(),
+            reason,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::AttentionGroupUpdated { group } => Ok(group),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("attention dismiss", &other)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attention display helpers
+// ---------------------------------------------------------------------------
+
+fn print_attention_groups_table(groups: &[AttentionGroup]) {
+    let mut table = Table::new();
+    table
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(["ID", "SHORT", "KIND", "STATE", "ASSOCIATION", "CREATED"]);
+    for g in groups {
+        let short = g
+            .short_id
+            .map(|n| format!("A{n}"))
+            .unwrap_or_default();
+        let assoc = g
+            .association_project_id
+            .as_deref()
+            .or(g.association_task_id.as_deref())
+            .unwrap_or("-");
+        table.add_row([
+            g.id.as_str(),
+            short.as_str(),
+            g.kind.as_str(),
+            g.state.as_str(),
+            assoc,
+            g.created_at.as_str(),
+        ]);
+    }
+    println!("{table}");
+}
+
+fn print_attention_group_details(label: &str, g: &AttentionGroup) {
+    println!("{label}: {}", g.id);
+    if let Some(n) = g.short_id {
+        println!("  Short ID  : A{n}");
+    }
+    println!("  Kind      : {}", g.kind);
+    println!("  State     : {}", g.state);
+    println!("  Source    : {}", g.source_kind);
+    if let Some(ref id) = g.association_project_id {
+        println!("  Project   : {id}");
+    }
+    if let Some(ref id) = g.association_task_id {
+        println!("  Task      : {id}");
+    }
+    if let Some(ref path) = g.source_doc_path {
+        println!("  Doc path  : {path}");
+    }
+    if let Some(ref task_id) = g.source_task_id {
+        println!("  Source task: {task_id}");
+    }
+    if let Some(ref kind) = g.produced_artifact_kind {
+        println!("  Artifact  : {kind}");
+        if let Some(ref r) = g.produced_artifact_ref {
+            println!("  Ref       : {r}");
+        }
+    }
+    println!("  Created   : {}", g.created_at);
+    if let Some(ref t) = g.actioned_at {
+        println!("  Actioned  : {t}");
+    }
+    if let Some(ref t) = g.dismissed_at {
+        println!("  Dismissed : {t}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attention command handler
+// ---------------------------------------------------------------------------
+
+async fn run_attention_command(
+    command: AttentionCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    match command {
+        AttentionCommand::List(args) => {
+            let product = resolve_product(&mut client, args.product, ctx).await?;
+            let project_id = if let Some(sel) = args.project {
+                Some(
+                    resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?,
+                )
+            } else {
+                None
+            };
+            let task_id = if let Some(sel) = args.task {
+                Some(
+                    resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?,
+                )
+            } else {
+                None
+            };
+            let groups = list_attention_groups(
+                &mut client,
+                &product.id,
+                project_id,
+                task_id,
+                args.kind,
+                args.state,
+            )
+            .await?;
+            print_entity(ctx, &serde_json::json!({ "attention_groups": groups }), || {
+                if groups.is_empty() {
+                    println!(
+                        "No attention groups found for product '{}'.",
+                        product.slug
+                    );
+                } else {
+                    print_attention_groups_table(&groups);
+                }
+            })
+        }
+
+        AttentionCommand::Show(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let group =
+                resolve_attention_group(&mut client, &args.selector, product.as_ref()).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "attention_group": group }),
+                || {
+                    print_attention_group_details("Attention group", &group);
+                },
+            )
+        }
+
+        AttentionCommand::Create(args) => {
+            if args.project.is_none() && args.task.is_none() {
+                return Err(CliError::usage(
+                    "exactly one of --project or --task is required",
+                ));
+            }
+            if args.project.is_some() && args.task.is_some() {
+                return Err(CliError::usage(
+                    "--project and --task are mutually exclusive",
+                ));
+            }
+            let association_project_id = if let Some(sel) = args.project {
+                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
+            } else {
+                None
+            };
+            let association_task_id = if let Some(sel) = args.task {
+                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
+            } else {
+                None
+            };
+            let choice_options = if args.choices.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&args.choices).map_err(CliError::internal)?)
+            };
+            let input = CreateAttentionInput::builder()
+                .kind(args.kind)
+                .maybe_group_id(args.group)
+                .maybe_group_key(args.group_key)
+                .maybe_association_project_id(association_project_id)
+                .maybe_association_task_id(association_task_id)
+                .maybe_source_kind(Some("manual".to_owned()))
+                .maybe_question_type(args.question_type)
+                .maybe_prompt_text(args.prompt)
+                .maybe_choice_options(choice_options)
+                .maybe_proposed_name(args.name)
+                .maybe_proposed_description(args.description)
+                .maybe_proposed_effort(args.effort)
+                .maybe_proposed_work_kind(args.work_kind)
+                .maybe_rationale(args.rationale)
+                .build();
+            let (attention, group) = create_attention_rpc(&mut client, input).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "attention": attention, "attention_group": group }),
+                || {
+                    if !ctx.quiet {
+                        let short = group
+                            .short_id
+                            .map(|n| format!("A{n}"))
+                            .unwrap_or_else(|| group.id.clone());
+                        println!(
+                            "Created attention {} in group {short} (state: {})",
+                            attention.id, group.state
+                        );
+                    }
+                },
+            )
+        }
+
+        AttentionCommand::Answer(args) => {
+            let flag_count = [
+                args.yes,
+                args.no,
+                args.skip,
+                args.choice.is_some(),
+                args.answer.is_some(),
+            ]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+            if flag_count > 1 {
+                return Err(CliError::usage(
+                    "--yes, --no, --choice, --answer, and --skip are mutually exclusive",
+                ));
+            }
+            if flag_count == 0 {
+                return Err(CliError::usage(
+                    "one of --yes, --no, --choice <v>, --answer <text>, or --skip is required",
+                ));
+            }
+            let (answer, skip, dismiss) = if args.yes {
+                (Some("yes".to_owned()), false, false)
+            } else if args.no {
+                (Some("no".to_owned()), false, false)
+            } else if let Some(choice) = args.choice {
+                (Some(choice), false, false)
+            } else if let Some(ans) = args.answer {
+                (Some(ans), false, false)
+            } else {
+                (None, true, false)
+            };
+            let group =
+                answer_attention_rpc(&mut client, &args.id, answer, skip, dismiss).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "attention_group": group }),
+                || {
+                    if !ctx.quiet {
+                        println!(
+                            "Recorded answer for {} (group state: {})",
+                            args.id, group.state
+                        );
+                    }
+                },
+            )
+        }
+
+        AttentionCommand::Dismiss(args) => {
+            // The engine discriminates atg_… (group) vs atn_… (member) by prefix.
+            // A<n> selectors refer to groups and need product resolution.
+            let resolved_id = if args.id.starts_with("atg_") || args.id.starts_with("atn_") {
+                args.id.clone()
+            } else {
+                let product =
+                    resolve_optional_product(&mut client, args.product.clone(), ctx).await?;
+                let group =
+                    resolve_attention_group(&mut client, &args.id, product.as_ref()).await?;
+                group.id
+            };
+            let group = dismiss_attention_rpc(&mut client, &resolved_id, args.reason).await?;
+            print_entity(
+                ctx,
+                &serde_json::json!({ "attention_group": group }),
+                || {
+                    if !ctx.quiet {
+                        println!(
+                            "Dismissed {} (group state: {})",
+                            resolved_id, group.state
+                        );
+                    }
+                },
+            )
+        }
+
+        AttentionCommand::Action(args) => {
+            let product = resolve_optional_product(&mut client, args.product, ctx).await?;
+            let group =
+                resolve_attention_group(&mut client, &args.selector, product.as_ref()).await?;
+            if !args.confirm {
+                if !ctx.allow_input {
+                    return Err(CliError::usage(
+                        "pass --confirm to action the group non-interactively (or --no-input is set)",
+                    ));
+                }
+                // Interactive confirmation.
+                let short = group
+                    .short_id
+                    .map(|n| format!("A{n}"))
+                    .unwrap_or_else(|| group.id.clone());
+                print!(
+                    "Action group {short} ({kind}, {state})? [y/N]: ",
+                    kind = group.kind,
+                    state = group.state
+                );
+                io::stdout().flush().map_err(CliError::internal)?;
+                let mut line = String::new();
+                io::stdin().read_line(&mut line).map_err(CliError::internal)?;
+                if !matches!(line.trim(), "y" | "Y" | "yes" | "Yes") {
+                    if !ctx.quiet {
+                        println!("Aborted.");
+                    }
+                    return Ok(());
+                }
+            }
+            let actioned =
+                action_attention_group_rpc(&mut client, &group.id, args.skip_unanswered).await?;
+            let produced_kind = actioned.produced_artifact_kind.clone();
+            let produced_ref = actioned.produced_artifact_ref.clone();
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "attention_group": actioned,
+                    "produced": {
+                        "kind": produced_kind,
+                        "ref": produced_ref,
+                    }
+                }),
+                || {
+                    if !ctx.quiet {
+                        let artifact = produced_kind.as_deref().unwrap_or("none");
+                        let artifact_ref = produced_ref.as_deref().unwrap_or("");
+                        println!(
+                            "Actioned group {} → produced {artifact} {artifact_ref}",
+                            actioned.id
+                        );
+                    }
+                },
+            )
         }
     }
 }
@@ -8191,14 +8904,15 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem, ChoreCommand, Cli,
-        Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand,
-        ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, RunContext, TaskCommand,
-        TaskStatus, classify_bind_pr, classify_lint_finding, compile_schedule,
+        AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem,
+        ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction,
+        ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, RunContext,
+        TaskCommand, TaskStatus, classify_bind_pr, classify_lint_finding, compile_schedule,
         decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
         format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
-        lint_summary_line, parse_automation_selector, pick_by_index, short_name_for,
-        split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
+        lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
+        short_name_for, split_shake_report, status_vocab, validate_github_pr_url,
+        with_display_status,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
@@ -10220,5 +10934,32 @@ mod tests {
     fn parse_automation_selector_rejects_unknown_form() {
         assert!(parse_automation_selector("randomstring").is_err());
         assert!(parse_automation_selector("T42").is_err()); // task id — wrong namespace
+    }
+
+    // --- attention group selector parsing tests ---
+
+    #[test]
+    fn parse_attention_group_selector_primary_id() {
+        let sel = parse_attention_group_selector("atg_abc123").unwrap();
+        assert!(matches!(sel, AttentionGroupSelector::PrimaryId(id) if id == "atg_abc123"));
+    }
+
+    #[test]
+    fn parse_attention_group_selector_short_id_uppercase() {
+        let sel = parse_attention_group_selector("A3").unwrap();
+        assert!(matches!(sel, AttentionGroupSelector::ShortId(3)));
+    }
+
+    #[test]
+    fn parse_attention_group_selector_short_id_lowercase() {
+        let sel = parse_attention_group_selector("a12").unwrap();
+        assert!(matches!(sel, AttentionGroupSelector::ShortId(12)));
+    }
+
+    #[test]
+    fn parse_attention_group_selector_rejects_unknown_form() {
+        assert!(parse_attention_group_selector("randomstring").is_err());
+        assert!(parse_attention_group_selector("auto_abc").is_err()); // automation id — wrong namespace
+        assert!(parse_attention_group_selector("T42").is_err()); // task id — wrong namespace
     }
 }
