@@ -591,6 +591,29 @@ pub async fn serve(
         Duration::from_secs(60),
     );
 
+    // Periodic pool-claim reconciler: detects worker-pool slots still
+    // claimed by an execution that is terminal in the DB and has NO live
+    // worker pane, and releases the leaked claim. Every other release
+    // path (completion's `release_worker_pane`, the dead-pid / stale-
+    // worker / transient-recovery sweeps) keys off a *live* worker, so a
+    // claim whose execution terminated without a live pane — a mid-spawn
+    // cancel, a `finalize_pr_transition` DB-error early-return, a teardown
+    // that dropped the run→slot mapping but not the claim, a
+    // `bossctl agents stop` that freed the cube lease but not the claim —
+    // is released by nothing and outlives its execution forever. Once all
+    // automation slots leak this way, automation dispatch wedges with no
+    // self-healing. This sweep walks the pool's OWN claimed slots (not the
+    // live-state registry) to close that gap. Runs every 60s and fires on
+    // boot so a pool wedged before a restart self-heals without an
+    // operator restart.
+    let _pool_claim_sweep_handle = crate::pool_claim_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.execution_coordinator.clone(),
+        server_state.dispatch_events.clone(),
+        crate::pool_claim_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic stale-worker liveness backstop: detects worker slots whose
     // `claude` process is still alive but has made no transcript progress
     // (no hook event) for longer than the staleness threshold while

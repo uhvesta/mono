@@ -617,6 +617,34 @@ struct WorkerSlot {
     last_workspace_id: Option<String>,
 }
 
+/// A snapshot of one currently-claimed worker-pool slot: which logical
+/// worker id is held and by which execution. Returned by
+/// [`WorkerPool::claims`] so the pool-claim reconciler (and any
+/// occupancy report) can pair a held slot with its execution and decide
+/// whether the claim has outlived its execution. Unlike
+/// [`WorkerPool::claimed_execution_ids`] (a bare set), this preserves the
+/// `worker_id → execution_id` mapping the reconciler needs for a safe
+/// compare-and-release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerClaim {
+    pub worker_id: String,
+    pub execution_id: String,
+}
+
+/// Emit a structured `worker_pool_claim` log pairing a slot with the
+/// execution that just claimed it. Mirrors the release log in
+/// [`WorkerPool::release_worker`]; together they make pool occupancy
+/// observable from the engine log (and let an operator reconstruct
+/// "which execution holds each claim" without instrumenting the pool).
+fn log_pool_claim(worker_id: &str, execution_id: &str, selection: &str) {
+    tracing::info!(
+        worker_id,
+        execution_id,
+        selection,
+        "worker_pool_claim worker claimed"
+    );
+}
+
 impl WorkerPool {
     pub fn new(size: usize) -> Self {
         Self::new_with_prefix(size, "worker-", MAX_WORKER_POOL_SIZE)
@@ -674,7 +702,9 @@ impl WorkerPool {
             }) {
                 let worker = &mut inner.workers[idx];
                 worker.execution_id = Some(execution_id.to_owned());
-                return Some(worker.worker_id.clone());
+                let worker_id = worker.worker_id.clone();
+                log_pool_claim(&worker_id, execution_id, "affinity");
+                return Some(worker_id);
             }
         }
 
@@ -688,7 +718,9 @@ impl WorkerPool {
         let chosen_idx = *inner.rng.choice(&free)?;
         let worker = &mut inner.workers[chosen_idx];
         worker.execution_id = Some(execution_id.to_owned());
-        Some(worker.worker_id.clone())
+        let worker_id = worker.worker_id.clone();
+        log_pool_claim(&worker_id, execution_id, "random");
+        Some(worker_id)
     }
 
     /// Skip-the-queue claim used by `bossctl agents launch`. Same
@@ -713,7 +745,9 @@ impl WorkerPool {
             }) {
                 let worker = &mut inner.workers[idx];
                 worker.execution_id = Some(execution_id.to_owned());
-                return Some(worker.worker_id.clone());
+                let worker_id = worker.worker_id.clone();
+                log_pool_claim(&worker_id, execution_id, "force-affinity");
+                return Some(worker_id);
             }
         }
 
@@ -727,7 +761,9 @@ impl WorkerPool {
         if let Some(&idx) = inner.rng.choice(&free) {
             let worker = &mut inner.workers[idx];
             worker.execution_id = Some(execution_id.to_owned());
-            return Some(worker.worker_id.clone());
+            let worker_id = worker.worker_id.clone();
+            log_pool_claim(&worker_id, execution_id, "force-random");
+            return Some(worker_id);
         }
 
         // Every existing slot is busy. Grow the pool — bounded by the
@@ -744,6 +780,7 @@ impl WorkerPool {
         };
         let id = worker.worker_id.clone();
         inner.workers.push(worker);
+        log_pool_claim(&id, execution_id, "force-grow");
         Some(id)
     }
 
@@ -757,11 +794,78 @@ impl WorkerPool {
             .iter_mut()
             .find(|worker| worker.worker_id == worker_id)
         {
-            worker.execution_id = None;
+            let released_execution = worker.execution_id.take();
             if let Some(workspace_id) = last_workspace_id {
                 worker.last_workspace_id = Some(workspace_id.to_owned());
             }
+            if let Some(execution_id) = released_execution {
+                tracing::info!(
+                    worker_id,
+                    execution_id = %execution_id,
+                    "worker_pool_release worker freed"
+                );
+            }
         }
+    }
+
+    /// Compare-and-release: free `worker_id` back to the idle pool only
+    /// if it is currently claimed by exactly `execution_id`. Returns
+    /// `true` when the slot was released, `false` when the slot was not
+    /// found or is claimed by a different (or no) execution.
+    ///
+    /// This is the reconciler-safe variant of [`Self::release_worker`].
+    /// The pool-claim reconciler snapshots a leaked claim, then releases
+    /// it on a later await; in the gap between the two, normal teardown
+    /// could have freed the slot and a fresh dispatch could have
+    /// re-claimed the SAME slot for a different, live execution. An
+    /// unconditional `release_worker` would yank that new claim; the
+    /// execution-id guard makes the release a no-op in that race.
+    pub async fn release_worker_if_execution(
+        &self,
+        worker_id: &str,
+        execution_id: &str,
+        last_workspace_id: Option<&str>,
+    ) -> bool {
+        let mut inner = self.inner.lock().await;
+        if let Some(worker) = inner
+            .workers
+            .iter_mut()
+            .find(|worker| worker.worker_id == worker_id)
+        {
+            if worker.execution_id.as_deref() == Some(execution_id) {
+                worker.execution_id = None;
+                if let Some(workspace_id) = last_workspace_id {
+                    worker.last_workspace_id = Some(workspace_id.to_owned());
+                }
+                tracing::info!(
+                    worker_id,
+                    execution_id,
+                    "worker_pool_release worker freed (compare-and-release)"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Snapshot every currently-claimed slot as `(worker_id,
+    /// execution_id)` pairs. Used by the pool-claim reconciler to walk
+    /// the pool's OWN held slots (rather than the live-state registry)
+    /// and by occupancy reporting to show which execution holds each
+    /// slot. Preserves the slot→execution mapping that
+    /// [`Self::claimed_execution_ids`] discards.
+    pub async fn claims(&self) -> Vec<WorkerClaim> {
+        let inner = self.inner.lock().await;
+        inner
+            .workers
+            .iter()
+            .filter_map(|w| {
+                w.execution_id.as_ref().map(|execution_id| WorkerClaim {
+                    worker_id: w.worker_id.clone(),
+                    execution_id: execution_id.clone(),
+                })
+            })
+            .collect()
     }
 
     pub async fn capacity(&self) -> usize {
@@ -3093,6 +3197,33 @@ impl ExecutionCoordinator {
             .await;
         self.rescan_active_dispatch_after_release();
         self.kick();
+    }
+
+    /// Compare-and-release variant of [`Self::release_worker_and_kick`]
+    /// for the pool-claim reconciler: free `worker_id` only if it is
+    /// still claimed by exactly `execution_id`, then rescan + kick if it
+    /// was actually freed. Returns whether the slot was released.
+    ///
+    /// The execution-id guard makes this safe against the re-claim race
+    /// the reconciler is exposed to (snapshot a leaked claim, release it
+    /// later) — see [`WorkerPool::release_worker_if_execution`]. The
+    /// rescan + kick only fire on a real release so a no-op (already
+    /// freed, or re-claimed by a live execution) doesn't churn the
+    /// scheduler.
+    pub async fn release_pool_claim_if_execution(
+        self: &Arc<Self>,
+        worker_id: &str,
+        execution_id: &str,
+    ) -> bool {
+        let released = self
+            .pool_for_worker_id(worker_id)
+            .release_worker_if_execution(worker_id, execution_id, None)
+            .await;
+        if released {
+            self.rescan_active_dispatch_after_release();
+            self.kick();
+        }
+        released
     }
 
     /// Steady-state rescan of `tasks.status = 'active'` work that

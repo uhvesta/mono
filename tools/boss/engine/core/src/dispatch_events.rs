@@ -156,6 +156,23 @@ pub enum Stage {
     /// here the process is *alive but parked* — `kill(pid, 0)` would
     /// report it healthy.
     StaleWorkerReconcile,
+    /// The periodic pool-claim reconciler found a worker-pool slot still
+    /// claimed by an execution that is terminal in the DB and has no live
+    /// worker pane backing it, and released the claim. This is the
+    /// backstop for the leak that wedged the automation pool: every other
+    /// slot-releasing path (completion's `release_worker_pane`, the
+    /// dead-pid / stale-worker / transient-recovery sweeps) keys off a
+    /// live `LiveWorkerStateRegistry` entry, so a claim whose backing
+    /// execution terminated WITHOUT a live pane (mid-spawn cancel,
+    /// `finalize_pr_transition` DB error, a teardown that dropped the
+    /// run→slot mapping but not the pool claim) was released by nothing
+    /// and outlived its execution forever. The `details` object carries
+    /// the leaked `worker_id`, the terminal `execution_status`, and the
+    /// `pool` name so a leak is diagnosable from `bossctl dispatch tail`
+    /// without grepping engine logs. Distinct from `dead_pid_reconcile`
+    /// (slot has a live-state entry whose PID is gone) — here the slot
+    /// has NO live-state entry at all.
+    PoolClaimReconcile,
 }
 
 impl Stage {
@@ -179,6 +196,7 @@ impl Stage {
             Stage::TransientRecoveryExhausted => "transient_recovery_exhausted",
             Stage::TransientRecoveryNudge => "transient_recovery_nudge",
             Stage::StaleWorkerReconcile => "stale_worker_reconcile",
+            Stage::PoolClaimReconcile => "pool_claim_reconcile",
         }
     }
 }
