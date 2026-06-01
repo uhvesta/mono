@@ -807,6 +807,153 @@ fn base_ref_override_still_scopes_via_merge_base() {
     assert_eq!(scoped_paths(&vcs, &plan), vec!["feature.rs"]);
 }
 
+// ══ Row 10 — Push-to-branch shallow clone: fetch base and scope correctly ═════════
+
+/// Build the standard "single-branch Buildkite shallow clone" fixture used by
+/// the Row 10 tests.
+///
+/// Topology:
+/// ```text
+///   C1 (fork) ── C2 (main tip, "only_on_main.rs")
+///             \
+///              B1 (boss branch tip, "boss_change.rs") ← HEAD
+/// ```
+///
+/// The clone is a depth-1 single-branch checkout of `boss/exec_test`.
+/// `origin/main` is NOT in the local refs initially, and the configured fetch
+/// refspec covers only the boss branch — exactly matching a Buildkite
+/// `git clone --depth=1 --single-branch --branch boss/exec_test` checkout.
+///
+/// Returns `(remote_dir, clone_dir, fork_sha)`.
+fn shallow_push_clone() -> (TempDir, TempDir, String) {
+    let remote_dir = init_repo("main");
+    let remote = remote_dir.path().to_owned();
+
+    let fork = commit(&remote, "base.txt", "base\n", "C1: base");
+    commit(&remote, "only_on_main.rs", "fn main_only() {}\n", "C2: main-only");
+    git(&remote, &["checkout", "-b", "boss/exec_test", &fork]);
+    commit(&remote, "boss_change.rs", "fn boss() {}\n", "B1: boss change");
+
+    let clone_dir = tempdir().expect("tempdir clone");
+    let clone = clone_dir.path().to_owned();
+    git(&clone, &["init", "-b", "boss/exec_test"]);
+    git(&clone, &["config", "user.email", "test@checkleft.example"]);
+    git(&clone, &["config", "user.name", "Checkleft Test"]);
+    git(&clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    // Override the fetch refspec to cover ONLY the boss branch (not all of
+    // refs/heads/*). This prevents a bare `git fetch origin` from pulling in main,
+    // exactly matching a Buildkite single-branch shallow clone.
+    git(&clone, &[
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/boss/exec_test:refs/remotes/origin/boss/exec_test",
+    ]);
+    git(&clone, &["fetch", "--depth=1", "origin", "boss/exec_test"]);
+    git(&clone, &["checkout", "-b", "boss/exec_test", "FETCH_HEAD"]);
+
+    assert_eq!(
+        git_out(&clone, &["rev-parse", "--is-shallow-repository"]),
+        "true",
+        "clone must be shallow for this test to be meaningful"
+    );
+
+    (remote_dir, clone_dir, fork)
+}
+
+fn bk_push_env(branch: &str) -> CiEnvironment {
+    CiEnvironment {
+        buildkite: true,
+        buildkite_pull_request: Some("false".to_owned()),
+        buildkite_branch: Some(branch.to_owned()),
+        buildkite_pipeline_default_branch: Some("main".to_owned()),
+        ci: true,
+        ..Default::default()
+    }
+}
+
+/// Row 10 (reachable). Regression: a Buildkite push build with a single-branch
+/// shallow clone must fetch `origin/main` explicitly and compute a real merge-base,
+/// scoping the changeset to only the files actually changed in this push.
+///
+/// Before the fix (PR #1182), this would return `ChangePlan::Empty`, silently
+/// disabling all checkleft violations in CI. The correct behaviour is to fetch
+/// the base, diff against the fork point, and return only the files changed on
+/// the branch — not an empty changeset and not a diff-from-scratch.
+#[test]
+fn push_to_branch_shallow_fetches_base_and_scopes_to_changed_files() {
+    let (remote_dir, clone_dir, fork) = shallow_push_clone();
+    let clone = clone_dir.path();
+    let vcs = detect(clone);
+
+    let plan = resolve_change_plan(&bk_push_env("boss/exec_test"), &vcs, &auto())
+        .expect("push-to-branch in CI must resolve a real base, not error");
+
+    // Must be Scoped — not Empty (which would silently disable all checks).
+    assert!(
+        matches!(plan, ChangePlan::Scoped { .. }),
+        "push-to-branch must resolve a real changeset, got {plan:?}"
+    );
+    assert_eq!(
+        base_sha(&plan),
+        Some(fork.as_str()),
+        "base must be the fork point (merge-base of origin/main and HEAD)"
+    );
+
+    let paths = scoped_paths(&vcs, &plan);
+    assert_eq!(
+        paths,
+        vec!["boss_change.rs"],
+        "only the file actually changed on the branch must be in the changeset, got {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"only_on_main.rs".to_owned()),
+        "a file changed only on main must NOT appear in the changeset (no diff-from-scratch)"
+    );
+    assert!(
+        !paths.contains(&"base.txt".to_owned()),
+        "a file present since the fork point must NOT appear (not changed by this push)"
+    );
+
+    drop(remote_dir);
+}
+
+/// Row 10 (unreachable). When the default branch genuinely does not exist on the
+/// remote (wrong config, orphaned branch), checkleft must fail loudly with an
+/// actionable error — never silently produce an empty changeset.
+///
+/// Hard requirement from the task spec: a missing base must be a red build, not
+/// a green pass.
+#[test]
+fn push_to_branch_shallow_nonexistent_default_branch_errors_loudly() {
+    let (remote_dir, clone_dir, _fork) = shallow_push_clone();
+    let clone = clone_dir.path();
+    let vcs = detect(clone);
+
+    // Claim the default branch is "totally-nonexistent" — not on the remote.
+    let env = CiEnvironment {
+        buildkite: true,
+        buildkite_pull_request: Some("false".to_owned()),
+        buildkite_branch: Some("boss/exec_test".to_owned()),
+        buildkite_pipeline_default_branch: Some("totally-nonexistent".to_owned()),
+        ci: true,
+        ..Default::default()
+    };
+
+    let err = resolve_change_plan(&env, &vcs, &auto())
+        .expect_err("unreachable default branch must produce a hard error, not an empty changeset");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("origin/totally-nonexistent"),
+        "error must name the unreachable ref: {msg}"
+    );
+    assert!(
+        msg.contains("git fetch origin"),
+        "error must include the remedy: {msg}"
+    );
+
+    drop(remote_dir);
+}
+
 // ══ jj-colocated variant ═══════════════════════════════════════════════════════
 
 fn jj_available() -> bool {
