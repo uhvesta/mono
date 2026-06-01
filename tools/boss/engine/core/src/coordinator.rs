@@ -820,21 +820,20 @@ impl WorkerPool {
     }
 }
 
-/// Parse the trailing 1-indexed slot number out of a `worker-{N}`
-/// id. Both numbers refer to the same physical pane (the engine
-/// owns allocation; the app hosts the pane in slot N), so we
-/// normalize on this single conversion at the engine→app boundary.
+/// Parse the trailing 1-indexed slot number out of a worker id.
+/// Accepts both the main-pool `worker-{N}` form and the automation-pool
+/// `auto-worker-{N}` form — both refer to the same physical pane slot N
+/// at the engine→app boundary.
 ///
-/// Returns `None` for ids that don't match the `worker-{N}` shape
+/// Returns `None` for ids that don't match either recognised shape
 /// or whose suffix isn't a positive `u8`. Callers should treat
 /// `None` as a programming error — the only producer is
 /// [`WorkerPool::claim_worker`].
 pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
-    worker_id
-        .strip_prefix("worker-")?
-        .parse::<u8>()
-        .ok()
-        .filter(|n| *n >= 1)
+    let suffix = worker_id
+        .strip_prefix("worker-")
+        .or_else(|| worker_id.strip_prefix(AUTOMATION_WORKER_ID_PREFIX))?;
+    suffix.parse::<u8>().ok().filter(|n| *n >= 1)
 }
 
 /// Sink for `executions.<id>` topic invalidations. The engine wires this
@@ -5562,6 +5561,21 @@ mod tests {
             assert_eq!(worker_id, format!("worker-{slot}"));
             assert_eq!(slot_id_from_worker_id(&worker_id), Some(slot));
         }
+    }
+
+    #[test]
+    fn slot_id_from_worker_id_accepts_automation_pool_format() {
+        for slot in 1u8..=4 {
+            let auto_worker_id = format!("auto-worker-{slot}");
+            assert_eq!(
+                slot_id_from_worker_id(&auto_worker_id),
+                Some(slot),
+                "expected Some({slot}) for {auto_worker_id:?}"
+            );
+        }
+        assert_eq!(slot_id_from_worker_id("auto-worker-0"), None);
+        assert_eq!(slot_id_from_worker_id("auto-worker-"), None);
+        assert_eq!(slot_id_from_worker_id("auto-worker-abc"), None);
     }
 
     #[test]
