@@ -471,12 +471,36 @@ impl BranchVerifier for CommandBranchVerifier {
     }
 }
 
+/// Spawn a `gh` subprocess with the standard stdio / kill-on-drop
+/// settings used throughout this module, returning the trimmed stdout on
+/// success. `display` is a human-readable rendering of the command and is
+/// reused in both the spawn-failure context and the non-zero-exit error
+/// message (which also carries the captured stderr).
+async fn run_gh(args: &[&str], display: &str) -> Result<String> {
+    let output = Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("failed to spawn `{display}`"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{display}` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// Shell out to `gh pr view <pr_number> -R <repo_slug> --json headRefName`
 /// and return the branch name, or an error on failure / empty response.
 async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
     let pr_str = pr_number.to_string();
-    let output = Command::new("gh")
-        .args([
+    let head_ref = run_gh(
+        &[
             "pr",
             "view",
             &pr_str,
@@ -486,21 +510,10 @@ async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String
             "headRefName",
             "--jq",
             ".headRefName",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `gh pr view {pr_number} -R {repo_slug}`"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`gh pr view {pr_number} -R {repo_slug}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let head_ref = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug}"),
+    )
+    .await?;
     if head_ref.is_empty() {
         return Err(anyhow!("empty headRefName for PR {pr_number} in {repo_slug}"));
     }
@@ -511,8 +524,8 @@ async fn fetch_pr_head_ref_cmd(repo_slug: &str, pr_number: u64) -> Result<String
 /// and return the head SHA, or an error on failure / empty response.
 async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
     let pr_str = pr_number.to_string();
-    let output = Command::new("gh")
-        .args([
+    let head_oid = run_gh(
+        &[
             "pr",
             "view",
             &pr_str,
@@ -522,23 +535,10 @@ async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String
             "headRefOid",
             "--jq",
             ".headRefOid",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| {
-            format!("failed to spawn `gh pr view {pr_number} -R {repo_slug} --json headRefOid`")
-        })?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`gh pr view {pr_number} -R {repo_slug} --json headRefOid` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let head_oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug} --json headRefOid"),
+    )
+    .await?;
     if head_oid.is_empty() {
         return Err(anyhow!("empty headRefOid for PR {pr_number} in {repo_slug}"));
     }
@@ -609,8 +609,8 @@ fn classify_pr(pr: ApiPr) -> PrStatus {
 /// — if multiple historical rows happen to exist, we want the most
 /// recent (which `gh pr list` returns first).
 async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<ApiPr>> {
-    let output = Command::new("gh")
-        .args([
+    let stdout = run_gh(
+        &[
             "pr",
             "list",
             "-R",
@@ -625,23 +625,10 @@ async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<Api
             "url,state,mergedAt,changedFiles,additions,deletions",
             "--jq",
             r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| {
-            format!("failed to spawn `gh pr list -R {repo_slug} --head {branch}`")
-        })?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`gh pr list -R {repo_slug} --head {branch}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+        &format!("gh pr list -R {repo_slug} --head {branch}"),
+    )
+    .await?;
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -698,8 +685,8 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
         return Ok(None);
     }
     const SCAN_LIMIT: usize = 100;
-    let output = Command::new("gh")
-        .args([
+    let stdout = run_gh(
+        &[
             "pr",
             "list",
             "-R",
@@ -712,23 +699,10 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
             "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
             "--jq",
             r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| {
-            format!("failed to spawn `gh pr list -R {repo_slug} --state all` (suffix scan)")
-        })?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`gh pr list -R {repo_slug} --state all` (suffix scan) failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+        &format!("gh pr list -R {repo_slug} --state all (suffix scan)"),
+    )
+    .await?;
     let mut rows = 0usize;
     for line in stdout.lines() {
         let line = line.trim();
@@ -794,29 +768,18 @@ async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> 
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
     let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
-    let output = Command::new("gh")
-        .args([
+    let stdout = run_gh(
+        &[
             "api",
             &endpoint,
             "-H",
             "Accept: application/vnd.github+json",
             "--jq",
             "((.additions // 0) + (.deletions // 0))",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn `gh api {endpoint}`"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "`gh api {endpoint}` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+        &format!("gh api {endpoint}"),
+    )
+    .await?;
     let total: i64 = stdout.trim().parse().with_context(|| {
         format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim())
     })?;
