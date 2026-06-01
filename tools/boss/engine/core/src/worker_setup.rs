@@ -236,6 +236,62 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
+/// Inline Python decision hook that guards revision tasks from opening new
+/// PRs. Uses `shlex.split()` to tokenise the Bash command string so that
+/// PR-creation phrases inside quoted arguments (commit messages, `--body`
+/// strings) do NOT trigger the block — only the actual invoked program +
+/// verb/subcommand tokens are inspected.
+///
+/// Specifically:
+///   • `jj describe -m "fix: intercept cube pr ensure"` → APPROVE
+///   • `git commit -m "docs about gh pr create"` → APPROVE
+///   • `cube pr ensure --branch feat/foo` → BLOCK ("cube pr ensure")
+///   • `gh pr create --title "x"` → BLOCK ("gh pr create")
+///   • `jj describe -m "msg" && cube pr ensure` → BLOCK ("cube pr ensure")
+///
+/// Fallback: when `shlex.split` fails (unmatched quotes or exotic syntax)
+/// the script falls back to whitespace-splitting, which may have false
+/// positives for heredoc content but is conservative and safe.
+const REVISION_PR_GUARD_COMMAND: &str = concat!(
+    "python3 -c \"\n",
+    "import json,sys,re,shlex\n",
+    "inp=json.load(sys.stdin)\n",
+    "cmd=inp.get('tool_input',{}).get('command','')\n",
+    "DELIMS={'&&','||',';','|','&'}\n",
+    "try:\n",
+    "    toks=shlex.split(cmd,posix=True)\n",
+    "except Exception:\n",
+    "    toks=cmd.split()\n",
+    "groups=[]\n",
+    "cur=[]\n",
+    "for t in toks:\n",
+    "    if t in DELIMS:\n",
+    "        if cur:\n",
+    "            groups.append(cur[:])\n",
+    "        cur=[]\n",
+    "    else:\n",
+    "        cur.append(t)\n",
+    "if cur:\n",
+    "    groups.append(cur)\n",
+    "matched=None\n",
+    "for g in groups:\n",
+    "    i=0\n",
+    "    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n",
+    "        i+=1\n",
+    "    if i+2<len(g) and g[i]=='gh' and g[i+1]=='pr' and g[i+2]=='create':\n",
+    "        matched='gh pr create'\n",
+    "        break\n",
+    "    if i+2<len(g) and g[i]=='cube' and g[i+1]=='pr' and g[i+2]=='ensure':\n",
+    "        matched='cube pr ensure'\n",
+    "        break\n",
+    "if matched:\n",
+    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Use jj git push to update the existing PR instead.'\n",
+    "    print(json.dumps({'decision':'block','reason':msg}))\n",
+    "else:\n",
+    "    print(json.dumps({'decision':'approve'}))\n",
+    "\""
+);
+
 fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
     // Inline-prefix all env vars the shim needs. `BOSS_RUN_ID` is the
     // load-bearing one for live-worker-state correlation: if it's
@@ -272,11 +328,11 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
     });
 
     // For revision tasks, add a PreToolUse guard that blocks any
-    // `gh pr create` invocation. Revision workers push commits to an
-    // existing PR; opening a new PR violates the one-PR-per-task
-    // invariant. The guard is a small inline Python script that reads
-    // the tool_input JSON from stdin and blocks if the command matches
-    // `gh pr create` (tolerant of GIT_DIR=... prefixes and flags).
+    // `gh pr create` or `cube pr ensure` invocation. Revision workers
+    // push commits to an existing PR; opening a new PR violates the
+    // one-PR-per-task invariant. The guard tokenises the command with
+    // shlex so PR-creation phrases inside quoted arguments (commit
+    // messages, --body strings) do NOT trigger the block.
     //
     // Defense-in-depth: the guard fires when EITHER the execution kind
     // is `revision_implementation` OR the task kind is `revision`.
@@ -361,22 +417,12 @@ fn settings_value(input: &WorkerSetupInput) -> serde_json::Value {
     let is_revision = input.execution_kind == "revision_implementation"
         || input.task_kind.as_deref() == Some("revision");
     if is_revision {
-        let guard_command = concat!(
-            "python3 -c \"",
-            "import json,sys,re; ",
-            "inp=json.load(sys.stdin); ",
-            "cmd=inp.get('tool_input',{}).get('command',''); ",
-            r#"m=re.search(r'(?:^|\s|;|\||&|GIT_DIR=\S+\s+)gh\s+pr\s+create\b|cube\s+pr\s+ensure\b',cmd); "#,
-            "msg='Revision tasks push commits to the existing parent PR; they must not open a new PR. Use jj git push to update the existing PR instead.'; ",
-            "print(json.dumps({'decision':'block','reason':msg}) if m else json.dumps({'decision':'approve'})); ",
-            "\""
-        );
         pre_tool_use_hooks.push(serde_json::json!({
             "matcher": "Bash",
             "hooks": [
                 {
                     "type": "command",
-                    "command": guard_command,
+                    "command": REVISION_PR_GUARD_COMMAND,
                 }
             ],
         }));
@@ -2057,5 +2103,170 @@ mod tests {
         let script = settings_dir.path().join(PATH_GUARD_SCRIPT_NAME);
         assert!(script.exists(), "heal must refresh the gate script");
         assert_eq!(std::fs::read_to_string(&script).unwrap(), PATH_GUARD_SCRIPT);
+    }
+
+    // ── REVISION_PR_GUARD_COMMAND execution tests ─────────────────────────
+    //
+    // These tests actually run the guard script (via `sh -c`) to verify
+    // its behaviour end-to-end, including the shlex tokenisation fix.
+
+    /// Run the revision PR guard against a simulated Bash tool_input payload
+    /// and return the `decision` field from its JSON output.
+    fn run_revision_guard(bash_command: &str) -> String {
+        use std::io::Write as _;
+        let stdin_payload = serde_json::json!({
+            "tool_input": {"command": bash_command}
+        })
+        .to_string();
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(REVISION_PR_GUARD_COMMAND)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh must be available");
+
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin_payload.as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value =
+            serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+                panic!(
+                    "guard produced invalid JSON for command {:?}: {e}\nstdout={stdout}\nstderr={}",
+                    bash_command,
+                    String::from_utf8_lossy(&out.stderr),
+                )
+            });
+        parsed["decision"]
+            .as_str()
+            .unwrap_or("missing")
+            .to_owned()
+    }
+
+    // --- false-positive regression tests (must APPROVE) ---
+
+    #[test]
+    fn guard_approves_jj_describe_with_cube_pr_ensure_in_message() {
+        // The bug: `jj describe -m "...cube pr ensure..."` was blocked
+        // because the phrase appeared inside the quoted commit message.
+        let decision = run_revision_guard(
+            r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr ensure""#,
+        );
+        assert_eq!(
+            decision, "approve",
+            "guard must NOT block jj describe when the phrase is in the commit message",
+        );
+    }
+
+    #[test]
+    fn guard_approves_git_commit_with_gh_pr_create_in_message() {
+        let decision = run_revision_guard(
+            r#"git commit -m "docs: explain how gh pr create interacts with the hook""#,
+        );
+        assert_eq!(
+            decision, "approve",
+            "guard must NOT block git commit when the phrase is in the commit message",
+        );
+    }
+
+    #[test]
+    fn guard_approves_echo_with_pr_creation_phrase() {
+        let decision = run_revision_guard(r#"echo "cube pr ensure is documented here""#);
+        assert_eq!(decision, "approve", "echo must not be blocked");
+    }
+
+    #[test]
+    fn guard_approves_jj_describe_with_gh_pr_create_in_message() {
+        let decision = run_revision_guard(
+            r#"jj describe -m "fix: the gh pr create story in this branch""#,
+        );
+        assert_eq!(decision, "approve", "jj describe must not be blocked");
+    }
+
+    // --- true-positive tests (must BLOCK) ---
+
+    #[test]
+    fn guard_blocks_gh_pr_create() {
+        let decision = run_revision_guard("gh pr create --title 'My PR' --body 'content'");
+        assert_eq!(
+            decision, "block",
+            "guard must block a bare gh pr create",
+        );
+    }
+
+    #[test]
+    fn guard_blocks_cube_pr_ensure() {
+        let decision = run_revision_guard("cube pr ensure --branch feat/foo --title 'My PR'");
+        assert_eq!(
+            decision, "block",
+            "guard must block a bare cube pr ensure",
+        );
+    }
+
+    #[test]
+    fn guard_blocks_gh_pr_create_with_git_dir_prefix() {
+        let decision = run_revision_guard(
+            "GIT_DIR=.jj/repo/store/git gh pr create --title 'x' --body 'y'",
+        );
+        assert_eq!(
+            decision, "block",
+            "guard must block gh pr create even with a GIT_DIR= prefix",
+        );
+    }
+
+    #[test]
+    fn guard_blocks_cube_pr_ensure_in_compound_command() {
+        // A compound command: benign `jj describe` first, then a real
+        // `cube pr ensure` — the guard must catch the second part.
+        let decision = run_revision_guard(
+            r#"jj describe -m "push changes" && cube pr ensure --branch feat/x"#,
+        );
+        assert_eq!(
+            decision, "block",
+            "guard must block cube pr ensure in a compound command",
+        );
+    }
+
+    #[test]
+    fn guard_block_message_names_matched_command() {
+        use std::io::Write as _;
+        let stdin_payload = serde_json::json!({
+            "tool_input": {"command": "cube pr ensure --branch b"}
+        })
+        .to_string();
+
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(REVISION_PR_GUARD_COMMAND)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(stdin_payload.as_bytes())
+            .unwrap();
+        drop(child.stdin.take());
+
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+
+        let reason = parsed["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("cube pr ensure"),
+            "block reason must name the matched command, got: {reason}",
+        );
     }
 }

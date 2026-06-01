@@ -39,9 +39,59 @@
 //! path so the editorial hook can enforce the same rules it applies to a
 //! literal `gh pr create`.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+/// Strip the CONTENT of single- and double-quoted strings from `cmd`,
+/// preserving the quote characters themselves. This prevents phrases like
+/// `cube pr ensure` that appear inside a quoted commit-message argument
+/// (`-m "...cube pr ensure..."`) from matching the command-detection
+/// regexes — only the actual invoked program and its verb/subcommand tokens
+/// are visible after stripping.
+///
+/// Examples:
+/// - `jj describe -m "cube pr ensure"` → `jj describe -m ""`
+/// - `gh pr create --title "Foo"` → `gh pr create --title ""`
+/// - `cube pr ensure --branch foo` → `cube pr ensure --branch foo` (unchanged)
+fn strip_quoted_string_contents(cmd: &str) -> Cow<'_, str> {
+    // Fast path: if the command has no quotes at all, return it as-is.
+    if !cmd.contains('"') && !cmd.contains('\'') {
+        return Cow::Borrowed(cmd);
+    }
+    let mut out = String::with_capacity(cmd.len());
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match c {
+            '"' => {
+                // Skip content until closing '"', honouring backslash escapes.
+                // Use `while let` (not `for … by_ref()`) so we can call
+                // `chars.next()` again inside the body without a double-borrow.
+                while let Some(ch) = chars.next() {
+                    if ch == '\\' {
+                        chars.next(); // consume the escaped character
+                    } else if ch == '"' {
+                        out.push('"');
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                // POSIX single-quoted strings have no escape sequences inside.
+                while let Some(ch) = chars.next() {
+                    if ch == '\'' {
+                        out.push('\'');
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Cow::Owned(out)
+}
 
 /// Whether a `gh` invocation targets pull requests or issues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +128,14 @@ static GH_INVOCATION_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// nouns, and `gh pr`/`gh issue` with no subcommand). The first match in
 /// the string wins, mirroring the substring semantics the PR-URL path
 /// has always used.
+///
+/// Quoted argument values (e.g. `-m "gh pr create"`) are stripped before
+/// matching so that a PR-creation phrase inside a commit message or
+/// `--body` string does not falsely classify the command as a `gh`
+/// invocation.
 pub fn classify(command: &str) -> Option<GhInvocation> {
-    let caps = GH_INVOCATION_RE.captures(command)?;
+    let stripped = strip_quoted_string_contents(command);
+    let caps = GH_INVOCATION_RE.captures(&stripped)?;
     let noun = match &caps[1] {
         "pr" => GhNoun::Pr,
         "issue" => GhNoun::Issue,
@@ -107,8 +163,12 @@ static CUBE_PR_ENSURE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// internally, making that call invisible to the PreToolUse hook. This
 /// predicate lets the editorial hook intercept the outer `cube pr ensure`
 /// command and apply the same checks it would apply to a `gh pr create`.
+///
+/// Quoted argument values are stripped before matching so that a commit
+/// message mentioning `cube pr ensure` does not produce a false positive.
 pub fn is_cube_pr_ensure(command: &str) -> bool {
-    CUBE_PR_ENSURE_RE.is_match(command)
+    let stripped = strip_quoted_string_contents(command);
+    CUBE_PR_ENSURE_RE.is_match(&stripped)
 }
 
 #[cfg(test)]
@@ -235,5 +295,100 @@ mod tests {
     fn rejects_token_ending_in_cube() {
         // `notcube pr ensure` must not match.
         assert!(!is_cube_pr_ensure("notcube pr ensure --branch b"));
+    }
+
+    // ── false-positive regression tests ──────────────────────────────────
+    //
+    // These guard against the bug where a PR-creation phrase inside a
+    // quoted argument (e.g. a commit message) caused a false positive.
+
+    #[test]
+    fn cube_pr_ensure_not_matched_inside_double_quoted_commit_message() {
+        // Reproduces the T1031 bug: the phrase appears inside -m "..."
+        // but the command is `jj describe`, not `cube pr ensure`.
+        assert!(
+            !is_cube_pr_ensure(
+                r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr ensure""#,
+            ),
+            "cube pr ensure inside a double-quoted commit message must not match",
+        );
+    }
+
+    #[test]
+    fn cube_pr_ensure_not_matched_inside_single_quoted_commit_message() {
+        assert!(
+            !is_cube_pr_ensure("jj describe -m 'fix: intercept cube pr ensure'"),
+            "cube pr ensure inside a single-quoted commit message must not match",
+        );
+    }
+
+    #[test]
+    fn gh_pr_create_not_matched_inside_quoted_commit_message() {
+        assert!(
+            classify(r#"git commit -m "docs: explain gh pr create usage""#).is_none(),
+            "gh pr create inside a quoted commit message must not classify as a gh invocation",
+        );
+    }
+
+    #[test]
+    fn cube_pr_ensure_still_matches_after_quoted_arg() {
+        // A real `cube pr ensure` that happens to follow a quoted argument
+        // (e.g. `jj describe -m "msg" && cube pr ensure`) must still be
+        // caught. Stripping quotes must not suppress the real command.
+        assert!(
+            is_cube_pr_ensure(r#"jj describe -m "push fixes" && cube pr ensure --branch b"#),
+            "cube pr ensure after a quoted arg must still match",
+        );
+    }
+
+    #[test]
+    fn gh_pr_create_still_matches_after_quoted_arg() {
+        assert_eq!(
+            classify(r#"jj describe -m "msg" && gh pr create --title "x""#)
+                .map(|i| i.subcommand),
+            Some("create".to_owned()),
+            "gh pr create after a quoted arg must still be classified",
+        );
+    }
+
+    // ── strip_quoted_string_contents unit tests ───────────────────────────
+
+    #[test]
+    fn strip_removes_double_quoted_content() {
+        assert_eq!(
+            strip_quoted_string_contents(r#"foo -m "hello world" bar"#),
+            r#"foo -m "" bar"#,
+        );
+    }
+
+    #[test]
+    fn strip_removes_single_quoted_content() {
+        assert_eq!(
+            strip_quoted_string_contents("foo -m 'hello world' bar"),
+            "foo -m '' bar",
+        );
+    }
+
+    #[test]
+    fn strip_handles_backslash_escape_in_double_quotes() {
+        // `\"` inside a double-quoted string does not end the string.
+        assert_eq!(
+            strip_quoted_string_contents(r#"cmd "a\"b" rest"#),
+            r#"cmd "" rest"#,
+        );
+    }
+
+    #[test]
+    fn strip_preserves_unquoted_content() {
+        let s = "cube pr ensure --branch foo";
+        assert_eq!(strip_quoted_string_contents(s), s);
+    }
+
+    #[test]
+    fn strip_fast_path_no_quotes() {
+        // No allocation when there are no quotes.
+        let s = "plain command arg1 arg2";
+        let result = strip_quoted_string_contents(s);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
     }
 }
