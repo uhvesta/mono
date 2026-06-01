@@ -37,6 +37,7 @@ exclude_files = [
   "tools/boss/engine/core/src/runner.rs",
   "tools/boss/cli/src/main.rs",
   "tools/cube/src/app.rs",
+  "tools/boss/app-macos/Sources/ContentView.swift",
 ]
 
 [checks.policy]

@@ -1979,6 +1979,13 @@ struct WorkBoardCardView: View {
                             .lineLimit(1)
                             .fixedSize(horizontal: true, vertical: false)
                     }
+                    if task.sourceAutomationId != nil {
+                        Image(systemName: "wand.and.stars")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.purple)
+                            .help("Created by automation")
+                            .accessibilityLabel("Created by automation")
+                    }
                     if let extRef = externalRefLink {
                         ExternalRefLinkView(presentation: extRef)
                     }
@@ -2509,6 +2516,9 @@ struct WorkCardPopoverView: View {
                 }
                 metadataPRRow(prURL: task.prURL)
                 sourceChipRow
+                if task.sourceAutomationId != nil {
+                    automationRow
+                }
             }
 
             WorkDependenciesSection(model: model, taskID: task.id)
@@ -2776,6 +2786,21 @@ struct WorkCardPopoverView: View {
                 .background(
                     Capsule().fill(Color.secondary.opacity(0.15))
                 )
+        }
+    }
+
+    private var automationRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Automation")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 4) {
+                Image(systemName: "wand.and.stars")
+                    .font(.caption)
+                    .foregroundStyle(.purple)
+                Text("Created by automation")
+                    .font(.caption)
+            }
         }
     }
 
