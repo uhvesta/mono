@@ -354,6 +354,11 @@ pub const AUTOMATION_OUTCOME_FAILED_GAVE_UP: &str = "failed_gave_up";
 /// PR-completion path.
 pub const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
 
+/// Execution kind for an independent reviewer agent that reviews a worker's PR
+/// and produces a revision if the reviewer finds issues. Routes to the dedicated
+/// review worker pool. See design: automated-reviewer-pass-on-every-agent-authored-pr.md
+pub const EXECUTION_KIND_PR_REVIEW: &str = "pr_review";
+
 
 
 /// Trigger specification for an automation. The `schedule` variant is
