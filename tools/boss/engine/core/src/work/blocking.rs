@@ -126,6 +126,142 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// Parents that have stranded in `status='blocked'` with a NULL scalar
+    /// `blocked_reason` **and** an empty active `task_blocked_signals` set,
+    /// yet are owned by the remediation substrate (a `conflict_resolutions`
+    /// or `ci_remediations` attempt spawned a `revision_task_id` for them)
+    /// and still carry a bound PR.
+    ///
+    /// These rows are invisible to every other merge-poller candidate list:
+    /// [`Self::list_chores_pending_merge_check`] only returns `in_review`
+    /// rows, and [`Self::list_chores_blocked_on_merge_conflict`] /
+    /// [`Self::list_chores_blocked_on_ci_failure`] key on the scalar
+    /// `blocked_reason`, which is NULL here. So a PR that is still
+    /// dirty/red is never re-probed, no `task_blocked_signals` row is
+    /// re-armed, and no remediation revision ever (re)spawns — the parent
+    /// rests `blocked` forever with no affordance to recover (the T795 /
+    /// PR #1077 strand). The merge poller's stranded-blocked reconciliation
+    /// pass re-probes these and re-canonicalises a still-dirty row back
+    /// into the standard `blocked: merge_conflict` / `blocked: ci_failure`
+    /// loop via [`Self::recanonicalize_blocked_merge_conflict`] /
+    /// [`Self::recanonicalize_blocked_ci_failure`].
+    ///
+    /// Rows owned by *other* subsystems are deliberately excluded:
+    /// `blocked: dependency` / `blocked: parent_pr_closed` carry a non-NULL
+    /// scalar reason (so the `blocked_reason IS NULL` guard skips them), and
+    /// a *pure* dependency block carries no remediation attempt (so the
+    /// `revision_task_id IS NOT NULL` EXISTS guard screens it out). The
+    /// caller additionally skips any row still gated by an unsatisfied
+    /// prerequisite, leaving genuine dependency blocks to the
+    /// dependency-unblock sweep.
+    pub fn list_chores_stranded_blocked_remediation(&self) -> Result<Vec<PendingMergeCheck>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.product_id, t.pr_url
+             FROM tasks t
+             WHERE t.kind IN ('chore', 'project_task', 'design', 'investigation')
+               AND t.status = 'blocked'
+               AND t.blocked_reason IS NULL
+               AND t.pr_url IS NOT NULL
+               AND t.pr_url != ''
+               AND t.deleted_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_blocked_signals s
+                    WHERE s.work_item_id = t.id
+                      AND s.cleared_at IS NULL
+               )
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM conflict_resolutions cr
+                        WHERE cr.work_item_id = t.id
+                          AND cr.revision_task_id IS NOT NULL
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM ci_remediations ci
+                        WHERE ci.work_item_id = t.id
+                          AND ci.revision_task_id IS NOT NULL
+                   )
+               )
+             ORDER BY t.updated_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PendingMergeCheck {
+                work_item_id: row.get(0)?,
+                product_id: row.get(1)?,
+                pr_url: row.get(2)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Re-canonicalise a stranded NULL-reason blocked parent (see
+    /// [`Self::list_chores_stranded_blocked_remediation`]) back into the
+    /// standard `blocked: merge_conflict` state and re-arm its
+    /// `task_blocked_signals` row, so the merge poller's normal
+    /// blocked-on-merge_conflict probe re-discovers it and the conflict
+    /// detection path spawns a fresh remediation revision.
+    ///
+    /// The WHERE guard requires `status='blocked' AND blocked_reason IS
+    /// NULL` so this can only re-claim a genuinely-orphaned row — it never
+    /// overwrites a `dependency`, `merge_conflict`, or `ci_failure` reason
+    /// a live owner set. `status` itself is left at `blocked`; only the
+    /// scalar reason is filled in and the signal armed. Returns the updated
+    /// task on the flip; `Ok(None)` on a WHERE-guard miss (the row was
+    /// moved or cleared concurrently).
+    pub fn recanonicalize_blocked_merge_conflict(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        self.recanonicalize_blocked_signal(work_item_id, pr_url, "merge_conflict")
+    }
+
+    /// CI analogue of [`Self::recanonicalize_blocked_merge_conflict`]:
+    /// re-claim a stranded NULL-reason blocked parent as
+    /// `blocked: ci_failure` and re-arm the matching `task_blocked_signals`
+    /// row so the merge poller re-discovers it and the CI detection path
+    /// spawns a fresh remediation revision.
+    pub fn recanonicalize_blocked_ci_failure(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+    ) -> Result<Option<Task>> {
+        self.recanonicalize_blocked_signal(work_item_id, pr_url, "ci_failure")
+    }
+
+    fn recanonicalize_blocked_signal(
+        &self,
+        work_item_id: &str,
+        pr_url: &str,
+        reason: &str,
+    ) -> Result<Option<Task>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE tasks
+                SET blocked_reason    = ?3,
+                    last_status_actor = 'engine',
+                    updated_at        = ?4
+              WHERE id = ?1
+                AND status = 'blocked'
+                AND blocked_reason IS NULL
+                AND pr_url = ?2
+                AND deleted_at IS NULL",
+            params![work_item_id, pr_url, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        upsert_task_blocked_signal(&tx, work_item_id, reason, None, &now)?;
+        let updated = query_task(&tx, work_item_id)?.with_context(|| {
+            format!("unknown task after {reason} re-canonicalisation: {work_item_id}")
+        })?;
+        tx.commit()?;
+        Ok(Some(updated))
+    }
+
     /// WHERE-guarded flip of a chore/project_task from `in_review`
     /// to `blocked: merge_conflict`. Idempotent — a second call for
     /// a row already in this state updates zero rows and returns

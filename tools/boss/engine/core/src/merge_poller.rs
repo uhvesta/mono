@@ -46,6 +46,7 @@ use serde_json;
 use tokio::process::Command;
 use tokio::sync::Notify;
 
+use crate::blocking_signal::SignalKind;
 use crate::ci_watch;
 use crate::completion::{StopOutcome, WorkerCompletionHandler};
 use crate::conflict_watch;
@@ -1304,6 +1305,14 @@ pub struct SweepOutcome {
     /// once the task reaches Review, so leaving it alive only ties up a
     /// slot (issue #898).
     pub worker_stopped_on_review: usize,
+    /// Number of stranded `blocked` parents (NULL scalar `blocked_reason`,
+    /// empty active-signal set, remediation-owned, bound PR) that this
+    /// sweep re-canonicalised back into the standard
+    /// `blocked: merge_conflict` / `blocked: ci_failure` loop after
+    /// observing the PR is still dirty/red. Recovers the invariant
+    /// violation where a parent rests `blocked` with no signal while its
+    /// PR conflicts/fails (the T795 / PR #1077 strand).
+    pub stranded_blocked_recanonicalized: usize,
 }
 
 impl SweepOutcome {
@@ -1319,6 +1328,7 @@ impl SweepOutcome {
             + self.late_pr_recovered
             + self.revision_invalidated
             + self.worker_stopped_on_review
+            + self.stranded_blocked_recanonicalized
     }
 }
 
@@ -1393,6 +1403,16 @@ pub async fn run_one_pass(
             Vec::new()
         }
     };
+    let stranded_blocked = match work_db.list_chores_stranded_blocked_remediation() {
+        Ok(items) => items,
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "merge poller: failed to list stranded blocked remediation parents",
+            );
+            Vec::new()
+        }
+    };
     // Late-PR candidates (Bug B recovery): terminal executions within
     // the last 60 min whose task is still `active` with no `pr_url`.
     // These arise from the double-spawn race where the orphan sweep
@@ -1418,6 +1438,7 @@ pub async fn run_one_pass(
         + blocked_ci.len()
         + pending_pr_recheck.len()
         + stranded_ci_attempts.len()
+        + stranded_blocked.len()
         + late_pr_candidates.len();
     if total == 0 {
         return SweepOutcome::default();
@@ -1428,6 +1449,7 @@ pub async fn run_one_pass(
         blocked_ci = blocked_ci.len(),
         pending_pr_recheck = pending_pr_recheck.len(),
         stranded_ci_attempts = stranded_ci_attempts.len(),
+        stranded_blocked = stranded_blocked.len(),
         late_pr_candidates = late_pr_candidates.len(),
         "merge poller: sweep started",
     );
@@ -1466,6 +1488,19 @@ pub async fn run_one_pass(
         if ci_watch::rescue_stranded_ci_remediation_attempt(work_db, publisher, attempt).await {
             outcome.ci_remediation_redispatched += 1;
         }
+    }
+    // Reconcile stranded `blocked` parents (NULL scalar reason, empty
+    // active-signal set, remediation-owned, bound PR). These fell out of
+    // every scalar-reason-keyed candidate list above, so a still-dirty PR
+    // would otherwise never be re-probed and no remediation revision would
+    // ever (re)spawn — the invariant violation where a parent rests
+    // `blocked` with no signal while its PR conflicts/fails. Re-probe each,
+    // re-canonicalise a still-dirty row back into the standard
+    // merge_conflict / ci_failure loop, and let the normal detection path
+    // spawn a fresh revision.
+    for candidate in &stranded_blocked {
+        sweep_stranded_blocked_remediation(work_db, probe, publisher, candidate, &mut outcome)
+            .await;
     }
     // Late-PR sweep (Bug B): recover terminal executions whose pane
     // pushed a PR after the execution was marked abandoned.
@@ -1967,6 +2002,192 @@ async fn sweep_one(
     }
 }
 
+/// Reconcile a single stranded `blocked` parent (NULL scalar
+/// `blocked_reason`, empty active-signal set, remediation-owned, bound PR)
+/// surfaced by [`WorkDb::list_chores_stranded_blocked_remediation`].
+///
+/// The invariant this restores: a parent must never rest `blocked` with an
+/// empty signal set while its PR is still dirty/red. Such a parent is
+/// invisible to every scalar-reason-keyed candidate list, so we re-probe it
+/// here, and when the PR is still dirty/red we re-canonicalise it back into
+/// the standard `blocked: merge_conflict` / `blocked: ci_failure` state
+/// (re-arming the side-table signal) and immediately drive the normal
+/// detection path so a fresh remediation revision (re)spawns this sweep —
+/// even when a previous revision for an earlier conflict already sits in
+/// `review`/`done`. A clean+green PR is left untouched: it is not the
+/// dirty/red invariant violation, and the row's block is owned by whatever
+/// non-remediation flow parked it.
+///
+/// Rows still gated by an unsatisfied prerequisite are skipped — those are
+/// owned by the dependency-unblock sweep, not the remediation flow, and
+/// re-canonicalising one could lose its dependency block when the conflict
+/// later resolves.
+async fn sweep_stranded_blocked_remediation(
+    work_db: &WorkDb,
+    probe: &dyn MergeProbe,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    outcome: &mut SweepOutcome,
+) {
+    match work_db.gating_prereqs_for(&candidate.work_item_id) {
+        Ok(gating) if !gating.is_empty() => {
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                gating = gating.len(),
+                "merge poller: stranded-blocked parent is dependency-gated; leaving for dep sweep",
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "merge poller: failed to read gating prereqs for stranded-blocked parent; skipping",
+            );
+            return;
+        }
+    }
+    let probe_result = match probe.probe(&candidate.pr_url).await {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                ?err,
+                "merge poller: stranded-blocked probe failed; will retry next pass",
+            );
+            return;
+        }
+    };
+    let PrLifecycleState::Open(open) = &probe_result.state else {
+        // Merged / closed-unmerged: not a dirty-PR strand. Leave the row
+        // for the lifecycle paths that own those transitions.
+        return;
+    };
+    // Design §Q1: conflict pre-empts CI. A conflicting PR re-canonicalises
+    // to merge_conflict; a clean-but-failing PR re-canonicalises to
+    // ci_failure. A clean+green PR is not a dirty/red violation — leave it.
+    match open.mergeability {
+        OpenPrMergeability::Conflict => {
+            reconcile_stranded(
+                work_db,
+                publisher,
+                candidate,
+                &probe_result,
+                SignalKind::MergeConflict,
+                outcome,
+            )
+            .await;
+        }
+        OpenPrMergeability::Clean => {
+            if matches!(open.ci, OpenPrCiStatus::Failing { .. }) {
+                reconcile_stranded(
+                    work_db,
+                    publisher,
+                    candidate,
+                    &probe_result,
+                    SignalKind::CiFailure,
+                    outcome,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+/// Shared body of [`sweep_stranded_blocked_remediation`]: re-canonicalise
+/// the NULL-reason blocked parent into `kind`'s canonical blocked state and
+/// drive the matching detection path so a revision (re)spawns.
+async fn reconcile_stranded(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe_result: &PrLifecycleProbe,
+    kind: SignalKind,
+    outcome: &mut SweepOutcome,
+) {
+    let recanonicalized = match kind {
+        SignalKind::MergeConflict => work_db
+            .recanonicalize_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url),
+        SignalKind::CiFailure => {
+            work_db.recanonicalize_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url)
+        }
+    };
+    match recanonicalized {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            // WHERE-guard miss: the row was moved or re-claimed by another
+            // path between listing and now. Nothing to do.
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                reason = kind.reason(),
+                ?err,
+                "merge poller: failed to re-canonicalise stranded-blocked parent",
+            );
+            return;
+        }
+    }
+    outcome.stranded_blocked_recanonicalized += 1;
+    tracing::info!(
+        work_item_id = %candidate.work_item_id,
+        pr_url = %candidate.pr_url,
+        reason = kind.reason(),
+        "merge poller: re-canonicalised stranded blocked parent; driving detection to (re)spawn revision",
+    );
+    publisher
+        .publish_work_item_changed(
+            &candidate.product_id,
+            &candidate.work_item_id,
+            "stranded_remediation_recovered",
+        )
+        .await;
+    // Drive the standard detection so a fresh revision spawns this sweep.
+    // The parent is now `blocked: <reason>`, so detection takes the re-arm
+    // path; the PR is known-open, so feed that to the create gate via a
+    // static checker rather than a redundant `gh pr view`.
+    let checker = crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open);
+    match kind {
+        SignalKind::MergeConflict => {
+            if conflict_watch::on_conflict_detected(
+                work_db,
+                publisher,
+                &checker,
+                candidate,
+                probe_result,
+            )
+            .await
+            {
+                outcome.conflict_flagged += 1;
+            }
+        }
+        SignalKind::CiFailure => {
+            let failures = match &probe_result.state {
+                PrLifecycleState::Open(open) => match &open.ci {
+                    OpenPrCiStatus::Failing { failures } => failures.clone(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            if ci_watch::on_ci_failure_detected(
+                work_db,
+                publisher,
+                &checker,
+                candidate,
+                probe_result,
+                &failures,
+            )
+            .await
+            {
+                outcome.ci_flagged += 1;
+            }
+        }
+    }
+}
+
 /// Polymorphic retire dispatch (design §Q5 / Phase 10 #31).
 ///
 /// The merge poller's `Clean`-mergeability branch used to call every
@@ -2400,8 +2621,8 @@ mod tests {
         CubeWorkspaceStatus, ExecutionPublisher,
     };
     use crate::work::{
-        ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
-        CreateProjectInput, CreateTaskInput, WorkDb, WorkItem, WorkItemPatch,
+        AddDependencyInput, ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput,
+        CreateProductInput, CreateProjectInput, CreateTaskInput, WorkDb, WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -2429,6 +2650,36 @@ mod tests {
                     head_ref_oid: None,
                     head_ref_name: None,
                     base_ref_name: None,
+                    labels: Vec::new(),
+                    review: PrReviewState::Unknown,
+                    in_merge_queue: false,
+                }),
+            );
+        }
+
+        /// Set a probe with both `base_ref_oid` and `head_ref_oid`
+        /// populated. The conflict attempt's unique key is keyed on the
+        /// base sha; the CI remediation's unique key needs the head sha
+        /// (and `on_ci_failure_detected` defers entirely when it is
+        /// missing). Stranded-recovery regression tests vary both across
+        /// sweeps so a fresh attempt row (and a fresh revision) can be
+        /// inserted for the re-conflict / re-failure.
+        fn set_with_base_head(
+            &self,
+            url: &str,
+            state: PrLifecycleState,
+            base_ref_oid: &str,
+            head_ref_oid: &str,
+        ) {
+            self.states.lock().unwrap().insert(
+                url.to_owned(),
+                Ok(PrLifecycleProbe {
+                    url: url.to_owned(),
+                    state,
+                    base_ref_oid: Some(base_ref_oid.to_owned()),
+                    head_ref_oid: Some(head_ref_oid.to_owned()),
+                    head_ref_name: Some("feature-branch".to_owned()),
+                    base_ref_name: Some("main".to_owned()),
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
@@ -3025,6 +3276,405 @@ mod tests {
             review: PrReviewState::Unknown,
             in_merge_queue: false,
         }
+    }
+
+    /// Which blocking signal a stranded-recovery case exercises. The
+    /// reconciliation pass is parameterised over both so a conflict-only or
+    /// ci-only regression cannot hide (work-item requirement #6).
+    #[derive(Clone, Copy)]
+    enum StrandKind {
+        Conflict,
+        Ci,
+    }
+
+    impl StrandKind {
+        /// The `task_blocked_signals.reason` literal this kind arms.
+        fn reason(self) -> &'static str {
+            match self {
+                StrandKind::Conflict => "merge_conflict",
+                StrandKind::Ci => "ci_failure",
+            }
+        }
+    }
+
+    /// Point a stub probe at `pr` reporting the dirty/red signal for `kind`,
+    /// keyed on the given base/head SHAs so a fresh attempt row can be
+    /// inserted for a re-conflict / re-failure.
+    fn set_dirty_probe(
+        probe: &StubProbe,
+        pr: &str,
+        kind: StrandKind,
+        base_sha: &str,
+        head_sha: &str,
+    ) {
+        match kind {
+            StrandKind::Conflict => probe.set_with_base_head(
+                pr,
+                PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+                base_sha,
+                head_sha,
+            ),
+            StrandKind::Ci => {
+                probe
+                    .states
+                    .lock()
+                    .unwrap()
+                    .insert(pr.to_owned(), Ok(probe_ci_failing(pr, head_sha)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stranded_blocked_parent_with_dirty_pr_regains_signal_and_respawns_revision() {
+        // Regression for the T795 / PR #1077 strand, parameterised over both
+        // signal kinds so a conflict-only or ci-only regression cannot hide.
+        //
+        // Setup: the parent ran an earlier remediation (an attempt + revision
+        // that resolved an earlier conflict/CI failure; that revision now sits
+        // in `review`), then drifted into `status='blocked'` with a NULL scalar
+        // `blocked_reason` and an EMPTY active-signal set — invisible to every
+        // scalar-reason-keyed candidate list. Its PR is now dirty/red again.
+        //
+        // Expectation: the stranded-blocked reconciliation re-canonicalises the
+        // parent back into the standard loop, re-arms the signal, and spawns a
+        // FRESH revision — without disturbing the prior revision still in
+        // `review`.
+        for kind in [StrandKind::Conflict, StrandKind::Ci] {
+            let reason = kind.reason();
+            let dir = tempdir().unwrap();
+            let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+            let pr = "https://github.com/foo/bar/pull/1077";
+            let (_product, chore) = make_chore_in_review(&db, "Strand", pr);
+            let probe = StubProbe::new();
+            let publisher = Arc::new(RecordingPublisher::default());
+
+            // --- Pass 1: the original conflict/CI failure spawns a revision. ---
+            set_dirty_probe(&probe, pr, kind, "base-old", "head-old");
+            let o1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+            match kind {
+                StrandKind::Conflict => assert_eq!(o1.conflict_flagged, 1, "{reason}: pass1"),
+                StrandKind::Ci => assert_eq!(o1.ci_flagged, 1, "{reason}: pass1"),
+            }
+
+            // Capture the prior attempt + the revision it spawned.
+            let (prior_attempt_id, prior_rev_id) = match kind {
+                StrandKind::Conflict => {
+                    let a = db
+                        .active_conflict_resolution_for_work_item(&chore)
+                        .unwrap()
+                        .expect("prior conflict_resolutions row");
+                    (a.id.clone(), a.revision_task_id.clone().expect("prior revision"))
+                }
+                StrandKind::Ci => {
+                    let a = db
+                        .active_ci_remediation_for_work_item(&chore)
+                        .unwrap()
+                        .expect("prior ci_remediations row");
+                    (a.id.clone(), a.revision_task_id.clone().expect("prior revision"))
+                }
+            };
+
+            // The earlier remediation resolved its conflict/failure: mark the
+            // attempt succeeded and park the revision in `review` — the healthy
+            // post-resolve shape (the revision is intentionally NOT advanced to
+            // `done`).
+            match kind {
+                StrandKind::Conflict => {
+                    db.mark_conflict_resolution_succeeded(&prior_attempt_id, Some("head-resolved"))
+                        .unwrap();
+                    db.clear_merge_conflict_signal_only(&chore).unwrap();
+                }
+                StrandKind::Ci => {
+                    db.mark_ci_remediation_succeeded(&prior_attempt_id, Some("head-resolved"))
+                        .unwrap();
+                    db.clear_ci_failure_signal_only(&chore).unwrap();
+                    db.reset_ci_attempts_used(&chore).unwrap();
+                }
+            }
+            db.update_work_item(
+                &prior_rev_id,
+                WorkItemPatch {
+                    status: Some("in_review".into()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+            // The strand: the parent comes to rest `blocked` with a NULL reason
+            // and no side-table signal.
+            db.update_work_item(
+                &chore,
+                WorkItemPatch {
+                    status: Some("blocked".into()),
+                    blocked_reason: Some(String::new()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+
+            // Precondition: stranded + invisible to the scalar-reason lists.
+            match db.get_work_item(&chore).unwrap() {
+                WorkItem::Chore(t) => {
+                    assert_eq!(t.status, "blocked", "{reason}: precondition status");
+                    assert!(t.blocked_reason.is_none(), "{reason}: precondition NULL reason");
+                }
+                other => panic!("{reason}: expected chore, got {other:?}"),
+            }
+            assert!(
+                db.active_blocked_signals(&chore).unwrap().is_empty(),
+                "{reason}: precondition empty signal set",
+            );
+            assert!(
+                db.list_chores_blocked_on_merge_conflict().unwrap().is_empty()
+                    && db.list_chores_blocked_on_ci_failure().unwrap().is_empty(),
+                "{reason}: invisible to the scalar-reason candidate lists",
+            );
+            assert_eq!(
+                db.list_chores_stranded_blocked_remediation().unwrap().len(),
+                1,
+                "{reason}: stranded list must surface the orphan",
+            );
+
+            // --- Pass 2: PR is dirty/red again at a fresh base/head. ---
+            set_dirty_probe(&probe, pr, kind, "base-new", "head-new");
+            let o2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+            assert_eq!(
+                o2.stranded_blocked_recanonicalized, 1,
+                "{reason}: exactly one orphan recovered",
+            );
+            match kind {
+                StrandKind::Conflict => assert_eq!(o2.conflict_flagged, 1, "{reason}: respawn"),
+                StrandKind::Ci => assert_eq!(o2.ci_flagged, 1, "{reason}: respawn"),
+            }
+
+            // Invariant: the parent carries the blocking signal again and is no
+            // longer stranded.
+            assert!(
+                db.active_blocked_signals(&chore)
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.reason == reason),
+                "{reason}: parent must carry the blocking signal after recovery",
+            );
+            assert!(
+                db.list_chores_stranded_blocked_remediation().unwrap().is_empty(),
+                "{reason}: parent recovered out of the stranded set",
+            );
+
+            // A FRESH revision spawned, distinct from the prior one — which
+            // still sits in `review` (revisions are not auto-advanced to done).
+            let new_rev = match kind {
+                StrandKind::Conflict => {
+                    let rows = db
+                        .list_conflict_resolutions(None, &[], Some(&chore), None)
+                        .unwrap();
+                    assert_eq!(rows.len(), 2, "{reason}: a second attempt row for the re-dirty PR");
+                    rows.iter()
+                        .filter_map(|r| r.revision_task_id.clone())
+                        .find(|rid| rid != &prior_rev_id)
+                        .expect("a new conflict revision must spawn")
+                }
+                StrandKind::Ci => {
+                    let rows = db
+                        .list_ci_remediations(None, &[], Some(&chore), None)
+                        .unwrap();
+                    assert_eq!(rows.len(), 2, "{reason}: a second attempt row for the re-dirty PR");
+                    rows.iter()
+                        .filter_map(|r| r.revision_task_id.clone())
+                        .find(|rid| rid != &prior_rev_id)
+                        .expect("a new ci revision must spawn")
+                }
+            };
+            assert_ne!(new_rev, prior_rev_id, "{reason}: new revision is distinct");
+            match db.get_work_item(&prior_rev_id).unwrap() {
+                WorkItem::Task(t) => {
+                    assert_eq!(t.status, "in_review", "{reason}: prior revision stays in review");
+                    assert_eq!(t.kind, "revision");
+                }
+                other => panic!("{reason}: expected prior revision task, got {other:?}"),
+            }
+            match db.get_work_item(&new_rev).unwrap() {
+                WorkItem::Task(t) => {
+                    assert_eq!(t.kind, "revision", "{reason}: new fix vehicle is a revision");
+                    assert_ne!(t.status, "done", "{reason}: new revision is not auto-advanced");
+                }
+                other => panic!("{reason}: expected new revision task, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stranded_recovery_skips_dependency_gated_parent() {
+        // A stranded `blocked: NULL` parent that is ALSO gated by an
+        // unsatisfied prerequisite is left for the dependency-unblock sweep:
+        // re-canonicalising it could lose the genuine dependency block when the
+        // conflict later resolves. The remediation pass must not touch it.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/2077";
+        let (product, chore) = make_chore_in_review(&db, "Gated", pr);
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Give the parent remediation ownership (a prior conflict revision).
+        set_dirty_probe(&probe, pr, StrandKind::Conflict, "base-old", "head-old");
+        run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let crz = db
+            .active_conflict_resolution_for_work_item(&chore)
+            .unwrap()
+            .expect("prior crz");
+        db.mark_conflict_resolution_succeeded(&crz.id, Some("resolved")).unwrap();
+        db.clear_merge_conflict_signal_only(&chore).unwrap();
+
+        // Add an unsatisfied gating prerequisite, then model the strand
+        // (blocked with a NULL reason) co-occurring with the live dependency.
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.clone(),
+                name: "Prereq".into(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.add_dependency(AddDependencyInput {
+            dependent: chore.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+
+        // It surfaces in the stranded list and is genuinely gated...
+        assert_eq!(db.list_chores_stranded_blocked_remediation().unwrap().len(), 1);
+        assert!(
+            !db.gating_prereqs_for(&chore).unwrap().is_empty(),
+            "gated precondition",
+        );
+
+        // ...so the recovery pass leaves it untouched even with a dirty PR.
+        set_dirty_probe(&probe, pr, StrandKind::Conflict, "base-new", "head-new");
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        assert_eq!(
+            outcome.stranded_blocked_recanonicalized, 0,
+            "gated parent must be skipped",
+        );
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, "blocked");
+                assert!(t.blocked_reason.is_none(), "left untouched at blocked: NULL");
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        assert_eq!(
+            db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap().len(),
+            1,
+            "no fresh attempt spawned for a gated parent",
+        );
+    }
+
+    #[tokio::test]
+    async fn stranded_list_excludes_parent_without_remediation_ownership() {
+        // A `blocked: NULL` parent with a bound PR and an empty signal set but
+        // NO conflict/ci remediation history is not the remediation flow's to
+        // recover (it could be any non-remediation block); it must not surface.
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/3077";
+        let (_p, chore) = make_chore_in_review(&db, "NoRem", pr);
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            db.list_chores_stranded_blocked_remediation().unwrap().is_empty(),
+            "no remediation ownership ⇒ not a remediation orphan",
+        );
+    }
+
+    #[tokio::test]
+    async fn recanonicalize_blocked_only_claims_null_reason_blocked_rows() {
+        // The re-canonicalisation guard only re-claims a genuinely-orphaned
+        // `blocked: NULL` row; it never disturbs an `in_review` row or
+        // overwrites a foreign `blocked_reason` (e.g. `dependency`).
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/4077";
+        let (_p, chore) = make_chore_in_review(&db, "Recanon", pr);
+
+        // in_review row → guard requires status='blocked' → no-op.
+        assert!(
+            db.recanonicalize_blocked_merge_conflict(&chore, pr).unwrap().is_none(),
+            "must not claim an in_review row",
+        );
+
+        // blocked: dependency row → guard requires NULL reason → no-op.
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some("dependency".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            db.recanonicalize_blocked_ci_failure(&chore, pr).unwrap().is_none(),
+            "must not overwrite a foreign blocked_reason",
+        );
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => assert_eq!(t.blocked_reason.as_deref(), Some("dependency")),
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // blocked: NULL row → claimed → merge_conflict + signal armed.
+        db.update_work_item(
+            &chore,
+            WorkItemPatch {
+                status: Some("blocked".into()),
+                blocked_reason: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap();
+        let updated = db
+            .recanonicalize_blocked_merge_conflict(&chore, pr)
+            .unwrap()
+            .expect("claims the null-reason blocked row");
+        assert_eq!(updated.status, "blocked");
+        assert_eq!(updated.blocked_reason.as_deref(), Some("merge_conflict"));
+        assert!(
+            db.active_blocked_signals(&chore)
+                .unwrap()
+                .iter()
+                .any(|s| s.reason == "merge_conflict"),
+            "signal armed on re-canonicalisation",
+        );
+
+        // pr_url mismatch → guard miss.
+        assert!(
+            db.recanonicalize_blocked_merge_conflict(&chore, "https://github.com/foo/bar/pull/999")
+                .unwrap()
+                .is_none(),
+            "pr_url mismatch must miss the guard",
+        );
     }
 
     #[tokio::test]
