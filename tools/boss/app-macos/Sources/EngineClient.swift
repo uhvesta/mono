@@ -676,7 +676,8 @@ final class EngineClient: @unchecked Sendable {
         enabled: Bool = true,
         repoRemoteURL: String? = nil
     ) {
-        var input: [String: Any] = [
+        var payload: [String: Any] = [
+            "type": "create_automation",
             "product_id": productId,
             "name": name,
             "trigger": [
@@ -690,9 +691,9 @@ final class EngineClient: @unchecked Sendable {
             "created_via": "mac_app",
         ]
         if let repoRemoteURL, !repoRemoteURL.isEmpty {
-            input["repo_remote_url"] = repoRemoteURL
+            payload["repo_remote_url"] = repoRemoteURL
         }
-        sendLine(["type": "create_automation", "input": input])
+        sendLine(payload)
     }
 
     /// Enable an automation (set `enabled = true`). Engine replies with `automation_updated`.
