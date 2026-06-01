@@ -1426,15 +1426,12 @@ private struct WorkBoardCardItem: View {
             && task.blockedReason == "ci_failure"
 
         let activityState: AgentActivityState? = column == .doing
-            ? (isDispatchPending
-                ? .dispatchPending
-                : liveState?.slotId != nil
-                ? .active
-                : isResolvingConflicts
-                ? .waiting(reason: "Resolving merge conflict")
-                : isRemediatingCI
-                ? .waiting(reason: "Resolving CI failure")
-                : AgentActivityState(runtime: runtime, liveState: liveState))
+            ? .forDoingCard(
+                runtime: runtime,
+                liveState: liveState,
+                isDispatchPending: isDispatchPending,
+                isResolvingConflicts: isResolvingConflicts,
+                isRemediatingCI: isRemediatingCI)
             : nil
 
         let liveStatusForCard: String? = {

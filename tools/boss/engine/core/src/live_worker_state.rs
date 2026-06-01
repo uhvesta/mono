@@ -23,6 +23,13 @@ use boss_protocol::{
 /// instead of "Claude Unknown".
 pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 
+/// How long a slot must be stuck in `Spawning` with no hook events before
+/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] transitions it to
+/// `WaitingForInput`. 30 seconds matches the dead-PID grace period and
+/// gives a fresh-but-slow worker enough runway while being well below the
+/// typical interactive-wait tolerance.
+pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
+
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
 #[derive(Default)]
 pub struct LiveWorkerStateRegistry {
@@ -37,6 +44,12 @@ struct Inner {
     /// rather than `Idle` when claude is paused on a permission
     /// prompt.
     notification_pending: HashMap<u8, bool>,
+    /// Epoch-seconds timestamp recorded when `register_spawn` creates a
+    /// slot. Used by `mark_stalled_spawns` to detect workers that have
+    /// been stuck in `Spawning` without any hook event (the initial
+    /// directory-trust prompt fires before `SessionStart`, so the normal
+    /// `Notification`→`WaitingForInput` path is never triggered for it).
+    spawned_at: HashMap<u8, i64>,
 }
 
 impl LiveWorkerStateRegistry {
@@ -65,6 +78,7 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
+        guard.spawned_at.insert(slot_id, current_epoch_secs());
     }
 
     /// Drop the entry for `slot_id`. Called when the engine releases
@@ -73,6 +87,7 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.remove(&slot_id);
         guard.notification_pending.remove(&slot_id);
+        guard.spawned_at.remove(&slot_id);
     }
 
     /// Snapshot of every entry. Used by the frontend RPC handler and
@@ -145,6 +160,7 @@ impl LiveWorkerStateRegistry {
         let Inner {
             by_slot,
             notification_pending,
+            ..
         } = &mut *guard;
         let Some(state) = by_slot.get_mut(&slot_id) else {
             return false;
@@ -279,6 +295,67 @@ impl LiveWorkerStateRegistry {
         state.last_event_at = Some(current_iso8601());
         true
     }
+
+    /// Detect worker slots stuck in `Spawning` with no hook events for
+    /// longer than `threshold_secs` seconds and transition them to
+    /// `WaitingForInput`.
+    ///
+    /// The initial directory-trust prompt that Claude Code shows at
+    /// session startup (for models that use `--permission-mode auto`)
+    /// fires *before* `SessionStart`, so no hook event ever arrives and
+    /// the normal `Notification`→`WaitingForInput` path is never
+    /// triggered. An unattended headless worker can never answer the
+    /// prompt, so the run stalls indefinitely with no UI signal. This
+    /// method is the detection path: if `last_event_at` is `None` (no
+    /// hook at all) and the slot has been in `Spawning` for more than
+    /// `threshold_secs` seconds, the activity is promoted to
+    /// `WaitingForInput` so the existing kanban dot and
+    /// `WorkerWaitingIndicator` fire.
+    ///
+    /// Returns the slot IDs that were changed so callers can broadcast
+    /// the updated snapshot. Normal-running workers (whose `SessionStart`
+    /// hook fires within seconds of spawn) always have `last_event_at`
+    /// set before the threshold elapses; this method ignores them.
+    pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let Inner {
+            by_slot,
+            spawned_at,
+            ..
+        } = &mut *guard;
+        let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
+        let mut changed = Vec::new();
+        for (slot_id, state) in by_slot.iter_mut() {
+            if state.activity != WorkerActivity::Spawning {
+                continue;
+            }
+            if state.last_event_at.is_some() {
+                // SessionStart (or any other hook) already fired — the
+                // worker is past the startup phase; not our concern.
+                continue;
+            }
+            let Some(&age_secs) = spawned_at.get(slot_id) else {
+                continue;
+            };
+            if age_secs > cutoff {
+                // Spawned too recently; give the worker more time.
+                continue;
+            }
+            state.activity = WorkerActivity::WaitingForInput;
+            state.last_event_at = Some(iso8601_utc(now_epoch_secs));
+            changed.push(*slot_id);
+        }
+        changed
+    }
+
+    /// Override the recorded spawn timestamp for `slot_id`. Only
+    /// available in tests — production code always uses the wall-clock
+    /// time stamped by `register_spawn`.
+    #[cfg(test)]
+    pub fn set_spawn_time_for_test(&self, slot_id: u8, epoch_secs: i64) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.spawned_at.insert(slot_id, epoch_secs);
+    }
 }
 
 /// True iff `activity` indicates the worker is no longer attached
@@ -291,6 +368,13 @@ fn is_terminal_activity(activity: WorkerActivity) -> bool {
         activity,
         WorkerActivity::Terminated | WorkerActivity::Errored
     )
+}
+
+fn current_epoch_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn current_iso8601() -> String {
@@ -684,5 +768,128 @@ mod tests {
     fn iso8601_format_known_epoch() {
         assert_eq!(format_iso8601_utc(0), "1970-01-01T00:00:00Z");
         assert_eq!(format_iso8601_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    // ── mark_stalled_spawns (initial directory-trust prompt detection) ────────
+
+    /// Regression test for the initial-directory-trust-prompt detection path.
+    ///
+    /// The directory-trust prompt that Claude Code shows at session startup
+    /// (for Opus / `--permission-mode auto` workers) fires *before*
+    /// `SessionStart`, so no hook ever arrives and the slot stays in `Spawning`
+    /// with `last_event_at = None`. `mark_stalled_spawns` must detect this and
+    /// flip the slot to `WaitingForInput` so the kanban dot + indicator fire.
+    #[test]
+    fn stalled_spawn_with_no_events_transitions_to_waiting_for_input() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+
+        // Backdate the spawn time so the threshold has elapsed.
+        let old_spawn = 1_700_000_000_i64;
+        reg.set_spawn_time_for_test(1, old_spawn);
+
+        // No hooks have arrived — last_event_at is None, activity is Spawning.
+        let before = reg.get(1).unwrap();
+        assert_eq!(before.activity, WorkerActivity::Spawning);
+        assert!(before.last_event_at.is_none());
+
+        let now = old_spawn + STALLED_SPAWN_THRESHOLD_SECS + 1;
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert_eq!(changed, vec![1], "slot 1 should be reported as changed");
+        let after = reg.get(1).unwrap();
+        assert_eq!(after.activity, WorkerActivity::WaitingForInput);
+        assert!(
+            after.last_event_at.is_some(),
+            "last_event_at must be stamped on the stall transition"
+        );
+    }
+
+    /// A worker that received at least one hook event (even just `SessionStart`)
+    /// is NOT considered stalled, even if it is still in `Spawning` state
+    /// (which can't happen in practice, but is a meaningful boundary).
+    #[test]
+    fn spawn_with_events_is_not_marked_stalled() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(2, "run-2", "claude-opus-4-7", 1, None);
+
+        // Fire SessionStart so last_event_at gets set.
+        reg.apply_event(
+            2,
+            &WorkerEvent::SessionStart {
+                session_id: "s".into(),
+                source: SessionStartSource::Startup,
+            },
+        );
+
+        // Backdate the spawn time.
+        reg.set_spawn_time_for_test(2, 1_700_000_000);
+
+        let now = 1_700_000_000 + STALLED_SPAWN_THRESHOLD_SECS + 100;
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert!(changed.is_empty(), "slot with events must not be flagged");
+        let state = reg.get(2).unwrap();
+        assert_eq!(state.activity, WorkerActivity::Idle);
+    }
+
+    /// A worker that spawned very recently is not yet considered stalled —
+    /// it just needs more time to start.
+    #[test]
+    fn freshly_spawned_worker_not_marked_stalled() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(3, "run-3", "claude-opus-4-7", 1, None);
+
+        // The spawn time is "now", so the threshold has not elapsed.
+        let now = 1_700_000_100_i64;
+        reg.set_spawn_time_for_test(3, now - STALLED_SPAWN_THRESHOLD_SECS + 5);
+
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert!(changed.is_empty(), "freshly-spawned worker must not be flagged");
+        assert_eq!(
+            reg.get(3).unwrap().activity,
+            WorkerActivity::Spawning,
+            "activity must remain Spawning"
+        );
+    }
+
+    /// Workers in non-Spawning states are never touched by `mark_stalled_spawns`.
+    #[test]
+    fn non_spawning_states_not_affected_by_stall_detection() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+
+        // Advance to Working via PreToolUse.
+        reg.apply_event(1, &pre_tool("Bash"));
+
+        reg.set_spawn_time_for_test(1, 1_700_000_000);
+
+        let now = 1_700_000_000 + STALLED_SPAWN_THRESHOLD_SECS + 100;
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert!(changed.is_empty(), "Working slot must not be flagged");
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+    }
+
+    /// `mark_stalled_spawns` is idempotent: once a slot transitions to
+    /// `WaitingForInput`, it is no longer in `Spawning` and will not be
+    /// transitioned again.
+    #[test]
+    fn mark_stalled_spawns_is_idempotent() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_spawn_time_for_test(1, 1_700_000_000);
+
+        let now = 1_700_000_000 + STALLED_SPAWN_THRESHOLD_SECS + 1;
+        let first = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+        assert_eq!(first, vec![1]);
+
+        let second = reg.mark_stalled_spawns(now + 10, STALLED_SPAWN_THRESHOLD_SECS);
+        assert!(second.is_empty(), "should not fire again after first transition");
+        assert_eq!(
+            reg.get(1).unwrap().activity,
+            WorkerActivity::WaitingForInput
+        );
     }
 }

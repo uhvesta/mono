@@ -1820,6 +1820,51 @@ enum AgentActivityState {
         self.init(runtime: runtime)
     }
 
+    /// Resolve the activity state for a card in the Doing lane.
+    ///
+    /// Centralises the precedence rules that previously lived inline in
+    /// `WorkBoardCardItem` so they are unit-testable without hosting the
+    /// SwiftUI card.
+    ///
+    /// Precedence:
+    /// 1. Dispatch-pending (status=todo, autostart, no slot free yet)
+    ///    wins outright — the engine intends to run it but hasn't.
+    /// 2. A worker paused on a permission prompt
+    ///    (`activity == .waitingForInput`) reads as *waiting*, not
+    ///    active. Without this, the card shows a green "working" dot
+    ///    while the run is actually stalled on an input prompt no one
+    ///    is watching for. This must precede the bound-slot shortcut
+    ///    below; it clears on its own once the worker resumes and the
+    ///    activity flips back to `.working`.
+    /// 3. A bound live worker otherwise reads as active.
+    /// 4. Conflict / CI-remediation runs without a bound live worker
+    ///    read as their respective "resolving" waits.
+    /// 5. Fall back to the runtime+liveState mapping.
+    static func forDoingCard(
+        runtime: WorkTaskRuntime?,
+        liveState: WorkerLiveState?,
+        isDispatchPending: Bool,
+        isResolvingConflicts: Bool,
+        isRemediatingCI: Bool
+    ) -> AgentActivityState {
+        if isDispatchPending {
+            return .dispatchPending
+        }
+        if liveState?.activity == .waitingForInput {
+            return .waiting(reason: "Waiting on user input")
+        }
+        if liveState?.slotId != nil {
+            return .active
+        }
+        if isResolvingConflicts {
+            return .waiting(reason: "Resolving merge conflict")
+        }
+        if isRemediatingCI {
+            return .waiting(reason: "Resolving CI failure")
+        }
+        return AgentActivityState(runtime: runtime, liveState: liveState)
+    }
+
     var tooltip: String {
         switch self {
         case .active:

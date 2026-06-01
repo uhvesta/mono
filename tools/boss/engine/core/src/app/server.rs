@@ -763,6 +763,43 @@ pub async fn serve(
         server_state.work_db.clone(),
     );
 
+    // Periodic stalled-spawn detector: transitions workers from `Spawning`
+    // to `WaitingForInput` when they've been stuck without any hook event
+    // for longer than STALLED_SPAWN_THRESHOLD_SECS. The initial directory-trust
+    // prompt that Claude Code shows before `SessionStart` (for Opus /
+    // `--permission-mode auto` workers) blocks the run with no Notification hook,
+    // so the normal detection path never fires. This sweep detects the stall and
+    // flips the activity so the kanban dot + WorkerWaitingIndicator signal the
+    // operator that attention is needed. Runs every 10 seconds — the prompt
+    // appears at session startup, so fast detection matters.
+    {
+        let live_worker_states = server_state.live_worker_states.clone();
+        let server_clone = Arc::clone(&server_state);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let changed = live_worker_states.mark_stalled_spawns(
+                    now,
+                    crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS,
+                );
+                if !changed.is_empty() {
+                    tracing::info!(
+                        slots = ?changed,
+                        "stalled-spawn sweep: transitioned slots from Spawning to WaitingForInput \
+                         (no hook event since spawn — likely blocked on initial directory-trust prompt)",
+                    );
+                    server_clone.broadcast_live_worker_states().await;
+                }
+            }
+        });
+    }
+
     let coordinator = server_state.execution_coordinator.clone();
     coordinator.kick();
 
