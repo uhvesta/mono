@@ -166,7 +166,7 @@ rust_library(
     ],
     deps = [
         "//tools/boss/engine/conflict-diagnosis",
-        "//tools/boss/engine/core/boss-transcript-markdown:transcript_markdown",
+        "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/editorial",
         "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/pr-template",

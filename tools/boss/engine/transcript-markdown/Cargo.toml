@@ -2,7 +2,7 @@
 name = "boss-transcript-markdown"
 version.workspace = true
 edition.workspace = true
-workspace = "../../../../.."
+workspace = "../../../.."
 
 [dependencies]
 bon = { workspace = true }
