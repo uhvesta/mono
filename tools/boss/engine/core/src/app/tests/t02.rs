@@ -104,6 +104,197 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
     );
 }
 
+/// A remote worker holds no libghostty pane, so the spawn flow never
+/// registers a slot for it and `slot_for_run` is `None` — but its hooks
+/// tunnel back over the forwarded events socket. The dispatcher must
+/// lazily assign a virtual slot from the reserved remote range and seed
+/// the live-status state so the activity surface tracks the remote worker
+/// just like a local one. (Engine-restart reattach relies on this same
+/// path: the first hook over a re-established forward re-acquires the
+/// slot.)
+#[tokio::test]
+async fn dispatch_assigns_virtual_slot_to_remote_worker() {
+    use crate::protocol::WorkerEvent;
+    use crate::worker_registry::REMOTE_SLOT_BASE;
+    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity};
+
+    let server_state = test_server_state();
+    let product = server_state
+        .work_db
+        .create_product(CreateProductInput {
+            name: "p".into(),
+            description: None,
+            repo_remote_url: Some("git@example.com:p.git".into()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = server_state
+        .work_db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "remote chore".into(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    let execution = server_state
+        .work_db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
+        )
+        .unwrap();
+    // Start the run on a remote host — this stamps work_runs.host_id =
+    // "zakalwe" and leaves the execution non-terminal ("running").
+    server_state
+        .work_db
+        .start_execution_run_on_host(
+            &execution.id,
+            "worker-1",
+            "repo-1",
+            "lease-1",
+            "ws-1",
+            "/tmp/ws-1",
+            "zakalwe",
+        )
+        .unwrap();
+    assert_eq!(
+        server_state.worker_registry.slot_for_run(&execution.id),
+        None,
+        "precondition: a remote run never gets a slot from the spawn flow",
+    );
+
+    let event = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(execution.id.clone()),
+        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+        event: WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+    };
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    // A virtual slot from the reserved remote range was allocated …
+    let slot = server_state
+        .worker_registry
+        .slot_for_run(&execution.id)
+        .expect("remote worker must be assigned a virtual slot");
+    assert!(
+        slot >= REMOTE_SLOT_BASE,
+        "remote slot {slot} must come from the reserved range, not the local pool",
+    );
+    // … and the live-status state tracks the worker's activity (a
+    // PostToolUse drives Spawning → Working) bound to the work item.
+    let state = server_state
+        .live_worker_states
+        .get(slot)
+        .expect("live state must be registered for the remote worker's slot");
+    assert_eq!(state.run_id, execution.id);
+    assert_eq!(state.activity, WorkerActivity::Working);
+    assert_eq!(state.work_item_id.as_deref(), Some(chore.id.as_str()));
+
+    // A second hook for the same run reuses the slot rather than
+    // allocating another one.
+    dispatch_live_worker_state(&server_state, &event).await;
+    assert_eq!(
+        server_state.worker_registry.slot_for_run(&execution.id),
+        Some(slot),
+        "subsequent hooks must reuse the same virtual slot",
+    );
+}
+
+/// A late or duplicate hook for a remote run whose execution has already
+/// settled (completed/failed/etc.) must NOT resurrect a virtual slot — a
+/// finished worker should not reappear on the live surface.
+#[tokio::test]
+async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput};
+
+    let server_state = test_server_state();
+    let product = server_state
+        .work_db
+        .create_product(CreateProductInput {
+            name: "p".into(),
+            description: None,
+            repo_remote_url: Some("git@example.com:p.git".into()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = server_state
+        .work_db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "remote chore".into(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    let execution = server_state
+        .work_db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
+        )
+        .unwrap();
+    server_state
+        .work_db
+        .start_execution_run_on_host(
+            &execution.id,
+            "worker-1",
+            "repo-1",
+            "lease-1",
+            "ws-1",
+            "/tmp/ws-1",
+            "zakalwe",
+        )
+        .unwrap();
+    // Settle the execution (mirrors completion / orphan paths).
+    server_state
+        .work_db
+        .mark_execution_orphaned(&execution.id, "test: settled before late hook")
+        .unwrap();
+
+    let event = crate::events_socket::IncomingHookEvent {
+        peer_pid: None,
+        run_id: Some(execution.id.clone()),
+        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+        event: WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+    };
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    assert_eq!(
+        server_state.worker_registry.slot_for_run(&execution.id),
+        None,
+        "a settled remote execution must not get a virtual slot from a late hook",
+    );
+}
+
 /// Regression test for the 2026-05-12 wrong-namespace bug. The
 /// dispatcher's `_boss_run_id` carries an **execution id**
 /// (`exec_*`) — that's what `runner.rs::run_execution` plumbs into

@@ -226,6 +226,7 @@ pub use metrics_types::MetricsCounterRow;
 pub use metrics_types::MetricsGaugeRow;
 pub use output_types::LatePrCandidate;
 pub use output_types::PendingMergeCheck;
+pub use output_types::RemoteRunHandle;
 pub use output_types::SetRunTranscriptPathOutcome;
 pub use output_types::StoredExternalRef;
 pub use output_types::StrandedCiRemediationAttempt;

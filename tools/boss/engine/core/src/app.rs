@@ -110,6 +110,7 @@ use handler_helpers::{
     task_name_description_for_id, active_chore_run_id,
     build_chore_update_message, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution,
     resolve_transcript_for_tail, segment_to_wire, read_transcript_tail,
+    tail_lines_from_content,
 };
 
 

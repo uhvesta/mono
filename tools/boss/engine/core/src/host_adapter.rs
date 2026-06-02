@@ -121,6 +121,43 @@ pub trait HostAdapter: Send + Sync {
         workspace_path: &Path,
         cube_change_id: Option<&str>,
     ) -> Result<RunOutcome>;
+
+    // ── Live-status + transcript readback (Phase 4) ─────────────────────────
+
+    /// Read up to `max_bytes` from the tail of the transcript at `path`
+    /// on this host.
+    ///
+    /// `Ok(None)` means "the transcript is engine-local — read the path
+    /// off the local filesystem". The default (and [`LocalHostAdapter`])
+    /// returns `None` so the existing local read path is unchanged.
+    /// [`SshHostAdapter`] overrides this to pull the byte suffix over its
+    /// `ControlMaster` and returns `Ok(Some(jsonl))` — giving the
+    /// transcript-tail RPC the same bytes a local run would have read.
+    async fn read_transcript_tail_bytes(
+        &self,
+        _path: &str,
+        _max_bytes: u64,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Re-establish the reverse events-socket forward for a detached run
+    /// (`run_id` is the worker's `BOSS_RUN_ID` / execution id) after an
+    /// engine restart, so its hook stream reaches `engine_events_socket`
+    /// again.
+    ///
+    /// `Ok(false)` means "nothing to reattach": a local worker was a
+    /// child of the previous engine process and is already gone, so the
+    /// default (and [`LocalHostAdapter`]) is a no-op. [`SshHostAdapter`]
+    /// overrides this to clear the stale remote socket and re-open the
+    /// `ssh -R` forward, returning `Ok(true)` on success.
+    async fn reattach_events_forward(
+        &self,
+        _run_id: &str,
+        _engine_events_socket: &str,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ── LocalHostAdapter ──────────────────────────────────────────────────────────
@@ -786,6 +823,32 @@ impl HostAdapter for SshHostAdapter {
             bail!("{reason} on host {host}: {detail}");
         }
 
+        // Persist the remote worker pid onto the run row so it is the
+        // durable signal-addressing key the design's "Storage Additions"
+        // calls for, and so a post-restart diagnostic can see which OS
+        // process the detached worker is. Best-effort: a missing run row
+        // (start_execution_run_on_host always inserts before spawn, so
+        // this is only a race) or a write error logs and is swallowed —
+        // the pid is informational, not a spawn precondition.
+        if let Some(pid) = outcome.remote_pid {
+            match self.work_db.set_run_remote_pid_for_execution(&run_id, pid) {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    host_id = %host,
+                    run_id = %run_id,
+                    remote_pid = pid,
+                    "remote spawn: no work_runs row to stamp remote_pid onto yet",
+                ),
+                Err(err) => tracing::warn!(
+                    host_id = %host,
+                    run_id = %run_id,
+                    remote_pid = pid,
+                    ?err,
+                    "remote spawn: failed to persist remote_pid",
+                ),
+            }
+        }
+
         tracing::info!(
             host_id = %host,
             run_id = %run_id,
@@ -817,6 +880,48 @@ impl HostAdapter for SshHostAdapter {
             slot_id: None,
             spawn_config: Some(spawn_config),
         })
+    }
+
+    async fn read_transcript_tail_bytes(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        // The recorded transcript_path is a path on the remote host's
+        // filesystem; pull its byte suffix over the master so the RPC
+        // sees the same JSONL a local read would.
+        let content =
+            crate::remote_transcript::pull_remote_transcript_tail(&self.transport, path, max_bytes)
+                .await?;
+        Ok(Some(content))
+    }
+
+    async fn reattach_events_forward(
+        &self,
+        run_id: &str,
+        engine_events_socket: &str,
+    ) -> Result<bool> {
+        let remote_socket = remote_events_socket_path(run_id);
+        let outcome = crate::ssh_spawn::reestablish_events_forward(
+            &self.transport,
+            &remote_socket,
+            engine_events_socket,
+        )
+        .await?;
+        if !outcome.launched {
+            let detail = outcome.detail.unwrap_or_default();
+            bail!(
+                "reattach events forward failed on host {}: {detail}",
+                self.transport.host_id
+            );
+        }
+        tracing::info!(
+            host_id = %self.transport.host_id,
+            run_id = %run_id,
+            remote_socket = %remote_socket,
+            "reattach: re-established reverse events forward for detached remote run",
+        );
+        Ok(true)
     }
 }
 

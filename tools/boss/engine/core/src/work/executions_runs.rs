@@ -1104,6 +1104,107 @@ impl WorkDb {
         Ok(path.flatten())
     }
 
+    /// Host id of the most-recent `work_runs` row for `execution_id`,
+    /// or `None` when the execution has no run yet.
+    ///
+    /// The distributed-execution dispatch path stamps `host_id` on the
+    /// run at start (`'local'` for local runs, the scheduler-selected
+    /// id for remote ones). The transcript-tail RPC reads this to decide
+    /// whether the recorded `transcript_path` lives on the local
+    /// filesystem (`host_id = 'local'`) or must be pulled over SSH, and
+    /// the live-status dispatcher reads it to decide whether a slotless
+    /// run is a remote worker that warrants a virtual slot. Resolves the
+    /// latest run the same way [`Self::transcript_path_for_execution`]
+    /// does (`ORDER BY created_at DESC, id DESC`), so it always reflects
+    /// the live run after a re-spawn.
+    pub fn latest_run_host_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let host: Option<String> = conn
+            .query_row(
+                "SELECT host_id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(host)
+    }
+
+    /// Persist the remote worker pid onto the latest `work_runs` row for
+    /// `execution_id`. The SSH spawn path captures the pid from the
+    /// wrapper handshake (`parse_remote_pid`) and stamps it here so the
+    /// design's "Storage Additions" `work_runs.remote_pid` — the
+    /// addressing key for control-channel signal delivery — is durable.
+    ///
+    /// Mirrors [`Self::set_run_transcript_path_if_unset`]'s namespace
+    /// handling: `execution_id` is the `exec_*` id the spawn path holds,
+    /// resolved to the live `work_runs.id`. Returns `true` when a row was
+    /// updated, `false` when no run exists yet (benign — the caller logs
+    /// and moves on; the pid is informational, not a spawn precondition).
+    pub fn set_run_remote_pid_for_execution(
+        &self,
+        execution_id: &str,
+        remote_pid: i64,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET remote_pid = ?2
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id, remote_pid],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// Active runs on a non-local host whose backing execution is still
+    /// non-terminal — the set of detached remote workers the engine
+    /// should re-attach to after a restart.
+    ///
+    /// A remote worker is launched detached (`nohup`) and survives the
+    /// engine restarting, but the reverse events-socket forward that
+    /// carries its hook stream rides the engine's `ControlMaster` and
+    /// dies with the old engine process. On startup the engine queries
+    /// this set and re-establishes each forward (see
+    /// [`crate::remote_reattach`]) so the still-running worker's events
+    /// — and its eventual `Stop` / PR-URL completion — reach the engine
+    /// again. Local runs are excluded (`host_id != 'local'`): a local
+    /// worker is a child of the previous engine and is already gone.
+    /// Terminal executions are excluded so a settled run is never
+    /// re-attached.
+    pub fn list_reattachable_remote_runs(&self) -> Result<Vec<RemoteRunHandle>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.execution_id, r.host_id, r.remote_pid
+             FROM work_runs r
+             JOIN work_executions e ON e.id = r.execution_id
+             WHERE r.status = 'active'
+               AND r.host_id != 'local'
+               AND e.status NOT IN
+                   ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             ORDER BY r.created_at ASC, r.id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RemoteRunHandle {
+                run_id: row.get(0)?,
+                execution_id: row.get(1)?,
+                host_id: row.get(2)?,
+                remote_pid: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// Test-only helper: force `transcript_path` back to NULL on an
     /// existing row. Used by the dispatcher regression test to model
     /// the production race where a SessionStart's payload-driven

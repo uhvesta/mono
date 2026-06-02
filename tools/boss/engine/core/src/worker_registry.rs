@@ -23,6 +23,19 @@ use std::os::raw::c_void;
 
 const ANCESTOR_WALK_DEPTH: usize = 8;
 
+/// First slot id reserved for remote workers' virtual slots.
+///
+/// A remote worker holds no libghostty pane, so the spawn flow never
+/// allocates a real pool slot for it. But the live-status surface is
+/// slot-keyed, so the dispatcher assigns each live remote run a synthetic
+/// slot from a high range that cannot collide with the local worker pool
+/// (`1..=MAX_WORKER_POOL_SIZE`, currently 8) or the automation pool
+/// (`MAX_WORKER_POOL_SIZE+1..`, currently 9..=11). 200 leaves generous
+/// headroom below for pool growth and 56 ids above for concurrent remote
+/// runs — far more than any real deployment. See
+/// [`WorkerRegistry::get_or_allocate_remote_slot`].
+pub const REMOTE_SLOT_BASE: u8 = 200;
+
 #[derive(Clone, Default)]
 pub struct WorkerRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -69,6 +82,38 @@ impl WorkerRegistry {
             .run_to_slot
             .get(run_id)
             .copied()
+    }
+
+    /// Get the slot mapped to `run_id`, allocating a virtual remote slot
+    /// if none exists.
+    ///
+    /// Remote workers carry no libghostty pane, so the spawn flow never
+    /// calls [`Self::register_run_slot`] for them and [`Self::slot_for_run`]
+    /// returns `None` — which makes `dispatch_live_worker_state` drop their
+    /// hook fan-out and leaves the live-status surface blank for remote
+    /// runs. The dispatcher calls this for a slotless run it has identified
+    /// as a live remote worker: it returns the existing mapping when one is
+    /// present, otherwise allocates the lowest free slot in
+    /// `[REMOTE_SLOT_BASE, u8::MAX]` and records it under the same
+    /// `run_to_slot` map the local path uses, so every downstream lookup
+    /// (`slot_for_run`, `take_slot_for_run`) works identically.
+    ///
+    /// Returns `(slot_id, freshly_allocated)`. `freshly_allocated` is
+    /// `true` only on the first call for a run, so the caller stamps the
+    /// initial `LiveWorkerState` exactly once. Returns `None` only when
+    /// every slot in the remote range is already mapped — the caller then
+    /// drops the event as it would have before.
+    pub fn get_or_allocate_remote_slot(&self, run_id: &str) -> Option<(u8, bool)> {
+        let mut inner = self.inner.lock().expect("registry poisoned");
+        if let Some(slot) = inner.run_to_slot.get(run_id) {
+            return Some((*slot, false));
+        }
+        let slot = {
+            let used = &inner.run_to_slot;
+            (REMOTE_SLOT_BASE..=u8::MAX).find(|s| !used.values().any(|v| v == s))
+        }?;
+        inner.run_to_slot.insert(run_id.to_owned(), slot);
+        Some((slot, true))
     }
 
     /// Atomically remove and return the slot id for `run_id`. The
@@ -290,6 +335,48 @@ mod tests {
         assert_eq!(clone.lookup(7).as_deref(), Some("shared"));
         clone.unregister(7);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn remote_slot_allocation_is_idempotent_per_run() {
+        let reg = WorkerRegistry::new();
+        let (slot_a, fresh_a) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
+        assert!(fresh_a, "first allocation must report freshly_allocated");
+        assert!(slot_a >= REMOTE_SLOT_BASE, "remote slot must come from the reserved range");
+        // Second call for the same run returns the same slot, not fresh.
+        let (slot_again, fresh_again) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
+        assert_eq!(slot_again, slot_a);
+        assert!(!fresh_again);
+        // slot_for_run now resolves it like any other registered run.
+        assert_eq!(reg.slot_for_run("exec-a"), Some(slot_a));
+    }
+
+    #[test]
+    fn remote_slots_are_distinct_and_avoid_local_pool_range() {
+        let reg = WorkerRegistry::new();
+        // Occupy a couple of local-pool slots first.
+        reg.register_run_slot("local-1", 1);
+        reg.register_run_slot("local-9", 9);
+        let (a, _) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
+        let (b, _) = reg.get_or_allocate_remote_slot("exec-b").unwrap();
+        assert_ne!(a, b, "concurrent remote runs must get distinct slots");
+        for s in [a, b] {
+            assert!(s >= REMOTE_SLOT_BASE, "remote slot {s} collided with the pool range");
+        }
+    }
+
+    #[test]
+    fn remote_slot_reuses_lowest_free_after_release() {
+        let reg = WorkerRegistry::new();
+        let (a, _) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
+        assert_eq!(a, REMOTE_SLOT_BASE);
+        let (b, _) = reg.get_or_allocate_remote_slot("exec-b").unwrap();
+        assert_eq!(b, REMOTE_SLOT_BASE + 1);
+        // Release the first run's slot; the next allocation reuses it.
+        assert_eq!(reg.take_slot_for_run("exec-a"), Some(REMOTE_SLOT_BASE));
+        let (c, fresh) = reg.get_or_allocate_remote_slot("exec-c").unwrap();
+        assert_eq!(c, REMOTE_SLOT_BASE);
+        assert!(fresh);
     }
 
     #[cfg(target_os = "macos")]

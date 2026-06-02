@@ -7,6 +7,14 @@
 
 use super::*;
 
+/// Byte cap for an over-SSH remote transcript tail pull. The
+/// `TailRunTranscript` RPC requests a line count, not a byte count, so
+/// we pull a generous suffix and split it to the requested lines; 256 KiB
+/// comfortably covers the few-hundred-line tails the viewer requests
+/// while keeping the SSH round-trip cheap. Matches the bound
+/// `transient_recovery` uses for its local tail read.
+const REMOTE_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
 pub(super) async fn handle_create_execution(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
@@ -636,7 +644,56 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
         }
         match resolve_transcript_for_tail(&server_state, &run_id) {
             TranscriptResolution::Found { transcript_path } => {
-                match read_transcript_tail(&transcript_path, lines).await {
+                // The recorded `transcript_path` is interpreted on the
+                // host that produced it. For a local run it is a path on
+                // the engine's own filesystem; for a remote run it lives
+                // on the remote host and must be pulled over SSH. Resolve
+                // the run's host (the id may be a `run_*` or `exec_*`
+                // namespace, so try both keys) and route accordingly so
+                // `bossctl agents transcript` / the transcript viewer work
+                // identically against a remote worker.
+                let host = server_state
+                    .work_db
+                    .run_host(&run_id)
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        server_state
+                            .work_db
+                            .latest_run_host_for_execution(&run_id)
+                            .ok()
+                            .flatten()
+                    })
+                    .unwrap_or_else(|| "local".to_owned());
+                let read_result: Result<(Vec<String>, bool), String> = if host == "local" {
+                    read_transcript_tail(&transcript_path, lines)
+                        .await
+                        .map_err(|err| format!("transcript read failed for {transcript_path}: {err}"))
+                } else {
+                    match server_state
+                        .execution_coordinator
+                        .read_remote_transcript_tail(
+                            &host,
+                            &transcript_path,
+                            REMOTE_TRANSCRIPT_TAIL_BYTES,
+                        )
+                        .await
+                    {
+                        Ok(Some(content)) => Ok(tail_lines_from_content(&content, lines)),
+                        // A remote host reporting `None` means "treat as
+                        // local"; fall back to the local read rather than
+                        // surface a spurious error.
+                        Ok(None) => read_transcript_tail(&transcript_path, lines)
+                            .await
+                            .map_err(|err| {
+                                format!("transcript read failed for {transcript_path}: {err}")
+                            }),
+                        Err(err) => Err(format!(
+                            "remote transcript read failed for {transcript_path} on host {host}: {err:#}"
+                        )),
+                    }
+                };
+                match read_result {
                     Ok((lines_out, truncated)) => {
                         send_response(
                             &sink,
@@ -649,15 +706,11 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
                             },
                         );
                     }
-                    Err(err) => {
+                    Err(message) => {
                         send_response(
                             &sink,
                             &request_id,
-                            FrontendEvent::WorkError {
-                                message: format!(
-                                    "transcript read failed for {transcript_path}: {err}"
-                                ),
-                            },
+                            FrontendEvent::WorkError { message },
                         );
                     }
                 }

@@ -2202,3 +2202,111 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     assert_ne!(latest.id, stale.id);
     assert_eq!(latest.status, "ready");
 }
+
+/// Helper: product + chore + a started run on `host_id`, returning the
+/// execution id. The run lands in `work_runs` with status `active`.
+fn start_run_on_host_for_test(db: &WorkDb, host_id: &str) -> String {
+    let product = db
+        .create_product(CreateProductInput {
+            name: "p".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "c".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    let execution = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .build(),
+        )
+        .unwrap();
+    db.start_execution_run_on_host(
+        &execution.id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "ws-1",
+        "/tmp/ws-1",
+        host_id,
+    )
+    .unwrap();
+    execution.id
+}
+
+#[test]
+fn latest_run_host_for_execution_reports_dispatch_host() {
+    let db = WorkDb::open(temp_db_path("latest-run-host")).unwrap();
+    let exec_id = start_run_on_host_for_test(&db, "zakalwe");
+    assert_eq!(
+        db.latest_run_host_for_execution(&exec_id).unwrap().as_deref(),
+        Some("zakalwe"),
+    );
+    // An execution with no run yet resolves to None.
+    assert_eq!(
+        db.latest_run_host_for_execution("exec_does_not_exist").unwrap(),
+        None,
+    );
+}
+
+#[test]
+fn set_run_remote_pid_updates_latest_run() {
+    let db = WorkDb::open(temp_db_path("set-remote-pid")).unwrap();
+    let exec_id = start_run_on_host_for_test(&db, "zakalwe");
+    assert!(
+        db.set_run_remote_pid_for_execution(&exec_id, 4242).unwrap(),
+        "stamping a pid onto an existing run must report it updated a row",
+    );
+    // No run for this execution → false (benign no-op).
+    assert!(
+        !db.set_run_remote_pid_for_execution("exec_does_not_exist", 7)
+            .unwrap(),
+    );
+}
+
+#[test]
+fn list_reattachable_remote_runs_filters_local_and_terminal() {
+    let db = WorkDb::open(temp_db_path("reattachable")).unwrap();
+    let remote_exec = start_run_on_host_for_test(&db, "zakalwe");
+    let local_exec = start_run_on_host_for_test(&db, "local");
+
+    let runs = db.list_reattachable_remote_runs().unwrap();
+    let exec_ids: Vec<&str> = runs.iter().map(|r| r.execution_id.as_str()).collect();
+    assert!(
+        exec_ids.contains(&remote_exec.as_str()),
+        "an active remote run must be reattachable, got {exec_ids:?}",
+    );
+    assert!(
+        !exec_ids.contains(&local_exec.as_str()),
+        "a local run must never be reattachable",
+    );
+    let remote_handle = runs
+        .iter()
+        .find(|r| r.execution_id == remote_exec)
+        .unwrap();
+    assert_eq!(remote_handle.host_id, "zakalwe");
+
+    // Settling the execution removes it from the reattachable set.
+    db.mark_execution_orphaned(&remote_exec, "test: settled").unwrap();
+    let after = db.list_reattachable_remote_runs().unwrap();
+    assert!(
+        !after.iter().any(|r| r.execution_id == remote_exec),
+        "a run whose execution has settled must not be reattachable",
+    );
+}

@@ -662,6 +662,27 @@ pub async fn serve(
         crate::transient_recovery::DEFAULT_INTERVAL,
     );
 
+    // Engine-restart reattach (distributed-execution PR4): a remote
+    // worker is launched detached and survives the engine restarting,
+    // but the reverse events-socket forward carrying its hook stream
+    // died with the previous engine's ControlMaster. Re-establish a
+    // forward for every active remote run so the still-running worker's
+    // events — and its eventual Stop / PR-URL completion — reach this
+    // engine again; the first hook over the restored forward re-acquires
+    // the worker's live-status slot in `dispatch_live_worker_state`.
+    // One-shot, spawned in the background so an unreachable host cannot
+    // block startup; per-run failures are logged and re-tried on a later
+    // dispatch / `hosts probe`.
+    {
+        let coordinator = server_state.execution_coordinator.clone();
+        let engine_socket = crate::runner::engine_events_socket_path()
+            .display()
+            .to_string();
+        tokio::spawn(async move {
+            coordinator.reattach_remote_runs(&engine_socket).await;
+        });
+    }
+
     // Periodic orphan-active reconciler: re-dispatches `active` work
     // items that have no live execution (the post-crash "stuck-in-Doing"
     // fix). Runs every 60s and fires immediately on boot so items left

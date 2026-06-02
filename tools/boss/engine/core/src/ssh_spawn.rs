@@ -312,6 +312,52 @@ pub async fn perform_remote_launch(
     }
 }
 
+/// Re-establish the reverse events-socket forward for a remote run
+/// whose worker is still alive but whose forward died with the engine
+/// (engine restart / `ControlMaster` loss).
+///
+/// This is the reattach analogue of steps 1–2 of [`perform_remote_launch`]:
+/// it does **not** relaunch the worker (the detached `nohup`'d worker is
+/// still running on the remote), it only restores the tunnel its hook
+/// events flow through. Sequence over the (freshly re-opened) master:
+///
+/// 1. `rm -f` the stale remote socket so `-O forward` can re-bind it —
+///    the old forward's socket file lingers after the master that owned
+///    it exited.
+/// 2. `ssh -O forward -R <remote sock>:<engine sock>`.
+///
+/// Returns `Ok(true)` when the forward came up, `Ok(false)` with the
+/// forward's stderr surfaced by the caller when it did not. Errors only
+/// on a transport failure (the ssh subprocess itself failing to run).
+pub async fn reestablish_events_forward(
+    exec: &dyn SshExec,
+    remote_events_socket: &str,
+    engine_events_socket: &str,
+) -> Result<RemoteLaunchOutcome> {
+    // 1. Clear the stale socket left behind by the dead master.
+    let _ = exec.run(&["rm", "-f", remote_events_socket]).await?;
+
+    // 2. Re-open the forward over the new master.
+    let fwd = exec
+        .add_reverse_unix_forward(remote_events_socket, engine_events_socket)
+        .await?;
+    if fwd.success() {
+        Ok(RemoteLaunchOutcome {
+            launched: true,
+            failure_reason: None,
+            remote_pid: None,
+            detail: None,
+        })
+    } else {
+        Ok(RemoteLaunchOutcome {
+            launched: false,
+            failure_reason: Some(REASON_WORKER_LAUNCH_FAILED),
+            remote_pid: None,
+            detail: Some(non_empty_detail(&fwd, "events forward re-establish failed")),
+        })
+    }
+}
+
 /// Prefer the command's stderr (trimmed) for the failure detail; fall
 /// back to a synthetic `exit N` string so the detail is never empty.
 fn non_empty_detail(out: &SshOutput, fallback: &str) -> String {
@@ -616,5 +662,55 @@ mod tests {
             c,
             Call::Run(argv) if argv.first().map(String::as_str) == Some("env")
         )));
+    }
+
+    #[tokio::test]
+    async fn reestablish_forward_clears_socket_then_reforwards_without_relaunch() {
+        // Reattach must restore the tunnel WITHOUT relaunching the
+        // detached worker: the only calls are the stale-socket cleanup
+        // and the `-O forward`. A stray `env …` wrapper launch here
+        // would double-spawn the worker.
+        let exec = FakeExec::new(0, "");
+        let remote_sock = remote_events_socket_path("exec-7");
+        let engine_sock = "/Users/me/Library/Application Support/Boss/events.sock";
+        let outcome = reestablish_events_forward(&exec, &remote_sock, engine_sock)
+            .await
+            .unwrap();
+
+        assert!(outcome.launched);
+        assert_eq!(outcome.failure_reason, None);
+
+        let calls = exec.calls();
+        assert_eq!(
+            calls[0],
+            Call::Run(vec!["rm".into(), "-f".into(), remote_sock.clone()])
+        );
+        assert_eq!(
+            calls[1],
+            Call::AddForward {
+                remote: remote_sock,
+                local: engine_sock.into(),
+            }
+        );
+        // No worker relaunch on reattach.
+        assert!(!calls.iter().any(|c| matches!(
+            c,
+            Call::Run(argv) if argv.first().map(String::as_str) == Some("env")
+        )));
+        // No cancel — the restored forward must persist for the run.
+        assert!(!calls.iter().any(|c| matches!(c, Call::CancelForward { .. })));
+    }
+
+    #[tokio::test]
+    async fn reestablish_forward_reports_failure_when_forward_rejected() {
+        let mut exec = FakeExec::new(0, "");
+        exec.fail_forward = true;
+        let outcome =
+            reestablish_events_forward(&exec, &remote_events_socket_path("exec-9"), "/engine.sock")
+                .await
+                .unwrap();
+        assert!(!outcome.launched);
+        assert_eq!(outcome.failure_reason, Some(REASON_WORKER_LAUNCH_FAILED));
+        assert!(outcome.detail.unwrap().contains("forwarding request failed"));
     }
 }

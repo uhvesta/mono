@@ -24,6 +24,27 @@ pub enum SetRunTranscriptPathOutcome {
     RowMissing,
 }
 
+/// One detached remote run returned by
+/// [`WorkDb::list_reattachable_remote_runs`]: an `active` `work_runs`
+/// row on a non-local host whose execution is still non-terminal. The
+/// engine's startup reattach pass (see [`crate::remote_reattach`])
+/// re-establishes the reverse events-socket forward for each of these
+/// so the still-running worker's hook stream reaches the new engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRunHandle {
+    /// `work_runs.id` (`run_*`).
+    pub run_id: String,
+    /// `work_runs.execution_id` (`exec_*`) — also the worker's
+    /// `BOSS_RUN_ID` and the key for the remote events socket path.
+    pub execution_id: String,
+    /// The host the run was dispatched to (never `'local'`).
+    pub host_id: String,
+    /// Remote worker pid captured at spawn, if the wrapper handshake
+    /// reported one. Informational for signal addressing; reattach of
+    /// the events forward does not depend on it.
+    pub remote_pid: Option<i64>,
+}
+
 /// Result of a successful [`WorkDb::record_worker_pr_completion`] call.
 /// Carries the cube lease/workspace ids that were attached to the
 /// execution so the caller can drive cube release out-of-band.

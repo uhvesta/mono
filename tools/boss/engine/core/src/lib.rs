@@ -52,6 +52,8 @@ pub use boss_pr_template as pr_template;
 pub mod pr_url_capture;
 pub mod protocol;
 pub mod recovery_backup;
+pub mod remote_reattach;
+pub mod remote_transcript;
 pub mod remote_wrapper;
 pub mod repo_slug;
 pub mod resolution_signal_capture;

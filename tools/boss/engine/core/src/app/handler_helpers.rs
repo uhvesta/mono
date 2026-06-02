@@ -1166,9 +1166,19 @@ pub(super) async fn read_transcript_tail(
     lines: usize,
 ) -> std::io::Result<(Vec<String>, bool)> {
     let contents = tokio::fs::read_to_string(transcript_path).await?;
+    Ok(tail_lines_from_content(&contents, lines))
+}
+
+/// Split raw transcript text into its last `lines` JSONL lines, plus a
+/// `truncated` flag (true when earlier lines were dropped). Shared by
+/// the local read above and the remote-over-SSH pull
+/// ([`crate::remote_transcript`]) so both transports produce an
+/// identical `RunTranscriptTail` payload. `lines == 0` returns no lines
+/// and `truncated = true` iff any content exists.
+pub(super) fn tail_lines_from_content(contents: &str, lines: usize) -> (Vec<String>, bool) {
     let split_lines: Vec<&str> = contents.lines().collect();
     if lines == 0 {
-        return Ok((Vec::new(), !split_lines.is_empty()));
+        return (Vec::new(), !split_lines.is_empty());
     }
     let total = split_lines.len();
     let take = lines.min(total);
@@ -1178,5 +1188,5 @@ pub(super) async fn read_transcript_tail(
         .skip(total - take)
         .map(str::to_owned)
         .collect();
-    Ok((tail, truncated))
+    (tail, truncated)
 }

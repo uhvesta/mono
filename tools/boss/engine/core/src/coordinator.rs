@@ -1249,6 +1249,51 @@ impl ExecutionCoordinator {
         self.host_adapter_provider = provider;
     }
 
+    /// Read the tail of a run's transcript that lives on host `host_id`.
+    ///
+    /// Returns `Ok(None)` for `host_id = "local"` — the transcript is on
+    /// the engine's own filesystem, so the caller reads the recorded
+    /// path directly. For a remote host, resolves the host + adapter and
+    /// pulls the last `max_bytes` of `path` over SSH (the design's Q7
+    /// readback, done on demand rather than via a streaming socket).
+    /// `app.rs`'s `TailRunTranscript` handler routes remote runs through
+    /// here so `bossctl agents transcript` / the transcript viewer work
+    /// identically against a remote worker.
+    pub async fn read_remote_transcript_tail(
+        &self,
+        host_id: &str,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Option<String>> {
+        if host_id == "local" {
+            return Ok(None);
+        }
+        let host = self
+            .work_db
+            .get_host(host_id)?
+            .ok_or_else(|| anyhow!("unknown host '{host_id}' for remote transcript read"))?;
+        let adapter = self.host_adapter_provider.adapter_for(&host).await?;
+        adapter.read_transcript_tail_bytes(path, max_bytes).await
+    }
+
+    /// Re-establish reverse events forwards for every detached remote run
+    /// after an engine restart. Thin binding of the coordinator's
+    /// `work_db` + host-adapter provider to
+    /// [`crate::remote_reattach::reattach_remote_runs`]; `app.rs` calls
+    /// this once at startup so a remote worker that outlived the previous
+    /// engine has its hook stream (and eventual completion) routed back.
+    pub async fn reattach_remote_runs(
+        &self,
+        engine_events_socket: &str,
+    ) -> crate::remote_reattach::ReattachSummary {
+        crate::remote_reattach::reattach_remote_runs(
+            &self.work_db,
+            self.host_adapter_provider.as_ref(),
+            engine_events_socket,
+        )
+        .await
+    }
+
     /// Return a clone of the automation worker pool handle. Used by
     /// `app.rs` to expose the pool's live state to the Agents-tab UI.
     pub fn automation_worker_pool(&self) -> WorkerPool {
@@ -4271,6 +4316,35 @@ mod tests {
             WorkItem::Project(project) => &project.name,
             WorkItem::Task(task) | WorkItem::Chore(task) => &task.name,
         }
+    }
+
+    #[tokio::test]
+    async fn read_remote_transcript_tail_local_returns_none_and_unknown_host_errors() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let coordinator = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            Arc::new(FakeCubeClient::default()),
+            Arc::new(FakeExecutionRunner::default()),
+        );
+
+        // "local" short-circuits to None so the RPC reads the local fs.
+        assert_eq!(
+            coordinator
+                .read_remote_transcript_tail("local", "/whatever.jsonl", 1024)
+                .await
+                .unwrap(),
+            None,
+        );
+
+        // An unknown host is a hard error (the run referenced a host that
+        // is no longer registered) rather than a silent empty read.
+        let err = coordinator
+            .read_remote_transcript_tail("ghost", "/whatever.jsonl", 1024)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ghost"), "got: {err}");
     }
 
     #[tokio::test]

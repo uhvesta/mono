@@ -143,14 +143,42 @@ pub(super) async fn dispatch_live_worker_state(
             }
         }
     }
-    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
-        tracing::warn!(
-            run_id,
-            kind = event_kind,
-            "live_status: dropping hook fan-out — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run); transcript_path already persisted",
-        );
-        return;
+    let slot_id = match server_state.worker_registry.slot_for_run(run_id) {
+        Some(slot_id) => slot_id,
+        None => {
+            // No slot mapping. A *remote* worker never gets a libghostty
+            // pane (it holds no local slot), so the spawn flow never
+            // called `register_run_slot` for it — yet its hooks tunnel
+            // back here over the forwarded events socket. Lazily assign a
+            // virtual slot so the live-status surface tracks the remote
+            // worker's activity (Spawning/Working/Idle/…) just like a
+            // local one. This is also how a worker reattached after an
+            // engine restart re-acquires its live-status slot: the first
+            // hook over the re-established forward lands here. Local runs
+            // with no slot are genuinely gone or racing ahead of
+            // registration (the historical drop case) and fall through.
+            match register_remote_worker_slot(server_state, run_id).await {
+                Some(slot_id) => slot_id,
+                None => {
+                    tracing::warn!(
+                        run_id,
+                        kind = event_kind,
+                        "live_status: dropping hook fan-out — run_id is not registered against a slot (event ahead of register_run_slot or after take_slot_for_run, or a non-remote run); transcript_path already persisted",
+                    );
+                    return;
+                }
+            }
+        }
     };
+    // Remote workers get a virtual slot but no per-slot live-status
+    // summarizer task (the AI-summary loop tails a *local* transcript
+    // file, which a remote run does not have — wiring it to the
+    // over-SSH pull is a documented follow-up). The activity surface
+    // (`apply_event` + broadcast below) is what drives the live dot and
+    // works for remote runs; only the summarizer-trigger `notify` calls
+    // are gated off so they don't emit a misleading "notify dropped — no
+    // per-slot task" warn on every remote hook.
+    let is_remote_slot = slot_id >= crate::worker_registry::REMOTE_SLOT_BASE;
     let prior_activity = server_state
         .live_worker_states
         .get(slot_id)
@@ -171,9 +199,11 @@ pub(super) async fn dispatch_live_worker_state(
         .map(|s| s.activity);
     match &incoming.event {
         crate::protocol::WorkerEvent::Stop { .. } => {
-            server_state
-                .live_status_manager
-                .notify(slot_id, Trigger::Stop);
+            if !is_remote_slot {
+                server_state
+                    .live_status_manager
+                    .notify(slot_id, Trigger::Stop);
+            }
         }
         crate::protocol::WorkerEvent::PostToolUse {
             tool_name,
@@ -181,9 +211,11 @@ pub(super) async fn dispatch_live_worker_state(
             tool_response,
             ..
         } => {
-            server_state
-                .live_status_manager
-                .notify(slot_id, Trigger::PostToolUse);
+            if !is_remote_slot {
+                server_state
+                    .live_status_manager
+                    .notify(slot_id, Trigger::PostToolUse);
+            }
             // Primary-path PR URL capture. Every worker that opens a
             // PR does it via a Bash `gh pr create` (and also
             // `gh pr view` / `gh pr edit`); the PR URL is printed
@@ -278,20 +310,109 @@ pub(super) async fn dispatch_live_worker_state(
         }
         _ => {}
     }
-    if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
-        if prior != new {
+    if !is_remote_slot {
+        if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
+            if prior != new {
+                server_state
+                    .live_status_manager
+                    .notify(slot_id, Trigger::ActivityChanged(new));
+            }
+        } else if let Some(new) = new_activity {
+            // First event lands on a freshly spawned slot — the trigger
+            // gives the loop the activity it should base its initial
+            // policy on (in particular, Working → starts the timer
+            // floor).
             server_state
                 .live_status_manager
                 .notify(slot_id, Trigger::ActivityChanged(new));
         }
-    } else if let Some(new) = new_activity {
-        // First event lands on a freshly spawned slot — the trigger
-        // gives the loop the activity it should base its initial
-        // policy on (in particular, Working → starts the timer
-        // floor).
+    }
+}
+
+/// Assign a virtual live-status slot to a slotless run when it is a
+/// live **remote** worker, returning the slot to fan the hook out to.
+///
+/// `run_id` is the worker's `BOSS_RUN_ID`, which is the execution id.
+/// A remote worker holds no libghostty pane, so the local spawn flow
+/// never registered a slot for it — but the live-status surface is
+/// slot-keyed, so we allocate a synthetic slot from the reserved remote
+/// range (see [`crate::worker_registry::REMOTE_SLOT_BASE`]) and seed the
+/// initial `LiveWorkerState` the first time we see the run. Returns
+/// `None` (so the caller drops the event) when the run is not a live
+/// remote worker: a local run, a run with no recorded host, a run on a
+/// settled execution (late/duplicate hook for a finished worker), or
+/// when the remote slot range is exhausted.
+async fn register_remote_worker_slot(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+) -> Option<u8> {
+    let host = server_state
+        .work_db
+        .latest_run_host_for_execution(run_id)
+        .ok()
+        .flatten()?;
+    if host == "local" {
+        return None;
+    }
+    // Don't resurrect a finished run from a late or duplicate hook.
+    let execution = server_state.work_db.get_execution(run_id).ok()?;
+    if remote_execution_is_settled(&execution.status) {
+        return None;
+    }
+    let (slot_id, freshly_allocated) = server_state
+        .worker_registry
+        .get_or_allocate_remote_slot(run_id)?;
+    if freshly_allocated {
+        // Resolve the work item once for both the binding (name) and
+        // the model label. `model_override` is the user's explicit
+        // choice when set; otherwise fall back to a generic label (the
+        // effort-resolved model lives in the spawn-time config, which is
+        // not persisted, so it is not recoverable here).
+        let work_item = server_state.work_db.get_work_item(&execution.work_item_id).ok();
+        let binding = work_item.as_ref().map(|item| boss_protocol::WorkItemBinding {
+            work_item_id: execution.work_item_id.clone(),
+            work_item_name: crate::runner::work_item_name(item).to_owned(),
+            execution_id: run_id.to_owned(),
+        });
+        let model = work_item
+            .as_ref()
+            .and_then(remote_worker_model_override)
+            .unwrap_or_else(|| "claude".to_owned());
+        // shell_pid is a local-process concept; a remote worker has no
+        // local pid, so 0 (the live state stores it but the value is
+        // only meaningful for the local ancestor-walk correlation that
+        // remote runs bypass via the `_boss_run_id` token).
         server_state
-            .live_status_manager
-            .notify(slot_id, Trigger::ActivityChanged(new));
+            .live_worker_states
+            .register_spawn(slot_id, run_id, model, 0, binding);
+        tracing::info!(
+            run_id,
+            slot_id,
+            host = %host,
+            "live_status: assigned virtual slot to remote worker (no local pane); activity tracks the forwarded hook stream",
+        );
+        server_state.broadcast_live_worker_states().await;
+    }
+    Some(slot_id)
+}
+
+/// Terminal execution statuses — a hook for one of these is a stray
+/// late/duplicate delivery and must not allocate a fresh slot. Mirrors
+/// the set used by [`crate::work::WorkDb::list_reattachable_remote_runs`].
+fn remote_execution_is_settled(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
+    )
+}
+
+/// The work item's explicit model override, if it carries one (only
+/// tasks/chores do). Used to label a remote worker's live state.
+fn remote_worker_model_override(item: &boss_protocol::WorkItem) -> Option<String> {
+    use boss_protocol::WorkItem;
+    match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.model_override.clone(),
+        WorkItem::Product(_) | WorkItem::Project(_) => None,
     }
 }
 
