@@ -8761,7 +8761,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // not attributed to an execution in repo-B.
         let workspace = tempdir().unwrap();
         // Build a product and a chore for repo-A.
-        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        let (db, _product_id, _chore_id, execution_id) = fixture(workspace.path());
         let repo_a = "git@github.com:spinyfin/mono.git";
         let repo_b = "git@github.com:otherorg/otherrepo.git";
 

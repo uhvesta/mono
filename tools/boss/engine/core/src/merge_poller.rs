@@ -6261,7 +6261,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let pr = "https://github.com/foo/bar/pull/899";
-        let (_product_id, chore, exec_id) =
+        let (_product_id, _chore, exec_id) =
             make_blocked_ci_chore_with_live_worker(&db, "C-898-nohandler", pr);
 
         let probe = StubProbe::new();

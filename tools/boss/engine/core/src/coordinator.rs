@@ -25,8 +25,7 @@ use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
 use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, PreStartFailureOutcome, WorkDb, WorkExecution,
-    WorkItem, WorkRun,
+    CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
 };
 
 // Phase-3 counter handles for the cube workspace lease boundary.
@@ -3788,7 +3787,6 @@ struct FailedCheckJson {
     #[allow(dead_code)]
     name: String,
     conclusion: String,
-    target_url: String,
     provider: String,
     #[serde(default)]
     provider_job_id: Option<String>,
