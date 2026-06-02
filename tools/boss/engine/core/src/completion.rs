@@ -568,6 +568,45 @@ struct ApiPr {
     deletions: i64,
 }
 
+/// Parse the first six tab-separated fields emitted by the shared
+/// `gh pr list … --json url,state,mergedAt,changedFiles,additions,deletions
+/// --jq … @tsv` query (in that exact order) into an [`ApiPr`].
+///
+/// Returns `None` when the URL field is empty — the `select(.)` /
+/// row-absent case — matching the original `url.is_empty()` guard at both
+/// call sites. `mergedAt` of empty or `"null"` (case-insensitively) maps to
+/// `None`; the three numeric fields fall back to `0` when missing or
+/// unparseable.
+///
+/// Any trailing fields beyond the first six (e.g. the `headRefName` column
+/// in the suffix-scan query) are ignored, so callers that need them must
+/// parse them separately from the same line.
+fn parse_api_pr_tsv(line: &str) -> Option<ApiPr> {
+    let mut parts = line.split('\t');
+    let url = parts.next().unwrap_or("").trim().to_owned();
+    let state = parts.next().unwrap_or("").trim().to_owned();
+    let merged_at_raw = parts.next().unwrap_or("").trim();
+    let changed_files_raw = parts.next().unwrap_or("0").trim();
+    let additions_raw = parts.next().unwrap_or("0").trim();
+    let deletions_raw = parts.next().unwrap_or("0").trim();
+    if url.is_empty() {
+        return None;
+    }
+    let merged_at = if merged_at_raw.is_empty() || merged_at_raw.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(merged_at_raw.to_owned())
+    };
+    Some(ApiPr {
+        url,
+        state,
+        merged_at,
+        changed_files: changed_files_raw.parse::<i64>().unwrap_or(0),
+        additions: additions_raw.parse::<i64>().unwrap_or(0),
+        deletions: deletions_raw.parse::<i64>().unwrap_or(0),
+    })
+}
+
 fn classify_pr(pr: ApiPr) -> PrStatus {
     // Branch-keyed query already guarantees the PR was opened against
     // this execution's engine-supplied head branch — no SHA matching
@@ -633,32 +672,7 @@ async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<Api
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let mut parts = trimmed.split('\t');
-    let url = parts.next().unwrap_or("").trim().to_owned();
-    let state = parts.next().unwrap_or("").trim().to_owned();
-    let merged_at_raw = parts.next().unwrap_or("").trim();
-    let changed_files_raw = parts.next().unwrap_or("0").trim();
-    let additions_raw = parts.next().unwrap_or("0").trim();
-    let deletions_raw = parts.next().unwrap_or("0").trim();
-    if url.is_empty() {
-        return Ok(None);
-    }
-    let merged_at = if merged_at_raw.is_empty() || merged_at_raw.eq_ignore_ascii_case("null") {
-        None
-    } else {
-        Some(merged_at_raw.to_owned())
-    };
-    let changed_files = changed_files_raw.parse::<i64>().unwrap_or(0);
-    let additions = additions_raw.parse::<i64>().unwrap_or(0);
-    let deletions = deletions_raw.parse::<i64>().unwrap_or(0);
-    Ok(Some(ApiPr {
-        url,
-        state,
-        merged_at,
-        changed_files,
-        additions,
-        deletions,
-    }))
+    Ok(parse_api_pr_tsv(trimmed))
 }
 
 /// Prefix-agnostic cold-path fallback (issue #1145): find a PR whose head
@@ -710,33 +724,18 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
             continue;
         }
         rows += 1;
-        let mut parts = line.split('\t');
-        let url = parts.next().unwrap_or("").trim().to_owned();
-        let state = parts.next().unwrap_or("").trim().to_owned();
-        let merged_at_raw = parts.next().unwrap_or("").trim();
-        let changed_files_raw = parts.next().unwrap_or("0").trim();
-        let additions_raw = parts.next().unwrap_or("0").trim();
-        let deletions_raw = parts.next().unwrap_or("0").trim();
-        let head_ref = parts.next().unwrap_or("").trim();
-        if url.is_empty() || head_ref.is_empty() {
+        // The shared 6-field parser ignores trailing columns, so pull the
+        // 7th `headRefName` field out separately for the suffix filter.
+        let head_ref = line.split('\t').nth(6).unwrap_or("").trim();
+        if head_ref.is_empty() {
             continue;
         }
         if branch_work_item_suffix(head_ref) != suffix {
             continue;
         }
-        let merged_at = if merged_at_raw.is_empty() || merged_at_raw.eq_ignore_ascii_case("null") {
-            None
-        } else {
-            Some(merged_at_raw.to_owned())
-        };
-        return Ok(Some(ApiPr {
-            url,
-            state,
-            merged_at,
-            changed_files: changed_files_raw.parse::<i64>().unwrap_or(0),
-            additions: additions_raw.parse::<i64>().unwrap_or(0),
-            deletions: deletions_raw.parse::<i64>().unwrap_or(0),
-        }));
+        if let Some(pr) = parse_api_pr_tsv(line) {
+            return Ok(Some(pr));
+        }
     }
     if rows >= SCAN_LIMIT {
         tracing::warn!(
@@ -8664,6 +8663,62 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert_eq!(branch_work_item_suffix("exec_x"), "exec_x");
         // Multi-segment → only the final segment counts.
         assert_eq!(branch_work_item_suffix("feature/x/exec_y"), "exec_y");
+    }
+
+    #[test]
+    fn parse_api_pr_tsv_parses_all_six_fields() {
+        let pr = parse_api_pr_tsv(
+            "https://github.com/o/r/pull/7\topen\t2026-01-02T03:04:05Z\t3\t10\t4",
+        )
+        .expect("a non-empty url yields Some");
+        assert_eq!(pr.url, "https://github.com/o/r/pull/7");
+        assert_eq!(pr.state, "open");
+        assert_eq!(pr.merged_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+        assert_eq!(pr.changed_files, 3);
+        assert_eq!(pr.additions, 10);
+        assert_eq!(pr.deletions, 4);
+    }
+
+    #[test]
+    fn parse_api_pr_tsv_treats_null_and_empty_merged_at_as_none() {
+        // jq emits a literal "null" (any case) when mergedAt is absent.
+        let pr = parse_api_pr_tsv("https://x/pull/1\topen\tnull\t0\t0\t0").unwrap();
+        assert_eq!(pr.merged_at, None);
+        let pr = parse_api_pr_tsv("https://x/pull/1\topen\tNULL\t0\t0\t0").unwrap();
+        assert_eq!(pr.merged_at, None);
+        // An empty mergedAt column is likewise None.
+        let pr = parse_api_pr_tsv("https://x/pull/1\topen\t\t0\t0\t0").unwrap();
+        assert_eq!(pr.merged_at, None);
+    }
+
+    #[test]
+    fn parse_api_pr_tsv_returns_none_when_url_empty() {
+        // Empty leading field (the `select(.)` / absent-row case) → None.
+        assert!(parse_api_pr_tsv("\topen\tnull\t0\t0\t0").is_none());
+        assert!(parse_api_pr_tsv("").is_none());
+    }
+
+    #[test]
+    fn parse_api_pr_tsv_defaults_missing_and_unparseable_numerics_to_zero() {
+        // Missing trailing numeric columns fall back to 0.
+        let pr = parse_api_pr_tsv("https://x/pull/1\topen\tnull").unwrap();
+        assert_eq!((pr.changed_files, pr.additions, pr.deletions), (0, 0, 0));
+        // Non-numeric junk also falls back to 0 (parse::<i64>().unwrap_or(0)).
+        let pr = parse_api_pr_tsv("https://x/pull/1\topen\tnull\tx\ty\tz").unwrap();
+        assert_eq!((pr.changed_files, pr.additions, pr.deletions), (0, 0, 0));
+    }
+
+    #[test]
+    fn parse_api_pr_tsv_ignores_trailing_head_ref_field() {
+        // The suffix-scan query appends a 7th headRefName column; the shared
+        // parser must ignore it and still produce the same ApiPr. The call
+        // site parses headRefName separately for the suffix filter.
+        let line = "https://x/pull/9\topen\tnull\t1\t2\t3\tbduff/exec_abc";
+        let pr = parse_api_pr_tsv(line).unwrap();
+        assert_eq!(pr.url, "https://x/pull/9");
+        assert_eq!(pr.changed_files, 1);
+        assert_eq!(pr.deletions, 3);
+        assert_eq!(line.split('\t').nth(6), Some("bduff/exec_abc"));
     }
 
     #[test]
