@@ -5,13 +5,15 @@ import SwiftUI
 enum AgentPoolKind: String, CaseIterable, Identifiable {
     case main
     case automations
+    case reviewers
 
     var id: String { rawValue }
 
-    func label(mainCount: Int, automationCount: Int) -> String {
+    func label(mainCount: Int, automationCount: Int, reviewCount: Int) -> String {
         switch self {
         case .main: return "Main (\(mainCount))"
         case .automations: return "Automations (\(automationCount))"
+        case .reviewers: return "Reviewers (\(reviewCount))"
         }
     }
 }
@@ -31,7 +33,7 @@ struct WorkersDetailView: View {
         VStack(spacing: 0) {
             poolPickerHeader
             Divider()
-            // Both grids stay permanently in the view hierarchy so that
+            // All grids stay permanently in the view hierarchy so that
             // switching pools is a pure display filter — no SwiftUI identity
             // churn, no dismantleNSView, no libghostty surface teardown.
             // Only the visible grid receives hit-testing and is rendered.
@@ -53,6 +55,15 @@ struct WorkersDetailView: View {
                 )
                 .opacity(selectedPool == .automations ? 1 : 0)
                 .allowsHitTesting(selectedPool == .automations)
+
+                WorkerGrid(
+                    runtime: workspace.runtime,
+                    slots: workspace.reviewSlots,
+                    liveStates: liveStates,
+                    liveStatusModel: liveStatusModel
+                )
+                .opacity(selectedPool == .reviewers ? 1 : 0)
+                .allowsHitTesting(selectedPool == .reviewers)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -65,7 +76,8 @@ struct WorkersDetailView: View {
                 ForEach(AgentPoolKind.allCases) { pool in
                     Text(pool.label(
                         mainCount: WorkersWorkspaceModel.workerSlotCount,
-                        automationCount: WorkersWorkspaceModel.automationSlotCount
+                        automationCount: WorkersWorkspaceModel.automationSlotCount,
+                        reviewCount: WorkersWorkspaceModel.reviewSlotCount
                     )).tag(pool)
                 }
             }
