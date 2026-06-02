@@ -2616,9 +2616,15 @@ final class ChatViewModel: ObservableObject {
         if let cached = cachedItemsByColumn[column] {
             return cached
         }
+        // The Review column gets a dedicated ordering: newest by creation
+        // time at the top, so the column is predictable and scannable (the
+        // generic board sort keys on `ordinal`, which review-phase tasks
+        // rarely carry, leaving them in an apparently-random order). See
+        // boss issue #1250.
+        let sort = column == .review ? reviewBoardSort : boardTaskSort
         var items = visibleWorkItems
             .filter { effectiveBoardColumn(for: $0) == column }
-            .sorted(by: boardTaskSort)
+            .sorted(by: sort)
         // Revisions don't appear as standalone cards in Review or Done — they
         // roll up as single lines on the parent task's card in both lanes.
         // They are still visible in Backlog/Doing as distinct cards.
@@ -2890,6 +2896,22 @@ private func taskSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
         }
         return lhs.createdAt < rhs.createdAt
     }
+}
+
+/// Ordering for the Review column: newest by creation time at the top.
+/// `createdAt` is an RFC 3339 string, which sorts lexicographically in
+/// chronological order, so a descending string compare yields newest-first.
+/// Name then id break ties so the order is fully deterministic when two
+/// cards share a `createdAt`. See boss issue #1250.
+private func reviewBoardSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
+    if lhs.createdAt != rhs.createdAt {
+        return lhs.createdAt > rhs.createdAt
+    }
+    let nameOrder = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+    if nameOrder != .orderedSame {
+        return nameOrder == .orderedAscending
+    }
+    return lhs.id < rhs.id
 }
 
 private func boardTaskSort(_ lhs: WorkTask, _ rhs: WorkTask) -> Bool {
