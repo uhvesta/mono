@@ -1275,4 +1275,147 @@ mod tests {
         assert_eq!(lines[0]["i"], 1);
         assert_eq!(lines[1]["i"], 2);
     }
+
+    #[tokio::test]
+    async fn read_transcript_tail_parses_all_lines_when_under_max() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("small.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"i":1}}"#).unwrap();
+        writeln!(f).unwrap(); // blank line — must be skipped, not parsed
+        writeln!(f, r#"{{"i":2}}"#).unwrap();
+        writeln!(f, "   ").unwrap(); // whitespace-only line — also skipped
+        writeln!(f, r#"{{"i":3}}"#).unwrap();
+        drop(f);
+        // File is far under max_bytes → no seek, no dropped first line; every
+        // complete JSON line is parsed and blank lines are skipped.
+        let lines = read_transcript_tail(&path.to_string_lossy(), 1 << 20).await;
+        assert_eq!(lines.len(), 3, "blank/whitespace lines must be skipped");
+        assert_eq!(lines[0]["i"], 1);
+        assert_eq!(lines[1]["i"], 2);
+        assert_eq!(lines[2]["i"], 3);
+    }
+
+    #[tokio::test]
+    async fn read_transcript_tail_skips_malformed_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mixed.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"i":1}}"#).unwrap();
+        writeln!(f, "this is not json").unwrap();
+        writeln!(f, r#"{{"i":2"#).unwrap(); // truncated/invalid JSON (no closing brace)
+        writeln!(f, r#"{{"i":3}}"#).unwrap();
+        drop(f);
+        // Non-JSON and malformed lines are dropped rather than erroring; the
+        // two well-formed lines survive in order.
+        let lines = read_transcript_tail(&path.to_string_lossy(), 1 << 20).await;
+        assert_eq!(lines.len(), 2, "malformed lines must be skipped, not fatal");
+        assert_eq!(lines[0]["i"], 1);
+        assert_eq!(lines[1]["i"], 3);
+    }
+
+    #[test]
+    fn clip_trims_and_collapses_newlines() {
+        // Leading/trailing whitespace is trimmed and embedded newlines
+        // become single spaces.
+        assert_eq!(clip("  hello  ", 100), "hello");
+        assert_eq!(clip("line1\nline2\nline3", 100), "line1 line2 line3");
+        // Trim happens before newline replacement, so surrounding blank
+        // lines are removed entirely.
+        assert_eq!(clip("\n  middle  \n", 100), "middle");
+    }
+
+    #[test]
+    fn clip_returns_short_string_unchanged() {
+        // At/under max_bytes → returned as-is, no ellipsis.
+        let s = "short error";
+        let out = clip(s, s.len());
+        assert_eq!(out, s);
+        assert!(!out.contains('…'), "no ellipsis when within budget");
+
+        let out = clip("tiny", 100);
+        assert_eq!(out, "tiny");
+        assert!(!out.contains('…'));
+    }
+
+    #[test]
+    fn clip_truncates_overlong_ascii_with_ellipsis() {
+        let s = "x".repeat(1000);
+        let out = clip(&s, 10);
+        assert!(out.ends_with('…'), "over-length output must end with ellipsis");
+        // The retained prefix (everything before the ellipsis) stays within
+        // the byte budget.
+        let prefix = out.strip_suffix('…').unwrap();
+        assert!(
+            prefix.len() <= 10,
+            "prefix {} bytes must be <= max_bytes",
+            prefix.len()
+        );
+        assert_eq!(prefix, "x".repeat(10));
+    }
+
+    #[test]
+    fn clip_truncation_respects_utf8_char_boundary() {
+        // '世' is 3 bytes; 10 of them = 30 bytes. max_bytes = 8 lands inside
+        // the third character — clip must walk back to a char boundary (6)
+        // and must NOT panic.
+        let s = "世".repeat(10);
+        let out = clip(&s, 8);
+        assert!(out.ends_with('…'));
+        let prefix = out.strip_suffix('…').unwrap();
+        assert_eq!(prefix, "世世", "must walk back to the char boundary at 6");
+        assert!(prefix.len() <= 8);
+
+        // 'é' is 2 bytes; an odd max_bytes lands mid-codepoint and must also
+        // walk back without panicking.
+        let s = "é".repeat(10);
+        let out = clip(&s, 5);
+        assert!(out.ends_with('…'));
+        let prefix = out.strip_suffix('…').unwrap();
+        assert_eq!(prefix, "éé", "must walk back to the char boundary at 4");
+        assert!(prefix.len() <= 5);
+    }
+
+    #[test]
+    fn should_inspect_covers_every_worker_activity_variant() {
+        // Exhaustive over WorkerActivity so adding a variant forces a
+        // deliberate decision here rather than silently defaulting.
+        for activity in [
+            WorkerActivity::Spawning,
+            WorkerActivity::Working,
+            WorkerActivity::WaitingForInput,
+            WorkerActivity::Idle,
+            WorkerActivity::Errored,
+            WorkerActivity::Terminated,
+        ] {
+            let expected = match activity {
+                WorkerActivity::Idle
+                | WorkerActivity::WaitingForInput
+                | WorkerActivity::Errored
+                | WorkerActivity::Terminated => true,
+                WorkerActivity::Spawning | WorkerActivity::Working => false,
+            };
+            assert_eq!(
+                should_inspect(activity),
+                expected,
+                "unexpected should_inspect verdict for {activity:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn execution_status_is_terminal_classifies_states() {
+        for status in ["completed", "failed", "abandoned", "cancelled", "orphaned"] {
+            assert!(
+                execution_status_is_terminal(status),
+                "{status} should be terminal",
+            );
+        }
+        for status in ["running", "queued", "ready", "", "something_new"] {
+            assert!(
+                !execution_status_is_terminal(status),
+                "{status} should not be terminal",
+            );
+        }
+    }
 }
