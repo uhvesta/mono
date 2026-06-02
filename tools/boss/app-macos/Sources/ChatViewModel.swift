@@ -1352,6 +1352,14 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
+        // Optimistic update: move the card to the destination column immediately
+        // before the RPC completes. The engine remains the authority — on failure
+        // we bounce back via bounceBackOptimisticMoves.
+        let originColumn = effectiveBoardColumn(for: task)
+        pendingMoveOriginByTaskID[taskID] = originColumn
+        optimisticColumnByTaskID[taskID] = column
+        invalidateWorkCache()
+
         engine.sendUpdateWorkItem(id: task.id, patch: ["status": targetStatus])
 
         if targetStatus == "active" {
@@ -1892,6 +1900,11 @@ final class ChatViewModel: ObservableObject {
             mergeTaskRuntimes(taskRuntimes, for: product.id, tasks: tasks, chores: chores)
             dependenciesByProductID[product.id] = dependencies
             seedReviewTaskIDs(tasks: tasks, chores: chores, productID: product.id)
+            // After tasksByProjectID reflects real engine state, clear optimistic
+            // overrides for cards whose true column now matches the target.
+            // Done before the @Published assignments take effect in the view so
+            // the next render uses real boardColumn values — no visible flicker.
+            reconcileOptimisticOverrides(from: tasks + chores)
             reconcileWorkSelection()
             refreshWorkSubscriptions()
             refreshDesignDocStates(for: projects)
@@ -1922,15 +1935,20 @@ final class ChatViewModel: ObservableObject {
                 engine.sendGetWorkTree(productId: productID)
             }
         case .workError(let message):
-            workErrorMessage = message
             // Allow the user to retry any in-flight review terminal or
-            // merge-when-ready request that failed — the specific
-            // work_error message is shown in the modal, so clearing
-            // in-flight state here is safe.
+            // merge-when-ready request that failed.
             openingReviewTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
+            }
+            if !pendingMoveOriginByTaskID.isEmpty {
+                // Error is likely from an in-flight kanban move: bounce the
+                // card(s) back and show an inline non-blocking notice instead
+                // of interrupting with a modal dialog.
+                bounceBackOptimisticMoves(message: message)
+            } else {
+                workErrorMessage = message
             }
         case .error(let message):
             if isSocketTransportError(message) {
@@ -2530,6 +2548,33 @@ final class ChatViewModel: ObservableObject {
     /// conflict resolution routes to `.doing` so the kanban invariant
     /// holds: Doing = a worker is touching this right now.
     func effectiveBoardColumn(for task: WorkTask) -> WorkBoardColumnKey {
+        // Optimistic override wins while a drag is in-flight.
+        if let override = optimisticColumnByTaskID[task.id] {
+            return override
+        }
+        if task.status == "blocked",
+           task.blockedReason == "merge_conflict",
+           let attemptID = task.blockedAttemptID,
+           conflictResolutions.contains(where: {
+               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
+           }) {
+            return .doing
+        }
+        if task.status == "blocked",
+           task.blockedReason == "ci_failure",
+           let attemptID = task.blockedAttemptID,
+           ciRemediations.contains(where: {
+               $0.id == attemptID && ($0.status == "pending" || $0.status == "running")
+           }) {
+            return .doing
+        }
+        return task.boardColumn
+    }
+
+    /// Effective board column based solely on real engine state, ignoring any
+    /// in-flight optimistic override. Used during work-tree reconciliation to
+    /// compare actual task state against the optimistic position.
+    func realEffectiveBoardColumn(for task: WorkTask) -> WorkBoardColumnKey {
         if task.status == "blocked",
            task.blockedReason == "merge_conflict",
            let attemptID = task.blockedAttemptID,
@@ -2636,7 +2681,7 @@ final class ChatViewModel: ObservableObject {
     private var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
     private var cachedAmbiguousRepoNames: Set<String>?
 
-    private func invalidateWorkCache() {
+    func invalidateWorkCache() {
         cachedVisibleItems = nil
         cachedItemsByColumn.removeAll(keepingCapacity: true)
         cachedSectionsByColumn.removeAll(keepingCapacity: true)
@@ -2649,67 +2694,21 @@ final class ChatViewModel: ObservableObject {
     /// drag from Blocked → Doing is rejected because the row still has
     /// unsatisfied gating prereqs (design item 11). Single-slot — the
     /// previous notice is replaced when a new refusal fires.
-    @Published private(set) var dragRefusalNotice: DragRefusalNotice?
+    @Published var dragRefusalNotice: DragRefusalNotice?
 
-    struct DragRefusalNotice: Equatable {
-        let taskID: String
-        let message: String
-    }
+    // MARK: - Optimistic kanban moves
 
-    /// Variant of `moveTask` that returns whether the drop was
-    /// accepted. Used by the kanban's `dropDestination` so the source
-    /// lane can render an inline warning when the engine would refuse
-    /// the underlying status change.
-    func attemptMoveTask(_ taskID: String, to column: WorkBoardColumnKey) -> Bool {
-        guard let task = task(withID: taskID) else { return false }
-        let targetStatus = column.targetStatus
+    /// Optimistic column override for a card whose drop has been accepted
+    /// in the UI but not yet confirmed by the engine. `effectiveBoardColumn`
+    /// consults this before falling back to the real task status, giving an
+    /// instant visual response on drop.
+    var optimisticColumnByTaskID: [String: WorkBoardColumnKey] = [:]
+    /// Origin column for each in-flight optimistic move. Kept until the
+    /// engine's `workItemUpdated` event confirms the transition (at which
+    /// point it is removed without clearing the override). If `work_error`
+    /// arrives while entries remain here, the card bounces back.
+    var pendingMoveOriginByTaskID: [String: WorkBoardColumnKey] = [:]
 
-        // Dispatch-pending rows (status=todo, autostart=true) show in the
-        // Doing column but their status is already "todo" — same as Backlog's
-        // targetStatus. The normal status-equality guard would silently refuse
-        // the drop. Instead, accept Doing→Backlog for these rows and flip
-        // autostart=false; lane routing then moves the card to Backlog.
-        let isDispatchPending = task.status == "todo" && task.autostart
-        if isDispatchPending && column == .backlog {
-            engine.sendUpdateWorkItem(id: task.id, patch: ["autostart": false])
-            return true
-        }
-
-        guard task.status != targetStatus else { return false }
-
-        if task.status == "blocked",
-           targetStatus != "blocked",
-           hasGatingPrereqs(task)
-        {
-            let count = gatingPrereqs(for: task.id).count
-            let plural = count == 1 ? "prerequisite" : "prerequisites"
-            dragRefusalNotice = DragRefusalNotice(
-                taskID: task.id,
-                message: "\(task.name) is gated by \(count) incomplete \(plural) — clear them or remove the edge first."
-            )
-            scheduleDragRefusalDismiss(for: task.id)
-            return false
-        }
-
-        moveTask(taskID, to: column)
-        return true
-    }
-
-    func clearDragRefusal() {
-        dragRefusalNotice = nil
-    }
-
-    private func scheduleDragRefusalDismiss(for taskID: String) {
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-            await MainActor.run { [weak self] in
-                guard let self,
-                      self.dragRefusalNotice?.taskID == taskID
-                else { return }
-                self.dragRefusalNotice = nil
-            }
-        }
-    }
 
 
     /// Resolve a task to its current LiveWorkerState by joining
@@ -2791,6 +2790,19 @@ final class ChatViewModel: ObservableObject {
         case .project(let project):
             engine.sendGetWorkTree(productId: project.productID)
         case .task(let updatedTask), .chore(let updatedTask):
+            // When the engine confirms an optimistic move, drop the origin record
+            // so a subsequent work_error from an unrelated operation won't bounce
+            // a card that is already confirmed. The optimistic override itself
+            // stays until reconcileOptimisticOverrides clears it after the full
+            // work-tree arrives — removing it here would cause a flicker because
+            // tasksByProjectID still holds the old status.
+            if let targetColumn = optimisticColumnByTaskID[updatedTask.id],
+               updatedTask.boardColumn == targetColumn {
+                pendingMoveOriginByTaskID.removeValue(forKey: updatedTask.id)
+            } else if optimisticColumnByTaskID[updatedTask.id] != nil {
+                // Engine returned a different status — move silently rejected.
+                bounceBackOptimisticMoves(message: nil)
+            }
             maybeFireReviewNotification(for: updatedTask)
             engine.sendGetWorkTree(productId: updatedTask.productID)
         }
