@@ -1464,23 +1464,27 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "6. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n"
     ));
+    out.push_str("7. **Update the PR description** — this is a required step, not optional:\n");
     out.push_str(&format!(
-        "7. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
+        "   a. Read the current description: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number} --json body -q .body`\n"
+    ));
+    out.push_str("   b. Compare it carefully against what the PR NOW does after your change. Pay special attention to any section that describes behaviour, scope, or approach that this revision REVERSES, supersedes, or obsoletes — those sections MUST be corrected or removed. A description that tells a reviewer the exact opposite of what the code does is worse than a terse one.\n");
+    out.push_str("   c. If any part of the description is now inaccurate, write the corrected body to a temp file and apply it:\n");
+    out.push_str("      `body=$(mktemp) && <write corrected body to $body> && GIT_DIR=.jj/repo/store/git gh pr edit --body-file \"$body\" -R <owner/repo>`\n");
+    out.push_str("      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n");
+    out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
+    out.push_str("   e. Cosmetic and rebase-only revisions that change no observable behaviour may skip steps c–d if, after step b, you confirm the existing description is still accurate.\n");
+    out.push('\n');
+    out.push_str(&format!(
+        "8. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
     ));
     out.push_str(&format!(
-        "8. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
+        "9. Print the parent PR URL on its own line as the FINAL thing in your final response: {parent_pr_url}\n"
     ));
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
     out.push_str("Rebase-only exception: if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces no new diff, it is perfectly valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change.\n");
-    out.push('\n');
-    out.push_str("PR description accuracy:\n");
-    out.push_str("After updating the code, check whether the existing PR description still accurately describes what the PR now does. If the revision changed the scope, behaviour, or approach significantly, the PR description has become stale and MUST be updated so reviewers see an accurate picture.\n");
-    out.push('\n');
-    out.push_str("- **When to update:** whenever the revision changes what the PR does at a semantic level — different algorithm, different scope, different user-visible behaviour, different design. A cosmetic/rebase-only revision that changes no observable behaviour needs no description update.\n");
-    out.push_str("- **How to update:** write the new body to a temp file and use `GIT_DIR=.jj/repo/store/git gh pr edit --body-file <file> -R <owner/repo>` (never pass the body as an inline `--body` argument — shell will evaluate backticks and `$(...)`). Retrieve the current body first with `GIT_DIR=.jj/repo/store/git gh pr view --json body -q .body` so you can build on it if needed.\n");
-    out.push_str("- **What to write:** rewrite the description so it is accurate and self-contained for reviewers NOW. Do not simply append a \"revision changelog\" that leaves a contradictory original summary above it. A short \"Changes since initial version\" note is acceptable in addition, but the main summary must describe the CURRENT state of the PR — what it does, not what it used to do.\n");
     out.push('\n');
     out.push_str("Constraints:\n");
     out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
@@ -1492,6 +1496,7 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 6 above). Do NOT open a new PR.\n\
+         - Update the PR description per step 7 above — a stale or contradictory description is a defect.\n\
          - Confirm the parent PR shows your new commit with `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`.\n\
          - Print {parent_pr_url} on its own line as the final thing in your final response so the engine can pick it up.\n\
          - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty and no rebase was needed, stop and explain.\n"
