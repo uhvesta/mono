@@ -1056,17 +1056,6 @@ pub enum FrontendRequest {
     /// No DB writes; no topic events.
     ResolveProjectDesignDoc { project_id: String },
 
-    /// Restore a dismissed attention group back to `open` so the human can
-    /// re-evaluate and accept it. Only `dismissed` groups are eligible;
-    /// calling this on an `actioned` group is an error. Resets all
-    /// `skipped`/`dismissed` members back to `open`; answered members keep
-    /// their answers. Idempotent on already-open groups.
-    /// Replies with [`FrontendEvent::AttentionGroupUpdated`].
-    RestoreAttentionGroup {
-        /// `atg_…` or `A<n>` of the dismissed group to restore.
-        id: String,
-    },
-
     /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task, making it visible again. The
     /// `id` accepts a canonical `task_…` id or a friendly short id

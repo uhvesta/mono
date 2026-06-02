@@ -6,36 +6,16 @@ extension ChatViewModel {
     /// Replace the product's group set from a full `list_attention_groups`
     /// reply, bucketing the flat member list by group id and pruning member
     /// entries for groups that dropped out of the (open) list.
-    ///
-    /// Handles two response kinds:
-    /// - Open-list (default): replaces open/partially_answered groups while
-    ///   preserving dismissed groups so the "Rejected" section survives reloads.
-    /// - Dismissed-list (state="dismissed" request): merges dismissed groups
-    ///   into the stored open list.
-    ///
-    /// Detection is content-based: the engine only returns dismissed-state
-    /// groups when state="dismissed" was explicitly requested, so inspecting
-    /// the group states is reliable regardless of network arrival order.
-    /// `pendingDismissedGroupLoads` is used only for empty responses where
-    /// the state cannot be inferred from group content.
     func applyAttentionGroupsList(
         productID: String,
         groups: [AttentionGroup],
         members: [Attention]
     ) {
-        let hasPendingDismissed = pendingDismissedGroupLoads[productID, default: 0] > 0
-        // Identify dismissed-batch responses by content rather than arrival order:
-        // a non-empty response where every group is dismissed can only come from
-        // a state="dismissed" request. For empty responses, fall back to the counter.
-        let allGroupsDismissed = !groups.isEmpty && groups.allSatisfy(\.isDismissed)
-        let isDismissedBatch = allGroupsDismissed || (groups.isEmpty && hasPendingDismissed)
-        if isDismissedBatch && hasPendingDismissed {
-            let remaining = (pendingDismissedGroupLoads[productID] ?? 1) - 1
-            pendingDismissedGroupLoads[productID] = remaining > 0 ? remaining : nil
+        let priorIDs = Set((attentionGroupsByProductID[productID] ?? []).map(\.id))
+        let nextIDs = Set(groups.map(\.id))
+        for goneID in priorIDs.subtracting(nextIDs) {
+            attentionMembersByGroupID.removeValue(forKey: goneID)
         }
-        let prior = attentionGroupsByProductID[productID] ?? []
-        let incomingIDs = Set(groups.map(\.id))
-
         var bucketed: [String: [Attention]] = [:]
         for member in members {
             bucketed[member.groupID, default: []].append(member)
@@ -44,26 +24,7 @@ extension ChatViewModel {
             attentionMembersByGroupID[group.id] =
                 (bucketed[group.id] ?? []).sorted { $0.ordinal < $1.ordinal }
         }
-
-        if isDismissedBatch {
-            // Dismissed-only response: upsert dismissed groups, keep open ones.
-            // Remove member data for dismissed groups that are no longer present.
-            let priorDismissedIDs = Set(prior.filter(\.isDismissed).map(\.id))
-            for goneID in priorDismissedIDs.subtracting(incomingIDs) {
-                attentionMembersByGroupID.removeValue(forKey: goneID)
-            }
-            let keptOpen = prior.filter { !$0.isDismissed && !incomingIDs.contains($0.id) }
-            attentionGroupsByProductID[productID] = keptOpen + groups
-        } else {
-            // Open-list response: replace open groups, keep dismissed ones so
-            // the "Rejected" restore UI survives full reloads.
-            let keptDismissed = prior.filter { $0.isDismissed && !incomingIDs.contains($0.id) }
-            let openPriorIDs = Set(prior.filter { !$0.isDismissed }.map(\.id))
-            for goneID in openPriorIDs.subtracting(incomingIDs) {
-                attentionMembersByGroupID.removeValue(forKey: goneID)
-            }
-            attentionGroupsByProductID[productID] = groups + keptDismissed
-        }
+        attentionGroupsByProductID[productID] = groups
     }
 
     /// Insert or replace a group within its product bucket (live-update path).
@@ -116,48 +77,11 @@ extension ChatViewModel {
         engine.sendDismissAttention(id: groupID, reason: nil)
     }
 
-    /// Restore a dismissed group back to open so the human can re-evaluate it.
-    /// The engine resets all skipped/dismissed members to open and replies
-    /// with `attention_group_updated`, which `upsertAttentionGroup` picks up.
-    ///
-    /// Optimistically updates local state first so the view immediately
-    /// re-derives from the restored state rather than waiting for the async
-    /// engine round-trip. The engine's confirmation overwrites with
-    /// authoritative values (including recomputed group state).
-    func restoreAttentionGroup(_ groupID: String) {
-        for (productID, groups) in attentionGroupsByProductID {
-            if let idx = groups.firstIndex(where: { $0.id == groupID }) {
-                var updated = groups[idx]
-                updated.state = "open"
-                var updatedGroups = groups
-                updatedGroups[idx] = updated
-                attentionGroupsByProductID[productID] = updatedGroups
-                break
-            }
-        }
-        if var members = attentionMembersByGroupID[groupID] {
-            for i in members.indices
-                where members[i].answerState == "skipped" || members[i].answerState == "dismissed" {
-                members[i].answerState = "open"
-            }
-            attentionMembersByGroupID[groupID] = members
-        }
-        engine.sendRestoreAttentionGroup(id: groupID)
-    }
-
     /// Action a group — produce its downstream artifact (one revision /
     /// design task, or a batch task-create) and close it. Open members are
     /// skipped first ("skip remaining") so the human needn't touch every row.
     func actionAttentionGroup(_ groupID: String) {
         engine.sendActionAttentionGroup(id: groupID, skipUnanswered: true)
-    }
-
-    /// Load dismissed groups for a product and merge them into the stored list.
-    /// Called alongside `sendListAttentionGroups` so the "Rejected" section
-    /// is populated on product select and app reconnect.
-    func loadDismissedAttentionGroups(for productID: String) {
-        pendingDismissedGroupLoads[productID, default: 0] += 1
-        engine.sendListAttentionGroups(productId: productID, state: "dismissed")
     }
 
     /// Jump a group's association into view: a task association reveals its

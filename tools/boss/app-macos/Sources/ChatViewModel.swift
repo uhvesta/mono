@@ -76,15 +76,6 @@ final class ChatViewModel: ObservableObject {
     /// Attention group *members* keyed by `AttentionGroup.id`, in display
     /// order. Populated alongside [[attentionGroupsByProductID]].
     @Published var attentionMembersByGroupID: [String: [Attention]] = [:]
-    /// Count of in-flight dismissed-groups list responses per product ID.
-    /// Used by `applyAttentionGroupsList` to route the response to the
-    /// dismissed-merge path rather than the open-replace path. A counter
-    /// (not a Set) because product selection and work-tree receipt each call
-    /// `loadDismissedAttentionGroups`, so two dismissed requests can be in
-    /// flight simultaneously for the same product — a Set would lose the
-    /// second slot and misroute its response as an open-list, replacing the
-    /// open groups with dismissed ones.
-    var pendingDismissedGroupLoads: [String: Int] = [:]
     /// Historical execution rows keyed by task id. Populated on demand when
     /// the transcript viewer window sends `list_executions`. Cleared per-task
     /// before each fresh fetch so the viewer never shows stale rows.
@@ -932,7 +923,6 @@ final class ChatViewModel: ObservableObject {
             engine.sendGetWorkTree(productId: productID)
             engine.sendListAttentionItemsForWorkItem(workItemID: productID)
             engine.sendListAttentionGroups(productId: productID)
-            loadDismissedAttentionGroups(for: productID)
         }
     }
 
@@ -1755,7 +1745,6 @@ final class ChatViewModel: ObservableObject {
             if let productID = currentSelectedProductID {
                 engine.sendGetWorkTree(productId: productID)
                 engine.sendListAttentionGroups(productId: productID)
-                loadDismissedAttentionGroups(for: productID)
             }
         case .appSessionRegistered:
             isAppSessionRegistered = true
@@ -1908,7 +1897,6 @@ final class ChatViewModel: ObservableObject {
             refreshDesignDocStates(for: projects)
             engine.sendListAttentionItemsForWorkItem(workItemID: product.id)
             engine.sendListAttentionGroups(productId: product.id)
-            loadDismissedAttentionGroups(for: product.id)
             workErrorMessage = nil
             if let pending = pendingRevealScrollID {
                 let allIDs = Set(tasks.map(\.id) + chores.map(\.id))

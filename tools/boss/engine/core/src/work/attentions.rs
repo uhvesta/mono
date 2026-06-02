@@ -665,48 +665,6 @@ impl WorkDb {
         Ok(group)
     }
 
-    /// Restore a dismissed group back to `open` so the human can re-evaluate
-    /// and accept it. Only valid for `dismissed` groups; `actioned` groups
-    /// cannot be restored. Resets all `skipped`/`dismissed` members back to
-    /// `open`; any previously `answered` members retain their answers.
-    /// Idempotent: restoring an already-open group is a no-op.
-    pub fn restore_attention_group(&self, id: &str) -> Result<AttentionGroup> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let group = resolve_group(&tx, id)?
-            .with_context(|| format!("unknown attention group: {id}"))?;
-        match group.state.as_str() {
-            // Idempotent: already open or partially answered.
-            "open" | "partially_answered" => {
-                tx.commit()?;
-                return Ok(group);
-            }
-            "actioned" => bail!(
-                "attention group {} is actioned; only dismissed groups can be restored",
-                group.id
-            ),
-            _ => {}
-        }
-        // Clear the dismissed state so recompute_group_state can run.
-        tx.execute(
-            "UPDATE attention_groups SET state = 'open', dismissed_at = NULL WHERE id = ?1",
-            params![group.id],
-        )?;
-        // Reset skipped/dismissed members so the group can be re-answered.
-        // Answered members keep their answers (partial re-evaluation).
-        tx.execute(
-            "UPDATE attentions SET answer_state = 'open' \
-             WHERE group_id = ?1 AND answer_state IN ('skipped', 'dismissed')",
-            params![group.id],
-        )?;
-        // Recompute: open if all members reset, partially_answered if any were answered.
-        recompute_group_state(&tx, &group.id)?;
-        let group = query_attention_group(&tx, &group.id)?
-            .with_context(|| format!("missing attention group after restore: {}", group.id))?;
-        tx.commit()?;
-        Ok(group)
-    }
-
     /// Shared member-state transition for `answer_attention` /
     /// `dismiss_attention`. Refuses to mutate a member whose group is
     /// terminal, then recomputes and returns the group.
