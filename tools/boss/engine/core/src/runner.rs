@@ -13,6 +13,7 @@ use crate::coordinator::slot_id_from_worker_id;
 use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
+use crate::worker_setup::WorkerKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{EditorialRules, TemplatePolicy, WorkItemBinding};
 
@@ -454,6 +455,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 draft_pr_mode: spawner.draft_pr_mode(),
                 execution_kind: execution.kind.clone(),
                 task_kind: work_item_task_kind(work_item).map(str::to_owned),
+                worker_kind: WorkerKind::Standard,
             },
             StdDuration::from_secs(30),
         )

@@ -60,6 +60,26 @@ use std::path::{Path, PathBuf};
 
 use serde_json;
 
+/// The kind of worker being spawned, used to select the per-kind tool
+/// denylist. Kept in this module so the denylist rules and the kind
+/// definition are co-located and can evolve together.
+///
+/// New kinds should document their read/write access contract in a comment
+/// so reviewers can verify the deny rules match the stated posture.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum WorkerKind {
+    /// Normal implementation worker (task, chore, revision, etc.). Has
+    /// write access to its leased workspace; can push branches and open
+    /// PRs (subject to kind-specific guards such as the revision PR guard).
+    #[default]
+    Standard,
+    /// Read-only reviewer worker (design §9). Reads the PR diff and workspace
+    /// files; MUST NOT mutate files, push commits, or interact with GitHub
+    /// write endpoints. The deny rules in [`reviewer_deny_rules`] are the
+    /// primary enforcement layer for this mandate.
+    Reviewer,
+}
+
 /// All the inputs a worker-config render needs. The shape is
 /// deliberately minimal — anything more (project-specific guidance,
 /// allowlisted tools) lives in higher layers and is rendered separately.
@@ -103,6 +123,11 @@ pub struct WorkerSetupInput {
     /// (e.g. a revision re-dispatched as `task_implementation` due to a bug)
     /// still cannot open a new PR.
     pub task_kind: Option<String>,
+    /// Worker kind — determines the per-kind tool denylist installed in the
+    /// worker settings file. Defaults to [`WorkerKind::Standard`] which adds
+    /// no additional denies beyond the static sandbox rules. Set to
+    /// [`WorkerKind::Reviewer`] to enforce the read-only mandate (§9).
+    pub worker_kind: WorkerKind,
 }
 
 /// Render the worker-facing CLAUDE.md.
@@ -586,7 +611,74 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
     rules.push("Bash(boss engine stop)".to_owned());
     rules.push("Bash(boss engine stop:*)".to_owned());
 
+    // Per-kind extension: reviewer workers get the read-only denylist on top
+    // of the static rules above.
+    if input.worker_kind == WorkerKind::Reviewer {
+        rules.extend(reviewer_deny_rules());
+    }
+
     rules
+}
+
+/// Tool deny rules for reviewer workers, enforcing the read-only mandate
+/// from design §9 ("Automated reviewer pass on every agent-authored PR").
+///
+/// These rules are appended on top of the static deny rules that apply to
+/// every worker kind. They are kept as a named function (rather than inlined
+/// in `deny_rules`) so task 3 — which wires the reviewer execution kind to
+/// the spawn path — can confirm the exact rule set in tests.
+///
+/// **Read-only posture**: the reviewer reads the PR diff and workspace
+/// files but must not write, push, or post to any external surface.
+///
+/// Rules cover:
+/// - File-write tools (`Edit`, `Write`) — all paths via `**`
+/// - VCS push — `jj git push` and `git push` in all their CLI forms
+/// - PR mutation via `gh` — create, merge, close, edit, comment, review
+/// - Issue write via `gh` — create, comment, close, edit
+/// - `cube pr ensure` — Boss's PR-opening helper
+///
+/// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
+/// operations are intentionally not denied. They touch only the local
+/// repo state and can never publish commits or PR changes to GitHub, so
+/// they are safe for a read-only reviewer to run (e.g. to navigate the
+/// history for context).
+pub fn reviewer_deny_rules() -> Vec<String> {
+    vec![
+        // File-write tools — deny all edits and writes regardless of path.
+        "Edit(**)".to_owned(),
+        "Write(**)".to_owned(),
+        // VCS push — both the bare command and the trailing-args form.
+        "Bash(jj git push)".to_owned(),
+        "Bash(jj git push:*)".to_owned(),
+        "Bash(git push)".to_owned(),
+        "Bash(git push:*)".to_owned(),
+        // gh PR mutations — creation, merge, close, edit, comments, reviews.
+        "Bash(gh pr create)".to_owned(),
+        "Bash(gh pr create:*)".to_owned(),
+        "Bash(gh pr merge)".to_owned(),
+        "Bash(gh pr merge:*)".to_owned(),
+        "Bash(gh pr close)".to_owned(),
+        "Bash(gh pr close:*)".to_owned(),
+        "Bash(gh pr edit)".to_owned(),
+        "Bash(gh pr edit:*)".to_owned(),
+        "Bash(gh pr comment)".to_owned(),
+        "Bash(gh pr comment:*)".to_owned(),
+        "Bash(gh pr review)".to_owned(),
+        "Bash(gh pr review:*)".to_owned(),
+        // gh issue mutations — reviewers should never file or update issues.
+        "Bash(gh issue create)".to_owned(),
+        "Bash(gh issue create:*)".to_owned(),
+        "Bash(gh issue comment)".to_owned(),
+        "Bash(gh issue comment:*)".to_owned(),
+        "Bash(gh issue close)".to_owned(),
+        "Bash(gh issue close:*)".to_owned(),
+        "Bash(gh issue edit)".to_owned(),
+        "Bash(gh issue edit:*)".to_owned(),
+        // cube pr operations — Boss's PR management helper.
+        "Bash(cube pr)".to_owned(),
+        "Bash(cube pr:*)".to_owned(),
+    ]
 }
 
 /// Single-quote a shell argument, escaping internal quotes. Matches the
@@ -1349,6 +1441,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         }
     }
 
@@ -1365,6 +1458,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "task_implementation".into(),
             task_kind: Some("task".into()),
+            worker_kind: WorkerKind::Standard,
         };
         let parsed: serde_json::Value =
             serde_json::from_str(&render_remote_settings_json(&input)).unwrap();
@@ -1619,6 +1713,52 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
+        // Standard workers must not carry the reviewer deny rules — that
+        // would break every implementation worker.
+        let std_input = sample_input(); // worker_kind: Standard
+        let std_parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+        let std_deny: Vec<&str> = std_parsed["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for rule in reviewer_deny_rules() {
+            assert!(
+                !std_deny.contains(&rule.as_str()),
+                "standard worker must NOT carry reviewer deny rule: {rule}",
+            );
+        }
+
+        // Reviewer workers must carry every rule from reviewer_deny_rules().
+        let mut rev_input = sample_input();
+        rev_input.worker_kind = WorkerKind::Reviewer;
+        let rev_parsed: serde_json::Value =
+            serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
+        let rev_deny: Vec<&str> = rev_parsed["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for rule in reviewer_deny_rules() {
+            assert!(
+                rev_deny.contains(&rule.as_str()),
+                "reviewer worker must carry deny rule: {rule} (got {rev_deny:?})",
+            );
+        }
+        // Spot-check the most critical rules.
+        for critical in ["Edit(**)", "Write(**)", "Bash(jj git push:*)", "Bash(gh pr create:*)", "Bash(gh pr comment:*)", "Bash(cube pr:*)"] {
+            assert!(
+                rev_deny.contains(&critical),
+                "reviewer must deny {critical} (got {rev_deny:?})",
+            );
+        }
+    }
+
+    #[test]
     fn settings_json_does_not_deny_workspace_paths() {
         // Defensive: a buggy deny rule that accidentally fences off
         // `~/Documents/dev/workspaces/…` would break every worker
@@ -1716,6 +1856,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         };
 
         let written = write_workspace_files(&input).unwrap();
@@ -1781,6 +1922,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         };
 
         write_workspace_files(&input).unwrap();
@@ -2040,6 +2182,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         };
 
         write_workspace_files(&input).unwrap();
@@ -2115,6 +2258,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         };
 
         write_workspace_files(&input).unwrap();
@@ -2245,6 +2389,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         };
         let settings_file = settings_dir.path().join("mono-agent-heal.json");
         std::fs::write(&settings_file, render_settings_json(&input)).unwrap();
@@ -2527,6 +2672,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         };
         write_workspace_files(&input).unwrap();
 

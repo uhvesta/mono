@@ -30,7 +30,7 @@ use crate::protocol::{
     SpawnWorkerPaneResult,
 };
 use crate::worker_registry::WorkerRegistry;
-use crate::worker_setup::{WorkerSetupInput, WrittenFiles, write_workspace_files};
+use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
 
 /// Sanitized PATH for worker panes. Excludes `~/bin` (where the
 /// `bossctl` symlink lives in this user's setup) and any other
@@ -112,6 +112,11 @@ pub struct StartWorkerInput {
     /// `None` for non-task work items (products, projects).
     /// Forwarded to `WorkerSetupInput` for defense-in-depth guard checks.
     pub task_kind: Option<String>,
+    /// Worker kind — forwarded to `WorkerSetupInput` to select the per-kind
+    /// tool denylist. Defaults to [`WorkerKind::Standard`] for all
+    /// current callers; set to [`WorkerKind::Reviewer`] when spawning a
+    /// reviewer worker (task 3 of P992).
+    pub worker_kind: WorkerKind,
 }
 
 #[derive(Debug)]
@@ -215,6 +220,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         draft_pr_mode: input.draft_pr_mode,
         execution_kind: input.execution_kind.clone(),
         task_kind: input.task_kind.clone(),
+        worker_kind: input.worker_kind.clone(),
     };
     let written = write_workspace_files(&setup).map_err(StartWorkerError::WriteFiles)?;
 
@@ -465,6 +471,7 @@ mod tests {
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
+            worker_kind: WorkerKind::Standard,
         }
     }
 

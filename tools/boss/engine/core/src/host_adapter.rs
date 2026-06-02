@@ -44,7 +44,7 @@ use crate::ssh_spawn::{
 };
 use crate::ssh_transport::SshTransport;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
-use crate::worker_setup::{WorkerSetupInput, render_remote_settings_json};
+use crate::worker_setup::{WorkerKind, WorkerSetupInput, render_remote_settings_json};
 use crate::wrapper_distribution::{WrapperPushLocks, WrapperPushOutcome, ensure_wrapper_current};
 
 /// Remote dir (under `$HOME`) that holds rendered worker `--settings`
@@ -777,6 +777,7 @@ impl HostAdapter for SshHostAdapter {
             draft_pr_mode: false,
             execution_kind: execution.kind.clone(),
             task_kind: work_item_task_kind(work_item).map(str::to_owned),
+            worker_kind: WorkerKind::Standard,
         };
         let settings_json = render_remote_settings_json(&settings_input);
 
