@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import Textual
 import UpdateCore
 
 /// Sheet shown by "Check for Updates…" and (in a later task) by the chrome badge.
@@ -106,10 +105,8 @@ struct UpdateResultSheet: View {
             }
 
             // Release notes
-            if !update.changelog.isEmpty {
-                changelogView(update.changelog)
-            } else if !update.releaseNotes.isEmpty {
-                singleVersionNotesView(update.releaseNotes)
+            if !update.changelog.isEmpty || !update.releaseNotes.isEmpty {
+                changelogView(changelog: update.changelog, fallbackNotes: update.releaseNotes)
             }
 
             // In-app download/stage status (release builds only).
@@ -222,7 +219,7 @@ struct UpdateResultSheet: View {
     // MARK: - Changelog helpers
 
     @ViewBuilder
-    private func changelogView(_ changelog: [ReleaseNote]) -> some View {
+    private func changelogView(changelog: [ReleaseNote], fallbackNotes: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Release Notes")
                 .font(.caption.weight(.semibold))
@@ -230,59 +227,10 @@ struct UpdateResultSheet: View {
                 .textCase(.uppercase)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    ForEach(changelog, id: \.version.description) { note in
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack(spacing: 6) {
-                                Text("Version \(note.version.description)")
-                                    .font(.subheadline.weight(.semibold))
-                                if let date = note.publishedAt {
-                                    Text("·")
-                                        .foregroundStyle(.secondary)
-                                    Text(date, format: .dateTime.month(.abbreviated).day().year())
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            if note.notes.isEmpty {
-                                Text("No release notes.")
-                                    .font(.callout)
-                                    .foregroundStyle(.tertiary)
-                                    .italic()
-                            } else {
-                                StructuredText(markdown: note.notes)
-                                    .bossMarkdown()
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-                }
-                .padding(12)
-            }
-            .frame(maxHeight: 300)
-            .background(Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
-            )
-        }
-    }
-
-    private func singleVersionNotesView(_ notes: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Release Notes")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-
-            ScrollView {
-                StructuredText(markdown: notes)
-                    .bossMarkdown()
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                ReleaseNotesContent(changelog: changelog, fallbackNotes: fallbackNotes)
                     .padding(12)
             }
-            .frame(maxHeight: 200)
+            .frame(maxHeight: 300)
             .background(Color(nsColor: .controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 8))
             .overlay(

@@ -4928,15 +4928,13 @@ private struct UpdateBadgePopover: View {
 
             Divider()
 
-            if !update.releaseNotes.isEmpty {
+            if !update.changelog.isEmpty || !update.releaseNotes.isEmpty {
                 ScrollView {
-                    Text(update.releaseNotes)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    ReleaseNotesContent(changelog: update.changelog, fallbackNotes: update.releaseNotes)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
                 }
-                .frame(maxHeight: 160)
+                .frame(maxHeight: 220)
 
                 Divider()
             }
