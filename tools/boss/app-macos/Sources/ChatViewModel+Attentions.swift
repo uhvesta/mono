@@ -10,15 +10,26 @@ extension ChatViewModel {
     /// Handles two response kinds:
     /// - Open-list (default): replaces open/partially_answered groups while
     ///   preserving dismissed groups so the "Rejected" section survives reloads.
-    /// - Dismissed-list (fired when `pendingDismissedGroupLoads` contains the
-    ///   product id): merges dismissed groups into the stored open list.
+    /// - Dismissed-list (state="dismissed" request): merges dismissed groups
+    ///   into the stored open list.
+    ///
+    /// Detection is content-based: the engine only returns dismissed-state
+    /// groups when state="dismissed" was explicitly requested, so inspecting
+    /// the group states is reliable regardless of network arrival order.
+    /// `pendingDismissedGroupLoads` is used only for empty responses where
+    /// the state cannot be inferred from group content.
     func applyAttentionGroupsList(
         productID: String,
         groups: [AttentionGroup],
         members: [Attention]
     ) {
-        let isDismissedBatch = pendingDismissedGroupLoads[productID, default: 0] > 0
-        if isDismissedBatch {
+        let hasPendingDismissed = pendingDismissedGroupLoads[productID, default: 0] > 0
+        // Identify dismissed-batch responses by content rather than arrival order:
+        // a non-empty response where every group is dismissed can only come from
+        // a state="dismissed" request. For empty responses, fall back to the counter.
+        let allGroupsDismissed = !groups.isEmpty && groups.allSatisfy(\.isDismissed)
+        let isDismissedBatch = allGroupsDismissed || (groups.isEmpty && hasPendingDismissed)
+        if isDismissedBatch && hasPendingDismissed {
             let remaining = (pendingDismissedGroupLoads[productID] ?? 1) - 1
             pendingDismissedGroupLoads[productID] = remaining > 0 ? remaining : nil
         }
