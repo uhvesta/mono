@@ -23,6 +23,7 @@ rust_binary(
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
@@ -36,6 +37,7 @@ rust_test(
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

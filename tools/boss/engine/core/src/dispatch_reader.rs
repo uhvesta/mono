@@ -78,9 +78,10 @@ impl StageThresholds {
 /// Default Boss state root used by the file-scan readers when the
 /// caller didn't override it. Mirrors the writer's default (see
 /// [`crate::dispatch_events::JsonlFileSink`] callers in `app.rs`).
+/// Delegates to `boss-log-files` so the `~/Library/Application Support/Boss`
+/// location is defined once and shared with the log-path resolvers.
 pub fn default_state_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Boss"))
+    boss_log_files::default_state_root()
 }
 
 /// Path to the flat dispatch-event stream under `root`.

@@ -27,7 +27,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use boss_log_files::{next_rotated_path, rotated_segments};
 
 pub const TRACE_MAX_BYTES_ENV: &str = "BOSS_ENGINE_TRACE_MAX_BYTES";
 pub const TRACE_MAX_FILES_ENV: &str = "BOSS_ENGINE_TRACE_MAX_FILES";
@@ -81,14 +82,16 @@ pub fn open_trace_file(path: &Path) -> io::Result<File> {
 
 /// Delete the oldest rotated backups, keeping at most `max_files`.
 /// Silently ignores any deletion error — this is best-effort cleanup.
+///
+/// [`rotated_segments`] returns the `<base>.<unix_seconds>` files oldest-first
+/// (ascending timestamp), so the oldest `len - max_files` are simply the
+/// leading slice. The rotated-segment format and ordering both live in
+/// `boss-log-files` — this writer never re-encodes them.
 pub fn prune_old_rotated(active_path: &Path, max_files: usize) {
-    let mut backups = list_rotated_files(active_path);
+    let backups = rotated_segments(active_path);
     if backups.len() <= max_files {
         return;
     }
-    // Sort ascending by name.  The suffix is a 10-digit Unix timestamp,
-    // so lexicographic order equals chronological order.
-    backups.sort();
     let to_delete = backups.len() - max_files;
     for path in &backups[..to_delete] {
         if let Err(err) = std::fs::remove_file(path) {
@@ -98,57 +101,6 @@ pub fn prune_old_rotated(active_path: &Path, max_files: usize) {
             );
         }
     }
-}
-
-/// Returns a non-existing rotated path using a Unix-second timestamp
-/// suffix.  Increments the timestamp by one until a free slot is found,
-/// handling the rare case of multiple rotations within the same second.
-fn next_rotated_path(path: &Path) -> PathBuf {
-    let base = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mut ts = base;
-    loop {
-        let candidate = rotated_path_at(path, ts);
-        if !candidate.exists() {
-            return candidate;
-        }
-        ts += 1;
-    }
-}
-
-/// Build the rotated file path by replacing the `.jsonl` extension with
-/// `.jsonl.<ts_secs>` (e.g. `engine-trace.jsonl.1748694000`).
-fn rotated_path_at(path: &Path, ts_secs: u64) -> PathBuf {
-    path.with_extension(format!("jsonl.{ts_secs}"))
-}
-
-/// List all rotated backups in the same directory as `active_path`.
-/// A file qualifies iff its name is `<active_filename>.<all-digits>`.
-fn list_rotated_files(active_path: &Path) -> Vec<PathBuf> {
-    let Some(dir) = active_path.parent() else {
-        return vec![];
-    };
-    let Some(stem) = active_path.file_name().and_then(|n| n.to_str()) else {
-        return vec![];
-    };
-    let prefix = format!("{stem}.");
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return vec![];
-    };
-    rd.filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| {
-                    let suffix = n.strip_prefix(prefix.as_str()).unwrap_or("");
-                    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
-                })
-                .unwrap_or(false)
-        })
-        .collect()
 }
 
 /// Mutable state held inside the writer's mutex — the current open file
@@ -248,7 +200,7 @@ mod tests {
         rotate_on_startup(&path, 5);
 
         assert!(!path.exists(), "active path should be gone after startup rotation");
-        let backups = list_rotated_files(&path);
+        let backups = rotated_segments(&path);
         assert_eq!(backups.len(), 1, "expected one rotated backup");
     }
 
@@ -257,7 +209,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_trace(&dir);
         rotate_on_startup(&path, 5);
-        assert!(list_rotated_files(&path).is_empty());
+        assert!(rotated_segments(&path).is_empty());
     }
 
     #[test]
@@ -266,12 +218,12 @@ mod tests {
         let path = tmp_trace(&dir);
         // Create 8 fake rotated files with ascending timestamps.
         for i in 1_000_u64..=1_007 {
-            fs::write(rotated_path_at(&path, i), b"data").unwrap();
+            fs::write(boss_log_files::rotated_segment_path(&path, i), b"data").unwrap();
         }
 
         prune_old_rotated(&path, 5);
 
-        let backups = list_rotated_files(&path);
+        let backups = rotated_segments(&path);
         assert_eq!(backups.len(), 5, "expected 5 survivors");
         // The 5 newest (highest timestamp) must survive.
         let mut names: Vec<_> = backups
@@ -293,10 +245,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = tmp_trace(&dir);
         for i in 0_u64..3 {
-            fs::write(rotated_path_at(&path, i), b"data").unwrap();
+            fs::write(boss_log_files::rotated_segment_path(&path, i), b"data").unwrap();
         }
         prune_old_rotated(&path, 5);
-        assert_eq!(list_rotated_files(&path).len(), 3);
+        assert_eq!(rotated_segments(&path).len(), 3);
     }
 
     #[test]
@@ -315,7 +267,7 @@ mod tests {
         // 15 bytes exceeds the 10-byte threshold.
         writer.write_all(b"123456789012345").unwrap();
 
-        let backups = list_rotated_files(&path);
+        let backups = rotated_segments(&path);
         assert_eq!(backups.len(), 1, "expected one rotated backup after write");
         assert!(path.exists(), "new active file should exist after rotation");
         let guard = state.lock().unwrap();
@@ -329,7 +281,7 @@ mod tests {
         let path = tmp_trace(&dir);
         // Pre-populate 3 old rotated files.
         for i in 1_000_u64..=1_002 {
-            fs::write(rotated_path_at(&path, i), b"old").unwrap();
+            fs::write(boss_log_files::rotated_segment_path(&path, i), b"old").unwrap();
         }
         let file = open_trace_file(&path).unwrap();
         let state = Arc::new(Mutex::new(Some(RotatingState::new(file))));
@@ -343,7 +295,7 @@ mod tests {
         // 6 bytes exceeds the 5-byte threshold → rotation + prune.
         writer.write_all(b"123456").unwrap();
 
-        let backups = list_rotated_files(&path);
+        let backups = rotated_segments(&path);
         assert!(
             backups.len() <= 2,
             "expected at most 2 rotated backups after prune, got {}",
@@ -366,7 +318,7 @@ mod tests {
 
         writer.write_all(b"small").unwrap();
 
-        assert!(list_rotated_files(&path).is_empty(), "no rotation expected below threshold");
+        assert!(rotated_segments(&path).is_empty(), "no rotation expected below threshold");
     }
 
     #[test]
@@ -384,28 +336,5 @@ mod tests {
         let n = writer.write(b"data").unwrap();
         assert_eq!(n, 4);
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn list_rotated_files_ignores_non_numeric_suffixes() {
-        let dir = TempDir::new().unwrap();
-        let path = tmp_trace(&dir);
-        // A file with a non-numeric suffix should not be listed.
-        fs::write(
-            dir.path().join("engine-trace.jsonl.old"),
-            b"x",
-        )
-        .unwrap();
-        // A valid rotated file.
-        fs::write(rotated_path_at(&path, 9999), b"x").unwrap();
-        let backups = list_rotated_files(&path);
-        assert_eq!(backups.len(), 1);
-        assert!(
-            backups[0]
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with(".9999")
-        );
     }
 }

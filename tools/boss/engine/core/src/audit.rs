@@ -54,8 +54,11 @@ const SECS_PER_DAY: i64 = 86_400;
 pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 /// Override the audit log path. Primarily for tests; production code
-/// uses [`default_audit_log_path`].
-pub const AUDIT_PATH_ENV: &str = "BOSS_ENGINE_AUDIT_PATH";
+/// uses [`default_audit_log_path`]. The literal is owned by `boss-log-files`
+/// (the single source of truth for log path/rotation) and re-exported here so
+/// existing `audit::AUDIT_PATH_ENV` call sites — and any external readers like
+/// `bossctl` — agree on one definition.
+pub const AUDIT_PATH_ENV: &str = boss_log_files::AUDIT_PATH_ENV;
 
 /// Engine startup epoch seconds, captured by [`record_start`] and
 /// reused by [`record_shutdown`] to derive `uptime_sec`. Stored as a
@@ -77,16 +80,11 @@ static SHUTDOWN_EMITTED: AtomicBool = AtomicBool::new(false);
 
 /// Resolve the default path: honours `BOSS_ENGINE_AUDIT_PATH` first,
 /// otherwise falls back to `$HOME/Library/Application Support/Boss/
-/// engine-audit.log`.
+/// engine-audit.log`. Delegates to `boss-log-files` so the path resolution
+/// (env override + default location) lives in exactly one place, shared with
+/// the `bossctl` reader.
 pub fn default_audit_log_path() -> Option<PathBuf> {
-    if let Some(override_path) = std::env::var_os(AUDIT_PATH_ENV) {
-        let trimmed = override_path.to_string_lossy().trim().to_owned();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Boss/engine-audit.log"))
+    boss_log_files::default_audit_log_path()
 }
 
 /// Set the audit log path explicitly. Used by tests and by the

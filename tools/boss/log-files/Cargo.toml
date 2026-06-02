@@ -1,0 +1,11 @@
+[package]
+name = "boss-log-files"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

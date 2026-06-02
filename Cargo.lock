@@ -270,6 +270,7 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-editorial",
  "boss-feature-flags",
+ "boss-log-files",
  "boss-pr-template",
  "boss-protocol",
  "boss-ssh-transport",
@@ -320,6 +321,14 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "boss-log-files"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
 ]
 
 [[package]]
@@ -375,11 +384,11 @@ dependencies = [
  "anyhow",
  "boss-client",
  "boss-engine",
+ "boss-log-files",
  "boss-protocol",
  "clap",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
