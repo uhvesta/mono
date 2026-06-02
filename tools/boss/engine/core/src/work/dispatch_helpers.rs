@@ -194,12 +194,11 @@ pub(crate) fn repo_unresolved_kind_label(
 }
 
 pub(crate) fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> Result<()> {
-    let exists = conn.query_row(
+    if !row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM work_executions WHERE id = ?1)",
-        [execution_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if exists == 0 {
+        &[&execution_id],
+    )? {
         bail!("unknown execution: {execution_id}");
     }
     Ok(())

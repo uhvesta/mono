@@ -1,5 +1,20 @@
 use super::*;
 
+/// Run a `SELECT EXISTS(SELECT 1 FROM ...)` probe and return whether any
+/// row matched. Collapses the `query_row(... |row| row.get::<_, i64>(0))
+/// != 0` boilerplate that the `ensure_*_exists` bail-checks and the
+/// `unique_*_slug` uniqueness loops in this module would otherwise repeat
+/// at every site. `sql` must be a single `SELECT EXISTS(...)` expression
+/// yielding one `i64` column.
+pub(crate) fn row_exists(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> Result<bool> {
+    let exists: i64 = conn.query_row(sql, params, |row| row.get(0))?;
+    Ok(exists != 0)
+}
+
 /// Resolve the worker branch-name prefix for a new execution from its
 /// owning product's `worker_branch_prefix`. Returns `None` (→ engine
 /// default `boss/`) when the product carries no override. The stored
@@ -157,24 +172,22 @@ pub(crate) fn list_tasks_for_product(conn: &Connection, product_id: &str) -> Res
 }
 
 pub(crate) fn ensure_product_exists(conn: &Connection, product_id: &str) -> Result<()> {
-    let exists = conn.query_row(
+    if !row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM products WHERE id = ?1)",
-        [product_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if exists == 0 {
+        &[&product_id],
+    )? {
         bail!("unknown product: {product_id}");
     }
     Ok(())
 }
 
 pub(crate) fn ensure_project_exists(conn: &Connection, project_id: &str) -> Result<()> {
-    let exists = conn.query_row(
+    if !row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-        [project_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if exists == 0 {
+        &[&project_id],
+    )? {
         bail!("unknown project: {project_id}");
     }
     Ok(())
@@ -185,12 +198,11 @@ pub(crate) fn ensure_project_belongs_to_product(
     project_id: &str,
     product_id: &str,
 ) -> Result<()> {
-    let exists = conn.query_row(
+    if !row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1 AND product_id = ?2)",
-        params![project_id, product_id],
-        |row| row.get::<_, i64>(0),
-    )?;
-    if exists == 0 {
+        &[&project_id, &product_id],
+    )? {
         bail!("project {project_id} does not belong to product {product_id}");
     }
     Ok(())

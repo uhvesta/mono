@@ -225,12 +225,11 @@ pub(crate) fn unique_product_slug(conn: &Connection, base_slug: &str) -> Result<
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
-    while conn.query_row(
+    while row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM products WHERE slug = ?1)",
-        [candidate.as_str()],
-        |row| row.get::<_, i64>(0),
-    )? != 0
-    {
+        &[&candidate],
+    )? {
         candidate = format!("{base_slug}-{suffix}");
         suffix += 1;
     }
@@ -245,12 +244,11 @@ pub(crate) fn unique_product_slug_for_update(
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
-    while conn.query_row(
+    while row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM products WHERE slug = ?1 AND id != ?2)",
-        params![candidate, id],
-        |row| row.get::<_, i64>(0),
-    )? != 0
-    {
+        &[&candidate, &id],
+    )? {
         candidate = format!("{base_slug}-{suffix}");
         suffix += 1;
     }
@@ -265,12 +263,11 @@ pub(crate) fn unique_project_slug(
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
-    while conn.query_row(
+    while row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM projects WHERE product_id = ?1 AND slug = ?2)",
-        params![product_id, candidate],
-        |row| row.get::<_, i64>(0),
-    )? != 0
-    {
+        &[&product_id, &candidate],
+    )? {
         candidate = format!("{base_slug}-{suffix}");
         suffix += 1;
     }
@@ -286,12 +283,11 @@ pub(crate) fn unique_project_slug_for_update(
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
-    while conn.query_row(
+    while row_exists(
+        conn,
         "SELECT EXISTS(SELECT 1 FROM projects WHERE product_id = ?1 AND slug = ?2 AND id != ?3)",
-        params![product_id, candidate, id],
-        |row| row.get::<_, i64>(0),
-    )? != 0
-    {
+        &[&product_id, &candidate, &id],
+    )? {
         candidate = format!("{base_slug}-{suffix}");
         suffix += 1;
     }

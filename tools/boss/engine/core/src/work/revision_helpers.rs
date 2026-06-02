@@ -152,12 +152,11 @@ pub(crate) fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -
     let trimmed = selector.trim();
     // Full typed id
     if trimmed.starts_with("task_") {
-        let exists = conn.query_row(
+        if !row_exists(
+            conn,
             "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND deleted_at IS NULL)",
-            [trimmed],
-            |r| r.get::<_, i64>(0),
-        )?;
-        if exists == 0 {
+            &[&trimmed],
+        )? {
             bail!("unknown task: {trimmed}");
         }
         return Ok(trimmed.to_owned());
