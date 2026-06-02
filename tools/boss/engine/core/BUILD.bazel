@@ -86,6 +86,7 @@ rust_library(
         "src/orphan_sweep.rs",
         "src/pane_summary.rs",
         "src/pool_claim_sweep.rs",
+        "src/pr_review.rs",
         "src/pr_url_capture.rs",
         "src/protocol.rs",
         "src/recovery_backup.rs",

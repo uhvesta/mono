@@ -456,7 +456,11 @@ impl ExecutionRunner for PaneSpawnRunner {
                 draft_pr_mode: spawner.draft_pr_mode(),
                 execution_kind: execution.kind.clone(),
                 task_kind: work_item_task_kind(work_item).map(str::to_owned),
-                worker_kind: WorkerKind::Standard,
+                worker_kind: if execution.kind == boss_protocol::EXECUTION_KIND_PR_REVIEW {
+                    WorkerKind::Reviewer
+                } else {
+                    WorkerKind::Standard
+                },
             },
             StdDuration::from_secs(30),
         )
@@ -691,6 +695,13 @@ pub(crate) fn compose_worker_spawn(
     // Its `work_item_id` is the automation id, so we read the automation
     // directly. If the automation vanished mid-flight, fall back to the
     // generic prompt so the worker at least has workspace context.
+    //
+    // P992 task 6: a `pr_review` execution renders the reviewer prompt
+    // instead of the ordinary implementer prompt. Its `work_item_id` is
+    // the producing task id, so we read the task to get the PR context.
+    // If the task or its pr_url cannot be resolved, fall back to the
+    // generic prompt (reviewer still gets workspace context but a weaker
+    // framing — better than no spawn at all).
     let prompt_text = if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
         match work_db.get_automation(&execution.work_item_id) {
             Ok(Some(automation)) => {
@@ -726,6 +737,38 @@ pub(crate) fn compose_worker_spawn(
                         .build(),
                 )
             }
+        }
+    } else if execution.kind == boss_protocol::EXECUTION_KIND_PR_REVIEW {
+        let task_name = work_item_name(work_item);
+        let task_description = match work_item {
+            WorkItem::Task(task) | WorkItem::Chore(task) => task.description.as_str(),
+            _ => "",
+        };
+        let pr_url = work_item_pr_url(work_item).unwrap_or_default();
+        if pr_url.is_empty() {
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                "pr_review execution: producing task has no pr_url; \
+                 falling back to generic prompt — review will lack PR context",
+            );
+            compose_execution_prompt(
+                ExecutionPromptParams::builder()
+                    .execution(execution)
+                    .work_item(work_item)
+                    .workspace_path(workspace_path)
+                    .maybe_parent_project(parent_project.as_ref())
+                    .maybe_cube_change_id(cube_change_id)
+                    .maybe_conflict_attempt(conflict_attempt.as_ref())
+                    .maybe_recovery_branch(recovery_branch.as_deref())
+                    .maybe_ci_attempt(ci_attempt.as_ref())
+                    .maybe_editorial_rules(product_editorial_rules.as_ref())
+                    .pr_template_set(&pr_template_set)
+                    .editorial_enabled(editorial_enabled)
+                    .build(),
+            )
+        } else {
+            crate::pr_review::render_reviewer_initial_prompt(task_name, task_description, pr_url)
         }
     } else {
         compose_execution_prompt(

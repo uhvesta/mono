@@ -131,7 +131,14 @@ pub struct WorkerSetupInput {
 }
 
 /// Render the worker-facing CLAUDE.md.
+///
+/// For [`WorkerKind::Reviewer`] workers, returns a reviewer-specific CLAUDE.md
+/// that prominently states the read-only mandate and omits PR-creation
+/// instructions (reviewers never open or update PRs).
 pub fn render_claude_md(input: &WorkerSetupInput) -> String {
+    if input.worker_kind == WorkerKind::Reviewer {
+        return crate::pr_review::render_reviewer_claude_md(&input.lease_id);
+    }
     let workspace = input.workspace_path.display();
     let lease = &input.lease_id;
     let draft_directive = if input.draft_pr_mode {
@@ -2330,6 +2337,57 @@ mod tests {
             !rendered.contains("--draft"),
             "CLAUDE.md must NOT include --draft directive when draft_pr_mode is false",
         );
+    }
+
+    #[test]
+    fn reviewer_claude_md_states_read_only_mandate() {
+        let mut input = sample_input();
+        input.worker_kind = WorkerKind::Reviewer;
+        let rendered = render_claude_md(&input);
+        // Must contain the read-only mandate section.
+        assert!(
+            rendered.contains("Read-only mandate"),
+            "reviewer CLAUDE.md must contain read-only mandate section",
+        );
+        // Must contain lease id but NOT workspace path (workspace locations are
+        // not stable — cube can place workspaces anywhere).
+        assert!(rendered.contains(&input.lease_id));
+        assert!(
+            !rendered.contains(input.workspace_path.to_str().unwrap()),
+            "reviewer CLAUDE.md must not hardcode workspace path",
+        );
+        // Must NOT contain the standard PR-required delivery mandate from
+        // the implementation worker CLAUDE.md.
+        assert!(
+            !rendered.contains("Pull requests are the deliverable"),
+            "reviewer CLAUDE.md must not include the standard PR-required reminder",
+        );
+        // Must not instruct the reviewer to create a PR — the tool is listed
+        // only as a *forbidden* action, not as a delivery requirement.
+        assert!(
+            !rendered.contains("A task is not complete until a PR exists"),
+            "reviewer CLAUDE.md must not include the implementation PR mandate",
+        );
+    }
+
+    #[test]
+    fn reviewer_claude_md_mentions_allowed_read_only_tools() {
+        let mut input = sample_input();
+        input.worker_kind = WorkerKind::Reviewer;
+        let rendered = render_claude_md(&input);
+        assert!(rendered.contains("gh pr diff"), "must mention gh pr diff");
+        assert!(rendered.contains("gh pr view"), "must mention gh pr view");
+        assert!(rendered.contains("jj log"), "must mention jj log");
+    }
+
+    #[test]
+    fn standard_claude_md_is_unchanged_by_reviewer_branch() {
+        // Verify the reviewer kind change does not affect standard workers.
+        let input = sample_input(); // WorkerKind::Standard
+        let rendered = render_claude_md(&input);
+        assert!(rendered.contains("Pull requests are the deliverable"));
+        assert!(rendered.contains("cube pr ensure"));
+        assert!(rendered.contains("LOCAL MIRROR"));
     }
 
     #[test]
