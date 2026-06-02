@@ -792,6 +792,7 @@ impl ServerState {
         }
         let worker_pool = WorkerPool::new(cfg.work.worker_pool_size);
         let automation_pool = WorkerPool::new_automation(cfg.work.automation_pool_size);
+        let review_pool = WorkerPool::new_review(cfg.work.review_pool_size);
         let topic_broker = Arc::new(TopicBroker::default());
         let work_revision = Arc::new(AtomicU64::new(0));
         let publisher_impl = Arc::new(BrokerExecutionPublisher {
@@ -974,6 +975,7 @@ impl ServerState {
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
             execution_coordinator_inner.set_automation_pool(automation_pool);
+            execution_coordinator_inner.set_review_pool(review_pool);
             // Wire the SHA-delta gate's run-start snapshot: when an
             // execution transitions to `running`, the completion
             // handler captures the bound chore PR's head SHA into

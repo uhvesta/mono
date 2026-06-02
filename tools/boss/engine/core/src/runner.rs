@@ -329,14 +329,14 @@ impl ExecutionRunner for PaneSpawnRunner {
             .context("execution missing cube_lease_id; coordinator must lease before spawn")?;
 
         // The coordinator already claimed a slot via WorkerPool —
-        // `worker_id` is `worker-{N}` (main pool) or `auto-worker-{N}`
-        // (automation pool); N is the slot the engine owns. Decode it here
-        // and thread it into the spawn so the app hosts the pane in this
-        // exact slot rather than running its own (now-deleted)
-        // firstIndex(where:) heuristic.
+        // `worker_id` is `worker-{N}` (main pool), `auto-worker-{N}`
+        // (automation pool), or `review-{N}` (review pool); N is the slot
+        // the engine owns. Decode it here and thread it into the spawn so
+        // the app hosts the pane in this exact slot rather than running its
+        // own (now-deleted) firstIndex(where:) heuristic.
         let slot_id = slot_id_from_worker_id(worker_id).ok_or_else(|| {
             anyhow!(
-                "PaneSpawnRunner received worker_id {worker_id:?} that does not parse as worker-{{N}} or auto-worker-{{N}}"
+                "PaneSpawnRunner received worker_id {worker_id:?} that does not parse as worker-{{N}}, auto-worker-{{N}}, or review-{{N}}"
             )
         })?;
 
@@ -3590,12 +3590,7 @@ mod pane_spawn_tests {
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
 
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -3743,12 +3738,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4090,12 +4080,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4250,12 +4235,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 8,
-                automation_pool_size: 3,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).worker_pool_size(8).automation_pool_size(3).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4333,12 +4313,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4441,12 +4416,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4551,12 +4521,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4692,12 +4657,7 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig {
-                cwd: workspace.path().to_path_buf(),
-                db_path: workspace.path().join("state.db"),
-                worker_pool_size: 1,
-                automation_pool_size: 1,
-            },
+            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());

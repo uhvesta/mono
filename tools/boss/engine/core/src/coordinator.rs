@@ -87,16 +87,39 @@ pub const MAX_WORKER_POOL_SIZE: usize = 8;
 /// clamped. Fixed at 3 per the Pool model design.
 pub const MAX_AUTOMATION_POOL_SIZE: usize = 3;
 
+/// Hard cap on the review worker pool. The runtime config can request a
+/// smaller pool via `BOSS_REVIEW_POOL_SIZE`, but values above this are
+/// clamped. The third pool, modeled on the automation pool, that runs the
+/// always-Opus `pr_review` reviewer agents. See design:
+/// automated-reviewer-pass-on-every-agent-authored-pr.md
+pub const MAX_REVIEW_POOL_SIZE: usize = 3;
+
+/// Default review-pool slot count when `BOSS_REVIEW_POOL_SIZE` is unset.
+/// Deliberately small: reviews are short and run always-Opus, so we bound
+/// concurrent review spend rather than tracking the main pool's slot count.
+pub const DEFAULT_REVIEW_POOL_SIZE: usize = 2;
+
 /// Worker ID prefix for automation-pool slots. Distinct from the main-pool
 /// `"worker-"` prefix so `pool_for_worker_id` can route releases to the
 /// correct pool without an extra DB round-trip.
 const AUTOMATION_WORKER_ID_PREFIX: &str = "auto-worker-";
+
+/// Worker ID prefix for review-pool slots. Distinct from both the main-pool
+/// `"worker-"` and automation-pool `"auto-worker-"` prefixes so
+/// `pool_for_worker_id` can route releases to the review pool.
+const REVIEW_WORKER_ID_PREFIX: &str = "review-";
 
 /// Execution kind string for automation triage runs. Triage executions
 /// bind to an automation (not a task) and always route to the automation pool.
 /// Re-exported from `boss_protocol` so the runner (preamble) and completion
 /// handler (outcome detector) share one source of truth.
 pub(crate) use boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE;
+
+/// Execution kind string for reviewer agent runs. A `pr_review` execution
+/// reviews a worker's PR read-only and always routes to the dedicated review
+/// pool. Re-exported from `boss_protocol` so routing and the (future)
+/// completion handler share one source of truth.
+pub(crate) use boss_protocol::EXECUTION_KIND_PR_REVIEW;
 
 /// Upper bound on how long the engine waits for a single
 /// `cube workspace lease` subprocess invocation before declaring the
@@ -661,6 +684,13 @@ impl WorkerPool {
         Self::new_with_prefix(size, AUTOMATION_WORKER_ID_PREFIX, MAX_AUTOMATION_POOL_SIZE)
     }
 
+    /// Construct a review pool. Slots are named `review-N` so
+    /// `pool_for_worker_id` can distinguish them from main- and
+    /// automation-pool slots. Capped at [`MAX_REVIEW_POOL_SIZE`].
+    pub fn new_review(size: usize) -> Self {
+        Self::new_with_prefix(size, REVIEW_WORKER_ID_PREFIX, MAX_REVIEW_POOL_SIZE)
+    }
+
     fn new_with_prefix(size: usize, prefix: &str, hard_cap: usize) -> Self {
         let clamped = if size > hard_cap {
             tracing::warn!(
@@ -931,43 +961,57 @@ impl WorkerPool {
 /// Parse the trailing 1-indexed slot number out of a worker id.
 /// Regular-pool `worker-{N}` ids map directly to slot N.
 /// Automation-pool `auto-worker-{N}` ids map to slot
-/// `N + MAX_WORKER_POOL_SIZE` so the two pools occupy disjoint
-/// slot ranges (1..=8 for regular, 9..=11 for automation). This
-/// means "auto-worker-1" → slot 9 (Kira), "auto-worker-2" → 10
-/// (Dax), "auto-worker-3" → 11 (Bashir), never colliding with the
-/// regular-pool range.
+/// `N + MAX_WORKER_POOL_SIZE`; review-pool `review-{N}` ids map to
+/// slot `N + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE` so the
+/// three pools occupy disjoint slot ranges (1..=8 regular, 9..=11
+/// automation, 12..=14 review). This means "auto-worker-1" → slot 9
+/// (Kira), "review-1" → slot 12, never colliding with another pool's
+/// range.
 ///
-/// Returns `None` for ids that don't match either recognised shape
+/// Returns `None` for ids that don't match any recognised shape
 /// or whose suffix isn't a positive `u8`. Callers should treat
 /// `None` as a programming error — the only producer is
 /// [`WorkerPool::claim_worker`].
 pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
-    if let Some(suffix) = worker_id.strip_prefix("worker-") {
-        return suffix.parse::<u8>().ok().filter(|n| *n >= 1);
+    if let Some(suffix) = worker_id.strip_prefix(REVIEW_WORKER_ID_PREFIX) {
+        let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
+        return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE).ok();
     }
     if let Some(suffix) = worker_id.strip_prefix(AUTOMATION_WORKER_ID_PREFIX) {
         let ordinal = suffix.parse::<u8>().ok().filter(|n| *n >= 1)? as usize;
         return u8::try_from(ordinal + MAX_WORKER_POOL_SIZE).ok();
+    }
+    if let Some(suffix) = worker_id.strip_prefix("worker-") {
+        return suffix.parse::<u8>().ok().filter(|n| *n >= 1);
     }
     None
 }
 
 /// Derive the canonical worker-id string for a pane slot id.
 /// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
-/// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`;
-/// automation-pool slots (> MAX_WORKER_POOL_SIZE) produce
-/// `"auto-worker-{M}"` where M = slot_id − MAX_WORKER_POOL_SIZE.
-/// Callers that release a pane slot must use this instead of
+/// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool
+/// slots (MAX_WORKER_POOL_SIZE < slot ≤ MAX_WORKER_POOL_SIZE +
+/// MAX_AUTOMATION_POOL_SIZE) produce `"auto-worker-{M}"`; review-pool
+/// slots (beyond that) produce `"review-{M}"`, where M is the slot's
+/// offset from the start of the owning pool's range. Callers that
+/// release a pane slot must use this instead of
 /// [`WorkerPool::worker_id_for_slot`] to ensure the release is
 /// routed to the correct pool.
 pub fn worker_id_for_slot(slot_id: u8) -> String {
-    if (slot_id as usize) <= MAX_WORKER_POOL_SIZE {
+    let slot = slot_id as usize;
+    if slot <= MAX_WORKER_POOL_SIZE {
         format!("worker-{}", slot_id)
-    } else {
+    } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE {
         format!(
             "{}{}",
             AUTOMATION_WORKER_ID_PREFIX,
-            slot_id as usize - MAX_WORKER_POOL_SIZE
+            slot - MAX_WORKER_POOL_SIZE
+        )
+    } else {
+        format!(
+            "{}{}",
+            REVIEW_WORKER_ID_PREFIX,
+            slot - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE
         )
     }
 }
@@ -1045,6 +1089,11 @@ pub struct ExecutionCoordinator {
     /// executions. Sized independently from the main pool (default 3) so
     /// maintenance work never contends with interactive dispatch.
     automation_pool: WorkerPool,
+    /// Dedicated pool for `pr_review` reviewer executions. Sized
+    /// independently (default small — see [`DEFAULT_REVIEW_POOL_SIZE`]) so
+    /// review latency and always-Opus review spend stay isolated from both
+    /// the main and automation pools.
+    review_pool: WorkerPool,
     /// The local-host adapter. Retained as the `local` special case and
     /// the backing adapter for the default provider; the dispatch loop
     /// resolves the per-execution adapter through `host_adapter_provider`.
@@ -1163,6 +1212,7 @@ impl ExecutionCoordinator {
             work_db,
             worker_pool,
             automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
+            review_pool: WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE),
             host_adapter,
             host_adapter_provider,
             publisher,
@@ -1203,6 +1253,19 @@ impl ExecutionCoordinator {
     /// `app.rs` to expose the pool's live state to the Agents-tab UI.
     pub fn automation_worker_pool(&self) -> WorkerPool {
         self.automation_pool.clone()
+    }
+
+    /// Override the review pool. `app.rs` calls this with a pool sized
+    /// from `BOSS_REVIEW_POOL_SIZE`; tests may supply a smaller pool.
+    pub fn set_review_pool(&mut self, pool: WorkerPool) {
+        self.review_pool = pool;
+    }
+
+    /// Return a clone of the review worker pool handle. Used by `app.rs`
+    /// to expose the pool's live state to the Agents-tab UI and by the
+    /// pool-claim reconciler to sweep leaked review claims.
+    pub fn review_worker_pool(&self) -> WorkerPool {
+        self.review_pool.clone()
     }
 
 
@@ -1280,16 +1343,27 @@ impl ExecutionCoordinator {
 
     /// Return the pool that should handle `execution`.
     ///
+    /// `pr_review` executions always route to the review pool — this is
+    /// checked first so a reviewer of an automation-produced task still
+    /// lands in the review pool, not the automation pool.
     /// `automation_triage` executions always route to the automation pool.
     /// Regular task executions route to the automation pool when the owning
     /// task has `source_automation_id IS NOT NULL` (it was produced by an
     /// automation). All other executions go to the main pool.
     fn pool_for_execution<'a>(&'a self, execution: &WorkExecution) -> &'a WorkerPool {
-        if self.execution_targets_automation_pool(execution) {
+        if self.execution_targets_review_pool(execution) {
+            &self.review_pool
+        } else if self.execution_targets_automation_pool(execution) {
             &self.automation_pool
         } else {
             &self.worker_pool
         }
+    }
+
+    /// `true` when `execution` must run on the dedicated review pool —
+    /// i.e. it is a `pr_review` reviewer execution.
+    fn execution_targets_review_pool(&self, execution: &WorkExecution) -> bool {
+        execution.kind == EXECUTION_KIND_PR_REVIEW
     }
 
     fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
@@ -1303,10 +1377,13 @@ impl ExecutionCoordinator {
         )
     }
 
-    /// Return the pool that owns `worker_id`. Automation-pool slots are
-    /// identified by the `"auto-worker-"` prefix stamped at construction time.
+    /// Return the pool that owns `worker_id`. Automation-pool slots carry the
+    /// `"auto-worker-"` prefix and review-pool slots the `"review-"` prefix,
+    /// both stamped at construction time; everything else is the main pool.
     fn pool_for_worker_id<'a>(&'a self, worker_id: &str) -> &'a WorkerPool {
-        if worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
+        if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX) {
+            &self.review_pool
+        } else if worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
             &self.automation_pool
         } else {
             &self.worker_pool
@@ -1546,9 +1623,9 @@ impl ExecutionCoordinator {
     /// immediately (queue empty + pending wakeup) or yield (pool
     /// exhausted).
     /// Drain the `ready` execution queue, routing each execution to the
-    /// correct pool (main or automation). Per-pool exhaustion is handled
-    /// independently: a full automation pool does not block main-pool
-    /// dispatch and vice-versa.
+    /// correct pool (main, automation, or review). Per-pool exhaustion is
+    /// handled independently: a full pool does not block dispatch on the
+    /// other pools.
     ///
     /// All `ready` rows are fetched once at the top of each drain pass.
     /// Executions whose pool is already known to be exhausted are skipped
@@ -1577,17 +1654,34 @@ impl ExecutionCoordinator {
 
         let mut main_pool_exhausted = false;
         let mut auto_pool_exhausted = false;
+        let mut review_pool_exhausted = false;
 
         for execution in executions {
             let preferred_workspace_id = execution.preferred_workspace_id.clone();
-            let is_automation = self.execution_targets_automation_pool(&execution);
+            // Classify the target pool. Review is checked first (and excludes
+            // the others) so a reviewer of an automation-produced task is
+            // counted against the review pool, not the automation pool.
+            let is_review = self.execution_targets_review_pool(&execution);
+            let is_automation =
+                !is_review && self.execution_targets_automation_pool(&execution);
+            let is_main = !is_review && !is_automation;
+            let pool_label = if is_review {
+                "review"
+            } else if is_automation {
+                "automation"
+            } else {
+                "main"
+            };
 
             // Skip executions for pools we already know are full.
             // They remain `ready` and will be retried on the next kick.
+            if is_review && review_pool_exhausted {
+                continue;
+            }
             if is_automation && auto_pool_exhausted {
                 continue;
             }
-            if !is_automation && main_pool_exhausted {
+            if is_main && main_pool_exhausted {
                 continue;
             }
 
@@ -1598,7 +1692,7 @@ impl ExecutionCoordinator {
                         .with_work_item(&execution.work_item_id)
                         .with_details(serde_json::json!({
                             "preferred_workspace_id": preferred_workspace_id,
-                            "pool": if is_automation { "automation" } else { "main" },
+                            "pool": pool_label,
                         })),
                 )
                 .await;
@@ -1606,7 +1700,7 @@ impl ExecutionCoordinator {
                 execution_id = %execution.id,
                 work_item_id = %execution.work_item_id,
                 preferred_workspace_id = ?preferred_workspace_id,
-                pool = if is_automation { "automation" } else { "main" },
+                pool = pool_label,
                 "spawn_attempt status=ready -> picked_up"
             );
 
@@ -1616,19 +1710,19 @@ impl ExecutionCoordinator {
                 .await
             else {
                 // This pool is fully claimed. Record exhaustion and continue
-                // so executions for the other pool can still be dispatched.
+                // so executions for the other pools can still be dispatched.
                 let pool_capacity = pool.capacity().await;
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
                     pool_capacity,
-                    pool = if is_automation { "automation" } else { "main" },
+                    pool = pool_label,
                     "spawn_attempt status=ready -> deferred reason=pool_exhausted"
                 );
 
-                // Ghost-active invariant check (main pool only; automation
-                // tasks are excluded from the normal kanban).
-                if !is_automation {
+                // Ghost-active invariant check (main pool only; automation and
+                // review executions are excluded from the normal kanban).
+                if is_main {
                     let orphans = self
                         .work_db
                         .list_active_chores_without_live_run()
@@ -1654,13 +1748,15 @@ impl ExecutionCoordinator {
                         .with_work_item(&execution.work_item_id)
                         .with_details(serde_json::json!({
                             "reason": "pool_exhausted",
-                            "pool": if is_automation { "automation" } else { "main" },
+                            "pool": pool_label,
                             "pool_capacity": pool_capacity,
                         })),
                     )
                     .await;
 
-                if is_automation {
+                if is_review {
+                    review_pool_exhausted = true;
+                } else if is_automation {
                     auto_pool_exhausted = true;
                     // For automation triage executions, mark the automation_runs
                     // row as `pool_throttled` (not `failed_will_retry`) so the UI
@@ -1719,7 +1815,7 @@ impl ExecutionCoordinator {
             }
         }
 
-        if main_pool_exhausted || auto_pool_exhausted {
+        if main_pool_exhausted || auto_pool_exhausted || review_pool_exhausted {
             DrainOutcome::PoolExhausted
         } else {
             DrainOutcome::QueueEmpty
@@ -3792,9 +3888,10 @@ mod tests {
 
     use super::{
         AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle,
-        CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, ExecutionCoordinator,
-        ExecutionPublisher, FrontendEvent, Host, HostAdapter, HostAdapterProvider,
-        MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkerPool, pick_worst_failing_check,
+        CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW,
+        ExecutionCoordinator, ExecutionPublisher, FrontendEvent, Host, HostAdapter,
+        HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
+        MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, pick_worst_failing_check,
         slot_id_from_worker_id, worker_id_for_slot,
     };
 
@@ -6557,6 +6654,55 @@ mod tests {
             assert_eq!(wid, format!("auto-worker-{expected_ordinal}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
+        // Review pool: slots 12..=14 → "review-M" → back to the same slot.
+        for slot in 12u8..=14 {
+            let wid = worker_id_for_slot(slot);
+            let expected_ordinal =
+                slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
+            assert_eq!(wid, format!("review-{expected_ordinal}"));
+            assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
+        }
+    }
+
+    #[test]
+    fn slot_id_from_worker_id_accepts_review_pool_format() {
+        // Review-pool ordinals are offset past both the regular (8) and
+        // automation (3) ranges, so they occupy slots 12..=14 — disjoint
+        // from every other pool.
+        for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
+            let review_worker_id = format!("review-{ordinal}");
+            let expected_slot =
+                ordinal + MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
+            assert_eq!(
+                slot_id_from_worker_id(&review_worker_id),
+                Some(expected_slot),
+                "expected Some({expected_slot}) for {review_worker_id:?}"
+            );
+        }
+        assert_eq!(slot_id_from_worker_id("review-0"), None);
+        assert_eq!(slot_id_from_worker_id("review-"), None);
+        assert_eq!(slot_id_from_worker_id("review-abc"), None);
+    }
+
+    #[test]
+    fn review_pool_slots_are_disjoint_from_other_pools() {
+        // The slot IDs produced by review-N (12, 13, 14) must not overlap
+        // with any regular-pool (1..=8) or automation-pool (9..=11) slot.
+        let automation_ceiling = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE;
+        for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
+            let review_wid = format!("review-{ordinal}");
+            let slot = slot_id_from_worker_id(&review_wid).unwrap();
+            assert!(
+                slot as usize > automation_ceiling,
+                "review-{ordinal} must map to slot > {automation_ceiling}, got {slot}"
+            );
+            // Verify the reverse also works: the slot maps back to a review- id.
+            let back = worker_id_for_slot(slot);
+            assert!(
+                back.starts_with(REVIEW_WORKER_ID_PREFIX),
+                "slot {slot} must produce a review-pool worker_id, got {back:?}"
+            );
+        }
     }
 
     #[test]
@@ -8460,6 +8606,213 @@ mod tests {
         assert_eq!(
             ready, 1,
             "the second auto chore must be deferred (automation pool full); got {ready} ready"
+        );
+    }
+
+    /// A `pr_review` execution must route to the review pool; a normal
+    /// chore execution must continue to route to the main pool. Review is
+    /// checked before automation so the reviewer of an automation-produced
+    /// task still lands in the review pool.
+    #[tokio::test]
+    async fn pr_review_execution_routes_to_review_pool() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        );
+        coord.set_review_pool(WorkerPool::new_review(1));
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+
+        let review_exec = WorkExecution::builder()
+            .id("exec-review")
+            .work_item_id("task-under-review")
+            .created_at("1")
+            .kind(EXECUTION_KIND_PR_REVIEW)
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .status("ready")
+            .build();
+        assert!(coord.execution_targets_review_pool(&review_exec));
+
+        // pool_for_execution must hand back the review pool — claiming from
+        // it yields a `review-` worker id.
+        let wid = coord
+            .pool_for_execution(&review_exec)
+            .claim_worker("exec-review", None)
+            .await
+            .unwrap();
+        assert!(
+            wid.starts_with(REVIEW_WORKER_ID_PREFIX),
+            "pr_review must route to the review pool, got {wid:?}"
+        );
+
+        // A normal chore execution must NOT target the review pool.
+        let chore_exec = WorkExecution::builder()
+            .id("exec-chore")
+            .work_item_id("regular-task")
+            .created_at("1")
+            .kind("chore_implementation")
+            .repo_remote_url("git@github.com:spinyfin/mono.git")
+            .status("ready")
+            .build();
+        assert!(!coord.execution_targets_review_pool(&chore_exec));
+        let wid2 = coord
+            .pool_for_execution(&chore_exec)
+            .claim_worker("exec-chore", None)
+            .await
+            .unwrap();
+        assert!(
+            wid2.starts_with("worker-"),
+            "chore must route to the main pool, got {wid2:?}"
+        );
+    }
+
+    /// Releasing a `review-` worker id must free a slot in the review pool
+    /// (not the main or automation pool). This is the release-routing-by-
+    /// prefix guarantee `release_worker_and_kick` relies on.
+    #[tokio::test]
+    async fn review_prefix_worker_id_releases_to_review_pool() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(2),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner::default()),
+        );
+        coord.set_review_pool(WorkerPool::new_review(2));
+        coord.set_automation_pool(WorkerPool::new_automation(2));
+        let coordinator = Arc::new(coord);
+
+        let wid = coordinator
+            .review_worker_pool()
+            .claim_worker("exec-r", None)
+            .await
+            .unwrap();
+        assert!(wid.starts_with(REVIEW_WORKER_ID_PREFIX));
+        assert_eq!(coordinator.review_worker_pool().idle_count().await, 1);
+
+        // Release routes by prefix → the review-pool slot is freed.
+        coordinator.release_worker_and_kick(&wid, None).await;
+        assert_eq!(
+            coordinator.review_worker_pool().idle_count().await,
+            2,
+            "release must free the review-pool slot"
+        );
+        // The other pools must be untouched.
+        assert_eq!(coordinator.worker_pool().idle_count().await, 2);
+        assert_eq!(coordinator.automation_worker_pool().idle_count().await, 2);
+    }
+
+    /// Review pool exhaustion must not block main-pool dispatch. When the
+    /// review pool is full, a regular chore continues to be dispatched on
+    /// the main pool and the deferred `pr_review` stays `ready`.
+    #[tokio::test]
+    async fn review_pool_exhaustion_does_not_block_main_pool() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        // One regular chore — must still dispatch even when review is full.
+        db.create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Regular chore".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Insert a ready `pr_review` execution. It never reaches the
+        // schedule path in this test — the review pool is pre-occupied, so
+        // the claim fails first — so a synthetic work_item_id is fine.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO work_executions
+                   (id, work_item_id, kind, status, repo_remote_url, priority, created_at)
+                 VALUES (?1, ?2, ?3, 'ready', ?4, 0, '1')",
+                rusqlite::params![
+                    "exec-review-1",
+                    "task-under-review",
+                    EXECUTION_KIND_PR_REVIEW,
+                    "git@github.com:spinyfin/mono.git"
+                ],
+            )
+            .unwrap();
+        }
+
+        let cube = Arc::new(FakeCubeClient::default());
+        // Main pool: 1 slot; review pool: 1 slot.
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            Arc::new(FakeExecutionRunner {
+                pending: true,
+                ..FakeExecutionRunner::default()
+            }),
+        );
+        coord.set_review_pool(WorkerPool::new_review(1));
+        let coordinator = Arc::new(coord);
+
+        // Pre-occupy the review pool's only slot so the pr_review can't claim.
+        let occupied = coordinator
+            .review_worker_pool()
+            .claim_worker("occupied", None)
+            .await;
+        assert!(occupied.is_some(), "review pool slot must be claimable");
+
+        coordinator.kick();
+
+        // Wait for the main chore to run.
+        for _ in 0..200 {
+            let execs = db.list_executions(None).unwrap();
+            if execs
+                .iter()
+                .any(|e| e.status == "running" && e.kind != EXECUTION_KIND_PR_REVIEW)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        let execs = db.list_executions(None).unwrap();
+        let main_running = execs
+            .iter()
+            .filter(|e| e.status == "running" && e.kind != EXECUTION_KIND_PR_REVIEW)
+            .count();
+        assert_eq!(
+            main_running, 1,
+            "the regular chore must run even when the review pool is full"
+        );
+        // The pr_review must stay ready — review pool was full.
+        let review_ready = execs
+            .iter()
+            .filter(|e| e.kind == EXECUTION_KIND_PR_REVIEW && e.status == "ready")
+            .count();
+        assert_eq!(
+            review_ready, 1,
+            "the pr_review must be deferred while the review pool is full"
         );
     }
 }

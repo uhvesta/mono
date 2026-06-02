@@ -52,12 +52,7 @@ impl TestEngine {
         // with the RPC, so we need a process that actually exists.
         std::fs::write(&pid_path, std::process::id().to_string())?;
 
-        let work_config = WorkConfig {
-            cwd: temp.path().to_path_buf(),
-            db_path,
-            worker_pool_size: 1,
-            automation_pool_size: 1,
-        };
+        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path).build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();

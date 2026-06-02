@@ -260,12 +260,7 @@ async fn engine_health_report_flags_missing_anthropic_api_key() {
 #[tokio::test]
 async fn engine_health_report_is_empty_when_api_key_present() {
     let temp = tempfile::tempdir().unwrap();
-    let work = crate::config::WorkConfig {
-        cwd: temp.path().to_path_buf(),
-        db_path: temp.path().join("state.db"),
-        worker_pool_size: 1,
-        automation_pool_size: 1,
-    };
+    let work = crate::config::WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
     let agent = crate::config::AgentConfig {
         anthropic_api_key: Some("sk-test".to_owned()),
         cube: crate::config::CubeConfig {
@@ -1115,12 +1110,7 @@ fn set_boss_pid_round_trips() {
 fn server_state_with_app_pid(app_pid: libc::pid_t) -> Arc<ServerState> {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
-        crate::config::WorkConfig {
-            cwd: temp.path().to_path_buf(),
-            db_path: temp.path().join("state.db"),
-            worker_pool_size: 1,
-            automation_pool_size: 1,
-        },
+        crate::config::WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build(),
         None,
     ));
     std::mem::forget(temp);

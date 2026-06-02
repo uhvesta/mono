@@ -33,12 +33,7 @@ fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
 fn test_server_state() -> Arc<ServerState> {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
-        crate::config::WorkConfig {
-            cwd: temp.path().to_path_buf(),
-            db_path: temp.path().join("state.db"),
-            worker_pool_size: 1,
-            automation_pool_size: 1,
-        },
+        crate::config::WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build(),
         None,
     ));
     // Leak the temp dir for the lifetime of the test process; the

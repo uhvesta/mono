@@ -41,12 +41,7 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig {
-            cwd: temp.path().to_path_buf(),
-            db_path: temp.path().join("state.db"),
-            worker_pool_size: 1,
-            automation_pool_size: 1,
-        };
+        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();

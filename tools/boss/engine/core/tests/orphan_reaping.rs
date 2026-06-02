@@ -45,12 +45,7 @@ async fn serve_exits_when_watched_parent_dies() -> Result<()> {
         .map_err(|e| anyhow!("failed to spawn sleep: {e}"))?;
     let parent_pid = parent_proc.id() as i32;
 
-    let work = WorkConfig {
-        cwd: temp.path().to_path_buf(),
-        db_path,
-        worker_pool_size: 1,
-        automation_pool_size: 1,
-    };
+    let work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path).build();
     let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 
     let sock = socket_path.clone();
@@ -94,12 +89,7 @@ async fn serve_without_parent_watch_is_unaffected_by_subprocess_death() -> Resul
     let socket_path = temp.path().join("engine.sock");
     let db_path = temp.path().join("state.db");
 
-    let work = WorkConfig {
-        cwd: temp.path().to_path_buf(),
-        db_path,
-        worker_pool_size: 1,
-        automation_pool_size: 1,
-    };
+    let work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path).build();
     let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 
     let sock = socket_path.clone();

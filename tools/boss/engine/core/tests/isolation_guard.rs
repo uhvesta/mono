@@ -43,12 +43,7 @@ impl TestEngine {
         let pid_path = temp.path().join(format!("{stem}.pid"));
         let events_path = temp.path().join(format!("{stem}.events.sock"));
 
-        let work = WorkConfig {
-            cwd: temp.path().to_path_buf(),
-            db_path,
-            worker_pool_size: 1,
-            automation_pool_size: 1,
-        };
+        let work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path).build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 
         let sock = socket_path.clone();
@@ -177,12 +172,7 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
     let prod_db = temp.path().join("prod-state.db");
     let prod_pid = temp.path().join("boss-engine.pid");
 
-    let prod_work = WorkConfig {
-        cwd: temp.path().to_path_buf(),
-        db_path: prod_db,
-        worker_pool_size: 1,
-        automation_pool_size: 1,
-    };
+    let prod_work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(prod_db).build();
     let prod_cfg = Arc::new(RuntimeConfig::from_parts(prod_work, None));
     let prod_sock_c = prod_socket.clone();
     let prod_pid_c = prod_pid.clone();
@@ -201,12 +191,7 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
     let test_db = temp.path().join("boss-test-uuid.db");
     let test_pid = temp.path().join("boss-test-uuid.pid");
 
-    let test_work = WorkConfig {
-        cwd: temp.path().to_path_buf(),
-        db_path: test_db,
-        worker_pool_size: 1,
-        automation_pool_size: 1,
-    };
+    let test_work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(test_db).build();
     let test_cfg = Arc::new(RuntimeConfig::from_parts(test_work, None));
     let test_sock_c = test_socket.clone();
     let test_pid_c = test_pid.clone();

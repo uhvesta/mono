@@ -191,6 +191,7 @@ pub async fn run_one_pass(
     for (pool, pool_name) in [
         (coordinator.worker_pool(), "main"),
         (coordinator.automation_worker_pool(), "automation"),
+        (coordinator.review_worker_pool(), "review"),
     ] {
         for claim in pool.claims().await {
             // A live pane still backs this slot — the completion /
