@@ -44,6 +44,7 @@ rust_library(
         "src/build_info.rs",
         "src/ci_log_reader.rs",
         "src/ci_watch.rs",
+        "src/ci_watch_tests.rs",
         "src/cli.rs",
         "src/comments_anchor.rs",
         "src/completion.rs",
