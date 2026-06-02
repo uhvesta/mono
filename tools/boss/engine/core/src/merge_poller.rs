@@ -6655,4 +6655,407 @@ mod tests {
              badge would persist on app restart otherwise",
         );
     }
+
+    // ---- Direct unit tests for the pure CI-classification helpers --------
+    //
+    // These back the CI verdict surfacing (#1216) and terminal-rollup gating
+    // (#1203). The `parse_probe_*` matrix tests above exercise them only
+    // indirectly through `parse_probe_json`; the tests below call each
+    // private fn via `super::` so a regression in one helper points straight
+    // at the offending function rather than surfacing as a confusing
+    // integration failure.
+
+    /// `provider_for_url` infers the CI provider purely from the host /
+    /// path of the check's `targetUrl`. Buildkite is host-only; GitHub
+    /// Actions additionally requires an `/actions/` or `/check-runs/`
+    /// segment; everything else (including a bare github.com URL and the
+    /// empty string) is `Other`. Matching is case-insensitive.
+    #[test]
+    fn provider_for_url_classifies_hosts() {
+        use super::CiProvider::*;
+        let cases: &[(&str, super::CiProvider)] = &[
+            // Buildkite — host match is sufficient.
+            ("https://buildkite.com/acme/mono/builds/42", Buildkite),
+            (
+                "https://buildkite.com/acme/mono/builds/42#01h-job-uuid",
+                Buildkite,
+            ),
+            // GitHub Actions — github.com host PLUS an /actions/ or
+            // /check-runs/ segment.
+            (
+                "https://github.com/anthropic/mono/actions/runs/123/job/456",
+                GithubActions,
+            ),
+            (
+                "https://github.com/anthropic/mono/check-runs/789",
+                GithubActions,
+            ),
+            // Bare github.com without either segment → Other (e.g. a PR
+            // or status URL we can't read logs from).
+            ("https://github.com/anthropic/mono/pull/7", Other),
+            // Empty string and unrelated third-party hosts → Other.
+            ("", Other),
+            ("https://app.codecov.io/gh/anthropic/mono", Other),
+            ("https://sonarcloud.io/dashboard?id=mono", Other),
+            // Case-insensitivity: an upper/mixed-case host still matches.
+            (
+                "HTTPS://BuildKite.COM/Acme/Mono/Builds/42",
+                Buildkite,
+            ),
+            (
+                "https://GITHUB.com/anthropic/mono/ACTIONS/runs/1/job/2",
+                GithubActions,
+            ),
+        ];
+        for (url, expected) in cases {
+            assert_eq!(
+                super::provider_for_url(url),
+                *expected,
+                "provider_for_url({url:?})",
+            );
+        }
+    }
+
+    /// `parse_provider_job_id` extracts the provider-native job id from the
+    /// `targetUrl`. Buildkite ids ride in the URL fragment (after `#`);
+    /// GitHub Actions ids are the last path segment after `/job/` (with any
+    /// `?query` stripped and a trailing `/` trimmed). Anything that doesn't
+    /// match — or `CiProvider::Other` — yields `None`.
+    #[test]
+    fn parse_provider_job_id_extracts_or_none() {
+        use super::CiProvider::*;
+        // Buildkite: fragment after '#'.
+        assert_eq!(
+            super::parse_provider_job_id(
+                Buildkite,
+                "https://buildkite.com/acme/mono/builds/123#job-uuid",
+            ),
+            Some("job-uuid".to_owned()),
+        );
+        // Buildkite with no fragment → None.
+        assert_eq!(
+            super::parse_provider_job_id(Buildkite, "https://buildkite.com/acme/mono/builds/123"),
+            None,
+        );
+        // GitHub Actions: last segment after '/job/'.
+        assert_eq!(
+            super::parse_provider_job_id(
+                GithubActions,
+                "https://github.com/anthropic/mono/actions/runs/12345/job/67890",
+            ),
+            Some("67890".to_owned()),
+        );
+        // GitHub Actions: '?query' is stripped before extracting.
+        assert_eq!(
+            super::parse_provider_job_id(
+                GithubActions,
+                "https://github.com/anthropic/mono/actions/runs/12345/job/67890?check_suite_focus=true",
+            ),
+            Some("67890".to_owned()),
+        );
+        // GitHub Actions: trailing '/' is trimmed.
+        assert_eq!(
+            super::parse_provider_job_id(
+                GithubActions,
+                "https://github.com/anthropic/mono/actions/runs/12345/job/67890/",
+            ),
+            Some("67890".to_owned()),
+        );
+        // GitHub Actions URL with no '/job/' segment → None.
+        assert_eq!(
+            super::parse_provider_job_id(
+                GithubActions,
+                "https://github.com/anthropic/mono/actions/runs/12345",
+            ),
+            None,
+        );
+        // CiProvider::Other never parses a job id, regardless of the URL.
+        assert_eq!(
+            super::parse_provider_job_id(Other, "https://buildkite.com/acme/mono/builds/1#x"),
+            None,
+        );
+        assert_eq!(super::parse_provider_job_id(Other, ""), None);
+    }
+
+    /// `is_failure_conclusion` / `is_pass_conclusion` partition GitHub's
+    /// conclusion tokens into the gating buckets. Each is a closed set:
+    /// the failure set is FAILURE/ERROR/TIMED_OUT/CANCELLED/STARTUP_FAILURE/
+    /// ACTION_REQUIRED/STALE; the pass set is SUCCESS/NEUTRAL/SKIPPED.
+    /// Matching is case-insensitive, and an unknown token is in neither set
+    /// (so the caller keeps waiting rather than mis-routing remediation).
+    #[test]
+    fn conclusion_predicates_partition_closed_sets() {
+        let failures = [
+            "FAILURE",
+            "ERROR",
+            "TIMED_OUT",
+            "CANCELLED",
+            "STARTUP_FAILURE",
+            "ACTION_REQUIRED",
+            "STALE",
+        ];
+        for c in failures {
+            assert!(super::is_failure_conclusion(c), "{c} should be a failure");
+            assert!(
+                !super::is_pass_conclusion(c),
+                "{c} must not also be a pass",
+            );
+            // Case-insensitive: the lowercase form classifies identically.
+            let lower = c.to_ascii_lowercase();
+            assert!(
+                super::is_failure_conclusion(&lower),
+                "{lower} (lowercase) should be a failure",
+            );
+        }
+
+        let passes = ["SUCCESS", "NEUTRAL", "SKIPPED"];
+        for c in passes {
+            assert!(super::is_pass_conclusion(c), "{c} should be a pass");
+            assert!(
+                !super::is_failure_conclusion(c),
+                "{c} must not also be a failure",
+            );
+            let lower = c.to_ascii_lowercase();
+            assert!(
+                super::is_pass_conclusion(&lower),
+                "{lower} (lowercase) should be a pass",
+            );
+        }
+
+        // An unknown conclusion is in neither set.
+        for unknown in ["", "WAT", "in_progress", "queued"] {
+            assert!(
+                !super::is_failure_conclusion(unknown),
+                "{unknown:?} must not be a failure",
+            );
+            assert!(
+                !super::is_pass_conclusion(unknown),
+                "{unknown:?} must not be a pass",
+            );
+        }
+    }
+
+    /// Stable string tag for a `LeafVerdict` so the `normalize_leaf` cases
+    /// can assert with `assert_eq!` (the enum itself isn't `PartialEq`).
+    /// `Fail` carries its conclusion so we can check it is preserved.
+    fn leaf_tag(v: &super::LeafVerdict) -> String {
+        match v {
+            super::LeafVerdict::InFlight => "InFlight".to_owned(),
+            super::LeafVerdict::Pass => "Pass".to_owned(),
+            super::LeafVerdict::Fail { conclusion } => format!("Fail:{conclusion}"),
+        }
+    }
+
+    /// `normalize_leaf` folds the two GraphQL rollup leaf shapes into one
+    /// verdict bucket. Legacy `StatusContext` leaves dispatch on `state`;
+    /// modern `CheckRun` leaves combine `status` + `conclusion`. Missing
+    /// fields must be tolerated (no panic) rather than misclassified as a
+    /// failure.
+    #[test]
+    fn normalize_leaf_maps_both_shapes() {
+        // --- StatusContext shape (legacy commit-status: `state`, no
+        // `conclusion`). ---
+        let sc_success = serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/mono",
+            "state": "SUCCESS",
+        });
+        assert_eq!(leaf_tag(&super::normalize_leaf(&sc_success)), "Pass");
+
+        let sc_failure = serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/mono",
+            "state": "FAILURE",
+        });
+        assert_eq!(
+            leaf_tag(&super::normalize_leaf(&sc_failure)),
+            "Fail:FAILURE",
+        );
+
+        let sc_pending = serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/mono",
+            "state": "PENDING",
+        });
+        assert_eq!(leaf_tag(&super::normalize_leaf(&sc_pending)), "InFlight");
+
+        // StatusContext detected by shape (has `state`, no `conclusion`)
+        // even without `__typename`.
+        let sc_no_typename = serde_json::json!({
+            "context": "legacy/check",
+            "state": "SUCCESS",
+        });
+        assert_eq!(leaf_tag(&super::normalize_leaf(&sc_no_typename)), "Pass");
+
+        // --- CheckRun shape (`status` + `conclusion`). ---
+        // In-progress with empty/absent conclusion → InFlight.
+        let cr_in_progress = serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "ci/test",
+            "status": "IN_PROGRESS",
+            "conclusion": serde_json::Value::Null,
+        });
+        assert_eq!(
+            leaf_tag(&super::normalize_leaf(&cr_in_progress)),
+            "InFlight",
+        );
+
+        // Completed + failing conclusion → Fail (uppercased, preserved).
+        let cr_fail = serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "ci/test",
+            "status": "COMPLETED",
+            "conclusion": "failure",
+        });
+        assert_eq!(leaf_tag(&super::normalize_leaf(&cr_fail)), "Fail:FAILURE");
+
+        // Completed + passing conclusion → Pass.
+        let cr_pass = serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "ci/test",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        });
+        assert_eq!(leaf_tag(&super::normalize_leaf(&cr_pass)), "Pass");
+
+        // Completed + unknown conclusion → InFlight (don't mis-fail).
+        let cr_unknown = serde_json::json!({
+            "name": "ci/test",
+            "status": "COMPLETED",
+            "conclusion": "MYSTERY",
+        });
+        assert_eq!(leaf_tag(&super::normalize_leaf(&cr_unknown)), "InFlight");
+
+        // Entirely missing fields must not panic; an empty object has no
+        // `state`/`conclusion` so it falls to the CheckRun path with an
+        // empty conclusion → InFlight.
+        let empty = serde_json::json!({});
+        assert_eq!(leaf_tag(&super::normalize_leaf(&empty)), "InFlight");
+    }
+
+    /// `classify_ci` collapses the required-check leaves into a single
+    /// `OpenPrCiStatus`, consulting `combined_state` only when the rollup is
+    /// empty. The cases below pin the behaviours the engine depends on:
+    /// the empty-rollup fallback, fast-fail (a terminal failure surfaces
+    /// `Failing`), InFlight-dominates-Fail (a terminal failure mixed with an
+    /// in-flight check holds at `InFlight` so no moot fix worker spawns),
+    /// latest-leaf-per-name for re-runs, and the not-required filter.
+    #[test]
+    fn classify_ci_collapses_leaves() {
+        // Empty rollup → consult combined_state.
+        assert_eq!(super::classify_ci(&[], None), OpenPrCiStatus::Clean);
+        assert_eq!(
+            super::classify_ci(&[], Some("pending")),
+            OpenPrCiStatus::InFlight,
+        );
+        assert_eq!(
+            super::classify_ci(&[], Some("failure")),
+            OpenPrCiStatus::InFlight,
+        );
+        assert_eq!(
+            super::classify_ci(&[], Some("error")),
+            OpenPrCiStatus::InFlight,
+        );
+        assert_eq!(
+            super::classify_ci(&[], Some("success")),
+            OpenPrCiStatus::Clean,
+        );
+
+        // Fast-fail: a single terminal failure surfaces `Failing`, carrying
+        // the parsed provider + job id.
+        let failing = [serde_json::json!({
+            "name": "buildkite/mono",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "targetUrl": "https://buildkite.com/acme/mono/builds/42#job-uuid",
+            "isRequired": true,
+        })];
+        assert_eq!(
+            super::classify_ci(&failing, None),
+            OpenPrCiStatus::Failing {
+                failures: vec![RequiredCheckFailure {
+                    name: "buildkite/mono".into(),
+                    conclusion: "FAILURE".into(),
+                    target_url: "https://buildkite.com/acme/mono/builds/42#job-uuid".into(),
+                    provider: CiProvider::Buildkite,
+                    provider_job_id: Some("job-uuid".into()),
+                }],
+            },
+        );
+
+        // Mixed: a terminal failure alongside an in-flight required check
+        // surfaces `Failing` IMMEDIATELY (fast-fail). `Fail` dominates
+        // `InFlight` for terminal failures — see the function's doc comment
+        // and the T1150 regression note. Hiding a real failure until the
+        // slowest check finishes defeats fast detection; anti-phantom
+        // protection lives in the reconcile/withdraw path, not here.
+        let mixed = [
+            serde_json::json!({
+                "name": "ci/test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "isRequired": true,
+            }),
+            serde_json::json!({
+                "name": "ci/lint",
+                "status": "IN_PROGRESS",
+                "conclusion": serde_json::Value::Null,
+                "isRequired": true,
+            }),
+        ];
+        assert_eq!(
+            super::classify_ci(&mixed, None),
+            OpenPrCiStatus::Failing {
+                failures: vec![RequiredCheckFailure {
+                    name: "ci/test".into(),
+                    conclusion: "FAILURE".into(),
+                    target_url: "".into(),
+                    provider: CiProvider::Other,
+                    provider_job_id: None,
+                }],
+            },
+        );
+
+        // Re-runs of the same check: only the latest leaf counts. An earlier
+        // FAILURE followed by a later SUCCESS for the same name → Clean.
+        let rerun_cleared = [
+            serde_json::json!({
+                "name": "ci/test",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "isRequired": true,
+            }),
+            serde_json::json!({
+                "name": "ci/test",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "isRequired": true,
+            }),
+        ];
+        assert_eq!(
+            super::classify_ci(&rerun_cleared, None),
+            OpenPrCiStatus::Clean,
+        );
+
+        // A non-required failing check does not gate: it's filtered out, so a
+        // rollup whose only required check passes is Clean.
+        let optional_fail = [
+            serde_json::json!({
+                "name": "third-party/lint",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "isRequired": false,
+            }),
+            serde_json::json!({
+                "name": "ci/test",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "isRequired": true,
+            }),
+        ];
+        assert_eq!(
+            super::classify_ci(&optional_fail, None),
+            OpenPrCiStatus::Clean,
+        );
+    }
 }
