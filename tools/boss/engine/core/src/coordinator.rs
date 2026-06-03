@@ -91,12 +91,12 @@ pub const MAX_AUTOMATION_POOL_SIZE: usize = 3;
 /// clamped. The third pool, modeled on the automation pool, that runs the
 /// always-Opus `pr_review` reviewer agents. See design:
 /// automated-reviewer-pass-on-every-agent-authored-pr.md
-pub const MAX_REVIEW_POOL_SIZE: usize = 3;
+pub const MAX_REVIEW_POOL_SIZE: usize = 8;
 
 /// Default review-pool slot count when `BOSS_REVIEW_POOL_SIZE` is unset.
-/// Deliberately small: reviews are short and run always-Opus, so we bound
-/// concurrent review spend rather than tracking the main pool's slot count.
-pub const DEFAULT_REVIEW_POOL_SIZE: usize = 2;
+/// Raised to 8 to match the main worker pool and reduce review-queue
+/// contention when many PRs land simultaneously.
+pub const DEFAULT_REVIEW_POOL_SIZE: usize = 8;
 
 /// Worker ID prefix for automation-pool slots. Distinct from the main-pool
 /// `"worker-"` prefix so `pool_for_worker_id` can route releases to the
