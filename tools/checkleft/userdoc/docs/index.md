@@ -16,7 +16,7 @@ It runs targeted checks on changed files locally and in CI, so policy violations
 ## Who this is for
 
 - Engineers running checks locally before pushing or creating a PR.
-- Engineers authoring or updating `CHECKS.toml` policy.
+- Engineers authoring or updating `CHECKS.yaml` / `CHECKS.toml` policy.
 - Engineers implementing new built-in checks in Rust.
 - Coding agents that make repository changes under policy guardrails.
 - Engineers configuring and maintaining agent workflows that should follow repository conventions.

@@ -18,7 +18,7 @@ Each check receives three inputs:
 
 1. `ChangeSet`: the changed files and change metadata.
 2. `SourceTree`: read-only access to repository files.
-3. `config`: the check-specific config from `CHECKS.toml`.
+3. `config`: the check-specific config from the `CHECKS` file.
 
 At a high level, this means checks run from the facts of the change plus repository content, not from external services.
 

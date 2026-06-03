@@ -17,7 +17,7 @@ Non-goals for this phase:
 
 ## Implementation Reference Contract
 
-`CHECKS.toml` uses `implementation = ...` to point to external check packages.
+The `CHECKS` file uses `implementation` to point to external check packages.
 
 Supported reference forms:
 

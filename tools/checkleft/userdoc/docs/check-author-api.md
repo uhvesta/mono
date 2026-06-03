@@ -59,7 +59,7 @@ Each finding supports:
 1. Add a new module in `tools/checkleft/src/checks/`.
 2. Implement `Check`.
 3. Register it in `tools/checkleft/src/checks/mod.rs`.
-4. Add/update `CHECKS.toml` entries to configure an instance.
+4. Add/update `CHECKS.yaml` / `CHECKS.toml` entries to configure an instance.
 5. Add tests for:
    - happy path
    - invalid config

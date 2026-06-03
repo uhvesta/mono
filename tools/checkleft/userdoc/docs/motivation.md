@@ -18,7 +18,7 @@ It is intentionally designed for both human developers and coding agents. For bo
 - Fast local feedback for changed files.
 - Fast feedback loops for both humans and agents during iterative development.
 - Opinionated guardrails that enforce repository conventions in agent-generated changes.
-- Declarative configuration with hierarchical `CHECKS.toml` files.
+- Declarative configuration with hierarchical `CHECKS.yaml` / `CHECKS.toml` files.
 - Reusable built-in checks plus check-specific configuration.
 - Human-readable output for developers and JSON output for automation.
 - Consistent behavior in local dev, PR tooling, and CI.
@@ -81,4 +81,4 @@ A practical pattern is:
 - A single command (`./tools/checks run`) for local validation.
 - The same checks enforced before PR creation via `./tools/create-pr`.
 - CI integration with machine-readable output.
-- A policy model that can be scoped by directory using child `CHECKS.toml` files.
+- A policy model that can be scoped by directory using child `CHECKS.yaml` / `CHECKS.toml` files.

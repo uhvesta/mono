@@ -74,7 +74,7 @@ change-kind-aware path policy using grouped gitignore-style patterns.
     `tools/checkleft/userdoc/docs/canned-checks.md`
     with the new `rules[]` model.
 14. Update
-    `tools/checkleft/userdoc/docs/checks-toml.md`
+    `tools/checkleft/userdoc/docs/checks-config.md`
     with an example showing add/modify/delete rule scoping.
 
 ## Testing Strategy

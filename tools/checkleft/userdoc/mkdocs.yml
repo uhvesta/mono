@@ -10,7 +10,7 @@ nav:
   - Home: index.md
   - Motivation: motivation.md
   - Concepts: concepts.md
-  - Configuring checks: checks-toml.md
+  - Configuring checks: checks-config.md
   - External checks contract: external-check-package-contract.md
   - Running checks: cli.md
   - Writing checks: check-author-api.md
