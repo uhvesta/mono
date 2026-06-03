@@ -1,0 +1,46 @@
+# mono-checkleft-release Buildkite pipeline.
+#
+# Cuts a GitHub Release of the `checkleft` binary on spinyfin/mono, tagged
+# checkleft-vX.Y.Z-alpha.N, with prebuilt binaries for Linux and macOS attached
+# as assets. checkleft is consumed as a prebuilt by external repos; this is the
+# pipeline that produces what they pull.
+#
+# This is a SEPARATE pipeline from the main `mono` CI pipeline (it has its own
+# cron schedule and its own manual trigger), modeled on the `boss-release` step
+# in .buildkite/pipeline.yml. Registration is NOT automatic — see the operator
+# checklist in tools/checkleft/docs/buildkite-release-setup.md.
+#
+# Trigger model (enforced inside checkleft-release.sh, BUILDKITE_SOURCE):
+#   - scheduled (cron) builds  → skip unless checkleft changed since last tag.
+#   - manual builds (ui / api) → always release.
+# The pipeline should NOT be wired to build on push (the version-bump commit
+# carries `[skip ci]` and the idempotency guard no-ops a re-run regardless).
+#
+# Queue overrides (Pipeline Settings → Environment Variables):
+#   BUILDKITE_LINUX_QUEUE  — Linux-only queue for the linux/musl builds + the
+#                            orchestrator. Default bazel-any has Linux agents but
+#                            is mixed; set a Linux-only queue to avoid landing on
+#                            a Mac (the linux phase hard-fails if it does).
+#   BUILDKITE_MACOS_QUEUE  — macOS queue for the darwin builds.
+
+steps:
+  - label: ":rust: checkleft-release (linux)"
+    key: "checkleft-release-linux"
+    command: ".buildkite/steps/checkleft-release.sh linux"
+    agents:
+      queue: "${BUILDKITE_LINUX_QUEUE:-bazel-any}"
+    concurrency: 1
+    concurrency_group: "checkleft-release"
+    retry:
+      automatic: false
+
+  - label: ":apple: checkleft-release (darwin)"
+    key: "checkleft-release-darwin"
+    command: ".buildkite/steps/checkleft-release.sh darwin"
+    depends_on: "checkleft-release-linux"
+    agents:
+      queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
+    concurrency: 1
+    concurrency_group: "checkleft-release"
+    retry:
+      automatic: false
