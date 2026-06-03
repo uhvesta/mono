@@ -1144,22 +1144,44 @@ fn create_revision_uses_explicit_name_over_description_fallback() {
     let checker = FakePrStateChecker::always(PrOpenState::Open);
     let explicit_name = "Fix missing version number in release builds";
     let task = db.create_revision(
-            CreateRevisionInput {
-                parent_task_id: parent_id,
-                description: "I also don't see the version number in /release/ builds created by the buildkite release pipeline.".to_owned(),
-                name: Some(explicit_name.to_owned()),
-                priority: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-                created_via: None,
-            },
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id)
+                .description("I also don't see the version number in /release/ builds created by the buildkite release pipeline.")
+                .name(explicit_name)
+                .autostart(true)
+                .build(),
             &checker,
         ).unwrap();
 
     assert_eq!(
         task.name, explicit_name,
         "revision should use the coordinator-supplied name, not the fallback from description"
+    );
+}
+
+#[test]
+fn create_revision_with_autostart_false_stores_zero() {
+    let db = WorkDb::open(temp_db_path("revision-autostart-false")).unwrap();
+    let product_id = make_revision_product(&db, "noauto");
+    let pr_url = "https://github.com/spinyfin/mono/pull/77";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent_id)
+                .description("fix something but don't auto-start")
+                .autostart(false)
+                .build(),
+            &checker,
+        )
+        .unwrap();
+
+    assert_eq!(revision.status, "todo");
+    assert!(
+        !revision.autostart,
+        "revision created with autostart=false must have autostart=false on the row"
     );
 }
 

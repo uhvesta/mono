@@ -1243,6 +1243,16 @@ pub struct CreateRevisionInput {
     /// parent task's priority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+
+    /// When `false`, the revision is created in `todo` but the engine
+    /// does NOT auto-dispatch a worker. The caller must explicitly start
+    /// it (via `bossctl work start <id>` or a kanban drag-to-Doing).
+    /// Defaults to `true` (auto-dispatch immediately), which is the
+    /// existing behaviour and the right default for revision serialisation
+    /// on a parent PR.
+    #[serde(default = "default_true")]
+    #[builder(default = true)]
+    pub autostart: bool,
 }
 
 

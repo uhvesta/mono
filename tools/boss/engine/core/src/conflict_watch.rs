@@ -552,16 +552,11 @@ async fn maybe_spawn_conflict_revision(
     let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{}", attempt.id);
 
     let revision = match work_db.create_revision(
-        CreateRevisionInput {
-            parent_task_id: candidate.work_item_id.clone(),
-            description,
-            name: None,
-            priority: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-            created_via: Some(created_via),
-        },
+        CreateRevisionInput::builder()
+            .parent_task_id(candidate.work_item_id.clone())
+            .description(description)
+            .created_via(created_via)
+            .build(),
         pr_checker,
     ) {
         Ok(rev) => rev,

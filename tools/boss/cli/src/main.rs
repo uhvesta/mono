@@ -6270,6 +6270,7 @@ async fn run_create_revision(
             model_override: args.model,
             force_duplicate: args.force_duplicate,
             created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
+            autostart: !ctx.no_autostart,
         },
     )
     .await?;

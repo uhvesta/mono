@@ -439,16 +439,10 @@ fn make_done_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
 
 /// Helper: build a minimal `CreateRevisionInput` for the given parent id.
 fn revision_input(parent_id: &str) -> CreateRevisionInput {
-    CreateRevisionInput {
-        parent_task_id: parent_id.to_owned(),
-        description: "test revision ask".to_owned(),
-        name: None,
-        priority: None,
-        effort_level: None,
-        model_override: None,
-        force_duplicate: false,
-        created_via: None,
-    }
+    CreateRevisionInput::builder()
+        .parent_task_id(parent_id)
+        .description("test revision ask")
+        .build()
 }
 
 // ── attach_revision_projections ─────────────────────────────────────────

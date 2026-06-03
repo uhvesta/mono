@@ -413,12 +413,13 @@ pub(crate) fn insert_revision_in_tx(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| revision_name_from_description(&description));
+    let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
          effort_level, model_override, short_id, parent_task_id, repo_remote_url) \
-         VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, 1, ?7, ?8, \
-         ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, \
+         ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             product_id,
@@ -426,6 +427,7 @@ pub(crate) fn insert_revision_in_tx(
             name,
             description,
             now,
+            autostart_value,
             priority,
             created_via,
             effort_level,
