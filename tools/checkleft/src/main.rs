@@ -27,6 +27,20 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 
+#[derive(Debug, Args, Clone)]
+struct RunArgs {
+    #[command(flatten)]
+    config: ConfigArgs,
+    #[arg(long)]
+    all: bool,
+    #[arg(long)]
+    base_ref: Option<String>,
+    #[arg(long)]
+    default_branch: Option<String>,
+    #[arg(long, default_value = "human")]
+    format: OutputFormat,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "checkleft")]
 #[command(about = "Run repository convention checks")]
@@ -34,24 +48,17 @@ struct Cli {
     #[arg(long, global = true)]
     verbose: bool,
 
+    // Top-level run args: active when no subcommand is given (bare `checkleft` == `checkleft run`).
+    #[command(flatten)]
+    run_args: RunArgs,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Run {
-        #[command(flatten)]
-        config: ConfigArgs,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        base_ref: Option<String>,
-        #[arg(long)]
-        default_branch: Option<String>,
-        #[arg(long, default_value = "human")]
-        format: OutputFormat,
-    },
+    Run(RunArgs),
     List {
         #[command(flatten)]
         config: ConfigArgs,
@@ -124,64 +131,21 @@ async fn run_cli() -> Result<ExitCode> {
     info!(kind = ?vcs.kind(), "detected repository");
     let env = CiEnvironment::from_env();
 
-    match cli.command {
-        Commands::Run {
-            config,
-            all,
-            base_ref,
-            default_branch,
-            format,
-        } => {
-            let overrides = ChangeOverrides { all, base_ref, default_branch };
-            info!("resolving change plan");
-            let plan = resolve_change_plan(&env, &vcs, &overrides)?;
-            info!("building runner for run");
-            let runner = build_runner(
-                &root,
-                &vcs,
-                base_revision_from_plan(&vcs, &plan),
-                config.external_checks_file,
-                config.external_checks_url,
-            )
-            .await?;
-            info!("resolving changeset for run");
-            let changeset = attach_description_context(
-                changeset_from_plan(&vcs, &plan)?,
-                &vcs,
-            )
-            .await;
-            info!(
-                changed_files = changeset.changed_files.len(),
-                "resolved changeset for run"
-            );
-            let run_started_at = Instant::now();
-            let mut results = runner.run_changeset(&changeset).await?;
-            let elapsed = run_started_at.elapsed();
-            sort_results_for_output(&mut results);
+    let Cli { verbose: _, run_args: default_run_args, command } = cli;
 
-            match format {
-                OutputFormat::Human => print_human_results(&results, elapsed),
-                OutputFormat::Json => print_json_results(&results)?,
-            }
-
-            let has_error = results.iter().any(|result| {
-                result
-                    .findings
-                    .iter()
-                    .any(|finding| finding.severity == Severity::Error)
-            });
-            Ok(if has_error {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            })
+    match command {
+        None => {
+            dispatch_run(default_run_args, &root, &vcs, &env).await
         }
-        Commands::List {
+        Some(Commands::Run(args)) => {
+            dispatch_run(args, &root, &vcs, &env).await
+        }
+        Some(Commands::List {
             config,
             all,
             base_ref,
             default_branch,
-        } => {
+        }) => {
             let overrides = ChangeOverrides { all, base_ref, default_branch };
             info!("resolving change plan");
             let plan = resolve_change_plan(&env, &vcs, &overrides)?;
@@ -211,7 +175,7 @@ async fn run_cli() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         // TEMPORARY: bake-period parity check (P844 migration step 2). Remove once checks.sh is retired.
-        Commands::ShowPlan { base_ref, default_branch } => {
+        Some(Commands::ShowPlan { base_ref, default_branch }) => {
             let overrides = ChangeOverrides { all: false, base_ref, default_branch };
             let plan = resolve_change_plan(&env, &vcs, &overrides)?;
             match &plan {
@@ -238,6 +202,46 @@ async fn run_cli() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+async fn dispatch_run(
+    RunArgs { config, all, base_ref, default_branch, format }: RunArgs,
+    root: &Path,
+    vcs: &Vcs,
+    env: &CiEnvironment,
+) -> Result<ExitCode> {
+    let overrides = ChangeOverrides { all, base_ref, default_branch };
+    info!("resolving change plan");
+    let plan = resolve_change_plan(env, vcs, &overrides)?;
+    info!("building runner for run");
+    let runner = build_runner(
+        root,
+        vcs,
+        base_revision_from_plan(vcs, &plan),
+        config.external_checks_file,
+        config.external_checks_url,
+    )
+    .await?;
+    info!("resolving changeset for run");
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs).await;
+    info!(
+        changed_files = changeset.changed_files.len(),
+        "resolved changeset for run"
+    );
+    let run_started_at = Instant::now();
+    let mut results = runner.run_changeset(&changeset).await?;
+    let elapsed = run_started_at.elapsed();
+    sort_results_for_output(&mut results);
+
+    match format {
+        OutputFormat::Human => print_human_results(&results, elapsed),
+        OutputFormat::Json => print_json_results(&results)?,
+    }
+
+    let has_error = results
+        .iter()
+        .any(|result| result.findings.iter().any(|f| f.severity == Severity::Error));
+    Ok(if has_error { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 async fn build_runner(
