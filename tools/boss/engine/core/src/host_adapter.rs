@@ -1045,3 +1045,67 @@ impl HostAdapterProvider for SshHostAdapterProvider {
         Ok(adapter)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Pure helpers ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn non_empty_returns_trimmed_stderr_when_present() {
+        assert_eq!(non_empty("boom", 1), "boom");
+    }
+
+    #[test]
+    fn non_empty_trims_surrounding_whitespace() {
+        assert_eq!(non_empty("  permission denied\n", 1), "permission denied");
+    }
+
+    #[test]
+    fn non_empty_falls_back_to_synthetic_exit_for_empty_stderr() {
+        assert_eq!(non_empty("", 2), "exit 2");
+    }
+
+    #[test]
+    fn non_empty_falls_back_to_synthetic_exit_for_whitespace_only_stderr() {
+        assert_eq!(non_empty("   \n\t ", 127), "exit 127");
+    }
+
+    #[test]
+    fn stage_local_file_writes_contents_and_embeds_label() {
+        let staged = stage_local_file("mylabel", "hello world").expect("staging file");
+
+        // While the guard is live the file exists with the exact contents.
+        assert!(staged.path().exists(), "staged file should exist on disk");
+        assert_eq!(
+            std::fs::read(staged.path()).expect("read staged file"),
+            b"hello world",
+        );
+
+        // The filename embeds the caller-supplied label for diagnosability.
+        let file_name = staged
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("staged file has a UTF-8 name");
+        assert!(
+            file_name.contains("mylabel"),
+            "filename {file_name:?} should embed the label",
+        );
+    }
+
+    #[test]
+    fn staged_file_is_removed_on_drop() {
+        let path = {
+            let staged = stage_local_file("dropme", "transient").expect("staging file");
+            assert!(staged.path().exists());
+            staged.path().to_path_buf()
+        };
+        // Guard has dropped: the on-disk file is unlinked.
+        assert!(
+            !path.exists(),
+            "staging file should be removed once the guard drops",
+        );
+    }
+}
