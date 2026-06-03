@@ -666,6 +666,80 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Snapshot the bound PR's description/body captured at run start.
+    /// Baseline for the metadata-only CI-fix finalize gate (issue #1252):
+    /// `on_stop` diffs the live body against this to detect an
+    /// operator-visible PR-metadata delta. Unlike
+    /// [`Self::set_execution_pr_head_before`] an *empty* body is a valid
+    /// snapshot (a PR can legitimately start with no description, and a
+    /// worker that adds one is a real delta), so empty input is stored as
+    /// the empty string rather than rejected. `NULL` (never called) means
+    /// "no baseline" and the gate treats it as inapplicable.
+    pub fn set_execution_pr_body_before(&self, execution_id: &str, body: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pr_body_before = ?2 WHERE id = ?1",
+            params![execution_id, body],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// Read the PR body snapshot captured at run start, or `None` when no
+    /// snapshot was taken (new-PR flow, fetch failure, pre-migration row).
+    pub fn get_execution_pr_body_before(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let body: Option<String> = conn
+            .query_row(
+                "SELECT pr_body_before FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(body)
+    }
+
+    /// Stamp the "metadata delta observed at a clean Stop boundary" marker
+    /// for the metadata-only CI-fix finalize gate (issue #1252). Set ONLY
+    /// by the on-Stop handler — never the merge poller — so it is positive
+    /// evidence that the worker reached a real Stop boundary (a dead /
+    /// cut-off worker emits no Stop hook and so never gets marked) AND
+    /// produced an operator-visible PR-metadata change. The merge poller
+    /// gates its metadata-only finalize on this marker plus green CI,
+    /// which is what prevents the #1262 regression (finalizing a worker
+    /// that contributed nothing). Idempotent.
+    pub fn mark_execution_metadata_fix_confirmed(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET metadata_fix_confirmed_at = ?2 WHERE id = ?1",
+            params![execution_id, now_string()],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// Whether the metadata-only CI-fix marker has been stamped on this
+    /// execution (see [`Self::mark_execution_metadata_fix_confirmed`]).
+    /// The merge poller consults this before finalizing a revision whose
+    /// bound PR head never moved.
+    pub fn execution_metadata_fix_confirmed(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let at: Option<String> = conn
+            .query_row(
+                "SELECT metadata_fix_confirmed_at FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(at.map(|s| !s.is_empty()).unwrap_or(false))
+    }
+
     pub fn fail_execution_start(
         &self,
         execution_id: &str,

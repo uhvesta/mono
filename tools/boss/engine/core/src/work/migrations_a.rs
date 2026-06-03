@@ -63,6 +63,36 @@ pub(crate) fn migrate_work_executions_pr_head_before(conn: &Connection) -> Resul
     Ok(())
 }
 
+/// `pr_body_before` + `metadata_fix_confirmed_at`: positive-evidence
+/// columns for the metadata-only CI-fix finalize gate (issue #1252).
+///
+/// `pr_body_before` holds the bound PR's description/body captured at
+/// the moment this execution started running (the baseline against
+/// which `on_stop` detects an operator-visible PR-metadata delta).
+/// `metadata_fix_confirmed_at` is a timestamp the on-Stop handler
+/// stamps once it observes — at a *real* Stop boundary — that this
+/// revision produced such a delta. It is the load-bearing signal that
+/// lets the merge poller finalize a PR-description-only CI fix when CI
+/// goes green *after* the worker stopped, WITHOUT the #1262 regression
+/// of finalizing a dead/cut-off worker that never reached a clean Stop
+/// and contributed nothing. Both NULL on pre-migration rows and on the
+/// new-PR flow (no bound PR to snapshot). Idempotent.
+pub(crate) fn migrate_work_executions_metadata_fix_columns(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_body_before")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN pr_body_before TEXT",
+            [],
+        )?;
+    }
+    if !work_executions_has_column(conn, "metadata_fix_confirmed_at")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN metadata_fix_confirmed_at TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Add `tasks.parent_task_id` — the soft FK that ties a `revision` task
 /// to the task whose PR it targets — and the accompanying index so the
 /// coordinator can walk the chain efficiently. Mirrors the

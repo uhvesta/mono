@@ -461,6 +461,15 @@ pub trait BranchVerifier: Send + Sync {
         base: &str,
         head: &str,
     ) -> Result<u64>;
+
+    /// Returns the description/body of PR `pr_number` in `repo_slug`.
+    /// Used by the metadata-only CI-fix finalize gate (issue #1252) to
+    /// detect an operator-visible PR-metadata delta: a CI-fix revision
+    /// that repairs a PR-description validator via `gh pr edit --body`
+    /// makes no commit, so the head SHA never moves — the body diff is
+    /// the only evidence the worker contributed. An empty body is a
+    /// valid value (not an error), unlike the head-ref fetches.
+    async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -490,6 +499,10 @@ impl BranchVerifier for CommandBranchVerifier {
         head: &str,
     ) -> Result<u64> {
         fetch_diff_line_count_cmd(repo_slug, base, head).await
+    }
+
+    async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        fetch_pr_body_cmd(repo_slug, pr_number).await
     }
 }
 
@@ -590,6 +603,31 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
     })?;
     Ok(total)
 }
+
+/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json body` and
+/// return the PR description. An empty body is a valid result (returned
+/// as the empty string) — a PR can legitimately have no description, and
+/// the metadata-fix gate needs to distinguish "" (snapshotted empty)
+/// from a failed fetch.
+async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
+    let pr_str = pr_number.to_string();
+    run_gh(
+        &[
+            "pr",
+            "view",
+            &pr_str,
+            "-R",
+            repo_slug,
+            "--json",
+            "body",
+            "--jq",
+            ".body",
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug} --json body"),
+    )
+    .await
+}
+
 
 /// Parse the PR number from a canonical GitHub PR URL
 /// (`https://github.com/<owner>/<repo>/pull/<N>`).
@@ -1354,6 +1392,24 @@ impl WorkerCompletionHandler {
                 {
                     return outcome;
                 }
+                // Positive-evidence metadata-only CI-fix gate (issue #1252):
+                // a revision can legitimately finish WITHOUT moving the head
+                // when it repairs a PR-description validator via
+                // `gh pr edit --body` (no commit). Because we are inside the
+                // on-Stop handler, this is a *real* Stop boundary — a dead /
+                // cut-off worker emits no Stop hook and never reaches here.
+                // If this run also produced an operator-visible PR-metadata
+                // delta, record that positive evidence and finalize (now, if
+                // CI is already green; otherwise the merge poller finalizes
+                // it once CI goes green — see `recheck_for_pr`). Without a
+                // delta we fall through to the normal nudge: head unchanged
+                // AND body unchanged means the worker contributed nothing.
+                if let Some(outcome) = self
+                    .try_finalize_metadata_only_fix_on_stop(execution_id, &execution, &pr_url)
+                    .await
+                {
+                    return outcome;
+                }
                 tracing::info!(
                     execution_id,
                     bound_pr_url = %pr_url,
@@ -1765,10 +1821,38 @@ must not be asked to open one",
                     )
                     .await;
             }
-            ShaDeltaGateOutcome::NoContribution { pr_url: _ } => {
-                // Bound PR did not advance during this run. Fall through to
-                // the cold-path branch-keyed detector; the next sweep retries,
-                // waiting for a push that moves the head.
+            ShaDeltaGateOutcome::NoContribution { pr_url } => {
+                // Bound PR did not advance during this run. For most resumes
+                // the cold-path detector below returns quietly for revisions
+                // and the next sweep retries, waiting for a push that moves
+                // the head.
+                //
+                // The one exception is a legitimate PR-metadata-only CI fix
+                // (issue #1252): a revision that repaired a PR-description
+                // validator with `gh pr edit --body` makes no commit, so the
+                // head never moves and CI can go green *after* the worker
+                // stopped — past the last Stop event, so `on_stop` can no
+                // longer finalize it. The merge poller is the only path that
+                // can. But — unlike the rolled-back #1262 gate — we do NOT
+                // infer "done" from "head unchanged + CI green": that race
+                // reaped live and dead workers alike. We finalize ONLY when
+                // `on_stop` already stamped the positive-evidence marker
+                // (a real Stop boundary observed an operator-visible PR-body
+                // delta) AND CI is now green. A dead/cut-off worker never
+                // reaches a clean Stop, so it never carries the marker and is
+                // never finalized here — it falls through and is surfaced /
+                // re-dispatched by the normal incomplete-execution paths.
+                if execution.kind == ExecutionKind::RevisionImplementation
+                    && self
+                        .work_db
+                        .execution_metadata_fix_confirmed(execution_id)
+                        .unwrap_or(false)
+                    && let Some(outcome) = self
+                        .finalize_metadata_only_revision_if_ready(execution_id, &pr_url)
+                        .await
+                {
+                    return outcome;
+                }
             }
             ShaDeltaGateOutcome::Inapplicable => {
                 // No bound PR or snapshot unavailable — fall through to the
@@ -3445,6 +3529,45 @@ must not be asked to open one",
             head_oid = %head_oid,
             "execution_started hook: snapshotted pr_head_before for SHA-delta gate"
         );
+
+        // Also snapshot the PR body as the baseline for the metadata-only
+        // CI-fix finalize gate (issue #1252). A CI-fix revision that
+        // repairs a PR-description validator edits the body with no commit,
+        // so the head SHA never moves; the body diff against this snapshot
+        // is the only operator-visible evidence the worker contributed.
+        // Best-effort and independent of downstream finalisation — an empty
+        // body is a valid snapshot, but a fetch failure leaves it unset and
+        // the gate treats that as inapplicable.
+        match self
+            .branch_verifier
+            .fetch_pr_body(&repo_slug, pr_number)
+            .await
+        {
+            Ok(body) => {
+                if let Err(err) = self.work_db.set_execution_pr_body_before(execution_id, &body) {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "execution_started hook: failed to persist pr_body_before"
+                    );
+                } else {
+                    tracing::debug!(
+                        execution_id,
+                        bound_pr_url = %bound_pr_url,
+                        body_len = body.len(),
+                        "execution_started hook: snapshotted pr_body_before for metadata-fix gate"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    ?err,
+                    "execution_started hook: fetch PR body failed; skipping pr_body_before snapshot"
+                );
+            }
+        }
     }
 
     /// Check whether the blocking signal for a conflict-resolution or
@@ -3714,6 +3837,185 @@ must not be asked to open one",
             }
 
         None
+    }
+
+    /// On-Stop arm of the metadata-only CI-fix finalize gate (issue
+    /// #1252). Called from `on_stop_inner`'s `NoContribution` branch —
+    /// i.e. at a *real* Stop boundary where the bound PR head did not move
+    /// this run.
+    ///
+    /// Detects whether this revision produced an operator-visible
+    /// PR-metadata delta (the live PR body differs from the
+    /// `pr_body_before` snapshot taken at run start). If so it:
+    ///   - stamps the `metadata_fix_confirmed_at` marker — positive
+    ///     evidence (real Stop boundary + operator-visible delta) that the
+    ///     merge poller consumes when CI greens *after* this Stop, and
+    ///   - finalizes immediately if CI is already green (returning the
+    ///     finalize outcome); otherwise returns `AwaitingInput` (recorded,
+    ///     awaiting CI — deliberately NOT a nudge, because a metadata-only
+    ///     fix has nothing to push to the existing PR).
+    ///
+    /// Returns `None` when this is not a metadata-only fix (not a
+    /// revision, no baseline snapshot, fetch failure, or the body is
+    /// unchanged) so the caller falls through to its normal nudge: head
+    /// unchanged AND body unchanged means the worker contributed nothing
+    /// this run, which must NOT be mistaken for a clean no-op completion.
+    async fn try_finalize_metadata_only_fix_on_stop(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+    ) -> Option<StopOutcome> {
+        if execution.kind != ExecutionKind::RevisionImplementation {
+            return None;
+        }
+        // Baseline body snapshot from run start. `None` means no baseline
+        // (new-PR flow, or the start-of-run fetch failed) — we cannot prove
+        // a delta, so fall through to the normal nudge.
+        let before = match self.work_db.get_execution_pr_body_before(execution_id) {
+            Ok(Some(body)) => body,
+            Ok(None) => return None,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    ?err,
+                    "metadata-fix on-stop: pr_body_before read failed; falling through to nudge",
+                );
+                return None;
+            }
+        };
+        let repo_slug = parse_repo_slug(&execution.repo_remote_url).ok()?;
+        let pr_number = pr_number_from_url(bound_pr_url)?;
+        let current = match self
+            .branch_verifier
+            .fetch_pr_body(&repo_slug, pr_number)
+            .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    bound_pr_url,
+                    ?err,
+                    "metadata-fix on-stop: live PR body fetch failed; falling through to nudge",
+                );
+                return None;
+            }
+        };
+        if current == before {
+            // No operator-visible delta: head unchanged AND body unchanged.
+            // The worker contributed nothing this run — let the caller nudge.
+            return None;
+        }
+        // Operator-visible PR-metadata delta produced at a real Stop
+        // boundary. Persist the positive-evidence marker BEFORE attempting
+        // to finalize so a transient probe failure still lets the merge
+        // poller finalize once CI goes green.
+        if let Err(err) = self
+            .work_db
+            .mark_execution_metadata_fix_confirmed(execution_id)
+        {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "metadata-fix on-stop: failed to persist confirmation marker",
+            );
+        }
+        if let Some(outcome) = self
+            .finalize_metadata_only_revision_if_ready(execution_id, bound_pr_url)
+            .await
+        {
+            return Some(outcome);
+        }
+        // Delta recorded but CI not yet green: return quietly (no nudge —
+        // there is nothing to push). The merge poller's `recheck_for_pr`
+        // finalizes once CI goes green, gated on the marker just stamped.
+        tracing::info!(
+            execution_id,
+            bound_pr_url,
+            "stop event: PR-metadata-only CI fix recorded; awaiting CI to go green before \
+             finalizing (issue #1252)",
+        );
+        Some(StopOutcome::AwaitingInput)
+    }
+
+    /// Finalize a metadata-only CI-fix revision IF its bound PR is now in
+    /// a demonstrably-healthy state. Probes the bound parent PR and
+    /// decides from its live state:
+    ///   - open with clean CI → the fix landed → finalize to `in_review`;
+    ///   - already merged      → finalize to `done`;
+    ///   - CI still failing / in-flight, closed-unmerged, or the probe
+    ///     failed → return `None` (caller leaves it for a later sweep).
+    ///
+    /// Callers MUST first establish the positive evidence that this is a
+    /// legitimate no-code-change completion: a *real* Stop boundary that
+    /// observed an operator-visible PR-metadata delta. `on_stop` is itself
+    /// that boundary; the merge poller gates on the
+    /// `metadata_fix_confirmed_at` marker `on_stop` stamps. This helper
+    /// only re-checks CI — it deliberately does NOT re-derive the
+    /// Stop/delta evidence, so the regression-prone "head unchanged + CI
+    /// green" inference (#1262) can never be reached without it.
+    /// Idempotent against an already-finalized execution
+    /// (`finalize_pr_transition` returns `AlreadyTerminal` for a non-live
+    /// row).
+    async fn finalize_metadata_only_revision_if_ready(
+        &self,
+        execution_id: &str,
+        bound_pr_url: &str,
+    ) -> Option<StopOutcome> {
+        let probe = match self.merge_probe.probe(bound_pr_url).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    bound_pr_url,
+                    ?err,
+                    "metadata-fix finalize: bound-PR probe failed; will retry on a later sweep",
+                );
+                return None;
+            }
+        };
+        let target = match &probe.state {
+            // Require BOTH clean CI and clean mergeability: a metadata-only
+            // edit must not finalize a PR that still carries a *separate*
+            // blocking signal (e.g. a merge conflict on a conflict-resolution
+            // revision the worker did not actually rebase). Only a genuinely
+            // review-ready PR advances.
+            PrLifecycleState::Open(open)
+                if open.mergeability == OpenPrMergeability::Clean
+                    && matches!(open.ci, OpenPrCiStatus::Clean) =>
+            {
+                tracing::info!(
+                    execution_id,
+                    bound_pr_url,
+                    "metadata-fix finalize: bound PR open, mergeable, with clean CI and a \
+                     Stop-confirmed PR-metadata delta — finalizing the revision to in_review \
+                     (issue #1252)",
+                );
+                WorkerPrCompletionTarget::InReview
+            }
+            PrLifecycleState::Merged => {
+                tracing::info!(
+                    execution_id,
+                    bound_pr_url,
+                    "metadata-fix finalize: bound PR already merged — finalizing the revision \
+                     to done (issue #1252)",
+                );
+                WorkerPrCompletionTarget::Done
+            }
+            // CI still failing / in-flight, or PR closed-unmerged: the fix
+            // has not demonstrably landed. Leave it; a later sweep re-probes.
+            _ => return None,
+        };
+        Some(
+            self.finalize_pr_transition(
+                execution_id,
+                bound_pr_url.to_owned(),
+                target,
+                "metadata_only_fix",
+            )
+            .await,
+        )
     }
 
     /// Evaluate the resume-bounce SHA-delta gate. The gate uses the
@@ -4251,6 +4553,7 @@ mod tests {
         /// `999` (non-trivial) so tests that don't exercise the skip gate
         /// never accidentally trigger a skip.
         diff_line_count_result: Mutex<Result<u64, String>>,
+        body_result: Mutex<Result<String, String>>,
     }
 
     impl StubBranchVerifier {
@@ -4259,11 +4562,13 @@ mod tests {
         /// so tests that don't touch the SHA-delta path get a stable
         /// stand-in without having to wire one explicitly. Tests that
         /// exercise the gate call [`Self::with_head_oid`] to override.
+        /// The PR body defaults to empty.
         fn ok(branch: &str) -> Arc<Self> {
             Arc::new(Self {
                 result: Ok(branch.to_owned()),
                 head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
                 diff_line_count_result: Mutex::new(Ok(999)),
+                body_result: Mutex::new(Ok(String::new())),
             })
         }
 
@@ -4279,6 +4584,13 @@ mod tests {
         /// simulate a pure rebase (0 lines) or trivially small change.
         async fn set_diff_line_count(&self, count: Result<u64, String>) {
             *self.diff_line_count_result.lock().await = count;
+        }
+
+        /// Override the body returned by `fetch_pr_body`. Used by the
+        /// metadata-only CI-fix gate tests to simulate the live PR body
+        /// the worker did (or did not) edit during its run.
+        async fn set_body(&self, body: Result<String, String>) {
+            *self.body_result.lock().await = body;
         }
     }
 
@@ -4308,6 +4620,14 @@ mod tests {
             let guard = self.diff_line_count_result.lock().await;
             match &*guard {
                 Ok(count) => Ok(*count),
+                Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+            }
+        }
+
+        async fn fetch_pr_body(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+            let guard = self.body_result.lock().await;
+            match &*guard {
+                Ok(body) => Ok(body.clone()),
                 Err(msg) => Err(anyhow::anyhow!(msg.clone())),
             }
         }
@@ -8314,6 +8634,345 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "lease must stay held when revision is not done",
         );
         assert!(probes.snapshot().is_empty(), "recheck must not nudge");
+    }
+
+    // -----------------------------------------------------------
+    // PR-metadata-only CI-fix revision finalize (issue #1252), re-solved
+    // without the #1262 regression (rolled back in #1293).
+    //
+    // A CI-fix revision can legitimately finish WITHOUT moving the bound
+    // PR head — it repairs a PR-description validator via `gh pr edit
+    // --body`, no commit. The SHA-delta gate returns NoContribution on
+    // every sweep. We finalize such a revision ONLY on positive evidence:
+    //   1. a real Stop boundary (only `on_stop` stamps the marker; a
+    //      dead/cut-off worker emits no Stop hook), AND
+    //   2. an operator-visible PR-body delta (live body != run-start
+    //      snapshot), AND
+    //   3. CI green on the bound PR.
+    // The merge poller may finalize only what `on_stop` already marked,
+    // so a worker that contributed nothing (R1 dead, R2 reaped-while-live)
+    // is never mis-finalized.
+    // -----------------------------------------------------------
+
+    /// Configurable [`MergeProbe`] returning a fixed lifecycle state for
+    /// any PR url. Drives the bound-PR-health check in the metadata-fix
+    /// finalize path.
+    struct FixedStateProbe(crate::merge_poller::PrLifecycleState);
+    #[async_trait]
+    impl MergeProbe for FixedStateProbe {
+        async fn probe(
+            &self,
+            _pr_url: &str,
+        ) -> anyhow::Result<crate::merge_poller::PrLifecycleProbe> {
+            Ok(crate::merge_poller::PrLifecycleProbe {
+                url: String::new(),
+                state: self.0.clone(),
+                base_ref_oid: None,
+                head_ref_oid: None,
+                head_ref_name: None,
+                base_ref_name: None,
+                labels: Vec::new(),
+                review: crate::merge_poller::PrReviewState::Unknown,
+                in_merge_queue: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn on_stop_finalizes_metadata_only_revision_when_body_changed_and_ci_clean() {
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1252";
+        let head = "1111111111111111111111111111111111111111";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+        // Worker edited the PR body during this run: live body differs from
+        // the run-start snapshot. Head SHA unchanged → NoContribution.
+        db.set_execution_pr_body_before(&execution_id, "## Summary\nold body")
+            .unwrap();
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+        verifier
+            .set_body(Ok("## Summary\nold body\n\n## Testing\nfixed PR-template check".into()))
+            .await;
+        // The PR-template check went green after the edit.
+        let probe: Arc<dyn MergeProbe> =
+            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "metadata-only CI-fix revision with a body delta + clean CI must finalize to \
+             in_review; got {outcome:?}",
+        );
+        // Positive-evidence marker stamped.
+        assert!(
+            db.execution_metadata_fix_confirmed(&execution_id).unwrap(),
+            "on_stop must stamp the metadata-fix marker after observing the body delta",
+        );
+        // Revision advanced out of Doing to Review (revisions never own a pr_url).
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => {
+                assert_eq!(t.status, "in_review");
+                assert!(t.pr_url.is_none(), "revision tasks must not own a pr_url");
+            }
+            other => panic!("expected revision task, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, "completed");
+        assert!(execution.cube_lease_id.is_none());
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+        assert!(
+            probes.snapshot().is_empty(),
+            "a clean metadata-only completion must NOT nudge",
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stop_records_marker_but_awaits_ci_when_body_changed_but_ci_not_green() {
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState, RequiredCheckFailure};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1253";
+        let head = "2222222222222222222222222222222222222222";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+        db.set_execution_pr_body_before(&execution_id, "old body")
+            .unwrap();
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+        verifier.set_body(Ok("edited body that fixes the template".into())).await;
+        // The PR-template check is still re-running after the edit.
+        let failures = vec![RequiredCheckFailure {
+            name: "pr-template".into(),
+            conclusion: "IN_PROGRESS".into(),
+            target_url: String::new(),
+            provider: crate::merge_poller::CiProvider::GithubActions,
+            provider_job_id: None,
+        }];
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(
+            OpenPrStatus::ci_failing(failures),
+        )));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "body delta + not-yet-green CI must record the marker and await CI, not nudge; \
+             got {outcome:?}",
+        );
+        // Marker persisted so the merge poller can finalize once CI greens.
+        assert!(
+            db.execution_metadata_fix_confirmed(&execution_id).unwrap(),
+            "the metadata-fix marker must persist for the poller's later finalize",
+        );
+        // Revision stays in Doing; lease held; no nudge (nothing to push).
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, "waiting_human");
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
+        assert!(
+            probes.snapshot().is_empty(),
+            "a recorded metadata-only fix awaiting CI must NOT nudge the worker to push",
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stop_does_not_finalize_revision_when_body_unchanged() {
+        // R2 at the Stop boundary: the worker made no commit AND no PR-body
+        // edit (head unchanged, body unchanged). This is "contributed
+        // nothing", NOT a clean no-op completion. It must never be marked
+        // or finalized as a metadata-only fix — it falls through to the
+        // normal nudge.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1254";
+        let head = "3333333333333333333333333333333333333333";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+        db.set_execution_pr_body_before(&execution_id, "unchanged body")
+            .unwrap();
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+        verifier.set_body(Ok("unchanged body".into())).await; // identical → no delta
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier);
+
+        let _ = handler.on_stop(&execution_id).await;
+        assert!(
+            !db.execution_metadata_fix_confirmed(&execution_id).unwrap(),
+            "no body delta must NOT stamp the metadata-fix marker",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
+                t.status, "active",
+                "a no-contribution run must not be finalized as a metadata-only fix",
+            ),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, "waiting_human");
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recheck_finalizes_metadata_only_revision_after_ci_greens_when_marked() {
+        // The CI-went-green-after-Stop recovery: on_stop already stamped the
+        // marker (real Stop boundary + body delta) but CI was still
+        // re-running. A later merge-poller sweep finalizes it now CI is green.
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1255";
+        let head = "4444444444444444444444444444444444444444";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+        // Simulate the marker on_stop stamped on a prior turn.
+        db.mark_execution_metadata_fix_confirmed(&execution_id).unwrap();
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await; // head unchanged → NoContribution
+        let probe: Arc<dyn MergeProbe> =
+            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == parent_pr_url),
+            "marked metadata-only revision must finalize once its bound PR CI is green; \
+             got {outcome:?}",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, "completed");
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert!(probes.snapshot().is_empty(), "recovery must not nudge");
+    }
+
+    #[tokio::test]
+    async fn recheck_does_not_finalize_unmarked_revision_even_with_green_ci() {
+        // The #1262 regression guard (T1256 R1 dead worker, T1265 R2 live
+        // worker). The bound PR head is unchanged and CI is GREEN, but
+        // on_stop never stamped the marker (the worker died / was reaped
+        // before reaching a clean Stop with an operator-visible delta). The
+        // merge poller must NOT finalize it — that was the rolled-back
+        // behaviour. It stays Doing for the incomplete-execution paths.
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1256";
+        let head = "5555555555555555555555555555555555555555";
+        let (db, _product_id, revision_id, execution_id) =
+            revision_fixture(workspace.path(), parent_pr_url, head);
+        // NO marker stamped (the load-bearing difference from the test above).
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await; // head unchanged → NoContribution
+        // CI is green — proving we gate on the marker, not on "head
+        // unchanged + CI green".
+        let probe: Arc<dyn MergeProbe> =
+            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.recheck_for_pr(&execution_id).await;
+        assert_eq!(
+            outcome,
+            StopOutcome::AwaitingInput,
+            "an unmarked revision must NOT finalize even with green CI; got {outcome:?}",
+        );
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
+                t.status, "active",
+                "the #1262 regression must stay fixed: no marker means no finalize",
+            ),
+            other => panic!("expected task, got {other:?}"),
+        }
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, "waiting_human");
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "an unmarked revision's lease must stay held (not reaped)",
+        );
+        assert!(pane.calls.lock().await.is_empty());
+        assert!(probes.snapshot().is_empty());
     }
 
     // -----------------------------------------------------------
