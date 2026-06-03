@@ -1528,7 +1528,7 @@ fn compose_revision_directive(
     out.push_str("      `body=$(mktemp) && <write corrected body to $body> && GIT_DIR=.jj/repo/store/git gh pr edit --body-file \"$body\" -R <owner/repo>`\n");
     out.push_str("      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n");
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
-    out.push_str("   e. Cosmetic and rebase-only revisions that change no observable behaviour may skip steps c–d if, after step b, you confirm the existing description is still accurate.\n");
+    out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review.\n");
     out.push('\n');
     out.push_str(&format!(
         "8. Confirm the new commit is on the PR: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`\n"
@@ -1539,7 +1539,7 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
-    out.push_str("Rebase-only exception: if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces no new diff, it is perfectly valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change.\n");
+    out.push_str("Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n");
     out.push('\n');
     out.push_str("Constraints:\n");
     out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
