@@ -712,10 +712,10 @@ fn strip_markdown(md: &str) -> String {
             in_fence = !in_fence;
             continue;
         }
-        if trimmed.starts_with("> ") {
-            out.push_str(&trimmed[2..]);
-        } else if trimmed.starts_with('>') {
-            out.push_str(&trimmed[1..]);
+        if let Some(stripped) = trimmed.strip_prefix("> ") {
+            out.push_str(stripped);
+        } else if let Some(stripped) = trimmed.strip_prefix('>') {
+            out.push_str(stripped);
         } else if trimmed.starts_with("**") && trimmed.ends_with("**") {
             out.push_str(&trimmed[2..trimmed.len() - 2]);
         } else {

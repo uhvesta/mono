@@ -1518,9 +1518,7 @@ fn compose_revision_directive(
     out.push_str("5. `jj describe -m \"<short message describing THIS revision's change>\"`\n");
     out.push_str("   Then identify the parent branch name from `jj log` and advance it to the new commit:\n");
     out.push_str("   `jj bookmark set <parent-branch-name> -r @`\n");
-    out.push_str(&format!(
-        "6. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n"
-    ));
+    out.push_str("6. `GIT_DIR=.jj/repo/store/git jj git push -b <parent-branch-name>`   # NO --allow-new; the branch already exists.\n");
     out.push_str("7. **Update the PR description** — this is a required step, not optional:\n");
     out.push_str(&format!(
         "   a. Read the current description: `GIT_DIR=.jj/repo/store/git gh pr view {pr_number} --json body -q .body`\n"
@@ -1695,8 +1693,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
 fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     let is_rebounce = attempt
         .failure_kind
-        .as_deref()
-        .map_or(false, |k| k == "merge_queue_rebounce");
+        .as_deref() == Some("merge_queue_rebounce");
 
     let mut out = String::new();
     out.push_str("\n---\n\n");

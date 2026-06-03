@@ -1234,6 +1234,12 @@ pub struct KeychainTokenStore {
     backend: Box<dyn KeystoreBackend>,
 }
 
+impl Default for KeychainTokenStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KeychainTokenStore {
     /// Creates a store backed by the platform's native credential store.
     ///

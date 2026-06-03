@@ -550,7 +550,7 @@ async fn fetch_pr_head_oid_cmd(repo_slug: &str, pr_number: u64) -> Result<String
 /// Parse the PR number from a canonical GitHub PR URL
 /// (`https://github.com/<owner>/<repo>/pull/<N>`).
 pub(crate) fn pr_number_from_url(pr_url: &str) -> Option<u64> {
-    pr_url.split('/').last()?.parse().ok()
+    pr_url.split('/').next_back()?.parse().ok()
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
@@ -765,7 +765,7 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
 async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
     let pr_number = pr_url
         .split('/')
-        .last()
+        .next_back()
         .and_then(|s| s.parse::<u64>().ok())
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
     let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
@@ -2007,13 +2007,14 @@ must not be asked to open one",
     /// 3. Applies the engine severity gate (design §3): any `critical`/`high`
     ///    finding, or any `regression` finding (regardless of severity), warrants
     ///    a revision. `revision_warranted = false` alone does not suppress the gate.
-    /// 4a. If the gate passes: creates a revision task on the producing task
-    ///    with the rendered findings as `revision_instructions`, `source =
-    ///    pr_review`, dispatched on the general worker pool (`autostart = true`).
-    ///    The producing task still advances to `in_review`; the revision is
-    ///    an additional follow-up child task.
-    /// 4b. If the gate does not pass (no qualifying findings, or no parseable
-    ///    `ReviewResult`): the producing task simply advances to `in_review`.
+    /// 4. Branches on the gate outcome:
+    ///    - If the gate passes: creates a revision task on the producing task
+    ///      with the rendered findings as `revision_instructions`, `source =
+    ///      pr_review`, dispatched on the general worker pool (`autostart = true`).
+    ///      The producing task still advances to `in_review`; the revision is
+    ///      an additional follow-up child task.
+    ///    - If the gate does not pass (no qualifying findings, or no parseable
+    ///      `ReviewResult`): the producing task simply advances to `in_review`.
     ///
     /// In either case the reviewer execution is completed and its workspace
     /// released — it is always terminal after this handler runs.
@@ -2086,7 +2087,7 @@ must not be asked to open one",
 
         let revision_warranted = review_result
             .as_ref()
-            .is_some_and(|r| crate::pr_review::passes_severity_gate(r));
+            .is_some_and(crate::pr_review::passes_severity_gate);
 
         // Atomically: advance producing task to in_review + complete the reviewer
         // execution + clear its cube columns. This is the same path for both the
@@ -2128,8 +2129,8 @@ must not be asked to open one",
             );
         }
 
-        if let Some(lease_id) = completion.released_lease_id.as_deref() {
-            if let Err(err) = self.cube_client.release_workspace(lease_id).await {
+        if let Some(lease_id) = completion.released_lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await {
                 tracing::error!(
                     execution_id = %execution.id,
                     lease_id,
@@ -2137,7 +2138,6 @@ must not be asked to open one",
                     "pr_review finalize: cube workspace release failed",
                 );
             }
-        }
         self.pane_releaser.release_pane(&execution.id).await;
 
         let product_id = work_item_product_id(&completion.work_item);
@@ -3943,7 +3943,7 @@ fn should_enqueue_reviewer_for_revision(task_id: &str, work_db: &crate::work::Wo
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use anyhow::Result;
@@ -4138,7 +4138,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _: &PathBuf,
+            _: &Path,
             _: &str,
         ) -> Result<CubeChangeHandle> {
             unreachable!("not used in completion tests")

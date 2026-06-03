@@ -193,7 +193,7 @@ pub(super) async fn handle_shutdown(ctx: Dispatch, req: FrontendRequest) {
                 }
             }
         };
-        crate::audit::record_shutdown_rpc(outcome, peer_pid.map(|p| p as i32));
+        crate::audit::record_shutdown_rpc(outcome, peer_pid);
         if outcome == "accepted" {
             tracing::info!(
                 peer_pid = ?peer_pid,

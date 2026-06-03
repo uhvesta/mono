@@ -529,8 +529,8 @@ pub async fn claude_one_sentence(
 pub fn clean_summary(raw: &str) -> String {
     let trimmed = raw.trim();
     let stripped = trimmed
-        .trim_start_matches(|c: char| c == '"' || c == '\'' || c == '`')
-        .trim_end_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '.')
+        .trim_start_matches(['"', '\'', '`'])
+        .trim_end_matches(['"', '\'', '`', '.'])
         .trim();
     let redacted = live_status_redact::redact_text(stripped);
     if live_status_redact::is_mostly_redacted(&redacted) {

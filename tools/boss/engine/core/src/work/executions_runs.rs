@@ -480,7 +480,7 @@ impl WorkDb {
                     .then_with(|| left.id.cmp(&right.id))
             });
 
-            let first_incomplete = tasks.iter().position(|task| task_accepts_execution(task));
+            let first_incomplete = tasks.iter().position(task_accepts_execution);
 
             for (index, task) in tasks.iter().enumerate() {
                 if !task_accepts_execution(task) {

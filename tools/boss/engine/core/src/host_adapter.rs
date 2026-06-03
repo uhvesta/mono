@@ -90,7 +90,7 @@ pub trait HostAdapter: Send + Sync {
 
     async fn create_change(
         &self,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         title: &str,
     ) -> Result<CubeChangeHandle>;
 
@@ -218,7 +218,7 @@ impl HostAdapter for LocalHostAdapter {
 
     async fn create_change(
         &self,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         title: &str,
     ) -> Result<CubeChangeHandle> {
         self.cube_client.create_change(workspace_path, title).await
@@ -554,7 +554,7 @@ impl HostAdapter for SshHostAdapter {
 
     async fn create_change(
         &self,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         title: &str,
     ) -> Result<CubeChangeHandle> {
         #[derive(Deserialize)]

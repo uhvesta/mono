@@ -80,7 +80,7 @@ fn strip_quoted_string_contents(cmd: &str) -> Cow<'_, str> {
             }
             '\'' => {
                 // POSIX single-quoted strings have no escape sequences inside.
-                while let Some(ch) = chars.next() {
+                for ch in chars.by_ref() {
                     if ch == '\'' {
                         out.push('\'');
                         break;

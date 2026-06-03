@@ -695,7 +695,7 @@ impl ExternalTracker for GitHubTracker {
             check_graphql_errors(&response)?;
 
             // Null projectV2 means the project doesn't exist.
-            if response.pointer("/data/organization/projectV2").map_or(false, |v| v.is_null()) {
+            if response.pointer("/data/organization/projectV2").is_some_and(|v| v.is_null()) {
                 return Err(TrackerError::ConfigInvalid(format!(
                     "project #{} not found in org '{}'",
                     config.project_number, config.org

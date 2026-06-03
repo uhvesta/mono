@@ -967,7 +967,7 @@ pub async fn on_merge_queue_rebounce_detected(
 ///
 ///   * 30 min → `warn`-level log entry.
 ///   * 2  h  → `warn`-level log AND a typed `CiNeverStartsAlert`
-///             frontend event so the UI / activity feed surfaces it.
+///     frontend event so the UI / activity feed surfaces it.
 ///
 /// Each bucket is emitted at most once per pair — the row's
 /// `alert_level_emitted` column monotonically advances `none → warn →

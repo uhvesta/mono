@@ -198,13 +198,12 @@ pub(super) async fn dispatch_live_worker_state(
         .get(slot_id)
         .map(|s| s.activity);
     match &incoming.event {
-        crate::protocol::WorkerEvent::Stop { .. } => {
-            if !is_remote_slot {
+        crate::protocol::WorkerEvent::Stop { .. }
+            if !is_remote_slot => {
                 server_state
                     .live_status_manager
                     .notify(slot_id, Trigger::Stop);
             }
-        }
         crate::protocol::WorkerEvent::PostToolUse {
             tool_name,
             tool_input,

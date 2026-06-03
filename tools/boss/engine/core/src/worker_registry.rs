@@ -256,8 +256,7 @@ pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
         return Err(io::Error::last_os_error());
     }
     if (n as usize) < std::mem::size_of::<ProcBsdInfo>() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!("proc_pidinfo returned {n} bytes; expected {info_size}"),
         ));
     }

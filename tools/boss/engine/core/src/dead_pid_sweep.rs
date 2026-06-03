@@ -14,20 +14,20 @@
 //! 1. Snapshot [`crate::live_worker_state::LiveWorkerStateRegistry`] to
 //!    get every active slot's `(slot_id, run_id, shell_pid, activity)`.
 //! 2. For each slot with `shell_pid > 0` and non-terminal activity:
-//!    a. Look up the execution in the DB (age guard: skip if
+//!    1. Look up the execution in the DB (age guard: skip if
 //!       `started_at` is within [`DEAD_PID_GRACE_SECS`] seconds or
 //!       `None`, to avoid racing a fresh dispatch whose worker is still
 //!       spinning up).
-//!    b. Probe liveness via `kill(pid, 0)`:
+//!    2. Probe liveness via `kill(pid, 0)`:
 //!       - `ESRCH` → process does not exist → proceed.
 //!       - `0` (alive) or `EPERM` (alive, not ours) → skip.
 //!       - Other errors → conservative skip with a warning.
 //! 3. For dead PIDs:
-//!    a. Mark the execution `orphaned` in the DB.
-//!    b. Append an `[engine-reconcile]` audit line to the task description.
-//!    c. Release the worker pool slot so the orphan sweep can redispatch.
-//!    d. Emit a `dead_pid_reconcile` dispatch event.
-//!    e. Kick the coordinator.
+//!    1. Mark the execution `orphaned` in the DB.
+//!    2. Append an `[engine-reconcile]` audit line to the task description.
+//!    3. Release the worker pool slot so the orphan sweep can redispatch.
+//!    4. Emit a `dead_pid_reconcile` dispatch event.
+//!    5. Kick the coordinator.
 //!
 //! ## False-positive guard
 //!
@@ -390,7 +390,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _: &std::path::PathBuf,
+            _: &std::path::Path,
             _: &str,
         ) -> Result<CubeChangeHandle> {
             unimplemented!()

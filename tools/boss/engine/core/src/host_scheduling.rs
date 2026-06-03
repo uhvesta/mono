@@ -6,10 +6,10 @@
 //!    them (the engine union'd those in before calling this module).
 //! 2. **Ranking** — among the candidates that survive the filter,
 //!    prefer:
-//!     a. the host with branch affinity (a prior run for this
-//!        execution's PR branch landed on it),
-//!     b. then the host with the most free slots,
-//!     c. then lexicographic host id (for deterministic tests).
+//!    1. the host with branch affinity (a prior run for this
+//!       execution's PR branch landed on it),
+//!    2. then the host with the most free slots,
+//!    3. then lexicographic host id (for deterministic tests).
 //!
 //! Pinned hosts bypass step 1 entirely (per the design's "Pin escape
 //! hatch" — `work_executions.pinned_host_id`). The pinned host must

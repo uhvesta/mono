@@ -178,7 +178,7 @@ mod tests {
     use anyhow::{Result, anyhow, bail};
     use async_trait::async_trait;
     use boss_protocol::{RequestExecutionInput, WorkExecution};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -218,7 +218,7 @@ mod tests {
         async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
             unimplemented!()
         }
-        async fn create_change(&self, _: &PathBuf, _: &str) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
             unimplemented!()
         }
         async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {

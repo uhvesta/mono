@@ -326,7 +326,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _: &std::path::PathBuf,
+            _: &std::path::Path,
             _: &str,
         ) -> Result<CubeChangeHandle> {
             unimplemented!()

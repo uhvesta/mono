@@ -856,7 +856,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             }
             Trigger::PostToolUse => {
                 post_tool_use_count = post_tool_use_count.wrapping_add(1);
-                if post_tool_use_count % POST_TOOL_USE_K != 0 {
+                if !post_tool_use_count.is_multiple_of(POST_TOOL_USE_K) {
                     continue;
                 }
             }

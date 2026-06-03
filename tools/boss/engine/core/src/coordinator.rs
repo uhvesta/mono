@@ -299,7 +299,7 @@ pub trait CubeClient: Send + Sync {
     ) -> Result<CubeWorkspaceLease>;
     async fn create_change(
         &self,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         title: &str,
     ) -> Result<CubeChangeHandle>;
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
@@ -439,7 +439,7 @@ impl CubeClient for CommandCubeClient {
 
     async fn create_change(
         &self,
-        workspace_path: &PathBuf,
+        workspace_path: &Path,
         title: &str,
     ) -> Result<CubeChangeHandle> {
         #[derive(Deserialize)]
@@ -1183,7 +1183,7 @@ impl ExecutionCoordinator {
             work_db,
             worker_pool,
             host_adapter,
-            Arc::new(NoopExecutionPublisher::default()),
+            Arc::new(NoopExecutionPublisher),
         )
     }
 
@@ -1225,7 +1225,7 @@ impl ExecutionCoordinator {
             host_adapter,
             host_adapter_provider,
             publisher,
-            dispatch_events: Arc::new(NoopDispatchEventSink::default()),
+            dispatch_events: Arc::new(NoopDispatchEventSink),
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
@@ -3005,6 +3005,7 @@ impl ExecutionCoordinator {
                 // Surface every permanent pre-start failure as a
                 // `WorkAttentionItem` so the failure is diagnosable in one
                 // bossctl call instead of needing a tracing-log tail.
+                let err = format!("{error:#}");
                 let attention_body = format!(
                     "Execution `{execution_id}` could not start on worker `{worker_id}` \
                      after {attempts} attempt(s).\n\n\
@@ -3013,7 +3014,6 @@ impl ExecutionCoordinator {
                      for the full stage timeline.",
                     execution_id = execution.id,
                     attempts = execution.pre_start_failure_count,
-                    err = format!("{error:#}"),
                 );
                 if let Err(attention_err) =
                     self.work_db.create_attention_item(CreateAttentionItemInput {
@@ -3307,6 +3307,7 @@ impl ExecutionCoordinator {
                 // turns up in the kanban "Attention" lane and via
                 // `ListAttentionItems`. The structured event below
                 // gives tooling a parallel signal.
+                let err_detail = format!("{err:#}");
                 let attention = Some(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
                     work_item_id: None,
@@ -3315,12 +3316,11 @@ impl ExecutionCoordinator {
                     title: "Worker pane failed to spawn".to_owned(),
                     body_markdown: format!(
                         "Execution `{exec_id}` leased workspace `{ws}` but the worker pane never came up.\n\n\
-                         **Error:** {err}\n\n\
+                         **Error:** {err_detail}\n\n\
                          The lease was {release_state}. Inspect \
                          `dispatch-events/executions/{exec_id}/dispatch.jsonl` for the full stage timeline.",
                         exec_id = execution.id,
                         ws = lease.workspace_id,
-                        err = format!("{err:#}"),
                         release_state = if released {
                             "released back to cube"
                         } else {
@@ -4092,7 +4092,7 @@ mod tests {
 
         async fn create_change(
             &self,
-            workspace_path: &PathBuf,
+            workspace_path: &std::path::Path,
             title: &str,
         ) -> Result<CubeChangeHandle> {
             self.create_calls

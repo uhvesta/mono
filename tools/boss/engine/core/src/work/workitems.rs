@@ -174,7 +174,7 @@ impl WorkDb {
                 // leaves board noise / dispatch hazards.
                 // Use the same `now` timestamp so restore can identify
                 // which revisions were cascade-deleted alongside this parent.
-                let revision_ids = collect_chain_revision_ids(&*tx, id)?;
+                let revision_ids = collect_chain_revision_ids(&tx, id)?;
                 for rev_id in &revision_ids {
                     tx.execute(
                         "UPDATE tasks SET deleted_at = ?2, updated_at = ?2

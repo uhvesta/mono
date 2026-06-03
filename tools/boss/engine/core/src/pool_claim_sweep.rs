@@ -325,7 +325,7 @@ mod tests {
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
-        async fn create_change(&self, _: &std::path::PathBuf, _: &str) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
             unimplemented!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {

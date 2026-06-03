@@ -277,7 +277,7 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 /// means the revision's commit has already landed on the PR branch — that is
 /// NOT a merge blocker. `done` and deleted revisions likewise don't trigger
 /// the flag.
-pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {
+pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task]) {
     // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
     let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> =
         std::collections::HashMap::new();

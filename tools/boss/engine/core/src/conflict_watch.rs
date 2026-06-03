@@ -1384,7 +1384,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _: &std::path::PathBuf,
+            _: &std::path::Path,
             _: &str,
         ) -> anyhow::Result<crate::coordinator::CubeChangeHandle> {
             unreachable!("not used in conflict_watch tests")

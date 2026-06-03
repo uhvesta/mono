@@ -305,7 +305,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _workspace_path: &PathBuf,
+            _workspace_path: &Path,
             _title: &str,
         ) -> Result<CubeChangeHandle> {
             unreachable!()

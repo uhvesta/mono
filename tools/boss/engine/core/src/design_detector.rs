@@ -262,7 +262,7 @@ pub async fn on_design_pr_merged(
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
     let effective_branch = base_ref_name
-        .or_else(|| scan.base_ref_name.as_deref())
+        .or(scan.base_ref_name.as_deref())
         .map(str::to_owned);
 
     let input = SetProjectDesignDocInput {

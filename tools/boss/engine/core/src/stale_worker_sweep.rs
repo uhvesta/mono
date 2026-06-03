@@ -22,18 +22,18 @@
 //!
 //! 1. Snapshot [`crate::live_worker_state::LiveWorkerStateRegistry`].
 //! 2. For each slot:
-//!    a. Skip unless `activity == Working`. `Spawning` is still coming
+//!    1. Skip unless `activity == Working`. `Spawning` is still coming
 //!       up; `Idle`/`WaitingForInput` are handled by the completion and
 //!       transient-recovery paths; `Terminated`/`Errored` are done.
-//!    b. Skip if a tool is in flight (`current_tool.is_some()`). A
+//!    2. Skip if a tool is in flight (`current_tool.is_some()`). A
 //!       *foreground* `bazel build //...` on a cold cache legitimately
 //!       runs for many minutes with no intervening hook — reaping it
 //!       would be the regression we must not cause. The companion fix
 //!       (the pre-push gate's `timeout` guidance) bounds that case; this
 //!       sweep deliberately only targets the *idle-between-tools* wedge.
-//!    c. Skip if `last_event_at` is newer than the staleness threshold,
+//!    3. Skip if `last_event_at` is newer than the staleness threshold,
 //!       or absent (no hook has landed yet).
-//!    d. Age guard against the DB `started_at` (skip fresh dispatches).
+//!    4. Age guard against the DB `started_at` (skip fresh dispatches).
 //! 3. For a confirmed-stale slot: mark the execution `orphaned`, append
 //!    an `[engine-reconcile]` audit line, release the pool slot, emit a
 //!    `stale_worker_reconcile` dispatch event, and kick the coordinator
@@ -397,7 +397,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _: &std::path::PathBuf,
+            _: &std::path::Path,
             _: &str,
         ) -> Result<CubeChangeHandle> {
             unimplemented!()

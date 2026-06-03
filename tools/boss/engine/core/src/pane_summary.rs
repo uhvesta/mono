@@ -132,7 +132,6 @@ pub fn local_fallback(name: &str) -> Option<String> {
 /// `"resolving merge conflicts"` is returned instead.
 pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
     let short: Vec<String> = task_name
-        .trim()
         .split_whitespace()
         .take(3)
         .map(|w| w.to_lowercase())
@@ -150,7 +149,6 @@ pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
 /// empty / unavailable).
 pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
     let short: Vec<String> = task_name
-        .trim()
         .split_whitespace()
         .take(3)
         .map(|w| w.to_lowercase())
@@ -381,8 +379,8 @@ pub async fn claude_short_summary(
 fn clean_summary(raw: &str) -> String {
     let trimmed = raw.trim();
     let stripped = trimmed
-        .trim_start_matches(|c: char| c == '"' || c == '\'' || c == '`')
-        .trim_end_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '.')
+        .trim_start_matches(['"', '\'', '`'])
+        .trim_end_matches(['"', '\'', '`', '.'])
         .trim();
     let words: Vec<&str> = stripped.split_whitespace().take(7).collect();
     if words.is_empty() {

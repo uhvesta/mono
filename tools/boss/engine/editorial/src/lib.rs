@@ -273,7 +273,7 @@ fn apply_redactions(
                 let content = inner_backtick_content(s);
                 let mut replaced = false;
                 for (name, re) in baked_in_rewrite_patterns() {
-                    if re.is_match(content) && re.find(content).map_or(false, |m| {
+                    if re.is_match(content) && re.find(content).is_some_and(|m| {
                         m.start() == 0 && m.end() == content.len()
                     }) {
                         // Replace the whole inline-code span with empty.
@@ -288,7 +288,7 @@ fn apply_redactions(
                     for (re, replacement, kind) in &rules.compiled {
                         if *kind == RedactionKind::Rewrite
                             && re.is_match(content)
-                            && re.find(content).map_or(false, |m| {
+                            && re.find(content).is_some_and(|m| {
                                 m.start() == 0 && m.end() == content.len()
                             })
                         {
@@ -569,8 +569,8 @@ fn find_closing_ticks(text: &str, closing: &[u8]) -> Option<usize> {
 /// Return the inner content of an inline code span (strips leading/trailing
 /// backticks).
 fn inner_backtick_content(span: &str) -> &str {
-    let trimmed = span.trim_start_matches('`').trim_end_matches('`');
-    trimmed
+    
+    (span.trim_start_matches('`').trim_end_matches('`')) as _
 }
 
 // ---------------------------------------------------------------------------

@@ -418,7 +418,7 @@ fn apply_rewrite(
     let updated_command = if edits.is_empty() {
         None
     } else {
-        edits.sort_by(|a, b| b.0.cmp(&a.0));
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
         let mut out = command.to_owned();
         for (start, end, replacement) in edits {
             out.replace_range(start..end, &replacement);

@@ -466,11 +466,11 @@ impl WorkDb {
     /// [`content_key`] so re-running the same source (a re-detected PR, a
     /// re-emitted block) does **not** append duplicate members.
     ///
-    /// All `inputs` must share the same grouping identity (kind + association
-    /// + source); the group is resolved from the first input. Returns the
-    /// group plus the members **newly inserted on this call** (an empty `Vec`
-    /// when every member already existed), or `Ok(None)` for an empty batch so
-    /// callers can skip event publishing without a special case.
+    /// All `inputs` must share the same grouping identity
+    /// (kind + association + source); the group is resolved from the first
+    /// input. Returns the group plus the members **newly inserted on this call**
+    /// (an empty `Vec` when every member already existed), or `Ok(None)` for an
+    /// empty batch so callers can skip event publishing without a special case.
     pub fn reconcile_attentions(
         &self,
         inputs: Vec<CreateAttentionInput>,

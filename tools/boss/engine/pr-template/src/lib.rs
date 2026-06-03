@@ -231,7 +231,7 @@ fn extract_h2_or_h3_title(line: &str) -> Option<String> {
         return None;
     }
     let hash_count = line.chars().take_while(|&c| c == '#').count();
-    if hash_count < 2 || hash_count > 3 {
+    if !(2..=3).contains(&hash_count) {
         return None;
     }
     let rest = &line[hash_count..];

@@ -1249,8 +1249,9 @@ pub fn pr_labels_opt_out(labels: &[String]) -> bool {
 ///   - `state=OPEN` (or unknown / empty, treated as still-open):
 ///       * `mergeable=CONFLICTING` AND `mergeStateStatus=DIRTY` → `Conflict`
 ///       * everything else (incl. `UNKNOWN`) → `Clean`.
-///     The `ci` axis is supplied by the caller from
-///     [`classify_ci`] — both axes share the `Open` wrapper.
+///
+/// The `ci` axis is supplied by the caller from [`classify_ci`] — both axes
+/// share the `Open` wrapper.
 ///
 /// The two-field agreement on `CONFLICTING` + `DIRTY` is deliberate —
 /// either alone is the precise signal, but requiring both protects
@@ -1372,10 +1373,10 @@ impl SweepOutcome {
 /// drive lease release — pre-Phase-3 wiring, tests, etc.
 ///
 /// `completion_handler` is threaded in so the pending-PR-detection
-/// recheck can reuse the on-Stop transition path (`record_worker_pr_completion`
-/// + cube release + pane teardown + event publish). Pass `None` for
-/// pre-`completion_handler` wiring and tests that exercise only the
-/// in-review and conflict paths.
+/// recheck can reuse the on-Stop transition path
+/// (`record_worker_pr_completion` + cube release + pane teardown + event
+/// publish). Pass `None` for pre-`completion_handler` wiring and tests that
+/// exercise only the in-review and conflict paths.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
@@ -3239,7 +3240,7 @@ mod tests {
         }
         async fn create_change(
             &self,
-            _: &std::path::PathBuf,
+            _: &std::path::Path,
             _: &str,
         ) -> Result<crate::coordinator::CubeChangeHandle> {
             unreachable!("not used in merge_poller tests")
@@ -6034,7 +6035,7 @@ mod tests {
         async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
-        async fn create_change(&self, _: &std::path::PathBuf, _: &str) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
             unreachable!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {

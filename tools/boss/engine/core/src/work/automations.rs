@@ -157,12 +157,12 @@ impl WorkDb {
             "repo_remote_url",
             canonicalize_repo_remote_url(patch.repo_remote_url.clone())
         );
-        if trigger_kind.is_some() {
+        if let (Some(trigger_kind), Some(trigger_config)) = (trigger_kind, trigger_config) {
             sets.push(format!("trigger_kind = ?{idx}"));
-            params_raw.push(Box::new(trigger_kind.unwrap()));
+            params_raw.push(Box::new(trigger_kind));
             idx += 1;
             sets.push(format!("trigger_config = ?{idx}"));
-            params_raw.push(Box::new(trigger_config.unwrap()));
+            params_raw.push(Box::new(trigger_config));
             idx += 1;
             // Reset next_due_at so the scheduler recomputes the first occurrence
             // from the new cron expression instead of using a stale value from

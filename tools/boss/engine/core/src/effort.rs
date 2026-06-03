@@ -144,9 +144,7 @@ impl SpawnConfig {
             cmd.push_str(" --effort ");
             cmd.push_str(effort);
         }
-        if model_is_opus(&self.model) {
-            cmd.push_str(" --permission-mode auto");
-        } else if non_opus_auto_mode {
+        if model_is_opus(&self.model) || non_opus_auto_mode {
             cmd.push_str(" --permission-mode auto");
         } else {
             cmd.push_str(" --dangerously-skip-permissions");

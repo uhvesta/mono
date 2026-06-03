@@ -1,5 +1,9 @@
 use super::*;
 
+/// Raw row read by [`WorkDb::ci_budget_snapshot`]:
+/// `(per_pr_override, product_default, attempts_used, status, blocked_reason)`.
+type CiBudgetRow = (Option<i64>, i64, i64, Option<String>, Option<String>);
+
 impl WorkDb {
     /// Chores and project_tasks the engine previously flagged with
     /// `blocked: merge_conflict`. The merge poller iterates this list
@@ -1130,7 +1134,7 @@ impl WorkDb {
     /// retry path's response.
     pub fn ci_budget_snapshot(&self, work_item_id: &str) -> Result<Option<CiBudgetSnapshot>> {
         let conn = self.connect()?;
-        let row: Option<(Option<i64>, i64, i64, Option<String>, Option<String>)> = conn
+        let row: Option<CiBudgetRow> = conn
             .query_row(
                 "SELECT t.ci_attempt_budget,
                         COALESCE(p.ci_attempt_budget, 3) AS product_default,
