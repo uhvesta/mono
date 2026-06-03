@@ -5,7 +5,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut product =
-            query_product(&tx, id)?.with_context(|| format!("unknown product: {id}"))?;
+            query_product(&tx, id).require("product", id)?;
 
         apply_text_patch(&mut product.name, patch.name);
         apply_text_patch(&mut product.description, patch.description);
@@ -47,7 +47,7 @@ impl WorkDb {
             ],
         )?;
 
-        let updated = query_product(&tx, id)?.with_context(|| format!("unknown product: {id}"))?;
+        let updated = query_product(&tx, id).require("product", id)?;
         tx.commit()?;
         Ok(WorkItem::Product(updated))
     }
@@ -61,7 +61,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut project =
-            query_project(&tx, id)?.with_context(|| format!("unknown project: {id}"))?;
+            query_project(&tx, id).require("project", id)?;
         let previous_status = project.status.clone();
         let status_changed = patch.status.is_some();
 
@@ -110,7 +110,7 @@ impl WorkDb {
             )?;
         }
 
-        let updated = query_project(&tx, id)?.with_context(|| format!("unknown project: {id}"))?;
+        let updated = query_project(&tx, id).require("project", id)?;
         tx.commit()?;
         Ok(WorkItem::Project(updated))
     }
@@ -123,7 +123,7 @@ impl WorkDb {
     ) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let mut task = query_task(&tx, id)?.with_context(|| format!("unknown task: {id}"))?;
+        let mut task = query_task(&tx, id).require("task", id)?;
         if task.deleted_at.is_some() {
             bail!("cannot update a deleted task: {id}");
         }
@@ -256,7 +256,7 @@ impl WorkDb {
             record_ci_failure_suppression_in_tx(&tx, id, &task.updated_at)?;
         }
 
-        let updated = query_task(&tx, id)?.with_context(|| format!("unknown task: {id}"))?;
+        let updated = query_task(&tx, id).require("task", id)?;
         tx.commit()?;
         Ok(task_to_item(updated))
     }

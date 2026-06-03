@@ -42,8 +42,7 @@ pub(crate) fn update_execution_status(
         bail!("unknown execution: {execution_id}");
     }
 
-    query_execution(conn, execution_id)?
-        .with_context(|| format!("unknown execution: {execution_id}"))
+    query_execution(conn, execution_id).require("execution", execution_id)
 }
 
 pub(crate) fn can_reconcile_execution_status(status: &str) -> bool {

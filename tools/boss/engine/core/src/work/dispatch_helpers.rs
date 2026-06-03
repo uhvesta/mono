@@ -838,8 +838,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                      WHERE id = ?1",
                     params![existing.id, next_status, next_priority, next_preferred],
                 )?;
-                return query_execution(conn, &existing.id)?
-                    .with_context(|| format!("unknown execution: {}", existing.id));
+                return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else if existing.kind == ExecutionKind::CiRemediation {
                 tracing::info!(
                     work_item_id = %work_item_id,
@@ -921,8 +920,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                     execution_id = %existing.id,
                     "RequestExecution: re-queued stale ci_remediation for retry",
                 );
-                return query_execution(conn, &existing.id)?
-                    .with_context(|| format!("unknown execution: {}", existing.id));
+                return query_execution(conn, &existing.id).require("execution", &existing.id);
             } else {
                 tracing::info!(
                     work_item_id = %work_item_id,

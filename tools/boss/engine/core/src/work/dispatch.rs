@@ -496,7 +496,7 @@ impl WorkDb {
 
     pub fn get_execution(&self, id: &str) -> Result<WorkExecution> {
         let conn = self.connect()?;
-        query_execution(&conn, id)?.with_context(|| format!("unknown execution: {id}"))
+        query_execution(&conn, id).require("execution", id)
     }
 
     /// Return true if `execution` is a stale prior occupant of a reused

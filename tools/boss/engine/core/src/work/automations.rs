@@ -124,8 +124,7 @@ impl WorkDb {
         patch: AutomationPatch,
     ) -> Result<boss_protocol::Automation> {
         let conn = self.connect()?;
-        let existing = query_automation(&conn, id)?
-            .with_context(|| format!("unknown automation: {id}"))?;
+        let existing = query_automation(&conn, id).require("automation", id)?;
 
         let now = now_string();
 
@@ -199,8 +198,7 @@ impl WorkDb {
     /// Set `enabled = true` on an automation.
     pub fn enable_automation(&self, id: &str) -> Result<boss_protocol::Automation> {
         let conn = self.connect()?;
-        let _existing = query_automation(&conn, id)?
-            .with_context(|| format!("unknown automation: {id}"))?;
+        let _existing = query_automation(&conn, id).require("automation", id)?;
         let now = now_string();
         conn.execute(
             "UPDATE automations SET enabled = 1, updated_at = ?2 WHERE id = ?1",
@@ -213,8 +211,7 @@ impl WorkDb {
     /// Set `enabled = false` on an automation.
     pub fn disable_automation(&self, id: &str) -> Result<boss_protocol::Automation> {
         let conn = self.connect()?;
-        let _existing = query_automation(&conn, id)?
-            .with_context(|| format!("unknown automation: {id}"))?;
+        let _existing = query_automation(&conn, id).require("automation", id)?;
         let now = now_string();
         conn.execute(
             "UPDATE automations SET enabled = 0, updated_at = ?2 WHERE id = ?1",
@@ -233,8 +230,7 @@ impl WorkDb {
     pub fn delete_automation(&self, id: &str) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let _existing = query_automation(&tx, id)?
-            .with_context(|| format!("unknown automation: {id}"))?;
+        let _existing = query_automation(&tx, id).require("automation", id)?;
         tx.execute("DELETE FROM automation_runs WHERE automation_id = ?1", [id])?;
         tx.execute("DELETE FROM automations WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -266,8 +262,7 @@ impl WorkDb {
         automation_id: &str,
     ) -> Result<Vec<boss_protocol::AutomationRun>> {
         let conn = self.connect()?;
-        let _existing = query_automation(&conn, automation_id)?
-            .with_context(|| format!("unknown automation: {automation_id}"))?;
+        let _existing = query_automation(&conn, automation_id).require("automation", automation_id)?;
 
         let mut stmt = conn.prepare(
             "SELECT id, automation_id, scheduled_for, started_at, finished_at,
@@ -287,8 +282,7 @@ impl WorkDb {
         automation_id: &str,
     ) -> Result<Vec<boss_protocol::Task>> {
         let conn = self.connect()?;
-        let _existing = query_automation(&conn, automation_id)?
-            .with_context(|| format!("unknown automation: {automation_id}"))?;
+        let _existing = query_automation(&conn, automation_id).require("automation", automation_id)?;
 
         let mut stmt = conn.prepare(
             "SELECT id, product_id, project_id, kind, name, description, status, ordinal,
@@ -787,8 +781,7 @@ impl WorkDb {
     ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let automation = query_automation(&tx, automation_id)?
-            .with_context(|| format!("unknown automation: {automation_id}"))?;
+        let automation = query_automation(&tx, automation_id).require("automation", automation_id)?;
 
         let open: i64 = tx.query_row(
             "SELECT COUNT(*) FROM tasks

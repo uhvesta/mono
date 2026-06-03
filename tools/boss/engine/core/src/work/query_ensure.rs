@@ -1,5 +1,25 @@
 use super::*;
 
+/// Extension trait that collapses the pervasive
+/// `query_<entity>(conn, id)?.with_context(|| format!("unknown {entity}: {id}"))?`
+/// idiom into `query_<entity>(conn, id).require("<entity>", id)?`.
+///
+/// The `query_*` row helpers in this module return `Result<Option<T>>`
+/// — `Ok(None)` means "row not found", `Err` means the query itself
+/// failed. `require` turns the `None` case into the canonical
+/// `unknown {entity}: {id}` error while propagating any underlying
+/// query error verbatim, so the produced messages stay identical to
+/// the inline form it replaces.
+pub(crate) trait RequireRow<T> {
+    fn require(self, entity: &str, id: &str) -> Result<T>;
+}
+
+impl<T> RequireRow<T> for Result<Option<T>> {
+    fn require(self, entity: &str, id: &str) -> Result<T> {
+        self?.with_context(|| format!("unknown {entity}: {id}"))
+    }
+}
+
 /// Run a `SELECT EXISTS(SELECT 1 FROM ...)` probe and return whether any
 /// row matched. Collapses the `query_row(... |row| row.get::<_, i64>(0))
 /// != 0` boilerplate that the `ensure_*_exists` bail-checks and the

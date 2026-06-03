@@ -27,8 +27,7 @@ impl WorkDb {
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution_status_is_terminal(&execution.status) {
             return Ok(None);
         }
@@ -120,10 +119,8 @@ impl WorkDb {
             }
         }
 
-        let updated_execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
-        let updated_task = query_task(&tx, &work_item_id)?
-            .with_context(|| format!("unknown task: {work_item_id}"))?;
+        let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
         tx.commit()?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,

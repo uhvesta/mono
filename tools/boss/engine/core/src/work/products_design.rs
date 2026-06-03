@@ -7,7 +7,7 @@ impl WorkDb {
     /// prompt with the parent project's name/goal/description.
     pub fn get_project(&self, id: &str) -> Result<Project> {
         let conn = self.connect()?;
-        query_project(&conn, id)?.with_context(|| format!("unknown project: {id}"))
+        query_project(&conn, id).require("project", id)
     }
 
     /// Fetch a single product row by id. Returns `None` when no row
@@ -35,16 +35,14 @@ impl WorkDb {
     ) -> Result<Product> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let _ = query_product(&tx, product_id)?
-            .with_context(|| format!("unknown product: {product_id}"))?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         let stored = model.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
         tx.execute(
             "UPDATE products SET default_model = ?2, updated_at = ?3 WHERE id = ?1",
             params![product_id, stored, now],
         )?;
-        let updated = query_product(&tx, product_id)?
-            .with_context(|| format!("unknown product: {product_id}"))?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -64,8 +62,7 @@ impl WorkDb {
     ) -> Result<Product> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let _ = query_product(&tx, product_id)?
-            .with_context(|| format!("unknown product: {product_id}"))?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         if unset {
             tx.execute(
@@ -79,8 +76,7 @@ impl WorkDb {
                 params![product_id, kind, config_json, now],
             )?;
         }
-        let updated = query_product(&tx, product_id)?
-            .with_context(|| format!("unknown product: {product_id}"))?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -111,8 +107,7 @@ impl WorkDb {
     pub fn set_project_design_doc(&self, input: SetProjectDesignDocInput) -> Result<Project> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let before = query_project(&tx, &input.project_id)?
-            .with_context(|| format!("unknown project: {}", input.project_id))?;
+        let before = query_project(&tx, &input.project_id).require("project", &input.project_id)?;
         let now = now_string();
 
         if input.unset {
@@ -155,8 +150,7 @@ impl WorkDb {
             }
         }
 
-        let updated = query_project(&tx, &input.project_id)?
-            .with_context(|| format!("unknown project: {}", input.project_id))?;
+        let updated = query_project(&tx, &input.project_id).require("project", &input.project_id)?;
         record_design_doc_audit(
             &tx,
             &input.project_id,
@@ -203,10 +197,8 @@ impl WorkDb {
         F: FnOnce(&str) -> Option<String>,
     {
         let conn = self.connect()?;
-        let project = query_project(&conn, project_id)?
-            .with_context(|| format!("unknown project: {project_id}"))?;
-        let product = query_product(&conn, &project.product_id)?
-            .with_context(|| format!("unknown product: {}", project.product_id))?;
+        let project = query_project(&conn, project_id).require("project", project_id)?;
+        let product = query_product(&conn, &project.product_id).require("product", &project.product_id)?;
 
         let Some(path) = project.design_doc_path.clone() else {
             return Ok(ResolveProjectDesignDocOutput {
@@ -299,8 +291,7 @@ impl WorkDb {
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let before = query_project(&tx, project_id)?
-            .with_context(|| format!("unknown project: {project_id}"))?;
+        let before = query_project(&tx, project_id).require("project", project_id)?;
         if before.design_doc_path.is_some() {
             return Ok(false);
         }
@@ -314,8 +305,7 @@ impl WorkDb {
              WHERE id = ?1",
             params![project_id, repo, branch, validated_path, now],
         )?;
-        let after = query_project(&tx, project_id)?
-            .with_context(|| format!("unknown project: {project_id}"))?;
+        let after = query_project(&tx, project_id).require("project", project_id)?;
         record_design_doc_audit(
             &tx,
             project_id,
@@ -400,13 +390,11 @@ impl WorkDb {
         let approved_branch = normalize_optional_text(approved_branch.map(str::to_owned));
 
         let conn = self.connect()?;
-        let project = query_project(&conn, project_id)?
-            .with_context(|| format!("unknown project: {project_id}"))?;
+        let project = query_project(&conn, project_id).require("project", project_id)?;
         let Some(project_path) = project.design_doc_path.clone() else {
             return Ok(None);
         };
-        let product = query_product(&conn, &project.product_id)?
-            .with_context(|| format!("unknown product: {}", project.product_id))?;
+        let product = query_product(&conn, &project.product_id).require("product", &project.product_id)?;
         drop(conn);
 
         let project_repo_effective = project

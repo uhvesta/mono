@@ -21,8 +21,7 @@ impl WorkDb {
     pub fn cancel_execution(&self, execution_id: &str) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let existing = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution_status_is_terminal(&existing.status) {
             bail!(
                 "execution {execution_id} is already in terminal status `{}` and cannot be cancelled",
@@ -83,8 +82,7 @@ impl WorkDb {
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let existing = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution_status_is_terminal(&existing.status) {
             bail!(
                 "execution {execution_id} is already in terminal status `{}` and cannot be reaped as orphaned",
@@ -148,8 +146,7 @@ impl WorkDb {
     ) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let dead = query_execution(&tx, dead_execution_id)?
-            .with_context(|| format!("unknown execution: {dead_execution_id}"))?;
+        let dead = query_execution(&tx, dead_execution_id).require("execution", dead_execution_id)?;
 
         let now = now_string();
         if !execution_status_is_terminal(&dead.status) {
@@ -401,8 +398,7 @@ impl WorkDb {
     ) -> Result<ExecutionReconcileResult> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let _product = query_product(&tx, product_id)?
-            .with_context(|| format!("unknown product: {product_id}"))?;
+        let _product = query_product(&tx, product_id).require("product", product_id)?;
         let _projects = list_projects_for_product(&tx, product_id)?;
         let tasks = list_tasks_for_product(&tx, product_id)?;
         let mut result = ExecutionReconcileResult::default();
@@ -563,8 +559,7 @@ impl WorkDb {
     ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status != "ready" {
             bail!(
                 "execution {execution_id} is not ready and cannot start a run from status `{}`",
@@ -642,8 +637,7 @@ impl WorkDb {
             params![run_id, execution_id, agent_id, now, host_id],
         )?;
 
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?
             .with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
@@ -681,8 +675,7 @@ impl WorkDb {
     ) -> Result<(WorkExecution, WorkRun)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status != "ready" {
             bail!(
                 "execution {execution_id} is not ready and cannot fail startup from status `{}`",
@@ -713,8 +706,7 @@ impl WorkDb {
             params![run_id, execution_id, agent_id, error_text, now],
         )?;
 
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?
             .with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
@@ -744,8 +736,7 @@ impl WorkDb {
     ) -> Result<(WorkExecution, WorkRun, PreStartFailureOutcome)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status != "ready" {
             bail!(
                 "execution {execution_id} is not ready and cannot record pre-start failure \
@@ -806,8 +797,7 @@ impl WorkDb {
             PreStartFailureOutcome::PermanentFail
         };
 
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?
             .with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
@@ -827,8 +817,7 @@ impl WorkDb {
     ) -> Result<(WorkExecution, WorkRun, Option<WorkAttentionItem>)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         if execution.status != "running" {
             bail!(
                 "execution {execution_id} is not running and cannot finish a run from status `{}`",
@@ -836,7 +825,7 @@ impl WorkDb {
             );
         }
 
-        let run = query_run(&tx, run_id)?.with_context(|| format!("unknown run: {run_id}"))?;
+        let run = query_run(&tx, run_id).require("run", run_id)?;
         if run.execution_id != execution_id {
             bail!("run {run_id} does not belong to execution {execution_id}");
         }
@@ -934,9 +923,8 @@ impl WorkDb {
             None
         };
 
-        let execution = query_execution(&tx, execution_id)?
-            .with_context(|| format!("unknown execution: {execution_id}"))?;
-        let run = query_run(&tx, run_id)?.with_context(|| format!("unknown run: {run_id}"))?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let run = query_run(&tx, run_id).require("run", run_id)?;
         tx.commit()?;
         Ok((execution, run, attention_item))
     }
@@ -999,7 +987,7 @@ impl WorkDb {
 
     pub fn get_run(&self, id: &str) -> Result<WorkRun> {
         let conn = self.connect()?;
-        query_run(&conn, id)?.with_context(|| format!("unknown run: {id}"))
+        query_run(&conn, id).require("run", id)
     }
 
     /// Persist the verbatim `transcript_path` we learned from a hook
@@ -1368,6 +1356,6 @@ impl WorkDb {
         if updated == 0 {
             bail!("unknown run: {run_id}");
         }
-        query_run(&conn, run_id)?.with_context(|| format!("unknown run: {run_id}"))
+        query_run(&conn, run_id).require("run", run_id)
     }
 }

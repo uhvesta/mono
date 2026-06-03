@@ -213,8 +213,7 @@ fn resolve_or_create_group(
     input: &CreateAttentionInput,
 ) -> Result<AttentionGroup> {
     if let Some(group_id) = input.group_id.as_deref().filter(|s| !s.is_empty()) {
-        return resolve_group(conn, group_id)?
-            .with_context(|| format!("unknown attention group: {group_id}"));
+        return resolve_group(conn, group_id).require("attention group", group_id);
     }
 
     let grouping_key = match input.group_key.as_deref().filter(|s| !s.is_empty()) {
@@ -577,15 +576,14 @@ impl WorkDb {
     /// Fetch one group by `atg_…` id or `A<n>` short id.
     pub fn get_attention_group(&self, id: &str) -> Result<AttentionGroup> {
         let conn = self.connect()?;
-        resolve_group(&conn, id)?.with_context(|| format!("unknown attention group: {id}"))
+        resolve_group(&conn, id).require("attention group", id)
     }
 
     /// List the members of a group in display order. Validates the group id
     /// (rejecting a typo with an error rather than an empty list).
     pub fn list_attentions_for_group(&self, group_id: &str) -> Result<Vec<Attention>> {
         let conn = self.connect()?;
-        let group = resolve_group(&conn, group_id)?
-            .with_context(|| format!("unknown attention group: {group_id}"))?;
+        let group = resolve_group(&conn, group_id).require("attention group", group_id)?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {ATTN_COLS} FROM attentions \
              WHERE group_id = ?1 ORDER BY ordinal ASC, id ASC"
@@ -637,8 +635,7 @@ impl WorkDb {
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let group = resolve_group(&tx, id)?
-            .with_context(|| format!("unknown attention group: {id}"))?;
+        let group = resolve_group(&tx, id).require("attention group", id)?;
         match group.state.as_str() {
             // Idempotent: dismissing an already-dismissed group is a no-op.
             "dismissed" => {
@@ -673,8 +670,7 @@ impl WorkDb {
     ) -> Result<AttentionGroup> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let member = query_attention(&tx, member_id)?
-            .with_context(|| format!("unknown attention: {member_id}"))?;
+        let member = query_attention(&tx, member_id).require("attention", member_id)?;
         let group = query_attention_group(&tx, &member.group_id)?
             .with_context(|| format!("attention {member_id} references a missing group"))?;
         if group_is_terminal(&group.state) {
@@ -1036,8 +1032,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let group =
-            resolve_group(&tx, id)?.with_context(|| format!("unknown attention group: {id}"))?;
+        let group = resolve_group(&tx, id).require("attention group", id)?;
         match group.state.as_str() {
             "actioned" => bail!(
                 "attention group {} is already actioned; an actioned group is terminal",

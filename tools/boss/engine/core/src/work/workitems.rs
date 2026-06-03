@@ -74,7 +74,7 @@ impl WorkDb {
 
     pub fn get_attention_item(&self, id: &str) -> Result<WorkAttentionItem> {
         let conn = self.connect()?;
-        query_attention_item(&conn, id)?.with_context(|| format!("unknown attention item: {id}"))
+        query_attention_item(&conn, id).require("attention item", id)
     }
 
     /// Create an external-tracker attention item for `work_item_id` unless one
@@ -308,8 +308,7 @@ impl WorkDb {
 
     pub fn get_work_tree(&self, product_id: &str) -> Result<WorkTree> {
         let conn = self.connect()?;
-        let product = query_product(&conn, product_id)?
-            .with_context(|| format!("unknown product: {product_id}"))?;
+        let product = query_product(&conn, product_id).require("product", product_id)?;
 
         let projects = {
             let mut stmt = conn.prepare(
