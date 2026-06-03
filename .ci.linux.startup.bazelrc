@@ -1,2 +1,2 @@
-startup --output_base=/mnt/ssd/bazel/output_base
+startup --output_user_root=/mnt/ssd/bazel/output_base
 
