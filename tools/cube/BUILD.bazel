@@ -5,15 +5,15 @@ exports_files(["Cargo.toml"])
 
 rust_library(
     name = "cube_lib",
-    crate_name = "cube",
     srcs = glob(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
+    crate_name = "cube",
     crate_root = "src/lib.rs",
     edition = "2024",
-    deps = all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = all_crate_deps(normal = True),
 )
 
 rust_binary(
@@ -21,41 +21,40 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/main.rs",
     edition = "2024",
-    deps = [
-        ":cube_lib",
-    ] + all_crate_deps(normal = True),
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/installer:__pkg__",
     ],
+    deps = [
+        ":cube_lib",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
     name = "cube_lib_test",
+    size = "medium",
     crate = ":cube_lib",
-    size = "small",
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
     ),
 )
 
 rust_test(
     name = "cube_bin_test",
-    crate = ":cube",
     size = "small",
-    deps = all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
+    crate = ":cube",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
-
