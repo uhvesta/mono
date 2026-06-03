@@ -727,10 +727,11 @@ final class ChatViewModel: ObservableObject {
             }
         }
 
-        // Automation-sourced tasks are managed exclusively through the
-        // Automations tab. They must not appear in the normal kanban/backlog
-        // so the main board stays focused on human-filed work.
-        items = items.filter { $0.sourceAutomationId == nil }
+        // Automation-sourced chores are real work items that need human review.
+        // They appear on the kanban like any other chore — the card detail view
+        // marks them with a purple wand icon to indicate automation provenance.
+        // Do NOT filter them out here: a chore in in_review status needs to
+        // be visible so the operator can review and merge the PR.
 
         if showBlockedOnly {
             items = items.filter { $0.status == "blocked" }

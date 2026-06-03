@@ -824,9 +824,11 @@ struct WorkTask: Identifiable, Hashable {
     /// `Task.effort_level` on the wire; absent means unset, NOT medium.
     var effortLevel: String? = nil
     /// Non-null when this task was produced by an automation triage run.
-    /// Mirrors `Task.source_automation_id` on the wire. Used to exclude
-    /// automation-sourced tasks from the normal backlog/kanban view and
-    /// to route their execution to the automations pool.
+    /// Mirrors `Task.source_automation_id` on the wire. Used to display
+    /// the automation-provenance badge on the card and to route execution
+    /// to the automations worker pool. Cards with this set DO appear on
+    /// the kanban — the purple wand icon distinguishes them from human-filed
+    /// work so the operator can still review and merge their PRs.
     var sourceAutomationId: String? = nil
 
     var isChore: Bool {
