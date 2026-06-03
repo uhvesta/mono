@@ -13,7 +13,7 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
-    ExecutionKind, FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
+    FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
     Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TopicEventPayload, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,

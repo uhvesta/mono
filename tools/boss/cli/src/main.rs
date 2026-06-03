@@ -21,8 +21,6 @@ use boss_protocol::{
     Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
-#[cfg(test)]
-use boss_protocol::TaskKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
