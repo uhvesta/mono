@@ -1,0 +1,2 @@
+startup --output_base=/mnt/ssd/bazel/output_base
+

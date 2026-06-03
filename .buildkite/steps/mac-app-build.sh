@@ -5,6 +5,8 @@
 # depends on //tools/boss/app-macos:Boss and therefore requires macOS.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
+
 echo "--- [mac-app-build] starting"
 echo "[mac-app-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 

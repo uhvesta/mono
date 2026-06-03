@@ -1,0 +1,29 @@
+# ==========================================
+# CI GARBAGE COLLECTION
+# ==========================================
+build:ci --experimental_disk_cache_gc_max_size=3T
+build:ci --experimental_disk_cache_gc_max_age=60d
+build:ci --experimental_disk_cache_gc_idle_delay=5m
+
+# ==========================================
+# CI ENVIRONMENT OPTIMIZATIONS
+# ==========================================
+build:ci --color=yes
+build:ci --curses=no
+build:ci --show_progress_rate_limit=5.0
+build:ci --announce_rc
+
+startup:ci --max_idle_secs=259200
+
+# Linux cache configuration
+build:ci-linux --config=ci
+build:ci-linux --repository_cache=/mnt/ssd/bazel/repo_cache
+build:ci-linux --disk_cache=/mnt/ssd/bazel/disk_cache
+
+
+# Darwin cache configuration
+build:ci-darwin --config=ci
+build:ci-darwin --repository_cache=/Volumes/ssd/bazel/repo_cache
+build:ci-darwin --disk_cache=/Volumes/ssd/bazel/disk_cache
+
+

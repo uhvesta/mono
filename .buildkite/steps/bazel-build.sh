@@ -8,9 +8,11 @@
 # depends on //tools/boss/app-macos:Boss (Swift), which has no Linux toolchain.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
+
 echo "--- [bazel-build] starting"
 echo "[bazel-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-bazel build --config=ci-linux-disk-cache --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
+bazel build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
 
 echo "[bazel-build] ok"

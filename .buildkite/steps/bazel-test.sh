@@ -5,9 +5,11 @@
 # are excluded here; they run on the mac-app-build step on a macos-arm64 agent.
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
+
 echo "--- [bazel-test] starting"
 echo "[bazel-test] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
-bazel test --config=ci-linux-disk-cache --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
+bazel test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...
 
 echo "[bazel-test] ok"
