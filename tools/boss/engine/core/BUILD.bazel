@@ -180,6 +180,7 @@ rust_library(
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/transcript-tail",
+        "//tools/boss/github",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),

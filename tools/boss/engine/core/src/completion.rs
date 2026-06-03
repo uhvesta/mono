@@ -873,21 +873,7 @@ async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> 
 /// (`git@github.com:owner/repo.git`) and HTTPS
 /// (`https://github.com/owner/repo[.git]`) shapes.
 pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
-    let trimmed = remote_url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let (_, after_host) = trimmed
-        .split_once("github.com")
-        .ok_or_else(|| anyhow!("not a github.com URL: {remote_url}"))?;
-    let after_host = after_host.trim_start_matches([':', '/']);
-    let mut slash_iter = after_host.splitn(3, '/');
-    let owner = slash_iter
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("missing owner segment: {remote_url}"))?;
-    let repo = slash_iter
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("missing repo segment: {remote_url}"))?;
+    let (owner, repo) = boss_github::repo_slug::parse_github_owner_repo(remote_url)?;
     Ok(format!("{owner}/{repo}"))
 }
 

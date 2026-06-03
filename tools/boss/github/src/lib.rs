@@ -1,4 +1,4 @@
-//! GitHub App authentication helpers for Boss tooling.
+//! GitHub App authentication helpers and URL parsing utilities for Boss tooling.
 //!
 //! Authentication works without `gh`: we sign a JWT with the App's RSA
 //! private key, exchange it for a short-lived installation access token,
@@ -8,6 +8,8 @@
 //! `BOSS_SHAKE_APP_ID`, `BOSS_SHAKE_INSTALLATION_ID`, and
 //! `BOSS_SHAKE_PRIVATE_KEY_PEM`. See `tools/boss/cli/README.md` for
 //! the one-time developer setup instructions.
+
+pub mod repo_slug;
 
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

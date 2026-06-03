@@ -12,6 +12,7 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-editorial = { path = "../editorial" }
+boss-github = { path = "../../github" }
 boss-feature-flags = { path = "../feature-flags" }
 boss-log-files = { path = "../../log-files" }
 boss-pr-template = { path = "../pr-template" }

@@ -270,6 +270,7 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-editorial",
  "boss-feature-flags",
+ "boss-github",
  "boss-log-files",
  "boss-pr-template",
  "boss-protocol",
@@ -335,6 +336,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "wiremock",
 ]
