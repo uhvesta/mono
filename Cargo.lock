@@ -215,10 +215,10 @@ dependencies = [
  "anyhow",
  "boss-client",
  "boss-engine",
+ "boss-github",
  "boss-protocol",
  "clap",
  "comfy-table",
- "jsonwebtoken",
  "reqwest",
  "rustls",
  "serde",
@@ -321,6 +321,22 @@ dependencies = [
  "serde",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "boss-github"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "reqwest",
+ "rsa",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

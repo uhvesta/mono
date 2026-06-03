@@ -4,6 +4,7 @@ members = [
   "tools/boss/bossctl",
   "tools/boss/cli",
   "tools/boss/client",
+  "tools/boss/github",
   "tools/boss/engine/conflict-diagnosis",
   "tools/boss/engine/core",
   "tools/boss/engine/editorial",
@@ -48,6 +49,8 @@ hashbrown = { version = "0.15.5", features = ["default-hasher", "serde"] }
 indicatif = "0.17.11"
 jsonwebtoken = "10.4.0"
 keyring = "3.6.3"
+rand = "0.8"
+rsa = "0.9"
 regex = "1.11.1"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
 rpassword = "7.5.0"

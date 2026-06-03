@@ -6,26 +6,19 @@ exports_files(["Cargo.toml"])
 rust_binary(
     name = "boss",
     srcs = glob(["src/**/*.rs"]),
-    # `boss shake`'s github_app module loads embedded RSA test fixtures
-    # via `include_str!("../tests/fixtures/…")` inside #[cfg(test)]
-    # blocks. The fixtures aren't reachable from a non-test build, but
-    # `include_str!` is parsed unconditionally — Bazel needs them
-    # staged in the sandbox or the binary fails to compile.
-    compile_data = glob(["tests/fixtures/**"]) + [
+    compile_data = [
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
         # rules_rust expands $(execpath ...) to an absolute path at compile time.
         "//tools/boss/installer:build_info_rs",
     ],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
     # rules_rust does NOT propagate --action_env into the rustc compile
     # action's cache key or environment. Use rustc_env + --define so that
     # the cache key changes when the credential values change and rustc
     # actually sees the vars via option_env!(). Default values are empty
     # strings (see .bazelrc); the release pipeline overrides via --define.
     rustc_env = {
-        "BOSS_SHAKE_APP_ID": "$(BOSS_SHAKE_APP_ID)",
-        "BOSS_SHAKE_INSTALLATION_ID": "$(BOSS_SHAKE_INSTALLATION_ID)",
-        "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
         # Absolute path to the generated build-info constants file.
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
         # them to absolute filesystem paths before invoking rustc.
@@ -37,25 +30,26 @@ rust_binary(
     ],
     deps = [
         "//tools/boss/client",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_test(
     name = "boss_test",
-    crate = ":boss",
     size = "small",
+    crate = ":boss",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
+        "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -65,11 +59,15 @@ rust_test(
 # `$RUNFILES_DIR/_main/tools/boss/cli/boss`.
 rust_test(
     name = "infer_product_test",
-    srcs = ["tests/infer_product.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/infer_product.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -77,10 +75,6 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -91,11 +85,15 @@ rust_test(
 # `set-default-model` lifecycles.
 rust_test(
     name = "effort_and_model_test",
-    srcs = ["tests/effort_and_model.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/effort_and_model.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -103,10 +101,6 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -117,11 +111,15 @@ rust_test(
 # default → no-input refuse) behaves as designed.
 rust_test(
     name = "repo_resolution_test",
-    srcs = ["tests/repo_resolution.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/repo_resolution.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -130,27 +128,23 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
 )
 
 # Regression test: boss uninstall with BOSS_INSTALL_ROOT set must not kill
 # the host engine. Drives the boss binary as a subprocess; no engine needed.
 rust_test(
     name = "uninstall_test",
-    srcs = ["tests/uninstall.rs"],
-    edition = "2024",
     size = "small",
+    srcs = ["tests/uninstall.rs"],
     data = [":boss"],
-    deps = [] + all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
+    edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
+    ),
+    deps = [] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
     ),
 )
 
@@ -158,17 +152,17 @@ rust_test(
 # verb). Uses --dry-run so no `gh` call is made and no real issue is filed.
 rust_test(
     name = "shake_test",
-    srcs = ["tests/shake.rs"],
-    edition = "2024",
     size = "small",
+    srcs = ["tests/shake.rs"],
     data = [":boss"],
-    deps = [] + all_crate_deps(
-        normal = True,
-        normal_dev = True,
-    ),
+    edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
+    ),
+    deps = [] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
     ),
 )
 
@@ -178,11 +172,15 @@ rust_test(
 # that wrong-kind errors name the corrective verb.
 rust_test(
     name = "friendly_id_test",
-    srcs = ["tests/friendly_id.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/friendly_id.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -190,10 +188,6 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -204,11 +198,15 @@ rust_test(
 # escalation-handler task will use.
 rust_test(
     name = "audit_effort_test",
-    srcs = ["tests/audit_effort.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/audit_effort.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -216,10 +214,6 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -229,11 +223,15 @@ rust_test(
 # an in-process engine and verifies bind → show → unbind → show lifecycle.
 rust_test(
     name = "external_tracker_test",
-    srcs = ["tests/external_tracker.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/external_tracker.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -241,10 +239,6 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -255,11 +249,15 @@ rust_test(
 # the engine's WorkDb.
 rust_test(
     name = "engine_ci_verbs_test",
-    srcs = ["tests/engine_ci_verbs.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/engine_ci_verbs.rs"],
     data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         "//tools/boss/client",
         "//tools/boss/engine/core:engine_lib",
@@ -267,9 +265,5 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )

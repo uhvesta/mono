@@ -1,12 +1,8 @@
-//! GitHub App authentication for `boss shake`.
+//! GitHub App authentication helpers for Boss tooling.
 //!
-//! The verb files an issue against `spinyfin/mono` (the upstream Boss
-//! repo). Authentication has to work in the user's corporate
-//! environment, where `gh` requires a wrapper alias to function, so we
-//! cannot shell out to `gh`. Instead we authenticate as a registered
-//! GitHub App: sign a JWT with the App's RSA private key, exchange it
-//! for a short-lived installation access token, and use that token on
-//! the issue-create call.
+//! Authentication works without `gh`: we sign a JWT with the App's RSA
+//! private key, exchange it for a short-lived installation access token,
+//! and use that token for REST and GraphQL API calls.
 //!
 //! Credentials are embedded at build time from three env vars:
 //! `BOSS_SHAKE_APP_ID`, `BOSS_SHAKE_INSTALLATION_ID`, and
@@ -163,6 +159,37 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// Apply the headers every GitHub API call needs: the `github+json`
+/// Accept type, the pinned REST API version, and our identifying
+/// User-Agent. Returns the builder so calls can chain naturally after
+/// `.post(&url).bearer_auth(token)`.
+fn github_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    builder
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT)
+}
+
+/// On a non-2xx response, read the body and `bail!` with
+/// `{context} returned {status}: {body}`, optionally followed by a
+/// `hint` line. On success the response is returned for further
+/// decoding.
+async fn ensure_success(
+    resp: reqwest::Response,
+    context: &str,
+    hint: Option<&str>,
+) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        match hint {
+            Some(hint) => bail!("{context} returned {status}: {body}\n{hint}"),
+            None => bail!("{context} returned {status}: {body}"),
+        }
+    }
+    Ok(resp)
+}
+
 /// Exchange the App JWT for a short-lived installation access token.
 async fn fetch_installation_token(
     api_base: &str,
@@ -175,21 +202,12 @@ async fn fetch_installation_token(
         api_base.trim_end_matches('/'),
         installation_id
     );
-    let resp = client
-        .post(&url)
-        .bearer_auth(jwt)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
+    let resp = github_headers(client.post(&url).bearer_auth(jwt))
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("installation token exchange returned {status}: {body}");
-    }
+    let resp = ensure_success(resp, "installation token exchange", None).await?;
     let parsed: InstallationTokenResponse = resp
         .json()
         .await
@@ -234,22 +252,13 @@ async fn create_issue(
         body: &attributed_body,
         labels: &effective_labels,
     };
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
+    let resp = github_headers(client.post(&url).bearer_auth(token))
         .json(&payload)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!("issue create returned {status}: {body}");
-    }
+    let resp = ensure_success(resp, "issue create", None).await?;
     resp.json::<IssueResponse>()
         .await
         .context("decode issue-create response")
@@ -303,25 +312,18 @@ pub async fn add_issue_to_project(
             "contentId": issue_node_id,
         }),
     };
-    let resp = client
-        .post(&url)
-        .bearer_auth(token)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
+    let resp = github_headers(client.post(&url).bearer_auth(token))
         .json(&payload)
         .send()
         .await
         .with_context(|| format!("POST {url}"))?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        bail!(
-            "add-to-project returned {status}: {body}\n\
-             hint: confirm the GitHub App has Projects read/write permission"
-        );
-    }
+    let resp = ensure_success(
+        resp,
+        "add-to-project",
+        Some("hint: confirm the GitHub App has Projects read/write permission"),
+    )
+    .await?;
 
     let parsed: GraphqlResponse = resp
         .json()
@@ -379,24 +381,39 @@ pub async fn add_issue_to_project_with_embedded_token(
 mod tests {
     use super::*;
     use jsonwebtoken::{DecodingKey, Validation, decode};
+    use rsa::RsaPrivateKey;
+    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding as Pkcs1LineEnding};
+    use rsa::pkcs8::EncodePublicKey;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A throwaway RSA-2048 keypair generated offline (`openssl genrsa
-    /// 2048` + `openssl rsa -pubout`). Loaded via `include_str!` from
-    /// `tests/fixtures/` so the actual armoring matches what GitHub's
-    /// App download UI emits.
-    const TEST_RSA_PEM: &str = include_str!("../tests/fixtures/github-app-private-key.pem");
-    const TEST_RSA_PUBLIC_PEM: &str = include_str!("../tests/fixtures/github-app-public-key.pem");
+    /// Generate a fresh RSA-2048 keypair for tests. Returns `(private_pem,
+    /// public_pem)` in PKCS#1 and SPKI PEM formats respectively — the same
+    /// formats `jsonwebtoken` expects for `EncodingKey::from_rsa_pem` and
+    /// `DecodingKey::from_rsa_pem`.
+    fn generate_test_keypair() -> (String, String) {
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("RSA keygen failed");
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let private_pem = private_key
+            .to_pkcs1_pem(Pkcs1LineEnding::LF)
+            .expect("private key to PKCS#1 PEM")
+            .to_string();
+        let public_pem = public_key
+            .to_public_key_pem(rsa::pkcs8::spki::der::pem::LineEnding::LF)
+            .expect("public key to SPKI PEM");
+        (private_pem, public_pem)
+    }
 
     #[test]
     fn build_jwt_produces_decodable_rs256_token() {
-        let token = build_jwt_at("42", TEST_RSA_PEM.as_bytes(), 1_700_000_000).unwrap();
+        let (private_pem, public_pem) = generate_test_keypair();
+        let token = build_jwt_at("42", private_pem.as_bytes(), 1_700_000_000).unwrap();
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&["42"]);
         validation.validate_exp = false;
-        let key = DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_PEM.as_bytes()).unwrap();
+        let key = DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap();
 
         #[derive(Deserialize)]
         struct Claims {
@@ -437,10 +454,11 @@ mod tests {
     }
 
     fn make_test_config() -> AppConfig {
+        let (private_pem, _) = generate_test_keypair();
         AppConfig {
             app_id: "42".into(),
             installation_id: "67890".into(),
-            private_key_pem: TEST_RSA_PEM.to_owned(),
+            private_key_pem: private_pem,
         }
     }
 

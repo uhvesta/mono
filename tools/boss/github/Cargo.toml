@@ -1,0 +1,19 @@
+[package]
+name = "boss-github"
+version.workspace = true
+edition.workspace = true
+workspace = "../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+reqwest = { workspace = true, features = ["json"] }
+rustls = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+rsa = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+wiremock = { workspace = true }

@@ -6,10 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 boss-client = { path = "../client" }
+boss-github = { path = "../github" }
 boss-protocol = { path = "../protocol" }
 clap = { workspace = true, features = ["derive"] }
 comfy-table = { workspace = true }
-jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

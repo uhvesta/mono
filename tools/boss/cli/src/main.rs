@@ -28,8 +28,8 @@ use comfy_table::{ContentArrangement, Table};
 use serde::Serialize;
 
 mod buildkite_release;
-mod github_app;
 mod repo_resolution;
+use boss_github as github_app;
 
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
