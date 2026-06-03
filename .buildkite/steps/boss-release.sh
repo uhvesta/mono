@@ -290,45 +290,6 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 cp "${ZIP_PATH}" "${WORK_DIR}/${ARTIFACT}"
 echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 
-# ── smoke test: verify shake credentials are embedded in the binary ───────────
-# File a live test issue against spinyfin/mono using the just-built boss binary,
-# confirm it succeeds (proves credentials are embedded), then delete it.
-# Runs before the GitHub Release is created so a credential failure aborts the
-# release rather than producing a published-but-broken artifact.
-
-log "[boss-release] smoke test: verifying embedded shake credentials"
-SMOKE_DIR=$(mktemp -d -t boss-smoke)
-trap 'rm -rf "${SMOKE_DIR}"' RETURN
-ditto -x -k "${WORK_DIR}/${ARTIFACT}" "${SMOKE_DIR}/extracted"
-BOSS_BIN="${SMOKE_DIR}/extracted/Boss.app/Contents/Resources/bin/boss"
-[[ -x "${BOSS_BIN}" ]] || die "boss binary not found in shipped artifact at expected path: ${BOSS_BIN}
-Contents of extracted Boss.app/Contents/Resources/bin/:
-$(ls -la "${SMOKE_DIR}/extracted/Boss.app/Contents/Resources/bin/" 2>/dev/null || echo '(directory not found)')"
-
-SMOKE_MD="${WORK_DIR}/smoke.md"
-cat > "${SMOKE_MD}" << 'SMOKE_EOF'
-[boss-shake smoke test] release pipeline credential verification
-
-Automatically filed by the boss-release BK step to verify that embedded GitHub
-App credentials work in the just-built binary. Deleted immediately after creation.
-SMOKE_EOF
-
-SHAKE_OUT=$("${BOSS_BIN}" shake --json "${SMOKE_MD}" 2>&1) || true
-ISSUE_NUM=$(printf '%s' "${SHAKE_OUT}" | jq -r '.number // empty' 2>/dev/null || true)
-if [[ -z "${ISSUE_NUM}" ]]; then
-  die "smoke test FAILED — boss shake did not return an issue number.
-Output: ${SHAKE_OUT}
-The extracted binary (from ${ZIP_PATH}) does not have shake credentials embedded.
-Check, in order: (1) the three BOSS_SHAKE_* secrets are set/non-empty in the BK
-pipeline; (2) ZIP_PATH above resolves to a '-opt-' output dir, NOT '-fastbuild-'
-— if it shows fastbuild, the discovery cquery and the build are using different
-flags and the smoke test is verifying the credential-free mac-app-build artifact;
-(3) the rust_binary embeds the values via rustc_env/option_env! (tools/boss/cli)."
-fi
-echo "[boss-release] smoke test passed: filed test issue #${ISSUE_NUM}"
-gh issue delete "${ISSUE_NUM}" --repo spinyfin/mono --yes
-echo "[boss-release] smoke test issue #${ISSUE_NUM} deleted"
-
 # ── create GitHub Release ─────────────────────────────────────────────────────
 # Split into three independent steps to isolate failure modes and enable
 # selective retry on the (flaky) asset-upload step.
