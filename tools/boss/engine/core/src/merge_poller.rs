@@ -1763,8 +1763,10 @@ async fn sweep_pending_pr(
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
         // P992 task 7: ReviewerEnqueued is handled in its own arm above.
-        // ReviewPassCompleted only comes from on-Stop (reviewer finalisation).
+        // ReviewPassCompleted/ReviewPassRevisionCreated only come from on-Stop
+        // (reviewer finalisation).
         | StopOutcome::ReviewPassCompleted { .. }
+        | StopOutcome::ReviewPassRevisionCreated { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -1819,10 +1821,11 @@ async fn sweep_late_pr(
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
-        // P992 task 7: reviewer-related outcomes are handled on the on-Stop
+        // P992 task 7/8: reviewer-related outcomes are handled on the on-Stop
         // path; covered here for exhaustiveness.
         | StopOutcome::ReviewerEnqueued { .. }
         | StopOutcome::ReviewPassCompleted { .. }
+        | StopOutcome::ReviewPassRevisionCreated { .. }
         | StopOutcome::DbError => {}
     }
 }

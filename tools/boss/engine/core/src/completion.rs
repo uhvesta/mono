@@ -50,7 +50,8 @@ use tokio::process::Command;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
     AUTOMATION_OUTCOME_SKIPPED, Attention, AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_MERGE_CONFLICT_PREFIX, ExecutionKind, FrontendEvent, TaskKind,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput,
+    ExecutionKind, FrontendEvent, TaskKind,
 };
 
 use crate::attentions_detector;
@@ -64,8 +65,8 @@ use crate::merge_poller::{
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
-    WorkerPrCompletionTarget,
+    CreateAttentionItemInput, CreateExecutionInput, GhPrStateChecker, PendingMergeCheck, WorkDb,
+    WorkItem, WorkerPrCompletionTarget,
 };
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
@@ -2084,13 +2085,26 @@ must not be asked to open one",
         }
     }
 
-    /// P992 task 7: finalise a `pr_review` reviewer execution when its Stop
+    /// P992 task 8: finalise a `pr_review` reviewer execution when its Stop
     /// hook fires. The reviewer never opens a PR; instead, it reads the
-    /// producing task's PR diff and emits structured findings (parsed by task
-    /// 8). For task 7 the minimal resolution is to advance the producing task
-    /// to `in_review` and complete the reviewer execution so the PR enters the
-    /// human-Review column. Task 8 will replace the unconditional advance with
-    /// conditional logic (revision creation vs. clean approval).
+    /// producing task's PR diff and emits structured `ReviewResult` JSON in
+    /// a fenced code block in its final message. This handler:
+    ///
+    /// 1. Reads the reviewer's final assistant message from its transcript.
+    /// 2. Extracts and parses the `ReviewResult` JSON block.
+    /// 3. Applies the engine severity gate (design §3): any `critical`/`high`
+    ///    finding, or any `regression` finding (regardless of severity), warrants
+    ///    a revision. `revision_warranted = false` alone does not suppress the gate.
+    /// 4a. If the gate passes: creates a revision task on the producing task
+    ///    with the rendered findings as `revision_instructions`, `source =
+    ///    pr_review`, dispatched on the general worker pool (`autostart = true`).
+    ///    The producing task still advances to `in_review`; the revision is
+    ///    an additional follow-up child task.
+    /// 4b. If the gate does not pass (no qualifying findings, or no parseable
+    ///    `ReviewResult`): the producing task simply advances to `in_review`.
+    ///
+    /// In either case the reviewer execution is completed and its workspace
+    /// released — it is always terminal after this handler runs.
     async fn finalize_pr_review_pass(
         &self,
         execution: &crate::work::WorkExecution,
@@ -2134,9 +2148,31 @@ must not be asked to open one",
             }
         };
 
-        // Use record_worker_pr_completion to atomically:
-        //   1. advance the producing task from active → in_review (with pr_url kept),
-        //   2. complete the reviewer execution and clear its cube columns.
+        // P992 task 8: parse ReviewResult from the reviewer's transcript and
+        // apply the severity gate. Falls back gracefully (no revision) when the
+        // reviewer produced no parseable JSON block.
+        let review_result = self.read_final_triage_message(&execution.id).await
+            .and_then(|text| {
+                let result = crate::pr_review::extract_review_result(&text);
+                if result.is_none() {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        "pr_review finalize: no parseable ReviewResult JSON block in \
+                         reviewer transcript; advancing to in_review without revision",
+                    );
+                }
+                result
+            });
+
+        let revision_warranted = review_result
+            .as_ref()
+            .is_some_and(|r| crate::pr_review::passes_severity_gate(r));
+
+        // Atomically: advance producing task to in_review + complete the reviewer
+        // execution + clear its cube columns. This is the same path for both the
+        // revision and no-revision cases — the producing task's PR is ready for
+        // human review; the revision (if any) is a follow-up child task.
         let completion = match self.work_db.record_worker_pr_completion(
             &execution.id,
             &pr_url,
@@ -2170,6 +2206,69 @@ must not be asked to open one",
 
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
+
+        // P992 task 8: if the severity gate passed, create a revision on the
+        // producing task with the rendered findings as revision instructions.
+        // The revision is dispatched on the general worker pool (autostart = true,
+        // the default). Nothing is posted to GitHub — feedback stays inside Boss.
+        if revision_warranted {
+            // `review_result` is Some when `revision_warranted` is true.
+            let result = review_result.expect("revision_warranted implies Some(ReviewResult)");
+            let instructions = crate::pr_review::render_revision_instructions(&result);
+            let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", execution.id);
+
+            match self.work_db.create_revision(
+                CreateRevisionInput::builder()
+                    .parent_task_id(producing_task_id.clone())
+                    .description(instructions)
+                    .created_via(created_via)
+                    .build(),
+                &GhPrStateChecker,
+            ) {
+                Ok(revision) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        revision_task_id = %revision.id,
+                        pr_url = %pr_url,
+                        findings = result.findings.len(),
+                        "pr_review pass finalised; revision created for qualifying findings",
+                    );
+                    self.publisher
+                        .publish(
+                            &execution.id,
+                            &work_item_id,
+                            "completed",
+                            "pr_review_pass_revision_created",
+                        )
+                        .await;
+                    self.publisher
+                        .publish_work_item_changed(
+                            &product_id,
+                            &work_item_id,
+                            "pr_review_pass_revision_created",
+                        )
+                        .await;
+                    return StopOutcome::ReviewPassRevisionCreated {
+                        pr_url,
+                        revision_task_id: revision.id,
+                    };
+                }
+                Err(err) => {
+                    // Revision creation failed (parent no longer revisable — PR
+                    // merged or closed between review and now). The producing task
+                    // is already in in_review; fall through to ReviewPassCompleted.
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        ?err,
+                        "pr_review finalize: create_revision failed (parent likely no longer \
+                         revisable); advancing to in_review without revision",
+                    );
+                }
+            }
+        }
+
         self.publisher
             .publish(
                 &execution.id,
@@ -2611,7 +2710,8 @@ must not be asked to open one",
             // Unreachable: reviewer executions short-circuit before CI
             // remediation finalisation. Covered for exhaustiveness.
             StopOutcome::ReviewerEnqueued { .. }
-            | StopOutcome::ReviewPassCompleted { .. } => false,
+            | StopOutcome::ReviewPassCompleted { .. }
+            | StopOutcome::ReviewPassRevisionCreated { .. } => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -3779,6 +3879,12 @@ pub enum StopOutcome {
     /// P992 task 7: a `pr_review` reviewer execution finished and the
     /// producing task has been advanced to `in_review`.
     ReviewPassCompleted { pr_url: String },
+    /// P992 task 8: a `pr_review` reviewer execution found qualifying findings
+    /// (at least one `critical`/`high` severity or `regression` category) and
+    /// created a revision task on the producing task. The producing task is
+    /// advanced to `in_review`; the revision is dispatched on the general
+    /// worker pool to apply the feedback. Nothing is posted to GitHub.
+    ReviewPassRevisionCreated { pr_url: String, revision_task_id: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }

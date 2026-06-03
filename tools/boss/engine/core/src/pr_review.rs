@@ -220,6 +220,107 @@ impl ReviewResult {
     }
 }
 
+/// Extract and parse the first `ReviewResult` from a reviewer's final
+/// assistant message (design §3 of P992, task 8).
+///
+/// Searches for a fenced ` ```json ` block, tries to parse the content as
+/// `ReviewResult`, and returns the first successful parse. Returns `None`
+/// when no parseable block is found (reviewer may have crashed or emitted
+/// malformed JSON — the caller should fall back to advancing without revision).
+pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
+    let mut rest = text;
+    while let Some(fence_start) = rest.find("```json") {
+        let after_fence = &rest[fence_start + 7..];
+        let trimmed = after_fence.trim_start_matches('\n');
+        if let Some(end) = trimmed.find("```") {
+            let json_str = trimmed[..end].trim();
+            if let Ok(result) = ReviewResult::from_json(json_str) {
+                return Some(result);
+            }
+        }
+        rest = &rest[fence_start + 7..];
+    }
+    None
+}
+
+/// Engine severity gate (design §3 of P992, task 8).
+///
+/// Returns `true` when `result` qualifies for a revision:
+/// - any finding with `severity = Critical` or `High`, **or**
+/// - any finding with `category = Regression` (regardless of severity).
+///
+/// `revision_warranted = false` in the `ReviewResult` does not suppress the
+/// gate — the engine's own threshold governs.
+pub fn passes_severity_gate(result: &ReviewResult) -> bool {
+    result.findings.iter().any(|f| {
+        matches!(
+            f.severity,
+            ReviewFindingSeverity::Critical | ReviewFindingSeverity::High
+        ) || matches!(f.category, ReviewFindingCategory::Regression)
+    })
+}
+
+/// Render qualifying `ReviewResult` findings as human-readable revision
+/// instructions (design §4 of P992, task 8).
+///
+/// Groups all findings by severity (critical first, low last) and formats
+/// each with its title, file, location, and concrete detail. The rendering
+/// is the `revision_instructions` passed to the revising worker — it must
+/// be specific enough to act on without guessing.
+pub fn render_revision_instructions(result: &ReviewResult) -> String {
+    let severity_rank = |s: &ReviewFindingSeverity| match s {
+        ReviewFindingSeverity::Critical => 0u8,
+        ReviewFindingSeverity::High => 1,
+        ReviewFindingSeverity::Medium => 2,
+        ReviewFindingSeverity::Low => 3,
+    };
+
+    let mut findings = result.findings.clone();
+    findings.sort_by_key(|f| severity_rank(&f.severity));
+
+    let mut out = format!(
+        "Automated PR review found {} finding(s) requiring attention.\n\
+         Address all findings before finalising this revision.\n\n",
+        findings.len()
+    );
+
+    for f in &findings {
+        let loc = f
+            .location
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        let category = match f.category {
+            ReviewFindingCategory::Correctness => "correctness",
+            ReviewFindingCategory::Regression => "regression",
+            ReviewFindingCategory::Architecture => "architecture",
+            ReviewFindingCategory::Readability => "readability",
+            ReviewFindingCategory::Tests => "tests",
+            ReviewFindingCategory::EdgeCase => "edgecase",
+        };
+        out.push_str(&format!(
+            "### [{severity}] {title}\n\
+             **File:** `{file}`{loc}  \n\
+             **Category:** {category}  \n\
+             **Confidence:** {confidence}\n\n\
+             {detail}\n\n",
+            severity = f.severity.as_str(),
+            title = f.title,
+            file = f.file,
+            category = category,
+            confidence = match f.confidence {
+                ReviewFindingConfidence::High => "high",
+                ReviewFindingConfidence::Medium => "medium",
+                ReviewFindingConfidence::Low => "low",
+            },
+            detail = f.detail,
+        ));
+    }
+
+    out.push_str(&format!("**Review summary:** {}\n", result.summary));
+    out
+}
+
 /// Render the CLAUDE.md for a reviewer worker (design §9 of P992).
 ///
 /// Reviewer workers operate **read-only**: they read PR diffs and workspace
@@ -708,5 +809,226 @@ mod tests {
         });
         let result = ReviewResult::from_json(&json.to_string()).unwrap();
         assert!(result.regression_check.performed);
+    }
+
+    // --- extract_review_result ---
+
+    fn make_review_result_json(revision_warranted: bool, findings: serde_json::Value) -> String {
+        serde_json::json!({
+            "pr_url": "https://github.com/org/repo/pull/1",
+            "head_sha": "abc",
+            "summary": "summary text",
+            "revision_warranted": revision_warranted,
+            "findings": findings,
+            "regression_check": { "performed": true, "suspected_deletions": [] }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn extract_review_result_parses_fenced_json_block() {
+        let json = make_review_result_json(false, serde_json::json!([]));
+        let text = format!("Here is my review:\n\n```json\n{json}\n```\n\nDone.");
+        let result = extract_review_result(&text).expect("should parse");
+        assert_eq!(result.pr_url, "https://github.com/org/repo/pull/1");
+        assert!(!result.revision_warranted);
+    }
+
+    #[test]
+    fn extract_review_result_returns_none_for_plain_text() {
+        let text = "No structured output here, just prose.";
+        assert!(extract_review_result(text).is_none());
+    }
+
+    #[test]
+    fn extract_review_result_returns_none_for_malformed_json() {
+        let text = "```json\n{ not valid json }\n```";
+        assert!(extract_review_result(text).is_none());
+    }
+
+    #[test]
+    fn extract_review_result_finds_block_after_prose() {
+        let json = make_review_result_json(true, serde_json::json!([]));
+        let text = format!(
+            "I reviewed the PR.\n\nSome analysis here.\n\n```json\n{json}\n```"
+        );
+        let result = extract_review_result(&text).expect("should parse");
+        assert!(result.revision_warranted);
+    }
+
+    // --- passes_severity_gate ---
+
+    fn make_finding(
+        severity: ReviewFindingSeverity,
+        category: ReviewFindingCategory,
+    ) -> ReviewFinding {
+        ReviewFinding::builder()
+            .severity(severity)
+            .category(category)
+            .file("src/lib.rs")
+            .title("test finding")
+            .detail("something concrete")
+            .confidence(ReviewFindingConfidence::High)
+            .build()
+    }
+
+    #[test]
+    fn severity_gate_passes_on_critical() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Critical,
+                ReviewFindingCategory::Correctness,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(passes_severity_gate(&result));
+    }
+
+    #[test]
+    fn severity_gate_passes_on_high() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::High,
+                ReviewFindingCategory::Architecture,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(passes_severity_gate(&result));
+    }
+
+    #[test]
+    fn severity_gate_passes_on_regression_regardless_of_severity() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Low,
+                ReviewFindingCategory::Regression,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(passes_severity_gate(&result));
+    }
+
+    #[test]
+    fn severity_gate_blocked_on_medium_non_regression() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: true, // reviewer says warranted but engine gate disagrees
+            findings: vec![make_finding(
+                ReviewFindingSeverity::Medium,
+                ReviewFindingCategory::Readability,
+            )],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(!passes_severity_gate(&result));
+    }
+
+    #[test]
+    fn severity_gate_blocked_on_empty_findings() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: false,
+            findings: vec![],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        assert!(!passes_severity_gate(&result));
+    }
+
+    // --- render_revision_instructions ---
+
+    #[test]
+    fn render_revision_instructions_contains_title_and_detail() {
+        let result = ReviewResult {
+            pr_url: "https://github.com/org/repo/pull/5".to_owned(),
+            head_sha: String::new(),
+            summary: "One bug found.".to_owned(),
+            revision_warranted: true,
+            findings: vec![ReviewFinding::builder()
+                .severity(ReviewFindingSeverity::High)
+                .category(ReviewFindingCategory::Correctness)
+                .file("src/main.rs")
+                .location("fn handle, ~L42")
+                .title("Null pointer dereference")
+                .detail("The handle function dereferences without a null check; add a guard.")
+                .confidence(ReviewFindingConfidence::High)
+                .build()],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        let instructions = render_revision_instructions(&result);
+        assert!(instructions.contains("Null pointer dereference"));
+        assert!(instructions.contains("src/main.rs"));
+        assert!(instructions.contains("fn handle, ~L42"));
+        assert!(instructions.contains("add a guard"));
+        assert!(instructions.contains("One bug found."));
+        assert!(instructions.contains("high")); // severity
+    }
+
+    #[test]
+    fn render_revision_instructions_sorts_by_severity() {
+        let result = ReviewResult {
+            pr_url: String::new(),
+            head_sha: String::new(),
+            summary: String::new(),
+            revision_warranted: true,
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::Low)
+                    .category(ReviewFindingCategory::Readability)
+                    .file("a.rs")
+                    .title("Low finding")
+                    .detail("minor")
+                    .confidence(ReviewFindingConfidence::Low)
+                    .build(),
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::Critical)
+                    .category(ReviewFindingCategory::Correctness)
+                    .file("b.rs")
+                    .title("Critical finding")
+                    .detail("urgent")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        let instructions = render_revision_instructions(&result);
+        let critical_pos = instructions.find("Critical finding").expect("present");
+        let low_pos = instructions.find("Low finding").expect("present");
+        assert!(critical_pos < low_pos, "critical must appear before low");
     }
 }

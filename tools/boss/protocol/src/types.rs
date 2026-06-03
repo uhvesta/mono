@@ -2297,6 +2297,9 @@ pub const CREATED_VIA_MERGE_CONFLICT_PREFIX: &str = "merge-conflict:";
 /// Prefix for engine-triggered revisions spawned by the CI-failure watcher:
 /// `ci-fix:<ci_remediations.id>`. Mirrors `CREATED_VIA_MERGE_CONFLICT_PREFIX`.
 pub const CREATED_VIA_CI_FIX_PREFIX: &str = "ci-fix:";
+/// Prefix for engine-triggered revisions spawned by the automated PR reviewer
+/// (P992): `pr_review:<pr_review_execution_id>`.
+pub const CREATED_VIA_PR_REVIEW_PREFIX: &str = "pr_review:";
 /// Engine-triggered work spawned by actioning an attention group
 /// (`ActionAttentionGroup`): the revision / design task produced from a
 /// question group, or the batch of tasks/chores produced from a followup
@@ -2324,6 +2327,7 @@ pub fn is_known_created_via(value: &str) -> bool {
     KNOWN_CREATED_VIA.contains(&value)
         || value.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX)
         || value.starts_with(CREATED_VIA_CI_FIX_PREFIX)
+        || value.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
         || value.starts_with("pr-comment:")
 }
 
