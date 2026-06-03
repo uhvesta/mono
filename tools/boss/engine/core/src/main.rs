@@ -34,21 +34,19 @@ impl DualLogWriter {
 impl Write for DualLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.stderr.write_all(buf)?;
-        if let Some(file) = &self.file {
-            if let Ok(mut file) = file.lock() {
+        if let Some(file) = &self.file
+            && let Ok(mut file) = file.lock() {
                 let _ = file.write_all(buf);
             }
-        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.stderr.flush()?;
-        if let Some(file) = &self.file {
-            if let Ok(mut file) = file.lock() {
+        if let Some(file) = &self.file
+            && let Ok(mut file) = file.lock() {
                 let _ = file.flush();
             }
-        }
         Ok(())
     }
 }
@@ -75,12 +73,11 @@ fn resolve_log_path() -> PathBuf {
 }
 
 fn open_log_file(path: &Path) -> Result<File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create log directory {}", parent.display()))?;
         }
-    }
 
     OpenOptions::new()
         .create(true)

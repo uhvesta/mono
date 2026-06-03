@@ -101,13 +101,12 @@ pub fn generate_token() -> String {
 /// from a previous engine that crashed without removing its file
 /// would otherwise authenticate against the wrong process.
 pub fn write_token_file(path: &Path, contents: &ControlTokenFile) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create control-token directory {}", parent.display())
             })?;
         }
-    }
 
     let serialized = serde_json::to_string(contents)
         .context("failed to serialize control-token file")?;

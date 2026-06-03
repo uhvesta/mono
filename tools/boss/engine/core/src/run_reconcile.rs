@@ -197,8 +197,8 @@ fn classify(
     // recorded lease has logically expired, the worker has been gone
     // long enough that auto-redispatch is safer than waiting for the
     // next dispatcher tick.
-    if let Some(expires_at) = workspace.lease_expires_at_epoch_s {
-        if expires_at <= now_epoch_s {
+    if let Some(expires_at) = workspace.lease_expires_at_epoch_s
+        && expires_at <= now_epoch_s {
             tracing::info!(
                 execution_id = %execution.id,
                 cube_workspace_id,
@@ -209,7 +209,6 @@ fn classify(
             );
             return RunReconcileVerdict::Dead;
         }
-    }
 
     RunReconcileVerdict::Live
 }

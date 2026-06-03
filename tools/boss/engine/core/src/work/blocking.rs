@@ -1894,8 +1894,8 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
-        if let Some(snap) = snapshot {
-            if snap.consumes_budget != 0 {
+        if let Some(snap) = snapshot
+            && snap.consumes_budget != 0 {
                 tx.execute(
                     "UPDATE tasks
                         SET ci_attempts_used = CASE
@@ -1907,7 +1907,6 @@ impl WorkDb {
                     params![snap.work_item_id],
                 )?;
             }
-        }
         let updated = query_ci_remediation(&tx, attempt_id)?;
         tx.commit()?;
         Ok(updated)

@@ -728,8 +728,8 @@ impl WorkerPool {
     ) -> Option<String> {
         let mut inner = self.inner.lock().await;
 
-        if let Some(target) = preferred_workspace_id {
-            if let Some(idx) = inner.workers.iter().position(|w| {
+        if let Some(target) = preferred_workspace_id
+            && let Some(idx) = inner.workers.iter().position(|w| {
                 w.execution_id.is_none()
                     && w.last_workspace_id.as_deref() == Some(target)
             }) {
@@ -739,7 +739,6 @@ impl WorkerPool {
                 log_pool_claim(&worker_id, execution_id, "affinity");
                 return Some(worker_id);
             }
-        }
 
         let free: Vec<usize> = inner
             .workers
@@ -771,8 +770,8 @@ impl WorkerPool {
     ) -> Option<String> {
         let mut inner = self.inner.lock().await;
 
-        if let Some(target) = preferred_workspace_id {
-            if let Some(idx) = inner.workers.iter().position(|w| {
+        if let Some(target) = preferred_workspace_id
+            && let Some(idx) = inner.workers.iter().position(|w| {
                 w.execution_id.is_none()
                     && w.last_workspace_id.as_deref() == Some(target)
             }) {
@@ -782,7 +781,6 @@ impl WorkerPool {
                 log_pool_claim(&worker_id, execution_id, "force-affinity");
                 return Some(worker_id);
             }
-        }
 
         let free: Vec<usize> = inner
             .workers
@@ -864,8 +862,7 @@ impl WorkerPool {
             .workers
             .iter_mut()
             .find(|worker| worker.worker_id == worker_id)
-        {
-            if worker.execution_id.as_deref() == Some(execution_id) {
+            && worker.execution_id.as_deref() == Some(execution_id) {
                 worker.execution_id = None;
                 if let Some(workspace_id) = last_workspace_id {
                     worker.last_workspace_id = Some(workspace_id.to_owned());
@@ -877,7 +874,6 @@ impl WorkerPool {
                 );
                 return true;
             }
-        }
         false
     }
 
@@ -1897,11 +1893,10 @@ impl ExecutionCoordinator {
     /// completion handler branches on `kind` to run the outcome detector, so
     /// the synthetic fields never drive real task work.
     fn resolve_execution_work_item(&self, execution: &WorkExecution) -> Result<WorkItem> {
-        if execution.kind == ExecutionKind::AutomationTriage {
-            if let Some(item) = self.synthetic_triage_work_item(execution) {
+        if execution.kind == ExecutionKind::AutomationTriage
+            && let Some(item) = self.synthetic_triage_work_item(execution) {
                 return Ok(item);
             }
-        }
         self.work_db.get_work_item(&execution.work_item_id)
     }
 
@@ -2389,8 +2384,8 @@ impl ExecutionCoordinator {
                 // `triage_running` now that a pool slot is held and the
                 // agent is about to start. The completion handler will
                 // overwrite this with the terminal outcome.
-                if execution.kind == ExecutionKind::AutomationTriage {
-                    if let Err(err) = self
+                if execution.kind == ExecutionKind::AutomationTriage
+                    && let Err(err) = self
                         .work_db
                         .mark_automation_run_triage_started(&execution.id)
                     {
@@ -2400,7 +2395,6 @@ impl ExecutionCoordinator {
                             "failed to mark automation run triage_running on start",
                         );
                     }
-                }
                 // Resume-bounce SHA-delta gate: capture the bound
                 // chore PR's head SHA into the execution row BEFORE
                 // the worker spawns and starts pushing. The Stop
@@ -2996,8 +2990,8 @@ impl ExecutionCoordinator {
                 // tab shows the occurrence was abandoned (the schedule already
                 // advanced past it when the scheduler fired the triage). Until
                 // this point the run sat at the pessimistic `failed_will_retry`.
-                if execution.kind == ExecutionKind::AutomationTriage {
-                    if let Err(err) = self.work_db.finalize_automation_triage_run(
+                if execution.kind == ExecutionKind::AutomationTriage
+                    && let Err(err) = self.work_db.finalize_automation_triage_run(
                         &execution.id,
                         boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
                         None,
@@ -3012,7 +3006,6 @@ impl ExecutionCoordinator {
                             "failed to mark automation run failed_gave_up after permanent triage pre-start failure",
                         );
                     }
-                }
 
                 // Surface every permanent pre-start failure as a
                 // `WorkAttentionItem` so the failure is diagnosable in one
@@ -3433,8 +3426,8 @@ impl ExecutionCoordinator {
                         // a self-healing retry is pending (it is not: a
                         // pane-spawn failure like an invalid worker_id format
                         // will not recover on its own).
-                        if execution.kind == ExecutionKind::AutomationTriage {
-                            if let Err(finalize_err) =
+                        if execution.kind == ExecutionKind::AutomationTriage
+                            && let Err(finalize_err) =
                                 self.work_db.finalize_automation_triage_run(
                                     &execution.id,
                                     boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
@@ -3448,7 +3441,6 @@ impl ExecutionCoordinator {
                                     "failed to mark automation run failed_gave_up after pane-spawn failure",
                                 );
                             }
-                        }
                     }
                     Err(record_err) => {
                         tracing::error!(

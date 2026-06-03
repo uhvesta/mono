@@ -60,13 +60,11 @@ pub(crate) fn parse_bazelrc_closure(
             if matches!(
                 entry.kind,
                 BazelrcEntryKind::Import | BazelrcEntryKind::TryImport
-            ) {
-                if let Some(import_path) = &entry.import_path {
-                    if tree.exists(import_path) {
+            )
+                && let Some(import_path) = &entry.import_path
+                    && tree.exists(import_path) {
                         pending.push(import_path.clone());
                     }
-                }
-            }
         }
         entries.extend(parsed_entries);
     }
@@ -275,14 +273,12 @@ fn extract_flag_entries(
         }
 
         let mut value = inline_value;
-        if value.is_none() {
-            if let Some(next) = tokens.get(index + 1) {
-                if !next.starts_with('-') {
+        if value.is_none()
+            && let Some(next) = tokens.get(index + 1)
+                && !next.starts_with('-') {
                     value = Some(next.clone());
                     index += 1;
                 }
-            }
-        }
 
         let column = line.find(token).map(|col| (col + 1) as u32).unwrap_or(1);
         entries.push(BazelrcEntry {

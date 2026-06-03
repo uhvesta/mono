@@ -168,11 +168,10 @@ impl Vcs {
     }
 
     pub fn remote_repo_slug(&self) -> Option<String> {
-        if let Ok(output) = run_command(&self.root, "git", &["remote", "get-url", "origin"]) {
-            if let Some(slug) = parse_repo_slug_from_remote_url(output.trim()) {
+        if let Ok(output) = run_command(&self.root, "git", &["remote", "get-url", "origin"])
+            && let Some(slug) = parse_repo_slug_from_remote_url(output.trim()) {
                 return Some(slug);
             }
-        }
 
         None
     }

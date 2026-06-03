@@ -543,8 +543,8 @@ fn walk_java<'a>(
     match node.kind() {
         "class_declaration" | "interface_declaration" => {
             let previous_type = ctx.current_type.clone();
-            if let Some(name_node) = node.child_by_field_name("name") {
-                if let Ok(simple_name) = name_node.utf8_text(ctx.source) {
+            if let Some(name_node) = node.child_by_field_name("name")
+                && let Ok(simple_name) = name_node.utf8_text(ctx.source) {
                     let next_type = previous_type
                         .as_ref()
                         .map(|parent| format!("{parent}.{simple_name}"))
@@ -557,7 +557,6 @@ fn walk_java<'a>(
                         .unwrap_or_else(|| simple_name.to_owned());
                     ctx.current_type = Some(next_type);
                 }
-            }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 walk_java(child, ctx, rules);

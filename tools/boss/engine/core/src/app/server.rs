@@ -1030,11 +1030,10 @@ pub(super) fn register_app_session_trust_ok(
 /// stamp `"engine"` directly in SQL and never call this function.
 pub(super) fn resolve_status_actor(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> &'static str {
     let boss_pid = server_state.current_boss_pid();
-    if let (Some(boss_pid), Some(peer_pid)) = (boss_pid, peer_pid) {
-        if is_descendant_of_any(peer_pid, &[boss_pid]) {
+    if let (Some(boss_pid), Some(peer_pid)) = (boss_pid, peer_pid)
+        && is_descendant_of_any(peer_pid, &[boss_pid]) {
             return boss_protocol::LAST_STATUS_ACTOR_BOSS;
         }
-    }
     boss_protocol::LAST_STATUS_ACTOR_HUMAN
 }
 

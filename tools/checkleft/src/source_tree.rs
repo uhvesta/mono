@@ -49,8 +49,8 @@ impl LocalSourceTree {
             if let Component::Normal(part) = component {
                 current.push(part);
 
-                if let Ok(metadata) = fs::symlink_metadata(&current) {
-                    if metadata.file_type().is_symlink() {
+                if let Ok(metadata) = fs::symlink_metadata(&current)
+                    && metadata.file_type().is_symlink() {
                         let resolved = current.canonicalize().with_context(|| {
                             format!("failed to resolve symlink {}", current.display())
                         })?;
@@ -62,19 +62,17 @@ impl LocalSourceTree {
                             );
                         }
                     }
-                }
             }
         }
 
-        if let Ok(canonical) = current.canonicalize() {
-            if !canonical.starts_with(&self.root) {
+        if let Ok(canonical) = current.canonicalize()
+            && !canonical.starts_with(&self.root) {
                 bail!(
                     "resolved path escapes source tree root: {} -> {}",
                     relative_path.display(),
                     canonical.display()
                 );
             }
-        }
 
         Ok(current)
     }

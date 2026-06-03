@@ -130,16 +130,15 @@ fn load_from_disk(workspace_path: &Path) -> PrTemplateSet {
 
     // Single-file form
     let single = github_dir.join("PULL_REQUEST_TEMPLATE.md");
-    if single.is_file() {
-        if let Some(tmpl) = load_file(&single, workspace_path) {
+    if single.is_file()
+        && let Some(tmpl) = load_file(&single, workspace_path) {
             set.default_template = Some(tmpl);
         }
-    }
 
     // Directory form
     let template_dir = github_dir.join("PULL_REQUEST_TEMPLATE");
-    if template_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&template_dir) {
+    if template_dir.is_dir()
+        && let Ok(entries) = std::fs::read_dir(&template_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -158,7 +157,6 @@ fn load_from_disk(workspace_path: &Path) -> PrTemplateSet {
                 }
             }
         }
-    }
 
     set
 }

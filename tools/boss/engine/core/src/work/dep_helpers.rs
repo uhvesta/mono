@@ -113,8 +113,8 @@ pub(crate) fn resolve_dependency_edge(
                 status: project.status,
             });
         }
-    } else if peer_id.starts_with("task_") {
-        if let Some(task) = query_task(conn, peer_id)? {
+    } else if peer_id.starts_with("task_")
+        && let Some(task) = query_task(conn, peer_id)? {
             let kind = match task.kind {
                 TaskKind::Chore => "chore",
                 _ => "task",
@@ -127,7 +127,6 @@ pub(crate) fn resolve_dependency_edge(
                 status: task.status,
             });
         }
-    }
     Ok(DependencyEdge {
         id: peer_id.to_owned(),
         relation: relation.to_owned(),

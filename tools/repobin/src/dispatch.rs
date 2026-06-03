@@ -70,8 +70,8 @@ fn plan_from_target<B: BazelAdapter>(
     cwd: &Path,
     forwarded_args: &[OsString],
 ) -> Result<DispatchPlan, RepobinError> {
-    if let Some(root) = cache_root {
-        if let Some(executable_path) = dispatch_cache::lookup_in(root, repo_root, target) {
+    if let Some(root) = cache_root
+        && let Some(executable_path) = dispatch_cache::lookup_in(root, repo_root, target) {
             trace(format_args!(
                 "dispatch-cache hit target={target} repo_root={}",
                 repo_root.display()
@@ -85,7 +85,6 @@ fn plan_from_target<B: BazelAdapter>(
                 forwarded_args: forwarded_args.to_vec(),
             });
         }
-    }
 
     trace(format_args!(
         "dispatch-cache miss target={target} repo_root={} (running bazel build + cquery)",

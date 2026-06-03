@@ -164,11 +164,10 @@ impl RepoCacheLock {
 
         // Reuse existing pinned checkout if it is already at the requested SHA.
         if pinned_checkout.join(".git").is_dir() {
-            if let Ok(current) = read_head(&pinned_checkout) {
-                if sha_matches(&current, sha) {
+            if let Ok(current) = read_head(&pinned_checkout)
+                && sha_matches(&current, sha) {
                     return Ok(EnsureOutcome::Pinned { head: current });
                 }
-            }
             // Wrong SHA or unreadable — remove and reclone.
             fs::remove_dir_all(&pinned_checkout).map_err(|source| {
                 RepobinError::WriteCacheMetadata {

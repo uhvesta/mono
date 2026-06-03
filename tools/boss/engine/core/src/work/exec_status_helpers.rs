@@ -187,10 +187,9 @@ pub(crate) fn resolve_repo_for_work_item(
             if let Some(url) = product.docs_repo.as_deref().filter(|s| !s.is_empty()) {
                 return Ok(Some(url.to_owned()));
             }
-            if let Ok(user_docs) = std::env::var("BOSS_USER_DOCS_REPO") {
-                if !user_docs.is_empty() {
-                    return Ok(Some(user_docs));
-                }
+            if let Ok(user_docs) = std::env::var("BOSS_USER_DOCS_REPO")
+                && !user_docs.is_empty() {
+                return Ok(Some(user_docs));
             }
         }
         // All other kinds use the product's default code repo.

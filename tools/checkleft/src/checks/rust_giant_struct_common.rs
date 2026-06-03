@@ -194,13 +194,12 @@ pub fn struct_declaration_line(source: &str, struct_name: &str) -> Option<u32> {
     let search = format!("struct {struct_name}");
     for (i, line) in source.lines().enumerate() {
         let candidate = strip_visibility(line.trim_start());
-        if let Some(after) = candidate.strip_prefix(&search) {
-            if after.is_empty()
-                || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '('))
+        if let Some(after) = candidate.strip_prefix(&search)
+            && (after.is_empty()
+                || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '(')))
             {
                 return Some((i + 1) as u32);
             }
-        }
     }
     None
 }

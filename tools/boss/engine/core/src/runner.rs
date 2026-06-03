@@ -859,8 +859,8 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // the engine-collected log excerpt, the failing-check set, and the
     // attempt-kind-specific playbook (rebase-first for `fix`, just the
     // retrigger CLI for `retrigger`).
-    if execution.kind == ExecutionKind::CiRemediation {
-        if let Some(attempt) = ci_attempt {
+    if execution.kind == ExecutionKind::CiRemediation
+        && let Some(attempt) = ci_attempt {
             return compose_ci_remediation_prompt(
                 execution,
                 work_item,
@@ -870,7 +870,6 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 /* test_command */ None,
             );
         }
-    }
     let mut prompt = String::new();
     prompt.push_str(
         "You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n",
@@ -1032,11 +1031,10 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
-    ) {
-        if let Some(gate) = bazel_prepush_gate_block(workspace_path) {
+    )
+        && let Some(gate) = bazel_prepush_gate_block(workspace_path) {
             prompt.push_str(&gate);
         }
-    }
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation | ExecutionKind::ProjectDesign | ExecutionKind::InvestigationImplementation
@@ -1726,13 +1724,12 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     if !attempt.head_branch.is_empty() {
         out.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
     }
-    if is_rebounce {
-        if let Some(ref sha) = attempt.before_commit_sha {
+    if is_rebounce
+        && let Some(ref sha) = attempt.before_commit_sha {
             out.push_str(&format!(
                 "**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",
             ));
         }
-    }
     out.push_str(&format!(
         "**Head sha at trigger**: `{}`\n",
         attempt.head_sha_at_trigger,
@@ -2286,11 +2283,10 @@ fn task_details(task: &Task) -> Option<String> {
     if !task.description.trim().is_empty() {
         lines.push(format!("  - description: {}", task.description.trim()));
     }
-    if let Some(pr_url) = task.pr_url.as_deref() {
-        if !pr_url.trim().is_empty() {
+    if let Some(pr_url) = task.pr_url.as_deref()
+        && !pr_url.trim().is_empty() {
             lines.push(format!("  - pr_url: {}", pr_url.trim()));
         }
-    }
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 

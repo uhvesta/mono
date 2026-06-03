@@ -199,12 +199,11 @@ fn changed_line_fraction(src_lines: &[&str], result: &str) -> f64 {
     }
     let mut unchanged = 0usize;
     for &line in src_lines {
-        if let Some(count) = res_counts.get_mut(line) {
-            if *count > 0 {
+        if let Some(count) = res_counts.get_mut(line)
+            && *count > 0 {
                 *count -= 1;
                 unchanged += 1;
             }
-        }
     }
     (src_lines.len() - unchanged) as f64 / src_lines.len() as f64
 }

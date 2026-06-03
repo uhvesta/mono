@@ -448,8 +448,8 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     // Remote SSH workers skip this entirely (see `EngineDataDirSandbox`):
     // their `events_socket_path` is the forwarded `/tmp` socket, not a
     // Boss data dir, and the python guard script is never shipped there.
-    if sandbox == EngineDataDirSandbox::Enabled {
-        if let Some(state_dir) = input.events_socket_path.parent() {
+    if sandbox == EngineDataDirSandbox::Enabled
+        && let Some(state_dir) = input.events_socket_path.parent() {
             let guard_command = format!(
                 "BOSS_DATA_DIR={dir} python3 {script}",
                 dir = shell_escape(&state_dir.display().to_string()),
@@ -465,7 +465,6 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
                 ],
             }));
         }
-    }
 
     // Block a worker from *launching Boss itself* — the macOS app or its
     // bundled engine. A worker that starts Boss attaches to the operator's
@@ -583,8 +582,8 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
     // `events_socket_path` is the forwarded `/tmp` socket, so these would
     // wrongly fence the worker off all of `/tmp`; skip them there. The
     // static `bossctl` / `boss engine` guards below still apply to both.
-    if sandbox == EngineDataDirSandbox::Enabled {
-        if let Some(state_dir) = input.events_socket_path.parent() {
+    if sandbox == EngineDataDirSandbox::Enabled
+        && let Some(state_dir) = input.events_socket_path.parent() {
             let dir = state_dir.display().to_string();
             // Both the bare directory and the `**` subtree are listed
             // explicitly: glob `**` doesn't match the directory itself in
@@ -595,7 +594,6 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
                 rules.push(format!("{prefix}({dir}/**)"));
             }
         }
-    }
 
     // `bossctl` is the coordinator's CLI surface (probes, agents
     // list, work mutations). Workers don't drive the coordinator,

@@ -119,15 +119,14 @@ impl SshTransport {
         }
 
         // Stale or missing — unlink so the master can re-bind.
-        if self.control_socket.exists() {
-            if let Err(err) = std::fs::remove_file(&self.control_socket) {
+        if self.control_socket.exists()
+            && let Err(err) = std::fs::remove_file(&self.control_socket) {
                 tracing::warn!(
                     ?err,
                     socket = %self.control_socket.display(),
                     "could not unlink stale ssh control socket"
                 );
             }
-        }
 
         // Open a fresh master. `-M -N -f` is the canonical idiom:
         //   -M  this connection is the master

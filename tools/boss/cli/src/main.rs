@@ -3882,20 +3882,17 @@ fn parse_automation_selector(s: &str) -> Result<AutomationSelector, CliError> {
     // `A<n>` or `a<n>`
     if s.len() >= 2 {
         let first = s.as_bytes()[0];
-        if first == b'A' || first == b'a' {
-            if let Ok(n) = s[1..].parse::<i64>() {
-                if n > 0 {
+        if (first == b'A' || first == b'a')
+            && let Ok(n) = s[1..].parse::<i64>()
+                && n > 0 {
                     return Ok(AutomationSelector::ShortId(n));
                 }
-            }
-        }
     }
     // Plain positive integer → short id
-    if let Ok(n) = s.parse::<i64>() {
-        if n > 0 {
+    if let Ok(n) = s.parse::<i64>()
+        && n > 0 {
             return Ok(AutomationSelector::ShortId(n));
         }
-    }
     Err(CliError::usage(format!(
         "automation selector must be A<n> (e.g. A1) or an auto_… id; got {s:?}"
     )))
@@ -4464,19 +4461,16 @@ fn parse_attention_group_selector(s: &str) -> Result<AttentionGroupSelector, Cli
     }
     if s.len() >= 2 {
         let first = s.as_bytes()[0];
-        if first == b'A' || first == b'a' {
-            if let Ok(n) = s[1..].parse::<i64>() {
-                if n > 0 {
+        if (first == b'A' || first == b'a')
+            && let Ok(n) = s[1..].parse::<i64>()
+                && n > 0 {
                     return Ok(AttentionGroupSelector::ShortId(n));
                 }
-            }
-        }
     }
-    if let Ok(n) = s.parse::<i64>() {
-        if n > 0 {
+    if let Ok(n) = s.parse::<i64>()
+        && n > 0 {
             return Ok(AttentionGroupSelector::ShortId(n));
         }
-    }
     Err(CliError::usage(format!(
         "attention group selector must be A<n> (e.g. A1) or an atg_… id; got {s:?}"
     )))
@@ -7315,43 +7309,36 @@ fn parse_work_item_selector(s: &str) -> WorkItemSelector {
     if let Some(slash) = s.find('/') {
         let product_slug = &s[..slash];
         let rest = s[slash + 1..].trim_start_matches('#');
-        if !product_slug.is_empty() {
-            if let Ok(n) = rest.parse::<i64>() {
-                if n > 0 {
+        if !product_slug.is_empty()
+            && let Ok(n) = rest.parse::<i64>()
+                && n > 0 {
                     return WorkItemSelector::ProductShortId {
                         product_slug: product_slug.to_owned(),
                         n,
                     };
                 }
-            }
-        }
     }
     // `#42` form (explicit friendly-id prefix)
-    if let Some(rest) = s.strip_prefix('#') {
-        if let Ok(n) = rest.parse::<i64>() {
-            if n > 0 {
+    if let Some(rest) = s.strip_prefix('#')
+        && let Ok(n) = rest.parse::<i64>()
+            && n > 0 {
                 return WorkItemSelector::ShortId(n);
             }
-        }
-    }
     // `T441` / `t441` / `P12` / `p12` — friendly kanban id (T for tasks/chores, P for projects).
     // Case-insensitive; the leading letter is just visual sugar for the short_id number.
     if s.len() >= 2 {
         let first = s.as_bytes()[0];
-        if first == b'T' || first == b't' || first == b'P' || first == b'p' {
-            if let Ok(n) = s[1..].parse::<i64>() {
-                if n > 0 {
+        if (first == b'T' || first == b't' || first == b'P' || first == b'p')
+            && let Ok(n) = s[1..].parse::<i64>()
+                && n > 0 {
                     return WorkItemSelector::ShortId(n);
                 }
-            }
-        }
     }
     // Plain integer → short id (Q5 step 2: `#` is optional)
-    if let Ok(n) = s.parse::<i64>() {
-        if n > 0 {
+    if let Ok(n) = s.parse::<i64>()
+        && n > 0 {
             return WorkItemSelector::ShortId(n);
         }
-    }
     // Primary id prefixes
     if is_typed_work_item_id(s) {
         return WorkItemSelector::PrimaryId(s.to_owned());
@@ -7870,11 +7857,10 @@ fn apply_task_list_filters(
                     return false;
                 }
             }
-            if let Some(selector) = repo {
-                if !selector.matches(resolved_repo_for_task(task, product_repo)) {
+            if let Some(selector) = repo
+                && !selector.matches(resolved_repo_for_task(task, product_repo)) {
                     return false;
                 }
-            }
             true
         })
         .take(limit.unwrap_or(usize::MAX))
@@ -8676,11 +8662,10 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
     if !flags.json {
         println!("This will remove:");
         println!("  {}", app_path.display());
-        if args.purge_state {
-            if let Some(ref state) = state_root {
+        if args.purge_state
+            && let Some(ref state) = state_root {
                 println!("  {} (--purge-state)", state.display());
             }
-        }
     }
 
     if !args.yes {
@@ -8719,9 +8704,9 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
 
     let mut removed = vec![app_path.display().to_string()];
 
-    if args.purge_state {
-        if let Some(state) = state_root {
-            if state.exists() {
+    if args.purge_state
+        && let Some(state) = state_root
+            && state.exists() {
                 std::fs::remove_dir_all(&state).map_err(|e| {
                     CliError::internal(anyhow::anyhow!(
                         "failed to remove {}: {e}",
@@ -8730,8 +8715,6 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
                 })?;
                 removed.push(state.display().to_string());
             }
-        }
-    }
 
     if flags.json {
         println!(

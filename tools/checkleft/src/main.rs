@@ -311,8 +311,8 @@ fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckP
             "`{CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV}=generated-only` requires `{CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV}` to be set"
         );
     }
-    if mode != ExternalProviderMode::FileOnly {
-        if let Some(index_path) = index_path {
+    if mode != ExternalProviderMode::FileOnly
+        && let Some(index_path) = index_path {
             info!(index_path = %index_path, "loading generated external package index");
             let generated_provider = GeneratedExternalCheckPackageProvider::from_index_path(
                 root,
@@ -323,7 +323,6 @@ fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckP
                 Arc::new(generated_provider),
             ));
         }
-    }
 
     if providers.is_empty() {
         return Ok(Arc::new(NoopExternalCheckPackageProvider));
@@ -391,11 +390,10 @@ async fn resolve_pr_description(
     repository: Option<&str>,
     change_id: Option<&str>,
 ) -> Option<String> {
-    if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV) {
-        if !raw.trim().is_empty() {
+    if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV)
+        && !raw.trim().is_empty() {
             return Some(raw);
         }
-    }
 
     let Some(repository) = repository else {
         return None;
@@ -618,11 +616,10 @@ impl OutputStyle {
             }
         }
 
-        if let Ok(term) = std::env::var("TERM") {
-            if term.contains("256color") {
+        if let Ok(term) = std::env::var("TERM")
+            && term.contains("256color") {
                 return Self { level: ColorLevel::Color256 };
             }
-        }
 
         Self { level: ColorLevel::Basic }
     }

@@ -832,14 +832,13 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                         // was one, otherwise write the literal so the
                         // card is not misleading.
                         let prior = registry.get(slot_id).and_then(|s| s.live_status);
-                        if prior.is_none() {
-                            if registry.set_live_status(
+                        if prior.is_none()
+                            && registry.set_live_status(
                                 slot_id,
                                 Some(live_status::AWAITING_INPUT_LITERAL.to_owned()),
                             ) {
                                 broadcaster.broadcast_live_worker_states().await;
                             }
-                        }
                         continue;
                     }
                     WorkerActivity::Spawning | WorkerActivity::Terminated => {
@@ -898,9 +897,9 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
 
         // Idle-clear: if we've been idle longer than IDLE_CLEAR_AFTER
         // and a prior `live_status` is still set, drop it.
-        if last_activity == WorkerActivity::Idle {
-            if let Some(idle_at) = idle_since {
-                if idle_at.elapsed() >= IDLE_CLEAR_AFTER {
+        if last_activity == WorkerActivity::Idle
+            && let Some(idle_at) = idle_since
+                && idle_at.elapsed() >= IDLE_CLEAR_AFTER {
                     tracing::info!(
                         slot_id,
                         idle_for_s = idle_at.elapsed().as_secs(),
@@ -912,10 +911,8 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     idle_since = None;
                     continue;
                 }
-            }
             // Within the 30s grace — fall through and let the summary
             // path describe the last action before settling.
-        }
 
         // Rate limit. The single-task design ensures only one
         // summarize call is outstanding at a time — the channel

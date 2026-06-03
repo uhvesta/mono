@@ -416,9 +416,9 @@ impl DeviceFlow {
 
         if response.status() == 403 {
             // Check for SAML SSO requirement header.
-            if let Some(sso_header) = response.headers().get("X-GitHub-SSO") {
-                if let Ok(s) = sso_header.to_str() {
-                    if s.contains("required") {
+            if let Some(sso_header) = response.headers().get("X-GitHub-SSO")
+                && let Ok(s) = sso_header.to_str()
+                    && s.contains("required") {
                         // Header format: "required; url=https://github.com/orgs/foo/sso?..."
                         if let Some(url_part) = s.split("url=").nth(1) {
                             return OrgAuthState::NeedsSso {
@@ -426,8 +426,6 @@ impl DeviceFlow {
                             };
                         }
                     }
-                }
-            }
             // 403 without SSO header: OAuth App not yet approved for this org.
             return OrgAuthState::NeedsOrgApproval {
                 request_url: format!(
@@ -690,8 +688,8 @@ impl GitHubAuthController {
                     // A keychain write failure is logged but does not fail the
                     // flow — the in-memory state still reflects the live token
                     // (design §5: keychain unavailable → fall back, don't abort).
-                    if let Some(store) = &store {
-                        if let Err(e) = store.set(&record) {
+                    if let Some(store) = &store
+                        && let Err(e) = store.set(&record) {
                             tracing::error!(
                                 target: "boss_engine::external_tracker::github_oauth",
                                 error = %e,
@@ -699,7 +697,6 @@ impl GitHubAuthController {
                                  token held in memory only"
                             );
                         }
-                    }
                     // Org state is Unknown here; T-4's orchestrator runs the
                     // org/SSO probe and calls `update_org_state` to resolve it.
                     GitHubAuthState::Authorized {
@@ -729,15 +726,14 @@ impl GitHubAuthController {
     /// in-memory state still drops to `Disconnected`.
     pub async fn disconnect(&self) {
         self.signal_cancel().await;
-        if let Some(store) = &self.store {
-            if let Err(e) = store.delete() {
+        if let Some(store) = &self.store
+            && let Err(e) = store.delete() {
                 tracing::warn!(
                     target: "boss_engine::external_tracker::github_oauth",
                     error = %e,
                     "disconnect: failed to delete OAuth token from keychain"
                 );
             }
-        }
         self.state_tx.send_replace(GitHubAuthState::Disconnected);
     }
 

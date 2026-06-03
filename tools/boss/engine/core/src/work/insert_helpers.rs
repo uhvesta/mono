@@ -136,11 +136,10 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     ensure_product_exists(conn, &input.product_id)?;
     ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
 
-    if !input.force_duplicate {
-        if let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
+    if !input.force_duplicate
+        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
             return Err(anyhow::Error::new(dup));
         }
-    }
 
     let product = query_product(conn, &input.product_id)?.with_context(|| {
         format!(
@@ -172,11 +171,10 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
 pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> Result<Task> {
     ensure_product_exists(conn, &input.product_id)?;
 
-    if !input.force_duplicate {
-        if let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
+    if !input.force_duplicate
+        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
             return Err(anyhow::Error::new(dup));
         }
-    }
 
     let product = query_product(conn, &input.product_id)?.with_context(|| {
         format!(
@@ -219,11 +217,10 @@ pub(crate) fn insert_investigation_in_tx(
     if let Some(ref pid) = input.project_id {
         ensure_project_belongs_to_product(conn, pid, &input.product_id)?;
     }
-    if !input.force_duplicate {
-        if let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
+    if !input.force_duplicate
+        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
             return Err(anyhow::Error::new(dup));
         }
-    }
     let id = next_id("task");
     let now = now_string();
     let description = input.description.unwrap_or_default();

@@ -216,13 +216,11 @@ fn is_excluded(path: &Path, globs: &GlobSet, config_dir: &Path) -> bool {
 
 fn candidate_paths(changed_file: &ChangedFile) -> Vec<&Path> {
     let mut paths = vec![changed_file.path.as_path()];
-    if matches!(changed_file.kind, ChangeKind::Renamed) {
-        if let Some(old_path) = changed_file.old_path.as_deref() {
-            if old_path != changed_file.path.as_path() {
+    if matches!(changed_file.kind, ChangeKind::Renamed)
+        && let Some(old_path) = changed_file.old_path.as_deref()
+            && old_path != changed_file.path.as_path() {
                 paths.push(old_path);
             }
-        }
-    }
     paths
 }
 

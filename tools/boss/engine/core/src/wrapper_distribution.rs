@@ -253,15 +253,14 @@ struct TempFileGuard(PathBuf);
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(&self.0) {
-            if err.kind() != std::io::ErrorKind::NotFound {
+        if let Err(err) = std::fs::remove_file(&self.0)
+            && err.kind() != std::io::ErrorKind::NotFound {
                 tracing::debug!(
                     ?err,
                     path = %self.0.display(),
                     "wrapper_distribution: failed to unlink local staging file"
                 );
             }
-        }
     }
 }
 

@@ -252,8 +252,8 @@ fn extract_text_blocks(
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("text");
-            if bt == "text" {
-                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+            if bt == "text"
+                && let Some(text) = block.get("text").and_then(|v| v.as_str()) {
                     let s = *seq;
                     *seq += 1;
                     events.push(TranscriptEvent {
@@ -263,7 +263,6 @@ fn extract_text_blocks(
                         model: model.clone(),
                     });
                 }
-            }
         }
     } else if let Some(text) = content.as_str() {
         let s = *seq;

@@ -229,14 +229,13 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
     let mut by_root: std::collections::HashMap<String, Vec<(String, usize)>> =
         std::collections::HashMap::new();
     for (idx, t) in tasks.iter().enumerate() {
-        if t.kind == TaskKind::Revision {
-            if let Some((root_id, _)) = &root_info[idx] {
+        if t.kind == TaskKind::Revision
+            && let Some((root_id, _)) = &root_info[idx] {
                 by_root
                     .entry(root_id.clone())
                     .or_default()
                     .push((t.created_at.clone(), idx));
             }
-        }
     }
     for entries in by_root.values_mut() {
         entries.sort_by(|a, b| a.0.cmp(&b.0)); // stable sort by created_at
@@ -307,11 +306,10 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &m
     let mut in_progress_roots: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for t in tasks.iter() {
-        if t.kind == TaskKind::Revision && (t.status == "todo" || t.status == "active") {
-            if let Some(root_id) = walk_to_root(&t.id, &lookup) {
+        if t.kind == TaskKind::Revision && (t.status == "todo" || t.status == "active")
+            && let Some(root_id) = walk_to_root(&t.id, &lookup) {
                 in_progress_roots.insert(root_id);
             }
-        }
     }
 
     if in_progress_roots.is_empty() {

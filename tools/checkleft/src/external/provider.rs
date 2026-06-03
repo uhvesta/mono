@@ -89,14 +89,13 @@ impl GeneratedExternalCheckPackageProvider {
                     full_index_path.display()
                 )
             })?;
-        if let Some(version) = raw_index.version {
-            if version != 1 {
+        if let Some(version) = raw_index.version
+            && version != 1 {
                 bail!(
                     "unsupported generated external package index version `{version}` in {} (expected 1)",
                     full_index_path.display()
                 );
             }
-        }
 
         let index_dir = full_index_path
             .parent()

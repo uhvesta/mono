@@ -855,11 +855,10 @@ fn track_remote_bookmarks(
     // to resolve. Keeping `main`/`master` first preserves the historical
     // tracking order for the common cases.
     let mut candidates: Vec<String> = vec!["main".to_string(), "master".to_string()];
-    if let Some(branch) = default_branch {
-        if !candidates.iter().any(|c| c == branch) {
+    if let Some(branch) = default_branch
+        && !candidates.iter().any(|c| c == branch) {
             candidates.push(branch.to_string());
         }
-    }
     let mut tracked_any = false;
     for branch in &candidates {
         let result = runner.run(&CommandInvocation {
@@ -1175,11 +1174,10 @@ fn run_workspace(
             // Ordering: try the --prefer workspace first, then others by id.
             let ordered_ids: Vec<String> = {
                 let mut v = Vec::new();
-                if let Some(pref) = prefer.as_deref() {
-                    if free_workspaces.iter().any(|w| w.workspace_id == pref) {
+                if let Some(pref) = prefer.as_deref()
+                    && free_workspaces.iter().any(|w| w.workspace_id == pref) {
                         v.push(pref.to_string());
                     }
-                }
                 for w in &free_workspaces {
                     if !v.contains(&w.workspace_id) {
                         v.push(w.workspace_id.clone());
@@ -1385,8 +1383,8 @@ fn run_workspace(
             // but the conflicts would still appear in `jj status` for the
             // new worker — better to clean them up now so the workspace is
             // truly pristine.
-            if !repair_bookmarks.is_empty() {
-                if let Err(error) = repair_conflicted_bookmarks(
+            if !repair_bookmarks.is_empty()
+                && let Err(error) = repair_conflicted_bookmarks(
                     runner,
                     database_path,
                     &workspace.workspace_path,
@@ -1395,7 +1393,6 @@ fn run_workspace(
                     let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
                     return Err(error);
                 }
-            }
 
             // If the workspace we just claimed was reclaimed-from-expired
             // in this lease call, guard the reset: a destructive
@@ -2163,8 +2160,8 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
             CubeError::InvalidArgument(format!("failed to check for existing PR: {e}"))
         })?;
 
-    if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(&list_json) {
-        if let Some(url) = prs
+    if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(&list_json)
+        && let Some(url) = prs
             .first()
             .and_then(|pr| pr.get("url"))
             .and_then(|v| v.as_str())
@@ -2176,7 +2173,6 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
                 json!({"action": "exists", "url": url, "number": number}),
             );
         }
-    }
 
     // No existing PR — create one.
     let mut create_args: Vec<&str> = vec![
@@ -2249,11 +2245,10 @@ fn parse_github_remote(remote_list_output: &str) -> Option<(String, String)> {
         // Split on the first run of whitespace to get (name, url).
         let mut iter = line.splitn(2, |c: char| c.is_whitespace());
         let name = iter.next().map(str::trim).filter(|s| !s.is_empty())?;
-        if let Some(url) = iter.next().map(str::trim) {
-            if let Some(slug) = parse_github_slug(url) {
+        if let Some(url) = iter.next().map(str::trim)
+            && let Some(slug) = parse_github_slug(url) {
                 return Some((name.to_string(), slug));
             }
-        }
     }
     None
 }
@@ -2384,14 +2379,13 @@ fn next_workspace_id(prefix: &str, existing: &[String]) -> String {
     let mut max_n: u32 = 0;
     let mut found_any = false;
     for id in existing {
-        if let Some(suffix) = id.strip_prefix(prefix) {
-            if let Ok(n) = suffix.parse::<u32>() {
+        if let Some(suffix) = id.strip_prefix(prefix)
+            && let Ok(n) = suffix.parse::<u32>() {
                 found_any = true;
                 if n > max_n {
                     max_n = n;
                 }
             }
-        }
     }
     let next = if found_any { max_n + 1 } else { 1 };
     format!("{prefix}{next:03}")
@@ -2764,14 +2758,13 @@ fn gc_stale_workspace_logs(store: &Store) {
             Some(id) => id.to_string(),
             None => continue,
         };
-        if !active_workspaces.contains(&workspace_id) {
-            if let Err(e) = fs::remove_dir_all(&path) {
+        if !active_workspaces.contains(&workspace_id)
+            && let Err(e) = fs::remove_dir_all(&path) {
                 eprintln!(
                     "cube: workspace logs gc: failed to remove {}: {e}",
                     path.display()
                 );
             }
-        }
     }
 }
 

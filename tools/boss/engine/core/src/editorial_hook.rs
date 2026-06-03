@@ -613,8 +613,8 @@ fn parse_gh_args(command: &str) -> GhArgs {
             raw.as_str(),
             "--body" | "-b" | "--body-file" | "-F" | "--title" | "-t" | "--message" | "-m"
         );
-        if takes_value {
-            if let Some(next) = tokens.get(i + 1) {
+        if takes_value
+            && let Some(next) = tokens.get(i + 1) {
                 let spanned = SpannedValue {
                     value: next.value.clone(),
                     span: (next.start, next.end),
@@ -629,7 +629,6 @@ fn parse_gh_args(command: &str) -> GhArgs {
                 i += 2;
                 continue;
             }
-        }
 
         i += 1;
     }

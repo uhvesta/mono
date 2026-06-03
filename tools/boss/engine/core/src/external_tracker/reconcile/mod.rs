@@ -714,18 +714,17 @@ async fn process_product(
                         "Behavior 5: upstream issue closed after merged PR"
                     );
                 }
-                if let Some(ref pr_url) = candidate.pr_url {
-                    if let Err(e) = tracker
+                if let Some(ref pr_url) = candidate.pr_url
+                    && let Err(e) = tracker
                         .post_closing_pr_comment(ctx, &candidate.upstream_ref, pr_url)
                         .await
-                    {
-                        warn!(
-                            work_item_id = %candidate.work_item_id,
-                            canonical_id = %candidate.upstream_ref.canonical_id,
-                            error = %e,
-                            "post_closing_pr_comment failed (non-fatal); PR linkage comment will be missing"
-                        );
-                    }
+                {
+                    warn!(
+                        work_item_id = %candidate.work_item_id,
+                        canonical_id = %candidate.upstream_ref.canonical_id,
+                        error = %e,
+                        "post_closing_pr_comment failed (non-fatal); PR linkage comment will be missing"
+                    );
                 }
             }
             Err(TrackerError::NotFound(_)) => {
@@ -894,21 +893,21 @@ async fn reconcile_existing(
     let work_item_id = &task.id;
 
     // Behavior 4: attach a PR URL if the boss row currently has none.
-    if task.pr_url.as_deref().unwrap_or("").is_empty() {
-        if let Some(best_pr) = pick_best_pr(&upstream.pr_associations) {
-            match work_db.reconciler_attach_pr_url(work_item_id, &best_pr.pr_url) {
-                Ok(true) => {
-                    PR_ATTACHED.inc(metrics);
-                    outcome.pr_attached += 1;
-                    info!(work_item_id, pr_url = %best_pr.pr_url, "Behavior 4: pr_url attached");
-                    publisher
-                        .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
-                        .await;
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(work_item_id, error = %e, "reconciler_attach_pr_url failed");
-                }
+    if task.pr_url.as_deref().unwrap_or("").is_empty()
+        && let Some(best_pr) = pick_best_pr(&upstream.pr_associations)
+    {
+        match work_db.reconciler_attach_pr_url(work_item_id, &best_pr.pr_url) {
+            Ok(true) => {
+                PR_ATTACHED.inc(metrics);
+                outcome.pr_attached += 1;
+                info!(work_item_id, pr_url = %best_pr.pr_url, "Behavior 4: pr_url attached");
+                publisher
+                    .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
+                    .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(work_item_id, error = %e, "reconciler_attach_pr_url failed");
             }
         }
     }
@@ -1188,10 +1187,10 @@ async fn import_new(
     };
 
     // Attach a PR URL if one is already associated upstream.
-    if let Some(pr) = pick_best_pr(&upstream.pr_associations) {
-        if let Err(e) = work_db.reconciler_attach_pr_url(&chore.id, &pr.pr_url) {
-            warn!(work_item_id = %chore.id, error = %e, "reconciler_attach_pr_url failed after import");
-        }
+    if let Some(pr) = pick_best_pr(&upstream.pr_associations)
+        && let Err(e) = work_db.reconciler_attach_pr_url(&chore.id, &pr.pr_url)
+    {
+        warn!(work_item_id = %chore.id, error = %e, "reconciler_attach_pr_url failed after import");
     }
 
     publisher

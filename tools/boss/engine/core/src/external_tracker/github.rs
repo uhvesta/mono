@@ -436,11 +436,10 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
         .collect();
 
     // Apply label filter: if configured, at least one label must match.
-    if let Some(filter) = &config.label_filter {
-        if !filter.iter().any(|f| labels.iter().any(|l| l == f)) {
+    if let Some(filter) = &config.label_filter
+        && !filter.iter().any(|f| labels.iter().any(|l| l == f)) {
             return None;
         }
-    }
 
     let assignees: Vec<String> = content
         .get("assignees")

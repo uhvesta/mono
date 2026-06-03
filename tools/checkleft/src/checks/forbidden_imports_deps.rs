@@ -134,11 +134,10 @@ struct CompiledRule {
 
 impl CompiledRule {
     fn applies_to(&self, path: &Path) -> bool {
-        if let Some(exclude_files) = &self.exclude_files {
-            if is_excluded(path, exclude_files, &self.config_dir) {
+        if let Some(exclude_files) = &self.exclude_files
+            && is_excluded(path, exclude_files, &self.config_dir) {
                 return false;
             }
-        }
         if let Some(include_globs) = &self.include_globs {
             return include_globs.is_match(path);
         }

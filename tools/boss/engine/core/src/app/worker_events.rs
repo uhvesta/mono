@@ -1001,11 +1001,10 @@ pub(super) fn extract_last_assistant_text(chunk: &str) -> Option<String> {
                 }
             }
         }
-        if buf.is_empty() {
-            if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
+        if buf.is_empty()
+            && let Some(text) = message.get("text").and_then(|t| t.as_str()) {
                 buf.push_str(text);
             }
-        }
         if !buf.is_empty() {
             latest = Some(buf);
         }

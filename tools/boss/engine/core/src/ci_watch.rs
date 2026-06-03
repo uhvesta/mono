@@ -224,8 +224,7 @@ pub async fn on_ci_failure_detected(
     // churning the flip / insert / budget path on every sweep.
     if let Ok(Some(active)) =
         work_db.active_ci_remediation_for_work_item(&candidate.work_item_id)
-    {
-        if active.revision_task_id.is_some() {
+        && active.revision_task_id.is_some() {
             if work_db
                 .rearm_blocked_ci_failure_signal(&candidate.work_item_id)
                 .unwrap_or(false)
@@ -255,7 +254,6 @@ pub async fn on_ci_failure_detected(
             let _ = work_db.record_ci_failure_in_flight(&candidate.work_item_id, &active.id);
             return false;
         }
-    }
 
     // The head sha is the discriminator for both the suppression
     // table and the `ci_remediations` unique key. Without it we can't
@@ -459,9 +457,9 @@ pub async fn on_ci_failure_detected(
     // in-flight signal, so the parent stays in the Review column while the
     // revision runs in Doing.
     let mut task_unblocked_for_revision = false;
-    if let Some(ref a) = attempt {
-        if a.attempt_kind == "fix" && a.status == "pending" && a.revision_task_id.is_none() {
-            if maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await
+    if let Some(ref a) = attempt
+        && a.attempt_kind == "fix" && a.status == "pending" && a.revision_task_id.is_none()
+            && maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await
             {
                 task_unblocked_for_revision = blocking_signal::unblock_for_revision(
                     work_db,
@@ -473,8 +471,6 @@ pub async fn on_ci_failure_detected(
             // If the spawn was refused (create_revision gate), the attempt is
             // abandoned and the parent stays `blocked: ci_failure` — the
             // human-attention terminal.
-        }
-    }
 
     // (The "parent already blocked with an active revision" reconcile case is
     // handled by the pre-flight early-exit above; here `task_unblocked_for_revision`
@@ -487,15 +483,14 @@ pub async fn on_ci_failure_detected(
         // been cleared back to `in_review` for an in-flight revision, but a fix
         // attempt still progressed, so the bump is keyed off the attempt, not
         // the parent's terminal status.
-        if attempt.is_some() && attempt_kind == "fix" {
-            if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
+        if attempt.is_some() && attempt_kind == "fix"
+            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
                     ?err,
                     "ci_watch: failed to increment ci_attempts_used",
                 );
             }
-        }
         // Parent stays in Review while the revision runs
         // (`ci_revision_in_flight`); it surfaces in Blocked
         // (`blocked_ci_failure`) only when there is no fix vehicle.
@@ -905,8 +900,8 @@ pub async fn on_merge_queue_rebounce_detected(
     // insert above so `attempt` is `None` and this branch is skipped. The PR is
     // known-open at this point (it was in the merge queue), so a static checker
     // is correct here and avoids a redundant `gh pr view` round-trip.
-    if let Some(ref a) = attempt {
-        if a.status == "pending" && a.revision_task_id.is_none() {
+    if let Some(ref a) = attempt
+        && a.status == "pending" && a.revision_task_id.is_none() {
             maybe_spawn_ci_revision(
                 work_db,
                 publisher,
@@ -917,18 +912,16 @@ pub async fn on_merge_queue_rebounce_detected(
             )
             .await;
         }
-    }
 
     if task_transitioned {
-        if attempt.is_some() {
-            if let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
+        if attempt.is_some()
+            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
                 tracing::warn!(
                     work_item_id = %candidate.work_item_id,
                     ?err,
                     "ci_watch: failed to increment ci_attempts_used (rebounce)",
                 );
             }
-        }
         publisher
             .publish_work_item_changed(
                 &candidate.product_id,
@@ -1342,8 +1335,8 @@ pub async fn on_ci_resolved(
         match work_db.mark_ci_remediation_succeeded(&attempt.id, None) {
             Ok(Some(succeeded)) => {
                 attempt_transitioned = true;
-                if parent_in_review_with_revision {
-                    if let Err(err) =
+                if parent_in_review_with_revision
+                    && let Err(err) =
                         work_db.clear_ci_failure_signal_only(&candidate.work_item_id)
                     {
                         tracing::warn!(
@@ -1352,7 +1345,6 @@ pub async fn on_ci_resolved(
                             "ci_watch: failed to clear in-flight signal after retire",
                         );
                     }
-                }
                 publisher
                     .publish_frontend_event_on_product(
                         &candidate.product_id,

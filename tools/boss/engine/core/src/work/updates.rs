@@ -136,8 +136,8 @@ impl WorkDb {
         apply_text_patch(&mut task.status, patch.status);
         apply_optional_patch(&mut task.pr_url, patch.pr_url);
         // Reject non-empty repo override when the product has its own repo.
-        if let Some(ref repo_patch) = patch.repo_remote_url {
-            if !repo_patch.trim().is_empty() {
+        if let Some(ref repo_patch) = patch.repo_remote_url
+            && !repo_patch.trim().is_empty() {
                 let product = query_product(&tx, &task.product_id)?.with_context(|| {
                     format!(
                         "orphan task {id}: parent product {} missing",
@@ -154,7 +154,6 @@ impl WorkDb {
                     );
                 }
             }
-        }
         apply_repo_remote_url_patch(&mut task.repo_remote_url, patch.repo_remote_url);
         if let Some(priority_patch) = patch.priority {
             task.priority = normalize_priority(Some(&priority_patch))?;

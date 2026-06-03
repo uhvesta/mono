@@ -223,14 +223,13 @@ impl RuntimeConfig {
 /// PATH, so they continue to resolve cube (and jj, gh, claude, etc.) from
 /// PATH naturally. This bundle-relative lookup is engine-only.
 fn resolve_cube_command() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             let candidate = dir.join(DEFAULT_CUBE_COMMAND);
             if candidate.is_file() {
                 return candidate.to_string_lossy().into_owned();
             }
         }
-    }
     DEFAULT_CUBE_COMMAND.to_owned()
 }
 

@@ -187,11 +187,9 @@ fn prune_old_files(dir: &Path, keep_days: u64) {
         if let Some(date_part) = name
             .strip_prefix("ipc-")
             .and_then(|s| s.strip_suffix(".jsonl"))
-        {
-            if date_part < cutoff_date.as_str() {
+            && date_part < cutoff_date.as_str() {
                 let _ = std::fs::remove_file(entry.path());
             }
-        }
     }
 }
 

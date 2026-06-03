@@ -288,11 +288,10 @@ fn resolve_path() -> Option<PathBuf> {
 }
 
 fn append_to(path: &Path, value: &Value) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
-    }
 
     rotate_if_needed(path).ok();
 

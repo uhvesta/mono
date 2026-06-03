@@ -443,11 +443,10 @@ fn toolchain_cache_root_from_base(cache_home: &Path) -> PathBuf {
 }
 
 fn default_cache_home() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("XDG_CACHE_HOME") {
-        if !path.is_empty() {
+    if let Some(path) = env::var_os("XDG_CACHE_HOME")
+        && !path.is_empty() {
             return Ok(PathBuf::from(path));
         }
-    }
 
     let home = env::var_os("HOME").context("XDG_CACHE_HOME and HOME are unset")?;
     Ok(PathBuf::from(home).join(".cache"))

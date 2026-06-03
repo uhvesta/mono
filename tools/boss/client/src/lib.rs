@@ -267,11 +267,10 @@ pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
     // never landed.
     match try_shutdown_via_rpc().await {
         Ok(()) => {
-            if let Some(owner) = read_pid_file(pid_file_path) {
-                if owner == pid {
+            if let Some(owner) = read_pid_file(pid_file_path)
+                && owner == pid {
                     let _ = std::fs::remove_file(pid_file_path);
                 }
-            }
             return Ok(());
         }
         Err(err) => {
@@ -293,11 +292,10 @@ pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
         bail!("failed to stop boss engine pid {pid}");
     }
 
-    if let Some(owner) = read_pid_file(pid_file_path) {
-        if owner == pid {
+    if let Some(owner) = read_pid_file(pid_file_path)
+        && owner == pid {
             let _ = std::fs::remove_file(pid_file_path);
         }
-    }
 
     Ok(())
 }

@@ -117,11 +117,10 @@ fn run() -> Result<()> {
     // event preserves FIFO ordering on the engine's accept queue —
     // the current event's connect would otherwise sit in the backlog
     // ahead of the drained connections.
-    if let Some(buf) = buffer_path.as_deref() {
-        if let Err(err) = drain_buffer(&socket_path, buf) {
+    if let Some(buf) = buffer_path.as_deref()
+        && let Err(err) = drain_buffer(&socket_path, buf) {
             eprintln!("boss-event: drain of {} skipped: {err:#}", buf.display());
         }
-    }
 
     // Then send the current event, with bounded connect-retry and a
     // single mid-send reconnect on broken pipe.

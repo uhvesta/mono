@@ -46,26 +46,22 @@ pub fn resolve_default_branch(
 
     // 2b. BK merge queue: target branch is encoded in the branch name as
     //     `gh-readonly-queue/<target>/…`.
-    if let Some(bk_branch) = env.buildkite_branch.as_deref() {
-        if let Some(rest) = bk_branch.strip_prefix("gh-readonly-queue/") {
-            if let Some(target) = rest.split('/').next().filter(|s| !s.is_empty()) {
+    if let Some(bk_branch) = env.buildkite_branch.as_deref()
+        && let Some(rest) = bk_branch.strip_prefix("gh-readonly-queue/")
+            && let Some(target) = rest.split('/').next().filter(|s| !s.is_empty()) {
                 return target.to_owned();
             }
-        }
-    }
 
     // 2c. GHA: `repository.default_branch` from the event payload.
-    if env.github_actions {
-        if let Some(payload) = env.read_github_event_payload() {
-            if let Some(branch) = payload
+    if env.github_actions
+        && let Some(payload) = env.read_github_event_payload()
+            && let Some(branch) = payload
                 .repository
                 .and_then(|r| r.default_branch)
                 .filter(|s| !s.is_empty())
             {
                 return branch;
             }
-        }
-    }
 
     // 3. Remote symbolic ref.
     if let Some(branch) = prober

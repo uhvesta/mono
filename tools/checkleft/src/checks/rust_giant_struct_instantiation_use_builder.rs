@@ -271,21 +271,18 @@ fn struct_is_giant(
     for item in items {
         match item {
             syn::Item::Struct(s) if !in_test_mod && !has_cfg_test(&s.attrs) => {
-                if s.ident == name {
-                    if let syn::Fields::Named(named) = &s.fields {
-                        if named.named.len() > max_fields {
+                if s.ident == name
+                    && let syn::Fields::Named(named) = &s.fields
+                        && named.named.len() > max_fields {
                             return true;
                         }
-                    }
-                }
             }
             syn::Item::Mod(m) => {
                 let is_test = has_cfg_test(&m.attrs);
-                if let Some((_, sub_items)) = &m.content {
-                    if struct_is_giant(sub_items, name, max_fields, in_test_mod || is_test) {
+                if let Some((_, sub_items)) = &m.content
+                    && struct_is_giant(sub_items, name, max_fields, in_test_mod || is_test) {
                         return true;
                     }
-                }
             }
             _ => {}
         }
@@ -323,13 +320,11 @@ fn collect_large_literals_in_items(
             }
             syn::Item::Trait(t) => {
                 for trait_item in &t.items {
-                    if let syn::TraitItem::Fn(f) = trait_item {
-                        if let Some(body) = &f.default {
-                            if !in_test_mod {
+                    if let syn::TraitItem::Fn(f) = trait_item
+                        && let Some(body) = &f.default
+                            && !in_test_mod {
                                 collect_large_in_block(body, max_fields, out);
                             }
-                        }
-                    }
                 }
             }
             syn::Item::Const(c) => {

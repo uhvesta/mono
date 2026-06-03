@@ -552,11 +552,10 @@ impl WorkDb {
             let revision_ids = collect_chain_revision_ids(&conn, &owner.id)?;
             let mut revisions = Vec::with_capacity(revision_ids.len());
             for rev_id in &revision_ids {
-                if let Some(task) = query_task(&conn, rev_id)? {
-                    if task.deleted_at.is_none() {
+                if let Some(task) = query_task(&conn, rev_id)?
+                    && task.deleted_at.is_none() {
                         revisions.push(task);
                     }
-                }
             }
             let mut revisions = attach_revision_projections(revisions, std::slice::from_ref(&owner));
             revisions.sort_by_key(|rev| rev.revision_seq.unwrap_or(i64::MAX));

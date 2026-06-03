@@ -719,8 +719,8 @@ pub async fn on_resolved(
                     // When the parent was `in_review` (never blocked), clear the
                     // `merge_conflict` signal so `maybe_clear_blocked` does not
                     // re-trigger on the next probe.
-                    if parent_in_review_with_revision {
-                        if let Err(err) =
+                    if parent_in_review_with_revision
+                        && let Err(err) =
                             work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
                         {
                             tracing::warn!(
@@ -729,7 +729,6 @@ pub async fn on_resolved(
                                 "conflict_watch: failed to clear in-flight signal after retire",
                             );
                         }
-                    }
                     // Release the cube workspace lease the attempt owned.
                     // Idempotent on the cube side — the lease may already
                     // have been released by the worker's on-Stop completion
@@ -737,8 +736,7 @@ pub async fn on_resolved(
                     // we log at debug.
                     if let (Some(client), Some(lease_id)) =
                         (cube_client, succeeded.cube_lease_id.as_deref())
-                    {
-                        if let Err(err) = client.release_workspace(lease_id).await {
+                        && let Err(err) = client.release_workspace(lease_id).await {
                             tracing::debug!(
                                 attempt_id = %succeeded.id,
                                 lease_id,
@@ -746,7 +744,6 @@ pub async fn on_resolved(
                                 "conflict_watch: lease release on retire failed (likely already released)",
                             );
                         }
-                    }
                     publisher
                         .publish_frontend_event_on_product(
                             &candidate.product_id,

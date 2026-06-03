@@ -1450,15 +1450,14 @@ impl ServerState {
     async fn drop_app_session_if_matches(&self, session_id: &str) {
         let mut guard = self.app_session.lock().await;
         let take = matches!(guard.as_ref(), Some(handle) if handle.session_id == session_id);
-        if take {
-            if let Some(prior) = guard.take() {
+        if take
+            && let Some(prior) = guard.take() {
                 for (_, tx) in prior.pending {
                     let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
                         result: Err(EngineToAppError::AppDisconnected),
                     });
                 }
             }
-        }
     }
 
     /// Snapshot of every allocated worker slot's live runtime state.

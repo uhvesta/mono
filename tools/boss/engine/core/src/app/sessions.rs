@@ -72,8 +72,8 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         // the live app across restarts. Only when a real trust
         // root was configured — test mode (`None`) stays
         // permissive so unit tests aren't pinned to a live pid.
-        if let (Some(prior), Some(observed)) = (current_app_pid, peer_pid) {
-            if prior != observed {
+        if let (Some(prior), Some(observed)) = (current_app_pid, peer_pid)
+            && prior != observed {
                 server_state.set_app_pid(observed);
                 tracing::info!(
                     prior_app_pid = prior,
@@ -81,7 +81,6 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
                     "app session re-attached: trust root re-pinned to relaunched app",
                 );
             }
-        }
         server_state
             .register_app_session(session_id.clone(), sink.clone())
             .await;

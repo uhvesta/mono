@@ -218,8 +218,8 @@ pub async fn run_one_pass(
         // released its pool slot, but the execution is alive. Abandoning it would
         // clobber a live in-flight workspace and create a duplicate worker on the
         // same row.
-        if let Some(live) = &live_execution {
-            if live.status == "waiting_human" {
+        if let Some(live) = &live_execution
+            && live.status == "waiting_human" {
                 tracing::warn!(
                     work_item_id = %work_item_id,
                     execution_id = %live.id,
@@ -229,7 +229,6 @@ pub async fn run_one_pass(
                 outcome.waiting_human_skipped += 1;
                 continue;
             }
-        }
 
         // Request a fresh execution. The `is_live` closure treats an
         // execution as live only if a worker slot currently claims it.

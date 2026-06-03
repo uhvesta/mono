@@ -177,11 +177,10 @@ pub fn should_drop_entry(value: &Value) -> bool {
         if tool_name_is_sensitive(name) {
             return true;
         }
-        if let Some(input) = value.get("tool_input") {
-            if input_targets_sensitive_path(name, input) {
+        if let Some(input) = value.get("tool_input")
+            && input_targets_sensitive_path(name, input) {
                 return true;
             }
-        }
     }
     if let Some(content) = value.get("content").and_then(|v| v.as_array()) {
         for block in content {
@@ -192,11 +191,10 @@ pub fn should_drop_entry(value: &Value) -> bool {
                 if tool_name_is_sensitive(name) {
                     return true;
                 }
-                if let Some(input) = obj.get("input") {
-                    if input_targets_sensitive_path(name, input) {
+                if let Some(input) = obj.get("input")
+                    && input_targets_sensitive_path(name, input) {
                         return true;
                     }
-                }
             }
         }
     }

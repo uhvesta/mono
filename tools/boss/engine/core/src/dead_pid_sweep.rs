@@ -232,8 +232,8 @@ pub async fn run_one_pass(
         // Append [engine-reconcile] audit line to the task description
         // so a human inspecting the chore can see why it was reset (and
         // where to find the recovery patch, if one was captured).
-        if let Some(work_item_id) = &state.work_item_id {
-            if let Err(err) = append_reconcile_audit(
+        if let Some(work_item_id) = &state.work_item_id
+            && let Err(err) = append_reconcile_audit(
                 work_db,
                 work_item_id,
                 execution_id,
@@ -246,7 +246,6 @@ pub async fn run_one_pass(
                     "dead-pid sweep: failed to append audit line to description (non-fatal)",
                 );
             }
-        }
 
         // Release the worker pool slot so the orphan sweep detects
         // the chore and creates a fresh ready execution for redispatch.

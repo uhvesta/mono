@@ -72,11 +72,10 @@ pub fn rotate_on_startup(path: &Path, max_files: usize) {
 /// Open (or create) the trace file for appending.  The directory is
 /// created if needed.  Called both at startup and after each rotation.
 pub fn open_trace_file(path: &Path) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
-    }
     OpenOptions::new().create(true).append(true).open(path)
 }
 

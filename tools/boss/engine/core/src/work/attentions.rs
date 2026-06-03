@@ -97,8 +97,8 @@ fn query_attention(conn: &Connection, id: &str) -> Result<Option<Attention>> {
 /// carries no product, an `A<n>` is resolved across all products and is an
 /// error when it is ambiguous (the caller should use the `atg_…` id).
 fn resolve_group(conn: &Connection, id: &str) -> Result<Option<AttentionGroup>> {
-    if let Some(rest) = id.strip_prefix('A') {
-        if let Ok(short_id) = rest.parse::<i64>() {
+    if let Some(rest) = id.strip_prefix('A')
+        && let Ok(short_id) = rest.parse::<i64>() {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {GROUP_COLS} FROM attention_groups WHERE short_id = ?1"
             ))?;
@@ -112,7 +112,6 @@ fn resolve_group(conn: &Connection, id: &str) -> Result<Option<AttentionGroup>> 
                 ),
             };
         }
-    }
     query_attention_group(conn, id)
 }
 
@@ -197,11 +196,9 @@ fn validate_member_input(input: &CreateAttentionInput) -> Result<()> {
                 .proposed_work_kind
                 .as_deref()
                 .filter(|s| !s.is_empty())
-            {
-                if !matches!(work_kind, "task" | "chore" | "project") {
+                && !matches!(work_kind, "task" | "chore" | "project") {
                     bail!("invalid proposed_work_kind {work_kind:?}; expected task|chore|project");
                 }
-            }
         }
         other => bail!("unknown attention kind {other:?}; expected \"question\" or \"followup\""),
     }

@@ -218,11 +218,10 @@ pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// `https://github.com/owner/repo/issues/number`. Returns an empty
 /// string for unknown trackers so callers can still surface the ref.
 pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> String {
-    if kind == "github" {
-        if let Some((repo, number)) = canonical_id.rsplit_once('#') {
+    if kind == "github"
+        && let Some((repo, number)) = canonical_id.rsplit_once('#') {
             return format!("https://github.com/{repo}/issues/{number}");
         }
-    }
     String::new()
 }
 

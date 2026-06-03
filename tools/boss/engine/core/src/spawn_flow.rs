@@ -296,8 +296,8 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     // Workers prepend this directory to PATH so `boss` / `boss-event`
     // callbacks resolve the bundled copies. Unset in dev mode (no bundle
     // bin/ directory) — workers fall back to PATH as today.
-    if let Ok(boss_bin_dir) = std::env::var("BOSS_BIN_DIR") {
-        if !boss_bin_dir.is_empty() {
+    if let Ok(boss_bin_dir) = std::env::var("BOSS_BIN_DIR")
+        && !boss_bin_dir.is_empty() {
             env.push(EnvVar {
                 key: "BOSS_BIN_DIR".into(),
                 value: boss_bin_dir.clone(),
@@ -306,7 +306,6 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                 path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
             }
         }
-    }
 
     let claimed_slot = input.slot_id;
     let response = spawner

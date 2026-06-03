@@ -56,11 +56,10 @@ impl ConfiguredCheck for ParsedFileSizeConfig {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
                 continue;
             }
-            if let Some(exclude_files) = &self.exclude_files {
-                if is_excluded(&changed_file.path, exclude_files, &self.config_dir) {
+            if let Some(exclude_files) = &self.exclude_files
+                && is_excluded(&changed_file.path, exclude_files, &self.config_dir) {
                     continue;
                 }
-            }
 
             let Ok(contents) = tree.read_file(&changed_file.path) else {
                 continue;

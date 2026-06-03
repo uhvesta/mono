@@ -82,15 +82,14 @@ pub fn parse_ifchange_file(path: &Path, contents: &str) -> Result<ParsedIfChange
                         line_number
                     );
                 }
-                if let Some(label) = label.as_ref() {
-                    if labels.contains_key(label) {
+                if let Some(label) = label.as_ref()
+                    && labels.contains_key(label) {
                         bail!(
                             "{}:{}: duplicate `LINT.IfChange({label})` label",
                             path.display(),
                             line_number
                         );
                     }
-                }
                 current = Some(OpenIfChangeBlock {
                     source_label: label,
                     ifchange_line: line_number,

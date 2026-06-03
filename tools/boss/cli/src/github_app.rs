@@ -328,8 +328,8 @@ pub async fn add_issue_to_project(
         .await
         .context("decode add-to-project GraphQL response")?;
 
-    if let Some(errors) = parsed.errors {
-        if !errors.is_empty() {
+    if let Some(errors) = parsed.errors
+        && !errors.is_empty() {
             let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
             bail!(
                 "add-to-project GraphQL mutation failed: {}\n\
@@ -337,7 +337,6 @@ pub async fn add_issue_to_project(
                 messages.join("; ")
             );
         }
-    }
 
     Ok(())
 }
