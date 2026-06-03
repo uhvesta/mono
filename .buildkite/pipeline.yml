@@ -5,19 +5,9 @@
 #   BUILDKITE_MACOS_QUEUE=macos-test
 
 steps:
-  - label: ":boot: bootstrap"
-    key: "bootstrap"
-    command: ".buildkite/steps/bootstrap.sh"
-    agents:
-      queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
-    notify:
-      - github_commit_status:
-          context: "buildkite/mono/bootstrap"
-
   - label: ":bazel: bazel-build"
     key: "bazel-build"
     command: ".buildkite/steps/bazel-build.sh"
-    depends_on: "bootstrap"
     artifact_paths:
       - "bazel-out/**/extra_action_outputs/**/*"
     agents:
@@ -29,7 +19,6 @@ steps:
   - label: ":apple: mac-app-build"
     key: "mac-app-build"
     command: ".buildkite/steps/mac-app-build.sh"
-    depends_on: "bootstrap"
     agents:
       queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
     notify:
@@ -39,7 +28,6 @@ steps:
   - label: ":white_check_mark: checks"
     key: "checks"
     command: ".buildkite/steps/checks.sh"
-    depends_on: "bootstrap"
     agents:
       queue: "${BUILDKITE_ANY_QUEUE:-bazel-any}"
     notify:
