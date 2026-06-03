@@ -1699,6 +1699,18 @@ async fn sweep_pending_pr(
                 "merge poller: recovered missed PR-open (PR already merged) for waiting_human worker",
             );
         }
+        // P992 task 7: the PR was detected and an independent reviewer pass
+        // was enqueued; the producing task is held in active. Count this as a
+        // recovery since the producing execution is finalized and progressing.
+        StopOutcome::ReviewerEnqueued { pr_url } => {
+            outcome.pr_recheck_recovered += 1;
+            tracing::info!(
+                execution_id,
+                pr_url = %pr_url,
+                "merge poller: recovered missed PR-open; reviewer enqueued, \
+                 producing task held for review pass",
+            );
+        }
         // Quiet branches — still no PR, transient detector failure,
         // or the execution moved on between list and recheck. Log at
         // info so a worker stuck in `waiting_human` with `pr_url=null`
@@ -1748,6 +1760,9 @@ async fn sweep_pending_pr(
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
+        // P992 task 7: ReviewerEnqueued is handled in its own arm above.
+        // ReviewPassCompleted only comes from on-Stop (reviewer finalisation).
+        | StopOutcome::ReviewPassCompleted { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -1802,6 +1817,10 @@ async fn sweep_late_pr(
         // Maint task 6: an automation_triage outcome only comes from the
         // on-Stop detector, never from a PR-detection recheck.
         | StopOutcome::AutomationTriage { .. }
+        // P992 task 7: reviewer-related outcomes are handled on the on-Stop
+        // path; covered here for exhaustiveness.
+        | StopOutcome::ReviewerEnqueued { .. }
+        | StopOutcome::ReviewPassCompleted { .. }
         | StopOutcome::DbError => {}
     }
 }

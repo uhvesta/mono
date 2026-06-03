@@ -64,7 +64,8 @@ use crate::merge_poller::{
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
-    CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget,
+    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
+    WorkerPrCompletionTarget,
 };
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
@@ -1076,6 +1077,14 @@ impl WorkerCompletionHandler {
             return self.finalize_automation_triage(&execution).await;
         }
 
+        // P992 task 7: a `pr_review` reviewer execution never opens a PR.
+        // It reads the PR diff and emits structured findings; the Stop handler
+        // advances the producing task to `in_review` (task 8 will also parse
+        // the ReviewResult and enqueue revisions when warranted).
+        if execution.kind == ExecutionKind::PrReview {
+            return self.finalize_pr_review_pass(&execution).await;
+        }
+
         // Flaky/infra retrigger park (issue #1205): a `ci_remediation`
         // worker that diagnosed the CI failure as infra and re-ran the job
         // (`mark-retriggered`) stamped the `ci_flaky_retriggered` signal on
@@ -1522,6 +1531,12 @@ must not be asked to open one",
             Err(_) => return StopOutcome::UnknownExecution,
         };
         if !matches!(execution.status.as_str(), "running" | "waiting_human") {
+            return StopOutcome::AlreadyTerminal;
+        }
+        // P992 task 7: reviewer executions never open a PR; skip the
+        // PR-detection recheck entirely. The reviewer's Stop path already
+        // drives its resolution via finalize_pr_review_pass.
+        if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
         // Primary path mirror: if the PostToolUse dispatcher already
@@ -2073,6 +2088,113 @@ must not be asked to open one",
         }
     }
 
+    /// P992 task 7: finalise a `pr_review` reviewer execution when its Stop
+    /// hook fires. The reviewer never opens a PR; instead, it reads the
+    /// producing task's PR diff and emits structured findings (parsed by task
+    /// 8). For task 7 the minimal resolution is to advance the producing task
+    /// to `in_review` and complete the reviewer execution so the PR enters the
+    /// human-Review column. Task 8 will replace the unconditional advance with
+    /// conditional logic (revision creation vs. clean approval).
+    async fn finalize_pr_review_pass(
+        &self,
+        execution: &crate::work::WorkExecution,
+    ) -> StopOutcome {
+        let producing_task_id = &execution.work_item_id;
+
+        // Look up the producing task to retrieve its pr_url (stamped during
+        // the PendingReview write when the reviewer was enqueued).
+        let pr_url = match self.work_db.get_work_item(producing_task_id) {
+            Ok(WorkItem::Task(ref t)) | Ok(WorkItem::Chore(ref t)) => {
+                match t.pr_url.as_deref() {
+                    Some(url) if !url.is_empty() => url.to_owned(),
+                    _ => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            producing_task_id,
+                            "pr_review finalize: producing task has no pr_url; \
+                             cannot advance to in_review",
+                        );
+                        return StopOutcome::DbError;
+                    }
+                }
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    producing_task_id,
+                    item_type = ?other,
+                    "pr_review finalize: work_item_id does not resolve to a task/chore",
+                );
+                return StopOutcome::DbError;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    producing_task_id,
+                    ?err,
+                    "pr_review finalize: could not load producing task",
+                );
+                return StopOutcome::DbError;
+            }
+        };
+
+        // Use record_worker_pr_completion to atomically:
+        //   1. advance the producing task from active → in_review (with pr_url kept),
+        //   2. complete the reviewer execution and clear its cube columns.
+        let completion = match self.work_db.record_worker_pr_completion(
+            &execution.id,
+            &pr_url,
+            None,
+            WorkerPrCompletionTarget::InReview,
+        ) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    producing_task_id,
+                    ?err,
+                    "pr_review finalize: DB write failed",
+                );
+                return StopOutcome::DbError;
+            }
+        };
+
+        if let Some(lease_id) = completion.released_lease_id.as_deref() {
+            if let Err(err) = self.cube_client.release_workspace(lease_id).await {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    lease_id,
+                    ?err,
+                    "pr_review finalize: cube workspace release failed",
+                );
+            }
+        }
+        self.pane_releaser.release_pane(&execution.id).await;
+
+        let product_id = work_item_product_id(&completion.work_item);
+        let work_item_id = work_item_id(&completion.work_item);
+        self.publisher
+            .publish(
+                &execution.id,
+                &work_item_id,
+                "completed",
+                "pr_review_pass_completed",
+            )
+            .await;
+        self.publisher
+            .publish_work_item_changed(&product_id, &work_item_id, "pr_review_pass_completed")
+            .await;
+
+        tracing::info!(
+            execution_id = %execution.id,
+            producing_task_id,
+            pr_url = %pr_url,
+            "pr_review pass finalised; producing task advanced to in_review",
+        );
+        StopOutcome::ReviewPassCompleted { pr_url }
+    }
+
     /// Read the final assistant text of `execution_id`'s transcript, if any.
     /// Returns `None` when no transcript is recorded/readable or it contains
     /// no assistant turn — the caller treats that as "no decision".
@@ -2127,11 +2249,74 @@ must not be asked to open one",
         source: &'static str,
     ) -> StopOutcome {
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
+
+        // P992 task 7: for primary implementation executions with a fresh
+        // (non-merged) PR, try to enqueue an independent reviewer pass
+        // instead of immediately advancing to human Review (design §1).
+        // If the pr_review execution cannot be created (DB error), fall back
+        // to the normal InReview path so the task is never left stuck.
+        let enqueued_reviewer = if !merged
+            && matches!(target, WorkerPrCompletionTarget::InReview)
+        {
+            match self.work_db.get_execution(execution_id) {
+                Ok(ref producing) if is_primary_implementation_kind(&producing.kind) => {
+                    match self.work_db.create_execution(
+                        CreateExecutionInput::builder()
+                            .work_item_id(producing.work_item_id.clone())
+                            .kind(ExecutionKind::PrReview)
+                            .status("ready")
+                            .repo_remote_url(producing.repo_remote_url.clone())
+                            .build(),
+                    ) {
+                        Ok(review_exec) => {
+                            tracing::info!(
+                                execution_id,
+                                review_execution_id = %review_exec.id,
+                                pr_url = %pr_url,
+                                producing_kind = %producing.kind,
+                                "pr_review execution enqueued; \
+                                 holding producing task for reviewer pass",
+                            );
+                            self.publisher.kick_scheduler();
+                            true
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id,
+                                ?err,
+                                "failed to create pr_review execution; \
+                                 falling back to immediate in_review",
+                            );
+                            false
+                        }
+                    }
+                }
+                Ok(_) => false, // non-primary kind; advance to in_review as normal
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "could not load execution for reviewer-enqueue check; \
+                         falling back to immediate in_review",
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        let effective_target = if enqueued_reviewer {
+            WorkerPrCompletionTarget::PendingReview
+        } else {
+            target
+        };
+
         let completion = match self.work_db.record_worker_pr_completion(
             execution_id,
             &pr_url,
             None,
-            target,
+            effective_target,
         ) {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
@@ -2265,6 +2450,16 @@ must not be asked to open one",
                 "pr completion: PR already merged; moved work item to done"
             );
             StopOutcome::PrMerged { pr_url }
+        } else if enqueued_reviewer {
+            tracing::info!(
+                execution_id,
+                work_item_id = %work_item_id,
+                pr_url = %pr_url,
+                source,
+                "pr completion: PR detected; reviewer enqueued — \
+                 producing task held in active pending review pass",
+            );
+            StopOutcome::ReviewerEnqueued { pr_url }
         } else {
             tracing::info!(
                 execution_id,
@@ -2420,6 +2615,10 @@ must not be asked to open one",
             // Unreachable here (this finalizer only runs for `ci_remediation`
             // kind), but a triage outcome must never mark a CI attempt failed.
             StopOutcome::AutomationTriage { .. } => false,
+            // Unreachable: reviewer executions short-circuit before CI
+            // remediation finalisation. Covered for exhaustiveness.
+            StopOutcome::ReviewerEnqueued { .. }
+            | StopOutcome::ReviewPassCompleted { .. } => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -3584,6 +3783,13 @@ pub enum StopOutcome {
     /// finalised (`completed`) and its pane/workspace released regardless of
     /// which marker (if any) the agent emitted.
     AutomationTriage { outcome: String },
+    /// P992 task 7: a primary-implementation worker's PR was detected and
+    /// an independent reviewer pass has been enqueued. The producing task
+    /// remains in `active` (Doing column) until the reviewer resolves.
+    ReviewerEnqueued { pr_url: String },
+    /// P992 task 7: a `pr_review` reviewer execution finished and the
+    /// producing task has been advanced to `in_review`.
+    ReviewPassCompleted { pr_url: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
@@ -3602,6 +3808,19 @@ fn work_item_product_id(item: &WorkItem) -> String {
         WorkItem::Project(project) => project.product_id.clone(),
         WorkItem::Task(task) | WorkItem::Chore(task) => task.product_id.clone(),
     }
+}
+
+/// P992 task 7: execution kinds whose PR completions should be held for an
+/// independent reviewer pass before advancing to the human-Review column.
+/// Only primary implementation executions (task and chore workers that open
+/// the initial PR) are in scope for v1; revisions, CI-remediations, and
+/// conflict-resolution workers are intentionally excluded until the reviewer
+/// loop (tasks 8/9) is wired for the full update cycle.
+fn is_primary_implementation_kind(kind: &ExecutionKind) -> bool {
+    matches!(
+        kind,
+        ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
+    )
 }
 
 #[cfg(test)]
@@ -4083,11 +4302,19 @@ mod tests {
         );
         let outcome = handler.on_stop(&execution_id).await;
 
-        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        // P992 task 7: chore_implementation now enqueues an independent reviewer
+        // and holds the task in `active` until the reviewer resolves.
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "expected ReviewerEnqueued; got {outcome:?}",
+        );
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                // Task is held in `active` (not advanced to `in_review`) while
+                // the independent reviewer pass runs.
+                assert_eq!(t.status, "active");
+                // pr_url IS stamped so the reviewer can find the PR.
                 assert_eq!(t.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/42"));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -4168,10 +4395,12 @@ mod tests {
         .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None)));
 
         let outcome = handler.on_stop(&execution_id).await;
+        // P992 task 7: chore_implementation now enqueues a reviewer and holds
+        // the task in `active` (not `in_review`).
         assert!(
-            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+            matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
                 if pr_url == "https://github.com/spinyfin/mono/pull/458"),
-            "expected PrDetected with staged URL, got {outcome:?}",
+            "expected ReviewerEnqueued with staged URL, got {outcome:?}",
         );
         assert_eq!(
             detector.call_count(),
@@ -4181,7 +4410,8 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                // Held in `active` while reviewer runs; pr_url is stamped.
+                assert_eq!(t.status, "active");
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/spinyfin/mono/pull/458"),
@@ -4241,7 +4471,11 @@ mod tests {
             probes.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
-        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        // P992 task 7: chore_implementation holds the task and enqueues reviewer.
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "expected ReviewerEnqueued; got {outcome:?}",
+        );
         assert_eq!(
             detector.call_count(),
             1,
@@ -4250,7 +4484,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, "active");
                 assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/12"));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -4296,10 +4530,11 @@ mod tests {
         // shortcut, recheck must succeed without ever touching the
         // detector.
         let outcome = handler.recheck_for_pr(&execution_id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
-            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+            matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
                 if pr_url == "https://github.com/spinyfin/mono/pull/458"),
-            "expected PrDetected from recheck via staged URL, got {outcome:?}",
+            "expected ReviewerEnqueued from recheck via staged URL, got {outcome:?}",
         );
         assert_eq!(
             detector.call_count(),
@@ -4309,7 +4544,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, "active");
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/spinyfin/mono/pull/458"),
@@ -4484,8 +4719,9 @@ mod tests {
         .with_branch_verifier(StubBranchVerifier::ok(&divergent_branch));
 
         let outcome = handler.on_stop(&execution_id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
-            matches!(outcome, StopOutcome::PrDetected { ref pr_url }
+            matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
                 if pr_url == "https://github.com/spinyfin/mono/pull/458"),
             "prefix-divergent but suffix-matching PR must associate; got {outcome:?}",
         );
@@ -4497,7 +4733,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, "active");
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/spinyfin/mono/pull/458"),
@@ -4891,15 +5127,16 @@ mod tests {
             probes,
         );
 
+        // P992 task 7: first Stop enqueues reviewer and holds task in active.
         assert!(matches!(
             handler.on_stop(&execution_id).await,
-            StopOutcome::PrDetected { .. }
+            StopOutcome::ReviewerEnqueued { .. }
         ));
         // A second Stop event for the same execution must NOT
         // duplicate work — release is called once, work item stays
-        // pinned at `in_review`. The pane releaser is invoked again
-        // here; production releasers must be idempotent on their own
-        // (see `WorkerRegistry::take_slot_for_run`).
+        // pinned at `active` (pending review). The pane releaser is
+        // invoked again here; production releasers must be idempotent
+        // on their own (see `WorkerRegistry::take_slot_for_run`).
         assert_eq!(
             handler.on_stop(&execution_id).await,
             StopOutcome::AlreadyTerminal,
@@ -4907,7 +5144,7 @@ mod tests {
         assert_eq!(cube.release_calls.lock().await.len(), 1);
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -5123,13 +5360,14 @@ mod tests {
         let alice_outcome = alice_handler.on_stop(&alice_exec).await;
         let bob_outcome = bob_handler.on_stop(&bob_exec).await;
 
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         let alice_url = match alice_outcome {
-            StopOutcome::PrDetected { pr_url } => pr_url,
-            other => panic!("alice expected PrDetected, got {other:?}"),
+            StopOutcome::ReviewerEnqueued { pr_url } => pr_url,
+            other => panic!("alice expected ReviewerEnqueued, got {other:?}"),
         };
         let bob_url = match bob_outcome {
-            StopOutcome::PrDetected { pr_url } => pr_url,
-            other => panic!("bob expected PrDetected, got {other:?}"),
+            StopOutcome::ReviewerEnqueued { pr_url } => pr_url,
+            other => panic!("bob expected ReviewerEnqueued, got {other:?}"),
         };
         assert_ne!(
             alice_url, bob_url,
@@ -5272,9 +5510,10 @@ mod tests {
             "a leaked stale Stop must not release any cube lease",
         );
 
-        // The live (newest) execution's own Stop still finalizes it.
+        // P992 task 7: the live execution's Stop enqueues a reviewer and
+        // holds the live chore in active.
         assert!(
-            matches!(handler.on_stop(&live_exec).await, StopOutcome::PrDetected { .. }),
+            matches!(handler.on_stop(&live_exec).await, StopOutcome::ReviewerEnqueued { .. }),
             "the live execution's own Stop must still complete it",
         );
     }
@@ -5414,7 +5653,11 @@ mod tests {
             probes.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
-        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "expected ReviewerEnqueued; got {outcome:?}",
+        );
         assert_eq!(detector.call_count(), 1);
         let calls = detector.calls_snapshot();
         assert_eq!(calls.len(), 1);
@@ -5721,20 +5964,21 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             probes,
         );
         let outcome = handler.on_stop(&execution.id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         match outcome {
-            StopOutcome::PrDetected { pr_url } => {
+            StopOutcome::ReviewerEnqueued { pr_url } => {
                 assert_eq!(
                     pr_url, workers_actual_pr,
                     "must bind to the worker-created PR, not the description-mentioned one",
                 );
             }
-            other => panic!("expected PrDetected, got {other:?}"),
+            other => panic!("expected ReviewerEnqueued, got {other:?}"),
         }
 
         let item = db.get_work_item(&chore.id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, "active");
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some(workers_actual_pr),
@@ -5830,11 +6074,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "the sweep must recover exactly one missed PR-open transition, got {outcome:?}",
         );
 
-        // Chore advanced to in_review with the PR url stamped.
+        // P992 task 7: chore held in `active` with pr_url stamped
+        // (reviewer is enqueued to run the review pass).
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, "active");
                 assert_eq!(t.pr_url.as_deref(), Some(workers_pr));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6209,13 +6454,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             outcome2.pr_recheck_unresolved, 0,
             "no candidates should remain unresolved after the recovery pass",
         );
+        // P992 task 7: chore_implementation holds tasks in `active` while
+        // reviewers are enqueued (not advanced to in_review yet).
         for chore_id in [c1.as_str(), chore2.id.as_str(), chore3.id.as_str()] {
             let item = db.get_work_item(chore_id).unwrap();
             match item {
                 WorkItem::Chore(t) => {
                     assert_eq!(
-                        t.status, "in_review",
-                        "chore {chore_id} must transition to in_review on the recovery pass",
+                        t.status, "active",
+                        "chore {chore_id} must be held in active (reviewer enqueued)",
                     );
                     assert_eq!(
                         t.pr_url.as_deref(),
@@ -6417,14 +6664,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         .with_feature_flags(flags);
 
         let outcome = handler.on_stop(&execution_id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
-            matches!(outcome, StopOutcome::PrDetected { .. }),
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
             "default-ON must still let `detect_pr` fire; got {outcome:?}",
         );
         assert_eq!(detector.call_count(), 1);
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -6512,8 +6760,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         .with_branch_verifier(verifier);
 
         let outcome = handler.on_stop(&execution_id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
-            matches!(outcome, StopOutcome::PrDetected { ref pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/606"),
+            matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url } if pr_url == "https://github.com/spinyfin/mono/pull/606"),
             "SHA-delta gate must finalize the bound PR when the head moved; got {outcome:?}",
         );
         assert!(
@@ -6524,7 +6773,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                // Task held in active (reviewer enqueued); pr_url stamped.
+                assert_eq!(t.status, "active");
                 assert_eq!(t.pr_url.as_deref(), Some(pr_url));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6636,11 +6886,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
 
         let outcome = handler.on_stop(&execution_id).await;
-        assert!(matches!(outcome, StopOutcome::PrDetected { .. }));
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
+        assert!(
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "expected ReviewerEnqueued; got {outcome:?}",
+        );
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, "active");
                 assert_eq!(t.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/42"));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -7429,12 +7683,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .await;
         let final_outcome = handler.on_stop(&execution_id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
-            matches!(final_outcome, StopOutcome::PrDetected { .. }),
+            matches!(final_outcome, StopOutcome::ReviewerEnqueued { .. }),
             "the worker's real PR must finalize; got {final_outcome:?}",
         );
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -9113,9 +9368,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             probes.clone(),
         );
         let outcome = handler.on_stop(&execution_id).await;
+        // P992 task 7: chore_implementation holds task and enqueues reviewer.
         assert!(
-            matches!(outcome, StopOutcome::PrDetected { .. }),
-            "expected PrDetected; got {outcome:?}",
+            matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+            "expected ReviewerEnqueued; got {outcome:?}",
         );
 
         let calls = detector.calls_snapshot();

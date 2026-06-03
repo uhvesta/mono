@@ -52,19 +52,23 @@ impl WorkDb {
         let now = now_string();
         // Compute the new status. The chore can only advance — if it
         // is already past the target column (`done` / `archived`), we
-        // keep the existing status.
+        // keep the existing status. `PendingReview` holds the task in
+        // its current status so the reviewer pass runs before human Review.
         let new_status = match target {
             _ if task.status == "done" || task.status == "archived" => task.status.clone(),
             WorkerPrCompletionTarget::InReview if task.status == "in_review" => task.status.clone(),
             WorkerPrCompletionTarget::InReview => "in_review".to_owned(),
             WorkerPrCompletionTarget::Done => "done".to_owned(),
+            // P992 task 7: hold in current status while the reviewer runs.
+            WorkerPrCompletionTarget::PendingReview => task.status.clone(),
         };
-        // Revision tasks do not own a PR — their `pr_url` must stay NULL.
-        // The parent (chain root) task's `pr_url` is the source of truth.
-        let pr_url_for_task: Option<&str> = if task.kind == TaskKind::Revision {
-            task.pr_url.as_deref()
-        } else {
-            Some(pr_url)
+        // Revision tasks do not own a PR — their `pr_url` must stay NULL
+        // (the chain root's `pr_url` is the source of truth), *except* for
+        // `PendingReview` where we must stamp it so the reviewer can find it.
+        let pr_url_for_task: Option<&str> = match target {
+            WorkerPrCompletionTarget::PendingReview => Some(pr_url),
+            _ if task.kind == TaskKind::Revision => task.pr_url.as_deref(),
+            _ => Some(pr_url),
         };
         tx.execute(
             "UPDATE tasks
