@@ -7,6 +7,15 @@ use std::time::{Duration, Instant};
 
 use crate::app::RepobinError;
 
+fn extra_bazel_flags() -> Vec<String> {
+    match std::env::var("REPOBIN_BAZEL_FLAGS") {
+        Ok(val) if !val.trim().is_empty() => {
+            shell_words::split(&val).unwrap_or_default()
+        }
+        _ => vec![],
+    }
+}
+
 const SLOW_BUILD_NOTICE: Duration = Duration::from_secs(3);
 const STREAM_BUILD_OUTPUT: Duration = Duration::from_secs(10);
 
@@ -37,6 +46,7 @@ impl BazelAdapter for RealBazel {
             .arg("--show_result=0")
             .arg("--noshow_progress")
             .arg("--ui_event_filters=-info")
+            .args(extra_bazel_flags())
             .arg(target)
             .current_dir(repo_root)
             .stdout(Stdio::piped())
@@ -166,6 +176,7 @@ impl BazelAdapter for RealBazel {
             .arg("cquery")
             .arg("--color=no")
             .arg("--curses=no")
+            .args(extra_bazel_flags())
             .arg(target)
             .arg("--output=starlark")
             .arg("--starlark:expr=target.files_to_run.executable.path if target.files_to_run.executable else ''")
@@ -210,6 +221,7 @@ impl BazelAdapter for RealBazel {
             .arg(&query)
             .arg("--color=no")
             .arg("--curses=no")
+            .args(extra_bazel_flags())
             .current_dir(repo_root)
             .output()
             .map_err(|source| RepobinError::SpawnBazel {
