@@ -26,7 +26,7 @@
 //!
 //! [`OpenPrMergeability`]: crate::merge_poller::OpenPrMergeability
 
-use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, FrontendEvent};
+use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, ExecutionKind, FrontendEvent, TaskKind};
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
@@ -2295,7 +2295,7 @@ mod tests {
             WorkItem::Task(t) => t,
             other => panic!("expected revision task, got {other:?}"),
         };
-        assert_eq!(revision.kind, "revision");
+        assert_eq!(revision.kind, TaskKind::Revision);
         assert_eq!(revision.parent_task_id.as_deref(), Some(chore.as_str()));
         assert_eq!(revision.created_via, format!("merge-conflict:{}", attempt.id));
         assert_eq!(revision.description, "Resolve merge conflict against main");
@@ -2304,7 +2304,7 @@ mod tests {
         // reconcile loop's revision_implementation dispatch instead.
         let ready = db.list_ready_executions().unwrap();
         assert!(
-            !ready.iter().any(|e| e.kind == "conflict_resolution"),
+            !ready.iter().any(|e| e.kind == ExecutionKind::ConflictResolution),
             "cutover must not create a conflict_resolution execution; got {ready:?}",
         );
     }

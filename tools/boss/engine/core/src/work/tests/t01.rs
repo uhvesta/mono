@@ -91,7 +91,7 @@ fn creates_tree_and_soft_deletes_chores() {
     // at `ordinal = 0` plus the user-created task — so the tree
     // sees both. The design task always sorts first.
     assert_eq!(tree.tasks.len(), 2);
-    assert_eq!(tree.tasks[0].kind, "design");
+    assert_eq!(tree.tasks[0].kind, TaskKind::Design);
     assert_eq!(tree.tasks[1].id, task.id);
     assert_eq!(tree.chores.len(), 1);
     assert_eq!(tree.chores[0].id, chore.id);
@@ -289,7 +289,7 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
     // Five user-created tasks plus the auto-created design task
     // that every new project carries.
     assert_eq!(tasks.len(), 6);
-    assert!(tasks.iter().any(|t| t.kind == "design"));
+    assert!(tasks.iter().any(|t| t.kind == TaskKind::Design));
 
     let _ = std::fs::remove_file(path);
 }
@@ -368,7 +368,7 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
     // remains. Assert exactly that shape so a future regression
     // that lets the Bad row leak out shows up.
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].kind, "design");
+    assert_eq!(tasks[0].kind, TaskKind::Design);
 
     let _ = std::fs::remove_file(path);
 }
@@ -408,7 +408,7 @@ fn create_many_chores_inserts_all_atomically() {
         .unwrap();
     assert_eq!(created.len(), 3);
     for chore in &created {
-        assert_eq!(chore.kind, "chore");
+        assert_eq!(chore.kind, TaskKind::Chore);
         assert!(!chore.autostart);
     }
 
@@ -832,7 +832,7 @@ fn reorders_project_tasks() {
     // are reordered. The reorder swap applies to the project_task
     // pair only, which now occupy indices 1 and 2.
     let tree = db.get_work_tree(&product.id).unwrap();
-    assert_eq!(tree.tasks[0].kind, "design");
+    assert_eq!(tree.tasks[0].kind, TaskKind::Design);
     assert_eq!(tree.tasks[1].id, second.id);
     assert_eq!(tree.tasks[2].id, first.id);
 
@@ -883,7 +883,7 @@ fn creates_and_lists_execution_entities() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(task.id.clone())
-            .kind("task_implementation")
+            .kind(ExecutionKind::TaskImplementation)
             .status("ready")
             .cube_repo_id("cube_repo_mono")
             .workspace_path("/tmp/mono-agent-001")
@@ -1018,7 +1018,7 @@ fn execution_requires_repo_remote_url_snapshot() {
     let err = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(product.id.clone())
-            .kind("project_design")
+            .kind(ExecutionKind::ProjectDesign)
             .build())
         .unwrap_err();
     assert!(
@@ -1030,7 +1030,7 @@ fn execution_requires_repo_remote_url_snapshot() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(product.id.clone())
-            .kind("project_design")
+            .kind(ExecutionKind::ProjectDesign)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .build())
         .unwrap();
@@ -1129,7 +1129,7 @@ fn reconciles_missing_executions_for_product_tree() {
 
     let first_execution = db.list_executions(Some(&first_task.id)).unwrap();
     assert_eq!(first_execution.len(), 1);
-    assert_eq!(first_execution[0].kind, "task_implementation");
+    assert_eq!(first_execution[0].kind, ExecutionKind::TaskImplementation);
     assert_eq!(first_execution[0].status, "ready");
 
     let second_execution = db.list_executions(Some(&second_task.id)).unwrap();
@@ -1138,7 +1138,7 @@ fn reconciles_missing_executions_for_product_tree() {
 
     let chore_execution = db.list_executions(Some(&chore.id)).unwrap();
     assert_eq!(chore_execution.len(), 1);
-    assert_eq!(chore_execution[0].kind, "chore_implementation");
+    assert_eq!(chore_execution[0].kind, ExecutionKind::ChoreImplementation);
     assert_eq!(chore_execution[0].status, "ready");
 
     let second_pass = db.reconcile_product_executions(&product.id).unwrap();
@@ -1608,7 +1608,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -1790,7 +1790,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -1855,7 +1855,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("running")
             .build())
         .unwrap();
@@ -1938,7 +1938,7 @@ fn start_execution_does_not_downgrade_done_chores() {
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -2061,7 +2061,7 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
     // status so the reconcile sees "latest execution is terminal."
     db.create_execution(CreateExecutionInput::builder()
         .work_item_id(chore.id.clone())
-        .kind("chore_implementation")
+        .kind(ExecutionKind::ChoreImplementation)
         .status("failed")
         .build())
     .unwrap();
@@ -2122,7 +2122,7 @@ fn reconcile_skips_active_chore_with_live_execution() {
     // is paused but the slot is still owned.
     db.create_execution(CreateExecutionInput::builder()
         .work_item_id(chore.id.clone())
-        .kind("chore_implementation")
+        .kind(ExecutionKind::ChoreImplementation)
         .status("waiting_human")
         .build())
     .unwrap();
@@ -2181,7 +2181,7 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     let stale = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("waiting_human")
             .build())
         .unwrap();

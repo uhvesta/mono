@@ -358,18 +358,79 @@ pub const AUTOMATION_OUTCOME_FAILED_GAVE_UP: &str = "failed_gave_up";
 pub const AUTOMATION_OUTCOME_POOL_THROTTLED: &str = "pool_throttled";
 pub const AUTOMATION_OUTCOME_TRIAGE_RUNNING: &str = "triage_running";
 
+/// Discriminator for the `work_executions.kind` column.  Exhaustive
+/// match enforces that every callsite handles new variants explicitly —
+/// adding a new kind here produces a compile error at every kind-keyed
+/// branch that must reason about it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionKind {
+    AutomationTriage,
+    ChoreImplementation,
+    CiRemediation,
+    ConflictResolution,
+    InvestigationImplementation,
+    PrReview,
+    ProductDesign,
+    ProjectDesign,
+    RevisionImplementation,
+    TaskImplementation,
+}
+
+impl ExecutionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AutomationTriage => "automation_triage",
+            Self::ChoreImplementation => "chore_implementation",
+            Self::CiRemediation => "ci_remediation",
+            Self::ConflictResolution => "conflict_resolution",
+            Self::InvestigationImplementation => "investigation_implementation",
+            Self::PrReview => "pr_review",
+            Self::ProductDesign => "product_design",
+            Self::ProjectDesign => "project_design",
+            Self::RevisionImplementation => "revision_implementation",
+            Self::TaskImplementation => "task_implementation",
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExecutionKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "automation_triage" => Ok(Self::AutomationTriage),
+            "chore_implementation" => Ok(Self::ChoreImplementation),
+            "ci_remediation" => Ok(Self::CiRemediation),
+            "conflict_resolution" => Ok(Self::ConflictResolution),
+            "investigation_implementation" => Ok(Self::InvestigationImplementation),
+            "pr_review" => Ok(Self::PrReview),
+            "product_design" => Ok(Self::ProductDesign),
+            "project_design" => Ok(Self::ProjectDesign),
+            "revision_implementation" => Ok(Self::RevisionImplementation),
+            "task_implementation" => Ok(Self::TaskImplementation),
+            other => Err(format!(
+                "unknown execution kind: `{other}`; expected one of: \
+                 automation_triage, chore_implementation, ci_remediation, \
+                 conflict_resolution, investigation_implementation, pr_review, \
+                 product_design, project_design, revision_implementation, task_implementation"
+            )),
+        }
+    }
+}
+
 /// `work_executions.kind` discriminator for an automation triage execution
-/// (Maint task 6). A triage execution is bound to an automation (its
-/// `work_item_id` is the `automations.id`), not to a task: it runs a triage
-/// agent that decides whether to produce a single maintenance task. This
-/// kind routes the execution to the dedicated automations worker pool and
-/// drives the triage preamble + outcome detector instead of the normal
-/// PR-completion path.
+/// (Maint task 6). Kept as a constant alias; prefer `ExecutionKind::AutomationTriage`
+/// in new code.
 pub const EXECUTION_KIND_AUTOMATION_TRIAGE: &str = "automation_triage";
 
-/// Execution kind for an independent reviewer agent that reviews a worker's PR
-/// and produces a revision if the reviewer finds issues. Routes to the dedicated
-/// review worker pool. See design: automated-reviewer-pass-on-every-agent-authored-pr.md
+/// Execution kind for an independent reviewer agent. Kept as a constant
+/// alias; prefer `ExecutionKind::PrReview` in new code.
 pub const EXECUTION_KIND_PR_REVIEW: &str = "pr_review";
 
 /// `task_blocked_signals.reason` literal stamped when a CI-remediation worker
@@ -960,7 +1021,7 @@ pub struct CreateCommentInput {
 
 
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateExecutionInput {
@@ -972,7 +1033,7 @@ pub struct CreateExecutionInput {
     #[builder(default)]
     pub allow_dirty: bool,
 
-    pub kind: String,
+    pub kind: ExecutionKind,
     /// When true, the cube lease fallback degrades silently to any free
     /// workspace if the preferred workspace is gone or leased. Used for
     /// `revision_implementation` executions where warmth is a hint only.
@@ -2323,6 +2384,58 @@ pub struct SetProjectDesignDocInput {
 
 
 
+/// Discriminator for the `tasks.kind` column.  Exhaustive match
+/// enforces that every callsite handles new variants explicitly —
+/// adding a new kind here produces a compile error at every kind-keyed
+/// branch that must reason about it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    Chore,
+    Design,
+    Investigation,
+    ProjectTask,
+    Revision,
+    Task,
+}
+
+impl TaskKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chore => "chore",
+            Self::Design => "design",
+            Self::Investigation => "investigation",
+            Self::ProjectTask => "project_task",
+            Self::Revision => "revision",
+            Self::Task => "task",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "chore" => Ok(Self::Chore),
+            "design" => Ok(Self::Design),
+            "investigation" => Ok(Self::Investigation),
+            "project_task" => Ok(Self::ProjectTask),
+            "revision" => Ok(Self::Revision),
+            "task" => Ok(Self::Task),
+            other => Err(format!(
+                "unknown task kind: `{other}`; expected one of: \
+                 chore, design, investigation, project_task, revision, task"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
@@ -2386,7 +2499,7 @@ pub struct Task {
     #[builder(default)]
     pub has_in_progress_revision: bool,
 
-    pub kind: String,
+    pub kind: TaskKind,
     /// Who made the most recent status change — `'human'`, `'boss'`,
     /// or `'engine'`. See `Project.last_status_actor` for full semantics.
     #[serde(default = "default_human_actor")]
@@ -2756,7 +2869,7 @@ pub struct WorkExecution {
     pub branch_naming: BranchNaming,
 
     pub created_at: String,
-    pub kind: String,
+    pub kind: ExecutionKind,
     /// Number of pre-start failures (cube_repo_ensure, workspace_lease,
     /// change_create, run_start) accumulated on this execution row. The
     /// engine retries up to N times before marking the execution `failed`
@@ -4235,6 +4348,106 @@ mod tests {
         // Unknown values still return false
         assert!(!is_known_created_via("something_undocumented"));
         assert!(!is_known_created_via(""));
+    }
+
+    // ── TaskKind / ExecutionKind round-trip tests ────────────────────────────
+
+    #[test]
+    fn task_kind_display_and_parse_are_inverses() {
+        let all = [
+            TaskKind::Chore,
+            TaskKind::Design,
+            TaskKind::Investigation,
+            TaskKind::ProjectTask,
+            TaskKind::Revision,
+            TaskKind::Task,
+        ];
+        for kind in &all {
+            let s = kind.to_string();
+            let back: TaskKind = s.parse().unwrap_or_else(|e| {
+                panic!("TaskKind::from_str({s:?}) failed: {e}")
+            });
+            assert_eq!(*kind, back, "round-trip failed for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn task_kind_serde_uses_wire_strings() {
+        assert_eq!(serde_json::to_string(&TaskKind::Chore).unwrap(), r#""chore""#);
+        assert_eq!(serde_json::to_string(&TaskKind::Design).unwrap(), r#""design""#);
+        assert_eq!(serde_json::to_string(&TaskKind::Investigation).unwrap(), r#""investigation""#);
+        assert_eq!(serde_json::to_string(&TaskKind::ProjectTask).unwrap(), r#""project_task""#);
+        assert_eq!(serde_json::to_string(&TaskKind::Revision).unwrap(), r#""revision""#);
+        assert_eq!(serde_json::to_string(&TaskKind::Task).unwrap(), r#""task""#);
+
+        let chore: TaskKind = serde_json::from_str(r#""chore""#).unwrap();
+        assert_eq!(chore, TaskKind::Chore);
+        let project_task: TaskKind = serde_json::from_str(r#""project_task""#).unwrap();
+        assert_eq!(project_task, TaskKind::ProjectTask);
+    }
+
+    #[test]
+    fn execution_kind_display_and_parse_are_inverses() {
+        let all = [
+            ExecutionKind::AutomationTriage,
+            ExecutionKind::ChoreImplementation,
+            ExecutionKind::CiRemediation,
+            ExecutionKind::ConflictResolution,
+            ExecutionKind::InvestigationImplementation,
+            ExecutionKind::PrReview,
+            ExecutionKind::ProductDesign,
+            ExecutionKind::ProjectDesign,
+            ExecutionKind::RevisionImplementation,
+            ExecutionKind::TaskImplementation,
+        ];
+        for kind in &all {
+            let s = kind.to_string();
+            let back: ExecutionKind = s.parse().unwrap_or_else(|e| {
+                panic!("ExecutionKind::from_str({s:?}) failed: {e}")
+            });
+            assert_eq!(*kind, back, "round-trip failed for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn execution_kind_serde_uses_wire_strings() {
+        assert_eq!(
+            serde_json::to_string(&ExecutionKind::ChoreImplementation).unwrap(),
+            r#""chore_implementation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionKind::RevisionImplementation).unwrap(),
+            r#""revision_implementation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionKind::InvestigationImplementation).unwrap(),
+            r#""investigation_implementation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionKind::ProjectDesign).unwrap(),
+            r#""project_design""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionKind::PrReview).unwrap(),
+            r#""pr_review""#
+        );
+
+        let task_impl: ExecutionKind = serde_json::from_str(r#""task_implementation""#).unwrap();
+        assert_eq!(task_impl, ExecutionKind::TaskImplementation);
+        let chore_impl: ExecutionKind = serde_json::from_str(r#""chore_implementation""#).unwrap();
+        assert_eq!(chore_impl, ExecutionKind::ChoreImplementation);
+    }
+
+    #[test]
+    fn execution_kind_constants_match_enum() {
+        assert_eq!(
+            EXECUTION_KIND_AUTOMATION_TRIAGE,
+            ExecutionKind::AutomationTriage.as_str()
+        );
+        assert_eq!(
+            EXECUTION_KIND_PR_REVIEW,
+            ExecutionKind::PrReview.as_str()
+        );
     }
 }
 

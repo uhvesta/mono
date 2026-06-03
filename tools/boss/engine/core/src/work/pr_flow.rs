@@ -61,7 +61,7 @@ impl WorkDb {
         };
         // Revision tasks do not own a PR — their `pr_url` must stay NULL.
         // The parent (chain root) task's `pr_url` is the source of truth.
-        let pr_url_for_task: Option<&str> = if task.kind == "revision" {
+        let pr_url_for_task: Option<&str> = if task.kind == TaskKind::Revision {
             task.pr_url.as_deref()
         } else {
             Some(pr_url)

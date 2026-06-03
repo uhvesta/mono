@@ -183,9 +183,13 @@ pub(crate) fn repo_unresolved_kind_label(
             let task = query_task(conn, work_item_id)?
                 .filter(|task| task.deleted_at.is_none())
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
-            match task.kind.as_str() {
-                "chore" => "chore",
-                _ => "task",
+            match task.kind {
+                TaskKind::Chore => "chore",
+                TaskKind::Design
+                | TaskKind::Investigation
+                | TaskKind::ProjectTask
+                | TaskKind::Revision
+                | TaskKind::Task => "task",
             }
         }
         ItemKind::Project => "project",
@@ -372,7 +376,7 @@ pub(crate) fn reconcile_work_item_execution(
     conn: &Connection,
     result: &mut ExecutionReconcileResult,
     work_item_id: &str,
-    kind: &str,
+    kind: ExecutionKind,
     desired_status: &str,
 ) -> Result<()> {
     // Dispatcher gate (Q8): if the work item has any unmet `blocks`
@@ -643,7 +647,7 @@ pub(crate) fn reconcile_revision_execution(
 
     match query_latest_execution_for_work_item(conn, &task.id)? {
         Some(existing)
-            if existing.kind == "revision_implementation"
+            if existing.kind == ExecutionKind::RevisionImplementation
                 && can_reconcile_execution_status(&existing.status)
                 && existing.status != effective_status =>
         {
@@ -651,7 +655,7 @@ pub(crate) fn reconcile_revision_execution(
             result.updated.push(updated);
         }
         Some(existing)
-            if existing.kind == "revision_implementation"
+            if existing.kind == ExecutionKind::RevisionImplementation
                 && can_reconcile_execution_status(&existing.status) =>
         {
             // Already in the right status — nothing to do.
@@ -669,7 +673,7 @@ pub(crate) fn reconcile_revision_execution(
                 conn,
                 CreateExecutionInput::builder()
                     .work_item_id(task.id.clone())
-                    .kind("revision_implementation")
+                    .kind(ExecutionKind::RevisionImplementation)
                     .status(effective_status)
                     .repo_remote_url(repo_remote_url)
                     .maybe_preferred_workspace_id(preferred_workspace_id)
@@ -836,7 +840,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 )?;
                 return query_execution(conn, &existing.id)?
                     .with_context(|| format!("unknown execution: {}", existing.id));
-            } else if existing.kind == "ci_remediation" {
+            } else if existing.kind == ExecutionKind::CiRemediation {
                 tracing::info!(
                     work_item_id = %work_item_id,
                     governing_execution_id = %existing.id,
@@ -969,7 +973,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
     // re-create the execution with the same `pr_url` the original dispatch
     // carried.  The chain root's `pr_url` is the authoritative source
     // because revision tasks themselves never own a `pr_url` column value.
-    let revision_pr_url: Option<String> = if kind == "revision_implementation" {
+    let revision_pr_url: Option<String> = if kind == ExecutionKind::RevisionImplementation {
         get_chain_root_task(conn, &work_item_id)?
             .and_then(|t| t.pr_url)
             .filter(|u| !u.is_empty())

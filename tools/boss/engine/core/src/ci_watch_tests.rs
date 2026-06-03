@@ -1172,7 +1172,7 @@ async fn detection_spawns_revision_and_stamps_attempt() {
         WorkItem::Task(t) => t,
         other => panic!("expected revision task, got {other:?}"),
     };
-    assert_eq!(revision.kind, "revision");
+    assert_eq!(revision.kind, TaskKind::Revision);
     assert_eq!(revision.parent_task_id.as_deref(), Some(chore.as_str()));
     assert_eq!(revision.created_via, format!("ci-fix:{}", attempt.id));
     assert_eq!(revision.description, "Fix failing CI: ci/test");

@@ -50,7 +50,7 @@ use tokio::process::Command;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
     AUTOMATION_OUTCOME_SKIPPED, Attention, AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_MERGE_CONFLICT_PREFIX, FrontendEvent,
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, ExecutionKind, FrontendEvent, TaskKind,
 };
 
 use crate::attentions_detector;
@@ -1014,7 +1014,7 @@ impl WorkerCompletionHandler {
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
-            if execution.kind == "ci_remediation" {
+            if execution.kind == ExecutionKind::CiRemediation {
                 self.finalize_ci_remediation_attempt(&execution, &outcome)
                     .await;
             }
@@ -1072,7 +1072,7 @@ impl WorkerCompletionHandler {
         // Its Stop is resolved by the marker-protocol outcome detector
         // (`automation: task <id>` / `automation: skip — …`), not by PR
         // detection or the nudge path below. Branch out before any of that.
-        if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
+        if execution.kind == ExecutionKind::AutomationTriage {
             return self.finalize_automation_triage(&execution).await;
         }
 
@@ -1084,7 +1084,7 @@ impl WorkerCompletionHandler {
         // re-derive the same verdict and burn worker turns. Park the worker
         // awaiting the CI retry / a human decision. The merge-poller clears
         // the signal and snaps the parent to Review once CI goes green.
-        if execution.kind == "ci_remediation" {
+        if execution.kind == ExecutionKind::CiRemediation {
             match self
                 .work_db
                 .has_active_ci_flaky_retrigger_signal(&execution.work_item_id)
@@ -1299,7 +1299,7 @@ impl WorkerCompletionHandler {
                 // AwaitingInput silently instead; the merge poller's
                 // recheck_for_pr will finalize via the SHA-delta gate once the
                 // API recovers.
-                if execution.kind == "revision_implementation"
+                if execution.kind == ExecutionKind::RevisionImplementation
                     && execution
                         .pr_head_before
                         .as_deref()
@@ -1399,7 +1399,7 @@ impl WorkerCompletionHandler {
                 // NEVER be told to create a PR — if it somehow has no
                 // bound PR, that is an anomalous upstream state; park it
                 // for a human rather than nudging it to `gh pr create`.
-                if execution.kind == "ci_remediation" {
+                if execution.kind == ExecutionKind::CiRemediation {
                     tracing::warn!(
                         execution_id,
                         kind = %execution.kind,
@@ -1421,7 +1421,7 @@ asked to open one",
                 // covers the common case; if we still have no resolvable PR
                 // it is an upstream data anomaly.  Park for a human instead
                 // of contradicting the worker's own task instructions.
-                if execution.kind == "revision_implementation" {
+                if execution.kind == ExecutionKind::RevisionImplementation {
                     tracing::warn!(
                         execution_id,
                         kind = %execution.kind,
@@ -2085,7 +2085,7 @@ must not be asked to open one",
         // Errors are logged inside the detector — they must not surface
         // here because they'd mask the successful PR transition.
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
-            if task.kind == "design" {
+            if task.kind == TaskKind::Design {
                 if let Some(ref project_id) = task.project_id {
                     if merged {
                         // Worker merged directly during its session; update
@@ -2565,7 +2565,7 @@ must not be asked to open one",
                 crate::runner::task_bound_pr_url(&task)
                     .map(str::to_owned)
                     .or_else(|| {
-                        if execution.kind == "revision_implementation" {
+                        if execution.kind == ExecutionKind::RevisionImplementation {
                             // Primary: execution.pr_url is stamped at dispatch time.
                             // Fallback: walk the parent chain to find the chain root's
                             // pr_url for executions where execution.pr_url was not set
@@ -2763,7 +2763,7 @@ must not be asked to open one",
                 crate::runner::task_bound_pr_url(&task)
                     .map(str::to_owned)
                     .or_else(|| {
-                        if execution.kind == "revision_implementation" {
+                        if execution.kind == ExecutionKind::RevisionImplementation {
                             execution
                                 .pr_url
                                 .clone()
@@ -2882,8 +2882,8 @@ must not be asked to open one",
         // Old-style kinds: `execution.work_item_id` IS the parent chore.
         // New-style `revision_implementation` (Phase 3+): `work_item_id` is
         // the revision task; the chore is its `parent_task_id`.
-        let (parent_chore_id, product_id) = match execution.kind.as_str() {
-            "conflict_resolution" | "ci_remediation" => {
+        let (parent_chore_id, product_id) = match execution.kind {
+            ExecutionKind::ConflictResolution | ExecutionKind::CiRemediation => {
                 // work_item_id is the chore directly.
                 let product_id = match self.work_db.get_work_item(&execution.work_item_id) {
                     Ok(WorkItem::Task(t) | WorkItem::Chore(t)) => t.product_id.clone(),
@@ -2891,12 +2891,12 @@ must not be asked to open one",
                 };
                 (execution.work_item_id.clone(), product_id)
             }
-            "revision_implementation" => {
+            ExecutionKind::RevisionImplementation => {
                 // work_item_id is the revision task. Only process it when
                 // the revision was created by an engine-triggered conflict /
                 // CI-fix attempt (`created_via` prefix).
                 let task = match self.work_db.get_work_item(&execution.work_item_id) {
-                    Ok(WorkItem::Task(t)) if t.kind == "revision" => t,
+                    Ok(WorkItem::Task(t)) if t.kind == TaskKind::Revision => t,
                     _ => return None,
                 };
                 let created_via = task.created_via.as_str();
@@ -3163,7 +3163,7 @@ must not be asked to open one",
                 let from_task = crate::runner::task_bound_pr_url(&task).map(str::to_owned);
                 match from_task {
                     Some(url) => url,
-                    None if execution.kind == "revision_implementation" => {
+                    None if execution.kind == ExecutionKind::RevisionImplementation => {
                         // Primary: execution.pr_url stamped at dispatch time.
                         // Fallback: chain-root lookup for executions where it
                         // was not stamped.
@@ -3832,7 +3832,7 @@ mod tests {
         let execution = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -3930,7 +3930,7 @@ mod tests {
         let execution = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("ci_remediation")
+                .kind(ExecutionKind::CiRemediation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -5071,7 +5071,7 @@ mod tests {
         let exec = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -5218,7 +5218,7 @@ mod tests {
         let execution = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -5441,7 +5441,7 @@ PR #379. PR #379.";
         let execution = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -5570,7 +5570,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let execution = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -5913,7 +5913,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let exec2 = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore2.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -5959,7 +5959,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let exec3 = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore3.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build())
             .unwrap();
@@ -6884,7 +6884,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
-                    .kind("revision_implementation")
+                    .kind(ExecutionKind::RevisionImplementation)
                     .status("ready")
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
@@ -7043,7 +7043,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
-                    .kind("revision_implementation")
+                    .kind(ExecutionKind::RevisionImplementation)
                     .status("ready")
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
@@ -7272,7 +7272,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let execution = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .repo_remote_url("git@github.com:spinyfin/mono.git")
                 .build())
@@ -7450,7 +7450,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
-                    .kind("revision_implementation")
+                    .kind(ExecutionKind::RevisionImplementation)
                     .status("ready")
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
@@ -7854,7 +7854,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
-                    .kind("revision_implementation")
+                    .kind(ExecutionKind::RevisionImplementation)
                     .status("ready")
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)
@@ -8176,7 +8176,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(revision.id.clone())
-                    .kind("revision_implementation")
+                    .kind(ExecutionKind::RevisionImplementation)
                     .status("ready")
                     .repo_remote_url("git@github.com:spinyfin/mono.git")
                     .prefer_is_soft(true)

@@ -776,7 +776,7 @@ impl HostAdapter for SshHostAdapter {
             events_socket_path: PathBuf::from(&remote_socket),
             boss_event_path: PathBuf::from(REMOTE_BOSS_EVENT_BIN),
             draft_pr_mode: false,
-            execution_kind: execution.kind.clone(),
+            execution_kind: execution.kind.as_str().to_owned(),
             task_kind: work_item_task_kind(work_item).map(str::to_owned),
             worker_kind: WorkerKind::Standard,
         };

@@ -115,8 +115,8 @@ pub(crate) fn resolve_dependency_edge(
         }
     } else if peer_id.starts_with("task_") {
         if let Some(task) = query_task(conn, peer_id)? {
-            let kind = match task.kind.as_str() {
-                "chore" => "chore",
+            let kind = match task.kind {
+                TaskKind::Chore => "chore",
                 _ => "task",
             };
             return Ok(DependencyEdge {
@@ -335,7 +335,7 @@ pub(crate) fn maybe_engine_unblock_dependent(
     if dependent_id.starts_with("task_") {
         let kind = execution_kind_for_work_item(conn, dependent_id)?;
         let mut reconcile_result = ExecutionReconcileResult::default();
-        reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, &kind, "ready")?;
+        reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, "ready")?;
     }
     Ok(true)
 }

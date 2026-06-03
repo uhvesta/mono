@@ -13,9 +13,9 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
-    FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput, Product, Project,
-    ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TopicEventPayload, WorkItem,
+    ExecutionKind, FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
+    Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TopicEventPayload, WorkItem,
     WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
     work_product_topic,
 };
@@ -119,7 +119,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
         },
     )
     .await?;
-    assert_eq!(task.kind, "project_task");
+    assert_eq!(task.kind, TaskKind::ProjectTask);
     assert_eq!(task.status, "todo");
     assert_eq!(task.project_id.as_deref(), Some(project.id.as_str()));
 
@@ -139,7 +139,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
         },
     )
     .await?;
-    assert_eq!(chore.kind, "chore");
+    assert_eq!(chore.kind, TaskKind::Chore);
     assert!(chore.project_id.is_none());
 
     let listed_products = list_products(&mut client).await?;
@@ -153,7 +153,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
     // Two rows: the auto-created `kind = 'design'` task plus the
     // user-created project_task. The design task always sorts first.
     assert_eq!(listed_tasks.len(), 2);
-    assert_eq!(listed_tasks[0].kind, "design");
+    assert_eq!(listed_tasks[0].kind, TaskKind::Design);
     assert_eq!(listed_tasks[1].id, task.id);
 
     let listed_chores = list_chores(&mut client, &product.id).await?;
@@ -1498,7 +1498,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     assert_eq!(
         listed_tasks
             .iter()
-            .filter(|t| t.kind == "design")
+            .filter(|t| t.kind == TaskKind::Design)
             .count(),
         1,
     );

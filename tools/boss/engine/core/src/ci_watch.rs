@@ -34,7 +34,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, FrontendEvent};
+use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateRevisionInput, ExecutionKind, FrontendEvent, TaskKind};
 use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};
@@ -522,7 +522,7 @@ pub async fn on_ci_failure_detected(
             if attempt.attempt_kind == "retrigger" {
                 match work_db.create_execution(CreateExecutionInput::builder()
                     .work_item_id(candidate.work_item_id.clone())
-                    .kind("ci_remediation")
+                    .kind(ExecutionKind::CiRemediation)
                     .status("ready")
                     .build()) {
                     Ok(_) => publisher.kick_scheduler(),
@@ -1538,7 +1538,7 @@ pub async fn rescue_stranded_ci_remediation_attempt(
 ) -> bool {
     match work_db.create_execution(CreateExecutionInput::builder()
         .work_item_id(attempt.work_item_id.clone())
-        .kind("ci_remediation")
+        .kind(ExecutionKind::CiRemediation)
         .status("ready")
         .build()) {
         Ok(_) => {

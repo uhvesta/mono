@@ -18,7 +18,7 @@ use boss_protocol::{
     OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
+    Task, TaskKind, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -2884,7 +2884,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let design_task = list_tasks(&mut client, &product.id, Some(&project.id), None, false)
                 .await?
                 .into_iter()
-                .find(|t| t.kind == "design")
+                .find(|t| t.kind == boss_protocol::TaskKind::Design)
                 .map(with_display_status);
 
             print_entity(
@@ -8936,7 +8936,7 @@ mod tests {
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
-        WorkItem,
+        TaskKind, WorkItem,
     };
 
     #[test]
@@ -8978,7 +8978,7 @@ mod tests {
             .product_id("prod_1")
             .name("n")
             .description("d")
-            .kind("task")
+            .kind(TaskKind::Task)
             .status("in_review")
             .created_at("t")
             .updated_at("t")
@@ -9137,7 +9137,7 @@ mod tests {
         assert!(ctx.discovery.autostart);
     }
 
-    fn dummy_task(id: &str, kind: &str) -> Task {
+    fn dummy_task(id: &str, kind: TaskKind) -> Task {
         Task::builder()
             .id(id)
             .product_id("prod_1")
@@ -9152,12 +9152,12 @@ mod tests {
 
     #[test]
     fn expect_leaf_accepts_task_and_chore() {
-        let task = dummy_task("task_1", "task");
+        let task = dummy_task("task_1", TaskKind::Task);
         let (unwrapped, label) = expect_leaf_work_item(WorkItem::Task(task.clone())).unwrap();
         assert_eq!(unwrapped.id, "task_1");
         assert_eq!(label, "task");
 
-        let chore = dummy_task("task_2", "chore");
+        let chore = dummy_task("task_2", TaskKind::Chore);
         let (unwrapped, label) = expect_leaf_work_item(WorkItem::Chore(chore)).unwrap();
         assert_eq!(unwrapped.id, "task_2");
         assert_eq!(label, "chore");
@@ -10510,7 +10510,7 @@ mod tests {
     #[test]
     fn repo_selector_matches_inherited_product_default() {
         let sel = RepoSelector::parse("nimbus").unwrap();
-        let task = dummy_task("task_1", "task");
+        let task = dummy_task("task_1", TaskKind::Task);
         assert!(task.repo_remote_url.is_none());
         let resolved =
             super::resolved_repo_for_task(&task, Some("git@github.com:myorg/nimbus.git"));

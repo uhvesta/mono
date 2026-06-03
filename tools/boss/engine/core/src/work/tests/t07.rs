@@ -15,7 +15,7 @@ fn find_by_pr_finds_chore_backed_pr() {
     let matches = db.find_work_items_by_pr(959).unwrap();
     assert_eq!(matches.len(), 1, "exactly one owner expected");
     assert_eq!(matches[0].owner.id, chore_id);
-    assert_eq!(matches[0].owner.kind, "chore");
+    assert_eq!(matches[0].owner.kind, TaskKind::Chore);
     assert!(matches[0].revisions.is_empty());
 }
 
@@ -550,7 +550,7 @@ fn create_automation_task_stamps_provenance_and_enforces_cap() {
     let task = db
         .create_automation_task(&automation.id, "fix clippy in foo", Some("the foo crate"))
         .unwrap();
-    assert_eq!(task.kind, "chore");
+    assert_eq!(task.kind, TaskKind::Chore);
     assert_eq!(task.project_id, None);
     assert!(task.autostart);
     assert_eq!(task.source_automation_id.as_deref(), Some(automation.id.as_str()));
@@ -606,7 +606,7 @@ fn create_automation_triage_execution_binds_to_automation() {
         .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
         .unwrap();
     assert_eq!(exec.work_item_id, automation.id);
-    assert_eq!(exec.kind, boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE);
+    assert_eq!(exec.kind, ExecutionKind::AutomationTriage);
     assert_eq!(exec.status, "ready");
     assert_eq!(exec.repo_remote_url, "git@github.com:spinyfin/mono.git");
 }

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use boss_protocol::FrontendEvent;
+use boss_protocol::{ExecutionKind, FrontendEvent, TaskKind};
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -1426,11 +1426,11 @@ impl ExecutionCoordinator {
     /// `true` when `execution` must run on the dedicated review pool —
     /// i.e. it is a `pr_review` reviewer execution.
     fn execution_targets_review_pool(&self, execution: &WorkExecution) -> bool {
-        execution.kind == EXECUTION_KIND_PR_REVIEW
+        execution.kind == ExecutionKind::PrReview
     }
 
     fn execution_targets_automation_pool(&self, execution: &WorkExecution) -> bool {
-        if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+        if execution.kind == ExecutionKind::AutomationTriage {
             return true;
         }
         matches!(
@@ -1824,7 +1824,7 @@ impl ExecutionCoordinator {
                     // For automation triage executions, mark the automation_runs
                     // row as `pool_throttled` (not `failed_will_retry`) so the UI
                     // shows "Queued" rather than a failure badge.
-                    if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                    if execution.kind == ExecutionKind::AutomationTriage {
                         let detail = format!(
                             "automation pool exhausted ({pool_capacity}/{pool_capacity} busy); \
                              triage queued, will dispatch when a slot frees"
@@ -1897,7 +1897,7 @@ impl ExecutionCoordinator {
     /// completion handler branches on `kind` to run the outcome detector, so
     /// the synthetic fields never drive real task work.
     fn resolve_execution_work_item(&self, execution: &WorkExecution) -> Result<WorkItem> {
-        if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+        if execution.kind == ExecutionKind::AutomationTriage {
             if let Some(item) = self.synthetic_triage_work_item(execution) {
                 return Ok(item);
             }
@@ -1918,7 +1918,7 @@ impl ExecutionCoordinator {
         let task = boss_protocol::Task::builder()
             .id(automation.id.clone())
             .product_id(automation.product_id.clone())
-            .kind("chore")
+            .kind(TaskKind::Chore)
             .name(format!("Automation triage: {}", automation.name))
             .description(automation.standing_instruction.clone())
             .status("active")
@@ -2389,7 +2389,7 @@ impl ExecutionCoordinator {
                 // `triage_running` now that a pool slot is held and the
                 // agent is about to start. The completion handler will
                 // overwrite this with the terminal outcome.
-                if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                if execution.kind == ExecutionKind::AutomationTriage {
                     if let Err(err) = self
                         .work_db
                         .mark_automation_run_triage_started(&execution.id)
@@ -2996,7 +2996,7 @@ impl ExecutionCoordinator {
                 // tab shows the occurrence was abandoned (the schedule already
                 // advanced past it when the scheduler fired the triage). Until
                 // this point the run sat at the pessimistic `failed_will_retry`.
-                if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                if execution.kind == ExecutionKind::AutomationTriage {
                     if let Err(err) = self.work_db.finalize_automation_triage_run(
                         &execution.id,
                         boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
@@ -3118,7 +3118,7 @@ impl ExecutionCoordinator {
         // Pre-spawn: collect the merge-tree diagnosis for revision_implementation
         // executions with merge-conflict provenance so compose_revision_directive
         // injects it into the worker prompt. No-op for other provenance.
-        if execution.kind == "revision_implementation" {
+        if execution.kind == ExecutionKind::RevisionImplementation {
             self.collect_revision_conflict_diagnosis_pre_spawn(&execution, &work_item, &lease)
                 .await;
         }
@@ -3433,7 +3433,7 @@ impl ExecutionCoordinator {
                         // a self-healing retry is pending (it is not: a
                         // pane-spawn failure like an invalid worker_id format
                         // will not recover on its own).
-                        if execution.kind == EXECUTION_KIND_AUTOMATION_TRIAGE {
+                        if execution.kind == ExecutionKind::AutomationTriage {
                             if let Err(finalize_err) =
                                 self.work_db.finalize_automation_triage_run(
                                     &execution.id,
@@ -3951,7 +3951,7 @@ mod tests {
     use super::{
         AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle,
         CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW,
-        ExecutionCoordinator, ExecutionPublisher, FrontendEvent, Host, HostAdapter,
+        ExecutionCoordinator, ExecutionKind, ExecutionPublisher, FrontendEvent, Host, HostAdapter,
         HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
         MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, pick_worst_failing_check,
         pool_model_override_for_worker_id, slot_id_from_worker_id, worker_id_for_slot,
@@ -7539,7 +7539,7 @@ mod tests {
         let real_exec = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(real.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .repo_remote_url("git@github.com:spinyfin/mono.git")
                 .build())
@@ -7885,7 +7885,7 @@ mod tests {
         .unwrap();
         db.create_execution(CreateExecutionInput::builder()
             .work_item_id(stuck.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("failed")
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .build())
@@ -7981,7 +7981,7 @@ mod tests {
         .unwrap();
         db.create_execution(CreateExecutionInput::builder()
             .work_item_id(parked.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("failed")
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .build())
@@ -8753,7 +8753,7 @@ mod tests {
             .id("exec-review")
             .work_item_id("task-under-review")
             .created_at("1")
-            .kind(EXECUTION_KIND_PR_REVIEW)
+            .kind(ExecutionKind::PrReview)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .status("ready")
             .build();
@@ -8776,7 +8776,7 @@ mod tests {
             .id("exec-chore")
             .work_item_id("regular-task")
             .created_at("1")
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .repo_remote_url("git@github.com:spinyfin/mono.git")
             .status("ready")
             .build();
@@ -8911,7 +8911,7 @@ mod tests {
             let execs = db.list_executions(None).unwrap();
             if execs
                 .iter()
-                .any(|e| e.status == "running" && e.kind != EXECUTION_KIND_PR_REVIEW)
+                .any(|e| e.status == "running" && e.kind != ExecutionKind::PrReview)
             {
                 break;
             }
@@ -8921,7 +8921,7 @@ mod tests {
         let execs = db.list_executions(None).unwrap();
         let main_running = execs
             .iter()
-            .filter(|e| e.status == "running" && e.kind != EXECUTION_KIND_PR_REVIEW)
+            .filter(|e| e.status == "running" && e.kind != ExecutionKind::PrReview)
             .count();
         assert_eq!(
             main_running, 1,
@@ -8930,7 +8930,7 @@ mod tests {
         // The pr_review must stay ready — review pool was full.
         let review_ready = execs
             .iter()
-            .filter(|e| e.kind == EXECUTION_KIND_PR_REVIEW && e.status == "ready")
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.status == "ready")
             .count();
         assert_eq!(
             review_ready, 1,

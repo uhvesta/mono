@@ -128,11 +128,19 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             }
         },
     };
+    let kind_raw: String = row.get(3)?;
+    let kind = kind_raw.parse::<TaskKind>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
     Ok(Task {
         id: row.get(0)?,
         product_id: row.get(1)?,
         project_id: row.get(2)?,
-        kind: row.get(3)?,
+        kind,
         name: row.get(4)?,
         description: row.get(5)?,
         status: row.get(6)?,
@@ -273,10 +281,18 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
+    let kind_raw: String = row.get(2)?;
+    let kind = kind_raw.parse::<ExecutionKind>().map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        )
+    })?;
     Ok(WorkExecution {
         id: row.get(0)?,
         work_item_id: row.get(1)?,
-        kind: row.get(2)?,
+        kind,
         status: row.get(3)?,
         repo_remote_url: row.get(4)?,
         cube_repo_id: row.get(5)?,

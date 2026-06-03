@@ -194,7 +194,7 @@ impl WorkDb {
             params![
                 new_id,
                 dead.work_item_id,
-                dead.kind,
+                dead.kind.as_str(),
                 dead.repo_remote_url,
                 dead.cube_repo_id,
                 dead.priority,
@@ -425,27 +425,27 @@ impl WorkDb {
         // unchanged task path.
         let mut project_tasks: HashMap<String, Vec<Task>> = HashMap::new();
         for task in tasks {
-            match task.kind.as_str() {
-                "chore" => {
+            match task.kind {
+                TaskKind::Chore => {
                     if task_accepts_execution(&task) {
                         reconcile_work_item_execution(
                             &tx,
                             &mut result,
                             &task.id,
-                            "chore_implementation",
+                            ExecutionKind::ChoreImplementation,
                             "ready",
                         )?;
                     }
                 }
                 // Investigation tasks dispatch independently (no project
                 // dependency chain) — each produces one standalone doc PR.
-                "investigation" => {
+                TaskKind::Investigation => {
                     if task_accepts_execution(&task) {
                         reconcile_work_item_execution(
                             &tx,
                             &mut result,
                             &task.id,
-                            "investigation_implementation",
+                            ExecutionKind::InvestigationImplementation,
                             "ready",
                         )?;
                     }
@@ -456,12 +456,12 @@ impl WorkDb {
                 // the chain root's status first (cached): if the parent PR
                 // has already merged (chain root is `done`), the revision
                 // is auto-blocked here rather than dispatched.
-                "revision" => {
+                TaskKind::Revision => {
                     if task_accepts_execution(&task) {
                         reconcile_revision_execution(&tx, &mut result, &task)?;
                     }
                 }
-                "project_task" | "design" => {
+                TaskKind::ProjectTask | TaskKind::Design => {
                     if let Some(project_id) = &task.project_id {
                         project_tasks
                             .entry(project_id.clone())
@@ -469,7 +469,9 @@ impl WorkDb {
                             .push(task);
                     }
                 }
-                _ => {}
+                TaskKind::Task => {
+                    // Plain task: no standalone execution; must be in a project.
+                }
             }
         }
 
@@ -493,9 +495,15 @@ impl WorkDb {
                 } else {
                     "waiting_dependency"
                 };
-                let execution_kind = match task.kind.as_str() {
-                    "design" => "project_design",
-                    _ => "task_implementation",
+                let execution_kind = match task.kind {
+                    TaskKind::Design => ExecutionKind::ProjectDesign,
+                    // All remaining kinds in this bucket are project_task rows;
+                    // the other variants are handled before being bucketed here.
+                    TaskKind::ProjectTask
+                    | TaskKind::Chore
+                    | TaskKind::Investigation
+                    | TaskKind::Revision
+                    | TaskKind::Task => ExecutionKind::TaskImplementation,
                 };
                 reconcile_work_item_execution(
                     &tx,

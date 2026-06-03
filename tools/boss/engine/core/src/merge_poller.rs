@@ -54,7 +54,7 @@ use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
 use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
-use boss_protocol;
+use boss_protocol::{self, ExecutionKind, TaskKind};
 
 /// Review-gating state of a PR at probe time. Derived from
 /// GitHub's `reviewDecision` field and the `reviews` array.
@@ -2538,7 +2538,7 @@ async fn mark_merged(
     );
     // Auto-populate the project's design-doc pointer on merge for
     // `kind=design` tasks. Errors are logged inside the detector.
-    if updated.kind == "design" {
+    if updated.kind == TaskKind::Design {
         if let Some(ref project_id) = updated.project_id {
             design_detector::on_design_pr_merged(
                 work_db,
@@ -3067,7 +3067,7 @@ mod tests {
 
         match db.get_work_item(&project_task_id).unwrap() {
             WorkItem::Task(t) => {
-                assert_eq!(t.kind, "project_task");
+                assert_eq!(t.kind, TaskKind::ProjectTask);
                 assert_eq!(t.status, "done");
                 assert_eq!(t.pr_url.as_deref(), Some(pr_proj));
             }
@@ -3596,13 +3596,13 @@ mod tests {
             match db.get_work_item(&prior_rev_id).unwrap() {
                 WorkItem::Task(t) => {
                     assert_eq!(t.status, "in_review", "{reason}: prior revision stays in review");
-                    assert_eq!(t.kind, "revision");
+                    assert_eq!(t.kind, TaskKind::Revision);
                 }
                 other => panic!("{reason}: expected prior revision task, got {other:?}"),
             }
             match db.get_work_item(&new_rev).unwrap() {
                 WorkItem::Task(t) => {
-                    assert_eq!(t.kind, "revision", "{reason}: new fix vehicle is a revision");
+                    assert_eq!(t.kind, TaskKind::Revision, "{reason}: new fix vehicle is a revision");
                     assert_ne!(t.status, "done", "{reason}: new revision is not auto-advanced");
                 }
                 other => panic!("{reason}: expected new revision task, got {other:?}"),
@@ -5339,7 +5339,7 @@ mod tests {
             crate::work::WorkItem::Task(t) => t,
             other => panic!("expected revision task, got {other:?}"),
         };
-        assert_eq!(revision.kind, "revision");
+        assert_eq!(revision.kind, TaskKind::Revision);
         assert_eq!(revision.parent_task_id.as_deref(), Some(chore.as_str()));
         assert!(
             revision.created_via.starts_with("merge-conflict:"),
@@ -5352,7 +5352,7 @@ mod tests {
         assert!(
             !ready
                 .iter()
-                .any(|e| e.work_item_id == chore && e.kind == "conflict_resolution"),
+                .any(|e| e.work_item_id == chore && e.kind == ExecutionKind::ConflictResolution),
             "cutover must not create a conflict_resolution execution; got {ready:?}",
         );
 
@@ -6062,7 +6062,7 @@ mod tests {
         let exec = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.id.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .repo_remote_url("git@github.com:foo/bar.git")
                 .build())
@@ -6178,7 +6178,7 @@ mod tests {
         let exec = db
             .create_execution(CreateExecutionInput::builder()
                 .work_item_id(chore.clone())
-                .kind("chore_implementation")
+                .kind(ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .repo_remote_url("git@github.com:foo/bar.git")
                 .build())

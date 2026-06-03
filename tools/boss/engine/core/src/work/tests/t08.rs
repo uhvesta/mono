@@ -438,7 +438,7 @@ fn action_question_with_open_pr_creates_revision() {
     assert_eq!(actioned.produced_work_item_ids.len(), 1);
 
     let revision = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(revision.kind, "revision");
+    assert_eq!(revision.kind, TaskKind::Revision);
     assert_eq!(revision.parent_task_id.as_deref(), Some(task_id.as_str()));
     assert_eq!(revision.created_via, "attention");
     assert!(
@@ -492,7 +492,7 @@ fn action_question_with_merged_doc_creates_design_task() {
     assert_eq!(actioned.produced_work_item_ids.len(), 1);
 
     let design = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(design.kind, "design");
+    assert_eq!(design.kind, TaskKind::Design);
     assert_eq!(design.project_id.as_deref(), Some(project_id.as_str()));
     assert_eq!(design.created_via, "attention");
     assert!(
@@ -520,7 +520,7 @@ fn action_question_without_source_task_creates_design_task() {
         Some("design_task")
     );
     let design = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(design.kind, "design");
+    assert_eq!(design.kind, TaskKind::Design);
 }
 
 #[test]
@@ -543,7 +543,7 @@ fn action_followup_group_creates_tasks() {
         "only the accepted followup becomes a task"
     );
     let task = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(task.kind, "project_task");
+    assert_eq!(task.kind, TaskKind::ProjectTask);
     assert_eq!(task.name, "extract helper");
     assert_eq!(task.project_id.as_deref(), Some(project_id.as_str()));
     assert_eq!(task.created_via, "attention");
@@ -560,7 +560,7 @@ fn action_followup_honours_chore_work_kind() {
     let checker = FakePrStateChecker::always(PrOpenState::Open);
     let actioned = db.action_attention_group(&g.id, false, &checker).unwrap();
     let chore = read_task(&db, &actioned.produced_work_item_ids[0]);
-    assert_eq!(chore.kind, "chore");
+    assert_eq!(chore.kind, TaskKind::Chore);
     assert!(chore.project_id.is_none(), "chores are product-level");
 }
 

@@ -297,7 +297,7 @@ fn get_live_execution_returns_waiting_human_execution_for_work_item() {
     let exec_b = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore_id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .repo_remote_url("git@github.com:foo/bar.git")
             .build())
@@ -337,7 +337,7 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
     let exec_b = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore_id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .repo_remote_url("git@github.com:foo/bar.git")
             .build())
@@ -750,7 +750,7 @@ fn create_revision_succeeds_for_open_pr() {
         .create_revision(revision_input(&parent_id), &checker)
         .unwrap();
 
-    assert_eq!(revision.kind, "revision");
+    assert_eq!(revision.kind, TaskKind::Revision);
     assert_eq!(revision.parent_task_id.as_deref(), Some(parent_id.as_str()));
     assert_eq!(revision.product_id, product_id);
     assert_eq!(revision.status, "todo");
@@ -858,13 +858,13 @@ fn create_revision_of_revision_gates_against_chain_root() {
     let r1 = db
         .create_revision(revision_input(&root_id), &checker_open)
         .unwrap();
-    assert_eq!(r1.kind, "revision");
+    assert_eq!(r1.kind, TaskKind::Revision);
 
     // R2: revision of R1 — gate should resolve to root's PR.
     let r2 = db
         .create_revision(revision_input(&r1.id), &checker_open)
         .unwrap();
-    assert_eq!(r2.kind, "revision");
+    assert_eq!(r2.kind, TaskKind::Revision);
     assert_eq!(r2.parent_task_id.as_deref(), Some(r1.id.as_str()));
 
     // Now simulate the root's PR being closed; revising R1 should fail.
@@ -1810,7 +1810,7 @@ fn request_execution_for_revision_task_produces_revision_implementation_kind() {
         .unwrap();
 
     assert_eq!(
-        exec.kind, "revision_implementation",
+        exec.kind, ExecutionKind::RevisionImplementation,
         "request_execution must produce revision_implementation for kind=revision tasks, got {:?}",
         exec.kind,
     );
@@ -1845,7 +1845,7 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
             |_| false,
         )
         .unwrap();
-    assert_eq!(first_exec.kind, "revision_implementation");
+    assert_eq!(first_exec.kind, ExecutionKind::RevisionImplementation);
     assert_eq!(first_exec.pr_url.as_deref(), Some(pr_url));
 
     // Simulate worker crash: mark the execution as abandoned.
@@ -1873,7 +1873,7 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
         "re-dispatch must create a fresh execution row",
     );
     assert_eq!(
-        second_exec.kind, "revision_implementation",
+        second_exec.kind, ExecutionKind::RevisionImplementation,
         "re-dispatched revision must still be revision_implementation, got {:?}",
         second_exec.kind,
     );

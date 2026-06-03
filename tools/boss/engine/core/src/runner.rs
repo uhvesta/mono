@@ -15,7 +15,7 @@ use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::worker_setup::WorkerKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
-use boss_protocol::{EditorialRules, TemplatePolicy, WorkItemBinding};
+use boss_protocol::{EditorialRules, ExecutionKind, TaskKind, TemplatePolicy, WorkItemBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {
@@ -426,7 +426,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             .agent()
             .ok()
             .and_then(|agent| agent.anthropic_api_key.clone());
-        let title_summary = if execution.kind == "ci_remediation" {
+        let title_summary = if execution.kind == ExecutionKind::CiRemediation {
             pane_summary::ci_remediation_summary(work_item_name(work_item))
         } else {
             pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await
@@ -454,9 +454,9 @@ impl ExecutionRunner for PaneSpawnRunner {
                 work_item_binding,
                 model: spawn_config.model.clone(),
                 draft_pr_mode: spawner.draft_pr_mode(),
-                execution_kind: execution.kind.clone(),
+                execution_kind: execution.kind.as_str().to_owned(),
                 task_kind: work_item_task_kind(work_item).map(str::to_owned),
-                worker_kind: if execution.kind == boss_protocol::EXECUTION_KIND_PR_REVIEW {
+                worker_kind: if execution.kind == ExecutionKind::PrReview {
                     WorkerKind::Reviewer
                 } else {
                     WorkerKind::Standard
@@ -590,7 +590,7 @@ pub(crate) fn compose_worker_spawn(
     // provenance, look up the linked attempt by the id embedded in
     // created_via (format: "merge-conflict:<crz_id>") so
     // compose_revision_directive can inject the conflict fragment.
-    let conflict_attempt = if execution.kind == "revision_implementation" {
+    let conflict_attempt = if execution.kind == ExecutionKind::RevisionImplementation {
         work_item_created_via(work_item)
             .and_then(|cv| cv.strip_prefix("merge-conflict:"))
             .and_then(|id| work_db.get_conflict_resolution(id).ok().flatten())
@@ -644,12 +644,12 @@ pub(crate) fn compose_worker_spawn(
     // look up the linked attempt by the id embedded in created_via
     // (format: "ci-fix:<crm_id>") so compose_revision_directive can
     // inject the CI remediation fragment.
-    let ci_attempt = if execution.kind == "ci_remediation" {
+    let ci_attempt = if execution.kind == ExecutionKind::CiRemediation {
         work_db
             .active_ci_remediation_for_work_item(&execution.work_item_id)
             .ok()
             .flatten()
-    } else if execution.kind == "revision_implementation" {
+    } else if execution.kind == ExecutionKind::RevisionImplementation {
         work_item_created_via(work_item)
             .and_then(|cv| cv.strip_prefix("ci-fix:"))
             .and_then(|id| work_db.get_ci_remediation(id).ok().flatten())
@@ -702,7 +702,7 @@ pub(crate) fn compose_worker_spawn(
     // If the task or its pr_url cannot be resolved, fall back to the
     // generic prompt (reviewer still gets workspace context but a weaker
     // framing — better than no spawn at all).
-    let prompt_text = if execution.kind == boss_protocol::EXECUTION_KIND_AUTOMATION_TRIAGE {
+    let prompt_text = if execution.kind == ExecutionKind::AutomationTriage {
         match work_db.get_automation(&execution.work_item_id) {
             Ok(Some(automation)) => {
                 let product_name = work_db
@@ -738,7 +738,7 @@ pub(crate) fn compose_worker_spawn(
                 )
             }
         }
-    } else if execution.kind == boss_protocol::EXECUTION_KIND_PR_REVIEW {
+    } else if execution.kind == ExecutionKind::PrReview {
         let task_name = work_item_name(work_item);
         let task_description = match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => task.description.as_str(),
@@ -859,7 +859,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // the engine-collected log excerpt, the failing-check set, and the
     // attempt-kind-specific playbook (rebase-first for `fix`, just the
     // retrigger CLI for `retrigger`).
-    if execution.kind == "ci_remediation" {
+    if execution.kind == ExecutionKind::CiRemediation {
         if let Some(attempt) = ci_attempt {
             return compose_ci_remediation_prompt(
                 execution,
@@ -959,7 +959,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // revisions and let the revision directive be the only word on branching.
     // (`existing_pr_url` is the work item's PR; revisions carry the parent PR
     // on `execution.pr_url`, so this guard is checked independently.)
-    if existing_pr_url.is_none() && execution.kind != "revision_implementation" {
+    if existing_pr_url.is_none() && execution.kind != ExecutionKind::RevisionImplementation {
         prompt.push_str(&format!(
             "- expected branch name: `{expected_branch}` — the engine reconstructs this from your execution id and uses it to find your PR. Push to this exact bookmark name.\n",
         ));
@@ -995,23 +995,27 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         prompt.push_str(&render_editorial_rules_block(editorial_rules, pr_template_set));
         prompt.push('\n');
     }
-    match execution.kind.as_str() {
-        "project_design" => {
+    match execution.kind {
+        ExecutionKind::ProjectDesign => {
             prompt.push_str(&compose_design_directive(parent_project));
         }
-        "investigation_implementation" => {
+        ExecutionKind::InvestigationImplementation => {
             prompt.push_str(&compose_investigation_directive());
         }
-        "revision_implementation" => {
+        ExecutionKind::RevisionImplementation => {
             prompt.push_str(&compose_revision_directive(execution, work_item, workspace_path, conflict_attempt, ci_attempt));
         }
-        "task_implementation" | "chore_implementation" => {
+        ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation => {
             prompt.push_str(
                 "Expected outcome for this run:\n- implement the requested change in the workspace,\n- run relevant local validation when practical,\n- stop once the work is ready for a human to review or redirect.\n",
             );
             prompt.push_str(check_bypass_prohibition_text());
         }
-        _ => {
+        ExecutionKind::AutomationTriage
+        | ExecutionKind::CiRemediation
+        | ExecutionKind::ConflictResolution
+        | ExecutionKind::PrReview
+        | ExecutionKind::ProductDesign => {
             prompt.push_str(
                 "Expected outcome for this run:\n- make concrete progress on the assigned work,\n- leave the workspace in a reviewable state,\n- stop with a concise review summary.\n",
             );
@@ -1026,16 +1030,16 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // Docs-only kinds (design/investigation) are excluded; revisions get
     // the gate inside `compose_revision_directive`.
     if matches!(
-        execution.kind.as_str(),
-        "task_implementation" | "chore_implementation"
+        execution.kind,
+        ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
     ) {
         if let Some(gate) = bazel_prepush_gate_block(workspace_path) {
             prompt.push_str(&gate);
         }
     }
     if matches!(
-        execution.kind.as_str(),
-        "task_implementation" | "chore_implementation" | "project_design" | "investigation_implementation"
+        execution.kind,
+        ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation | ExecutionKind::ProjectDesign | ExecutionKind::InvestigationImplementation
     ) {
         // Acceptance criterion: the engine watches for a PR URL on the
         // run's branch when claude stops. If the worker stops without
@@ -1090,11 +1094,11 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // the engine parses at completion. Design workers use the questions
     // manifest instead, so they are excluded here.
     if matches!(
-        execution.kind.as_str(),
-        "task_implementation"
-            | "chore_implementation"
-            | "investigation_implementation"
-            | "revision_implementation"
+        execution.kind,
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::InvestigationImplementation
+            | ExecutionKind::RevisionImplementation
     ) {
         prompt.push_str(&followups_emission_block());
     }
@@ -2126,7 +2130,7 @@ fn work_item_id(work_item: &WorkItem) -> &str {
 /// task-kind concept.
 pub(crate) fn work_item_task_kind(work_item: &WorkItem) -> Option<&str> {
     match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) => Some(&task.kind),
+        WorkItem::Task(task) | WorkItem::Chore(task) => Some(task.kind.as_str()),
         WorkItem::Product(_) | WorkItem::Project(_) => None,
     }
 }
@@ -2300,7 +2304,7 @@ mod compose_prompt_tests {
         WorkExecution::builder()
             .id("exec_abc123_01")
             .work_item_id("task-1")
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("pending")
             .repo_remote_url("git@github.com:org/repo.git")
             .workspace_path("/tmp/workspace")
@@ -2313,7 +2317,7 @@ mod compose_prompt_tests {
             Task::builder()
                 .id("task-1")
                 .product_id("prod-1")
-                .kind("chore")
+                .kind(TaskKind::Chore)
                 .name("Fix the thing")
                 .description("Description here.")
                 .status("todo")
@@ -2596,7 +2600,7 @@ mod compose_prompt_tests {
         WorkExecution::builder()
             .id("exec_abc123_01")
             .work_item_id("task-1")
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("pending")
             .repo_remote_url(remote.to_string())
             .workspace_path("/tmp/workspace")
@@ -2884,7 +2888,7 @@ mod compose_prompt_tests {
         WorkExecution::builder()
             .id("exec_rev_01")
             .work_item_id("task-1")
-            .kind("revision_implementation")
+            .kind(ExecutionKind::RevisionImplementation)
             .status("pending")
             .repo_remote_url("git@github.com:org/repo.git")
             .workspace_path("/tmp/workspace")
@@ -3031,7 +3035,7 @@ mod compose_prompt_tests {
         let mut task = crate::work::Task::builder()
             .id("task-rev-1")
             .product_id("prod-1")
-            .kind("revision")
+            .kind(TaskKind::Revision)
             .name("Revision task")
             .description("Fix the merge conflict.")
             .status("doing")
@@ -3604,7 +3608,7 @@ mod pane_spawn_tests {
         WorkExecution::builder()
             .id("exec-test-1")
             .work_item_id("task-1")
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("running")
             .repo_remote_url("git@example.com:foo.git")
             .cube_repo_id("foo")
@@ -3621,7 +3625,7 @@ mod pane_spawn_tests {
             Task::builder()
                 .id("task-1")
                 .product_id("prod-1")
-                .kind("chore")
+                .kind(TaskKind::Chore)
                 .name("Improve top header (agent card) styling")
                 .description("The gray header at the top is too cramped.")
                 .status("todo")
@@ -4399,7 +4403,7 @@ mod pane_spawn_tests {
             .create_execution(
                 CreateExecutionInput::builder()
                     .work_item_id(chore.id.clone())
-                    .kind("chore_implementation")
+                    .kind(ExecutionKind::ChoreImplementation)
                     .status("ready")
                     .build(),
             )
@@ -4528,7 +4532,7 @@ mod pane_spawn_tests {
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
-        execution.kind = "task_implementation".into();
+        execution.kind = ExecutionKind::TaskImplementation;
         execution.work_item_id = task.id.clone();
 
         runner
@@ -4612,7 +4616,7 @@ mod pane_spawn_tests {
             .list_tasks(&product.id, Some(&project.id), None, false)
             .unwrap()
             .into_iter()
-            .find(|t| t.kind == "design")
+            .find(|t| t.kind == TaskKind::Design)
             .expect("create_project should auto-file a kind='design' task");
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -4622,7 +4626,7 @@ mod pane_spawn_tests {
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
-        execution.kind = "project_design".into();
+        execution.kind = ExecutionKind::ProjectDesign;
         execution.work_item_id = design_task.id.clone();
 
         runner
@@ -4750,7 +4754,7 @@ mod pane_spawn_tests {
             .list_tasks(&product.id, Some(&project.id), None, false)
             .unwrap()
             .into_iter()
-            .find(|t| t.kind == "design")
+            .find(|t| t.kind == TaskKind::Design)
             .expect("create_project should auto-file a kind='design' task");
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
@@ -4760,7 +4764,7 @@ mod pane_spawn_tests {
         runner.set_server_state(weak);
 
         let mut execution = sample_execution(workspace.path());
-        execution.kind = "project_design".into();
+        execution.kind = ExecutionKind::ProjectDesign;
         execution.work_item_id = design_task.id.clone();
 
         runner

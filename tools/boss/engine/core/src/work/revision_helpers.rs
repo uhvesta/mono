@@ -185,7 +185,7 @@ pub(crate) fn resolve_task_id_from_selector(conn: &Connection, selector: &str) -
 /// Capped at a chain depth of 20 to protect against cycles in corrupt data.
 pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task]) -> Vec<Task> {
     // Compact lookup: id → (kind, parent_task_id, pr_url)
-    type Entry = (String, Option<String>, Option<String>);
+    type Entry = (TaskKind, Option<String>, Option<String>);
     let mut lookup: std::collections::HashMap<String, Entry> = std::collections::HashMap::new();
     for t in tasks.iter().chain(chores.iter()) {
         lookup.insert(
@@ -198,12 +198,12 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
     /// Returns `(root_id, root_pr_url)` or `None` when the chain is broken.
     fn chain_root(
         start: &str,
-        lookup: &std::collections::HashMap<String, (String, Option<String>, Option<String>)>,
+        lookup: &std::collections::HashMap<String, (TaskKind, Option<String>, Option<String>)>,
     ) -> Option<(String, Option<String>)> {
         let mut cur = start.to_owned();
         for _ in 0..20 {
             let (kind, parent_id, pr_url) = lookup.get(&cur)?;
-            if kind != "revision" {
+            if *kind != TaskKind::Revision {
                 return Some((cur, pr_url.clone()));
             }
             cur = parent_id.clone()?;
@@ -216,7 +216,7 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
     let mut root_info: Vec<Option<(String, Option<String>)>> = tasks
         .iter()
         .map(|t| {
-            if t.kind == "revision" {
+            if t.kind == TaskKind::Revision {
                 chain_root(&t.id, &lookup)
             } else {
                 None
@@ -229,7 +229,7 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
     let mut by_root: std::collections::HashMap<String, Vec<(String, usize)>> =
         std::collections::HashMap::new();
     for (idx, t) in tasks.iter().enumerate() {
-        if t.kind == "revision" {
+        if t.kind == TaskKind::Revision {
             if let Some((root_id, _)) = &root_info[idx] {
                 by_root
                     .entry(root_id.clone())
@@ -252,7 +252,7 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 
     // Apply projections to the task list.
     for (idx, task) in tasks.iter_mut().enumerate() {
-        if task.kind != "revision" {
+        if task.kind != TaskKind::Revision {
             continue;
         }
         if let Some((_, pr_url)) = root_info[idx].take() {
@@ -280,7 +280,7 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 /// the flag.
 pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &mut Vec<Task>) {
     // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
-    let mut lookup: std::collections::HashMap<String, (String, Option<String>)> =
+    let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> =
         std::collections::HashMap::new();
     for t in tasks.iter().chain(chores.iter()) {
         lookup.insert(t.id.clone(), (t.kind.clone(), t.parent_task_id.clone()));
@@ -290,12 +290,12 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &m
     /// Returns the root id or `None` when the chain is broken or cycles.
     fn walk_to_root(
         start: &str,
-        lookup: &std::collections::HashMap<String, (String, Option<String>)>,
+        lookup: &std::collections::HashMap<String, (TaskKind, Option<String>)>,
     ) -> Option<String> {
         let mut cur = start.to_owned();
         for _ in 0..20 {
             let (kind, parent_id) = lookup.get(&cur)?;
-            if kind != "revision" {
+            if *kind != TaskKind::Revision {
                 return Some(cur);
             }
             cur = parent_id.clone()?;
@@ -307,7 +307,7 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &m
     let mut in_progress_roots: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for t in tasks.iter() {
-        if t.kind == "revision" && (t.status == "todo" || t.status == "active") {
+        if t.kind == TaskKind::Revision && (t.status == "todo" || t.status == "active") {
             if let Some(root_id) = walk_to_root(&t.id, &lookup) {
                 in_progress_roots.insert(root_id);
             }
@@ -319,7 +319,7 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut Vec<Task>, chores: &m
     }
 
     for task in tasks.iter_mut() {
-        if task.kind != "revision" && in_progress_roots.contains(&task.id) {
+        if task.kind != TaskKind::Revision && in_progress_roots.contains(&task.id) {
             task.has_in_progress_revision = true;
         }
     }
@@ -572,7 +572,7 @@ pub(crate) fn insert_execution(
         params![
             id,
             input.work_item_id,
-            input.kind,
+            input.kind.as_str(),
             status,
             repo_remote_url,
             cube_repo_id,

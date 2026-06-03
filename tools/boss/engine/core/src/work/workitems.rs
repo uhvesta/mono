@@ -905,7 +905,7 @@ impl WorkDb {
             }
             let kind = execution_kind_for_work_item(&tx, &work_item_id)?;
             let mut result = ExecutionReconcileResult::default();
-            reconcile_work_item_execution(&tx, &mut result, &work_item_id, &kind, "ready")?;
+            reconcile_work_item_execution(&tx, &mut result, &work_item_id, kind, "ready")?;
             if !result.created.is_empty() || !result.updated.is_empty() {
                 tracing::info!(
                     work_item_id = %work_item_id,

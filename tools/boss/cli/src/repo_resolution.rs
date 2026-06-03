@@ -448,6 +448,7 @@ fn interactive_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boss_protocol::TaskKind;
 
     fn s(value: &str) -> String {
         value.to_owned()
@@ -457,7 +458,7 @@ mod tests {
         Task::builder()
             .id(id)
             .product_id("prod_1")
-            .kind("chore")
+            .kind(TaskKind::Chore)
             .name("x")
             .description("")
             .status("todo")

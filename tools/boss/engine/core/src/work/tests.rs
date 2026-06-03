@@ -32,7 +32,7 @@ fn complete_design_for_project(db: &WorkDb, project_id: &str) {
         .unwrap();
     let design = tasks
         .iter()
-        .find(|t| t.kind == "design")
+        .find(|t| t.kind == TaskKind::Design)
         .expect("project should have an auto-created design task");
     db.update_work_item(
         &design.id,
@@ -90,7 +90,7 @@ fn product_task_execution_with_prefix(
     let execution = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(task.id.clone())
-            .kind("task_implementation")
+            .kind(ExecutionKind::TaskImplementation)
             .status("ready")
             .build())
         .unwrap();
@@ -193,7 +193,7 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
         .unwrap();
     db.create_execution(CreateExecutionInput::builder()
         .work_item_id(task.id)
-        .kind("task_implementation")
+        .kind(ExecutionKind::TaskImplementation)
         .status("ready")
         .build())
     .unwrap()
@@ -310,7 +310,7 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
     let exec = db
         .create_execution(CreateExecutionInput::builder()
             .work_item_id(chore.id.clone())
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("ready")
             .repo_remote_url("git@github.com:foo/bar.git")
             .build())
@@ -460,7 +460,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         short_id: None,
         product_id: "p".to_owned(),
         project_id: None,
-        kind: kind.to_owned(),
+        kind: kind.parse().expect("invalid task kind in make_bare_task"),
         name: "n".to_owned(),
         description: "d".to_owned(),
         status: "todo".to_owned(),

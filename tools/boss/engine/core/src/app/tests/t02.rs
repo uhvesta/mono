@@ -1593,7 +1593,7 @@ fn in_review_chore_execution_returns_execution_id_when_in_review() {
         .create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
-                .kind("chore_implementation")
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status("ready")
                 .build(),
         )
@@ -1711,7 +1711,7 @@ fn active_to_todo_execution_returns_execution_id() {
         .create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
-                .kind("chore_implementation")
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status("running")
                 .build(),
         )
@@ -1777,7 +1777,7 @@ fn live_execution_for_deleted_item_returns_execution_id_when_running() {
         .create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
-                .kind("chore_implementation")
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status("running")
                 .build(),
         )
@@ -1798,7 +1798,7 @@ fn live_execution_for_deleted_item_returns_none_when_terminal() {
         db.create_execution(
             CreateExecutionInput::builder()
                 .work_item_id(chore_id.clone())
-                .kind("chore_implementation")
+                .kind(boss_protocol::ExecutionKind::ChoreImplementation)
                 .status(status)
                 .build(),
         )

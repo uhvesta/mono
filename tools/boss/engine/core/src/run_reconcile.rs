@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::WorkExecution;
+use boss_protocol::{ExecutionKind, WorkExecution};
 
 use crate::coordinator::{CubeClient, CubeWorkspaceStatus};
 
@@ -325,7 +325,7 @@ mod tests {
         WorkExecution::builder()
             .id(id)
             .work_item_id(format!("task-{id}"))
-            .kind("chore_implementation")
+            .kind(ExecutionKind::ChoreImplementation)
             .status("running")
             .repo_remote_url("git@example.com:foo.git")
             .cube_repo_id("foo")
