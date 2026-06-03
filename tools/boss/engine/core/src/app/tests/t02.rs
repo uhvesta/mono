@@ -2315,3 +2315,39 @@ fn executions_list_returns_empty_for_task_with_no_executions() {
         "a task with no executions must return an empty list"
     );
 }
+
+/// `tail_lines_from_content` with `lines == 0` must return the entire
+/// file contents, never truncated. This is the "show me the whole
+/// transcript" path that `bossctl agents transcript` uses by default
+/// (the default `--lines` is 0 so coordinators see the full conversation,
+/// not just the metadata events that happen to land at the tail).
+#[test]
+fn tail_lines_from_content_zero_returns_all_lines() {
+    let content = "line1\nline2\nline3\n";
+    let (lines, truncated) = tail_lines_from_content(content, 0);
+    assert_eq!(lines, vec!["line1", "line2", "line3"]);
+    assert!(!truncated, "lines=0 must never set truncated");
+}
+
+#[test]
+fn tail_lines_from_content_zero_on_empty_content() {
+    let (lines, truncated) = tail_lines_from_content("", 0);
+    assert!(lines.is_empty());
+    assert!(!truncated);
+}
+
+#[test]
+fn tail_lines_from_content_nonzero_tails_from_end() {
+    let content = "a\nb\nc\nd\ne\n";
+    let (lines, truncated) = tail_lines_from_content(content, 3);
+    assert_eq!(lines, vec!["c", "d", "e"]);
+    assert!(truncated);
+}
+
+#[test]
+fn tail_lines_from_content_nonzero_larger_than_total_returns_all() {
+    let content = "x\ny\n";
+    let (lines, truncated) = tail_lines_from_content(content, 100);
+    assert_eq!(lines, vec!["x", "y"]);
+    assert!(!truncated);
+}

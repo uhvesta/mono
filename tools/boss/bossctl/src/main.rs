@@ -321,23 +321,28 @@ enum AgentsAction {
         /// Worker reference: run id, slot id, or crew name.
         agent: String,
     },
-    /// Print the most recent transcript chunk from a worker.
+    /// Print the transcript of a worker's conversation.
     ///
     /// Works for both live workers and terminal/completed executions.
     /// For a completed execution, pass the execution id (`exec_*`) or
     /// run id (`run_*`) — the engine resolves the transcript path from
     /// the persistent `work_runs.transcript_path` record.
+    ///
+    /// By default the full transcript is returned (lines=0 means all
+    /// lines). Pass `--lines N` to tail only the last N lines.
     Transcript {
         /// Worker reference: run id (`run_*`), execution id (`exec_*`),
         /// slot id, or crew name. For completed executions, pass the
         /// execution id shown by `bossctl agents status <exec_id>`.
         agent: String,
-        #[arg(long, default_value_t = 100)]
+        /// Number of lines to return from the end of the transcript.
+        /// 0 (the default) returns the entire transcript.
+        #[arg(long, default_value_t = 0)]
         lines: usize,
         /// Output format for the transcript.
-        /// `text` renders a plain-text summary, `jsonl` prints raw JSONL
-        /// lines, and `markdown` converts the transcript to formatted
-        /// markdown via the engine's transcript converter.
+        /// `text` renders a plain-text summary (default), `jsonl` prints
+        /// raw JSONL lines, and `markdown` converts the transcript to
+        /// formatted markdown via the engine's transcript converter.
         #[arg(long, value_enum, default_value_t = TranscriptFormat::Text)]
         format: TranscriptFormat,
     },
@@ -1650,19 +1655,43 @@ async fn agents_transcript(
             lines: tail,
             truncated,
         } => {
-            if format == TranscriptFormat::Markdown {
-                // Convert the raw JSONL lines to rendered markdown locally.
+            if format == TranscriptFormat::Text || format == TranscriptFormat::Markdown {
                 let joined = tail.join("\n");
                 let events =
                     boss_engine::transcript_markdown::parse_transcript(&joined);
-                let segments = boss_engine::transcript_markdown::events_to_segments(
-                    &events,
-                    &Default::default(),
-                );
-                let md = boss_engine::transcript_markdown::segments_to_markdown(&segments);
-                print!("{md}");
+                let rendered = if format == TranscriptFormat::Markdown {
+                    let segments = boss_engine::transcript_markdown::events_to_segments(
+                        &events,
+                        &Default::default(),
+                    );
+                    boss_engine::transcript_markdown::segments_to_markdown(&segments)
+                } else {
+                    boss_engine::transcript_markdown::render_text(&events)
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "run_id": returned,
+                            "transcript_path": transcript_path,
+                            "rendered": rendered,
+                            "truncated": truncated,
+                        })
+                    );
+                } else {
+                    if truncated {
+                        println!(
+                            "transcript {transcript_path} (showing last {} lines; older content omitted)",
+                            tail.len()
+                        );
+                    } else {
+                        println!("transcript {transcript_path} ({} lines)", tail.len());
+                    }
+                    print!("{rendered}");
+                }
                 return Ok(());
             }
+            // TranscriptFormat::Jsonl — dump raw JSONL lines.
             if json {
                 println!(
                     "{}",

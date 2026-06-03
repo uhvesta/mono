@@ -1173,12 +1173,13 @@ pub(super) async fn read_transcript_tail(
 /// `truncated` flag (true when earlier lines were dropped). Shared by
 /// the local read above and the remote-over-SSH pull
 /// ([`crate::remote_transcript`]) so both transports produce an
-/// identical `RunTranscriptTail` payload. `lines == 0` returns no lines
-/// and `truncated = true` iff any content exists.
+/// identical `RunTranscriptTail` payload. `lines == 0` returns ALL lines
+/// (the whole file, no truncation).
 pub(super) fn tail_lines_from_content(contents: &str, lines: usize) -> (Vec<String>, bool) {
     let split_lines: Vec<&str> = contents.lines().collect();
     if lines == 0 {
-        return (Vec::new(), !split_lines.is_empty());
+        // 0 = "all lines" — return the complete transcript, never truncated.
+        return (split_lines.into_iter().map(str::to_owned).collect(), false);
     }
     let total = split_lines.len();
     let take = lines.min(total);
