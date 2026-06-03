@@ -853,7 +853,7 @@
           "REPO_MAPPING:rules_rust+,bazel_tools bazel_tools",
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
-          "FILE:@@//Cargo.lock 9d9969f5188f3b319f834aa270da32ca745496873c783ea5c293cae135fab969",
+          "FILE:@@//Cargo.lock 46a5e3de70320c418dbfe8945fb7d5c3f2ddf6de2f96ab33a73f9904957ba392",
           "FILE:@@//Cargo.toml e1ea785168a30a649694ba076634b1bb33e1d66f549dd89204ae9887dac5cebf",
           "FILE:@@//lib/rust/broker-robinhood/Cargo.toml 283446ff4724eb01b6f89291264a15a3904596fb9df32f157c50f8f691c3ed23",
           "FILE:@@//tools/boss/bossctl/Cargo.toml fc9da151e3258e899e8495b1da241043ead76639d5aeb700e5c4c04bee0f30c0",

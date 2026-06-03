@@ -7,11 +7,16 @@ use std::time::{Duration, Instant};
 
 use crate::app::RepobinError;
 
+fn extra_bazel_startup_flags() -> Vec<String> {
+    match std::env::var("REPOBIN_BAZEL_STARTUP_FLAGS") {
+        Ok(val) if !val.trim().is_empty() => shell_words::split(&val).unwrap_or_default(),
+        _ => vec![],
+    }
+}
+
 fn extra_bazel_flags() -> Vec<String> {
     match std::env::var("REPOBIN_BAZEL_FLAGS") {
-        Ok(val) if !val.trim().is_empty() => {
-            shell_words::split(&val).unwrap_or_default()
-        }
+        Ok(val) if !val.trim().is_empty() => shell_words::split(&val).unwrap_or_default(),
         _ => vec![],
     }
 }
@@ -40,6 +45,7 @@ impl BazelAdapter for RealBazel {
     fn build(&self, repo_root: &Path, target: &str) -> Result<(), RepobinError> {
         let mut command = Command::new("bazel");
         command
+            .args(extra_bazel_startup_flags())
             .arg("build")
             .arg("--color=no")
             .arg("--curses=no")
@@ -173,6 +179,7 @@ impl BazelAdapter for RealBazel {
 
     fn resolve_executable(&self, repo_root: &Path, target: &str) -> Result<PathBuf, RepobinError> {
         let output = Command::new("bazel")
+            .args(extra_bazel_startup_flags())
             .arg("cquery")
             .arg("--color=no")
             .arg("--curses=no")
@@ -217,6 +224,7 @@ impl BazelAdapter for RealBazel {
         // enumerating thousands of third-party crate files from external repositories.
         let query = format!("filter('^//', kind('source file', deps({target})))");
         let output = Command::new("bazel")
+            .args(extra_bazel_startup_flags())
             .arg("query")
             .arg(&query)
             .arg("--color=no")
