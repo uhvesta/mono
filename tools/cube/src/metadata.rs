@@ -90,6 +90,11 @@ pub struct WorkspaceRecord {
     /// `None` means health has not been checked since the row was created or
     /// last released.
     pub health_status: Option<WorkspaceHealth>,
+    /// Unix timestamp (seconds) when this workspace first entered an unhealthy
+    /// state (`dirty` or `conflicted`). Cleared when the workspace is claimed
+    /// or released clean. A dirty→conflicted (or vice-versa) transition while
+    /// continuously unhealthy does NOT reset this clock.
+    pub unhealthy_since_epoch_s: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

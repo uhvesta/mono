@@ -2719,7 +2719,144 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
             );
         }
     }
+
+    let gc_config = config::load_config()
+        .unwrap_or_default()
+        .unhealthy_gc;
+    let max_age_secs = gc_config.max_age_secs();
+    if let Ok(now) = current_epoch_s() {
+        gc_aged_unhealthy_workspaces(&runner, &store, database_path.as_deref(), now, max_age_secs);
+    }
+
     gc_stale_workspace_logs(&store);
+}
+
+/// During pool GC, reset any non-leased free workspace that has been
+/// continuously `dirty` or `conflicted` for longer than `max_age_secs`.
+/// Emits a `workspace.unhealthy_gc_reset` audit event for each workspace
+/// that is reclaimed so the discarded work is traceable.
+fn gc_aged_unhealthy_workspaces(
+    runner: &dyn CommandRunner,
+    store: &Store,
+    database_path: Option<&Path>,
+    now_epoch_s: i64,
+    max_age_secs: i64,
+) {
+    let records = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cube: unhealthy gc: failed to list workspaces: {e}");
+            return;
+        }
+    };
+
+    let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
+
+    for record in records {
+        if record.state == WorkspaceState::Leased {
+            continue;
+        }
+        let is_unhealthy = matches!(
+            record.health_status,
+            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+        );
+        if !is_unhealthy {
+            continue;
+        }
+        let Some(unhealthy_since) = record.unhealthy_since_epoch_s else {
+            continue;
+        };
+        if unhealthy_since > threshold_epoch_s {
+            continue;
+        }
+        if !workspace_path_exists(&record) {
+            continue;
+        }
+
+        // Re-check state: skip if the workspace was claimed between the list
+        // and this point.
+        let current_state = store
+            .list_workspaces_filtered(&WorkspaceListFilter {
+                repo: Some(&record.repo),
+                workspace_id: Some(&record.workspace_id),
+                ..Default::default()
+            })
+            .ok()
+            .and_then(|mut v| v.pop())
+            .map(|r| r.state);
+        if current_state != Some(WorkspaceState::Free) {
+            eprintln!(
+                "cube: unhealthy gc: {} was claimed mid-pass, skipping",
+                record.workspace_id,
+            );
+            continue;
+        }
+
+        let main_branch = match store.get_repo(&record.repo).ok().flatten() {
+            Some(r) => r.main_branch,
+            None => {
+                eprintln!(
+                    "cube: unhealthy gc: {}: repo {} not found, skipping",
+                    record.workspace_id, record.repo,
+                );
+                continue;
+            }
+        };
+
+        let prior_health = record
+            .health_status
+            .map(|h| h.as_str())
+            .unwrap_or("unknown");
+        let age_secs = now_epoch_s.saturating_sub(unhealthy_since);
+
+        if let Err(e) = reset_workspace(
+            runner,
+            database_path,
+            &record.workspace_path,
+            &main_branch,
+        ) {
+            eprintln!(
+                "cube: unhealthy gc: {}: reset failed: {e}",
+                record.workspace_id,
+            );
+            continue;
+        }
+
+        match store.gc_clear_workspace_unhealthy_state(&record.repo, &record.workspace_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!(
+                    "cube: unhealthy gc: {}: claimed between reset and store update",
+                    record.workspace_id,
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "cube: unhealthy gc: {}: failed to clear store state: {e}",
+                    record.workspace_id,
+                );
+                continue;
+            }
+        }
+
+        audit!(
+            database_path,
+            "workspace.unhealthy_gc_reset",
+            workspace_id = record.workspace_id,
+            repo = record.repo,
+            prior_health = prior_health,
+            prior_holder = record.holder.as_deref(),
+            prior_task = record.task.as_deref(),
+            unhealthy_since_epoch_s = unhealthy_since,
+            age_secs = age_secs,
+        );
+
+        eprintln!(
+            "cube: unhealthy gc: reset {} (was {} for {}s)",
+            record.workspace_id, prior_health, age_secs,
+        );
+    }
 }
 
 fn gc_stale_workspace_logs(store: &Store) {
@@ -3985,7 +4122,8 @@ mod tests {
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY,
         RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
-        is_bare_repo_slug, is_stdin_path, origin_path_matches_slug, origin_urls_equivalent,
+        gc_aged_unhealthy_workspaces, is_bare_repo_slug, is_stdin_path,
+        origin_path_matches_slug, origin_urls_equivalent,
         parse_github_remote, parse_github_slug, parse_origin,
         render_boss_infra_exclude_block, resolve_body_file, run_with_context,
         run_with_dependencies, upsert_managed_exclude,
@@ -4254,6 +4392,7 @@ mod tests {
                 origin_pattern: origin_pattern.to_string(),
                 clone_command: clone_command.map(str::to_string),
             }],
+            unhealthy_gc: Default::default(),
         }
     }
 
@@ -11582,5 +11721,174 @@ github\tssh://org-1@github.com/spinyfin/mono.git
         ensure_boss_infra_excluded(&workspace, "mono-agent-004");
 
         assert!(!workspace.join(".git").exists());
+    }
+
+    // ── unhealthy GC tests ────────────────────────────────────────────────────
+
+    fn setup_unhealthy_gc_scenario(
+        tempdir: &TempDir,
+        database_path: &std::path::Path,
+    ) -> (crate::store::Store, std::path::PathBuf) {
+        use crate::metadata::{RepoRecord, WorkspaceCandidate};
+        use crate::store::Store;
+
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
+
+        let mut store = Store::open_at(database_path).expect("store");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("repo");
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: ws_path.clone(),
+                }],
+            )
+            .expect("sync");
+
+        (store, ws_path)
+    }
+
+    fn reset_runner_for(ws_path: &std::path::Path) -> FakeRunner {
+        FakeRunner::new(vec![
+            ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                ws_path.to_path_buf(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["new", "main"], ""),
+        ])
+    }
+
+    #[test]
+    fn gc_resets_aged_dirty_workspace_to_clean() {
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+            .expect("mark dirty");
+
+        // Verify unhealthy_since was set.
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+        assert!(ws.unhealthy_since_epoch_s.is_some(), "unhealthy_since should be set");
+
+        // Simulate GC running 6 days later (threshold = 5 days).
+        let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
+        let max_age_secs = 5 * 86_400;
+
+        let runner = reset_runner_for(&ws_path);
+        gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs);
+        runner.assert_exhausted();
+
+        let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(
+            ws_after.health_status, None,
+            "health_status should be cleared after GC reset"
+        );
+        assert_eq!(
+            ws_after.unhealthy_since_epoch_s, None,
+            "unhealthy_since_epoch_s should be cleared after GC reset"
+        );
+        assert_eq!(ws_after.state, crate::metadata::WorkspaceState::Free);
+    }
+
+    #[test]
+    fn gc_resets_aged_conflicted_workspace_to_clean() {
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Conflicted)
+            .expect("mark conflicted");
+
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Conflicted));
+        assert!(ws.unhealthy_since_epoch_s.is_some());
+
+        let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
+        let max_age_secs = 5 * 86_400;
+
+        let runner = reset_runner_for(&ws_path);
+        gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs);
+        runner.assert_exhausted();
+
+        let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws_after.health_status, None);
+        assert_eq!(ws_after.unhealthy_since_epoch_s, None);
+    }
+
+    #[test]
+    fn gc_skips_recently_unhealthy_workspace() {
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+            .expect("mark dirty");
+
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        let unhealthy_since = ws.unhealthy_since_epoch_s.unwrap();
+
+        // GC runs only 1 day after unhealthy_since; threshold is 5 days.
+        let fake_now = unhealthy_since + 86_400;
+        let max_age_secs = 5 * 86_400;
+
+        // No reset commands should be issued.
+        let runner = FakeRunner::default();
+        gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs);
+        runner.assert_exhausted();
+
+        let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(
+            ws_after.health_status,
+            Some(crate::metadata::WorkspaceHealth::Dirty),
+            "recent unhealthy workspace should be left untouched"
+        );
+        assert_eq!(ws_after.unhealthy_since_epoch_s, Some(unhealthy_since));
+    }
+
+    #[test]
+    fn unhealthy_since_preserved_through_dirty_to_conflicted_transition() {
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+            .expect("mark dirty");
+
+        let ws_after_dirty = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        let original_since = ws_after_dirty.unhealthy_since_epoch_s.unwrap();
+
+        // Transition to conflicted without becoming clean first.
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Conflicted)
+            .expect("mark conflicted");
+
+        let ws_after_conflicted = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(
+            ws_after_conflicted.health_status,
+            Some(crate::metadata::WorkspaceHealth::Conflicted)
+        );
+        assert_eq!(
+            ws_after_conflicted.unhealthy_since_epoch_s,
+            Some(original_since),
+            "unhealthy_since should not be reset when transitioning between unhealthy states"
+        );
     }
 }

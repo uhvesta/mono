@@ -62,6 +62,51 @@ impl RepoResolver {
     }
 }
 
+/// Default number of days a free workspace may remain unhealthy (dirty or
+/// conflicted) before pool GC reclaims it. Override with
+/// `[unhealthy-gc] max-age-days` in `cube.toml` or the
+/// `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variable.
+pub const DEFAULT_UNHEALTHY_GC_MAX_AGE_DAYS: u64 = 5;
+
+const SECS_PER_DAY: i64 = 86_400;
+
+/// Controls the time-bounded reclaim of free workspaces that have been
+/// continuously unhealthy (dirty or conflicted) for too long.
+///
+/// Both `dirty` and `conflicted` workspaces share the same `max-age-days`
+/// threshold. The struct is designed so a separate, more-aggressive
+/// threshold for conflicted workspaces can be added as a new optional field
+/// later without a schema/redesign.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct UnhealthyGcConfig {
+    /// How many days a free workspace can remain unhealthy before pool GC
+    /// resets it back to clean. Defaults to [`DEFAULT_UNHEALTHY_GC_MAX_AGE_DAYS`].
+    /// Overridable via the `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variable.
+    #[serde(rename = "max-age-days")]
+    pub max_age_days: u64,
+}
+
+impl Default for UnhealthyGcConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: DEFAULT_UNHEALTHY_GC_MAX_AGE_DAYS,
+        }
+    }
+}
+
+impl UnhealthyGcConfig {
+    /// Returns the configured max unhealthy age in seconds, applying any
+    /// `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variable override.
+    pub fn max_age_secs(&self) -> i64 {
+        let days = std::env::var("CUBE_UNHEALTHY_GC_MAX_AGE_DAYS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(self.max_age_days);
+        (days as i64).saturating_mul(SECS_PER_DAY)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct CubeConfig {
@@ -69,6 +114,9 @@ pub struct CubeConfig {
     /// URL wins (see `cube repo ensure`).
     #[serde(rename = "repo-resolvers")]
     pub repo_resolvers: Vec<RepoResolver>,
+    /// Controls time-bounded reclaim of long-lived unhealthy free workspaces.
+    #[serde(rename = "unhealthy-gc")]
+    pub unhealthy_gc: UnhealthyGcConfig,
 }
 
 /// Load cube user config from the standard config file path.

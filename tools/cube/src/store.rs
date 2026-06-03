@@ -201,7 +201,8 @@ impl Store {
                 lease_expires_at_epoch_s,
                 head_commit,
                 last_release_reason,
-                health_status
+                health_status,
+                unhealthy_since_epoch_s
             FROM workspaces
             WHERE 1=1
             "#,
@@ -271,7 +272,8 @@ impl Store {
                     lease_expires_at_epoch_s,
                     head_commit,
                     last_release_reason,
-                    health_status
+                    health_status,
+                    unhealthy_since_epoch_s
                 FROM workspaces
                 WHERE repo = ?1
                 ORDER BY workspace_id
@@ -433,7 +435,9 @@ impl Store {
                     leased_at_epoch_s = ?5,
                     lease_expires_at_epoch_s = ?6,
                     head_commit = NULL,
-                    last_release_reason = NULL
+                    last_release_reason = NULL,
+                    health_status = NULL,
+                    unhealthy_since_epoch_s = NULL
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
                 "#,
                 params![
@@ -465,7 +469,8 @@ impl Store {
                     lease_expires_at_epoch_s,
                     head_commit,
                     last_release_reason,
-                    health_status
+                    health_status,
+                    unhealthy_since_epoch_s
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -501,6 +506,12 @@ impl Store {
     /// can surface it without re-running `jj status` on every workspace.
     /// Only updates free workspaces (leased workspaces have no meaningful
     /// health status until they are released).
+    ///
+    /// When transitioning to `dirty` or `conflicted`, `unhealthy_since_epoch_s`
+    /// is set to the current time on the first unhealthy transition and kept
+    /// unchanged on subsequent unhealthy transitions (dirty→conflicted or vice
+    /// versa). This preserves the original clock so pool GC can measure the
+    /// total unhealthy age accurately. Transitioning to `clean` clears it.
     pub fn update_workspace_health(
         &self,
         repo: &str,
@@ -511,7 +522,13 @@ impl Store {
             .execute(
                 r#"
                 UPDATE workspaces
-                SET health_status = ?3
+                SET
+                    health_status = ?3,
+                    unhealthy_since_epoch_s = CASE
+                        WHEN ?3 IN ('dirty', 'conflicted')
+                            THEN COALESCE(unhealthy_since_epoch_s, unixepoch())
+                        ELSE NULL
+                    END
                 WHERE repo = ?1 AND workspace_id = ?2 AND state = ?4
                 "#,
                 params![
@@ -523,6 +540,31 @@ impl Store {
             )
             .map_err(CubeError::Storage)?;
         Ok(())
+    }
+
+    /// Mark a workspace's health as clean after pool GC has reset it.
+    /// Clears both `health_status` and `unhealthy_since_epoch_s`, but only
+    /// if the workspace is still free — if it was claimed mid-pass, this
+    /// is a no-op (returns `false`). Returns `true` when the row was updated.
+    pub fn gc_clear_workspace_unhealthy_state(
+        &self,
+        repo: &str,
+        workspace_id: &str,
+    ) -> Result<bool, CubeError> {
+        let updated = self
+            .connection
+            .execute(
+                r#"
+                UPDATE workspaces
+                SET
+                    health_status = NULL,
+                    unhealthy_since_epoch_s = NULL
+                WHERE repo = ?1 AND workspace_id = ?2 AND state = ?3
+                "#,
+                params![repo, workspace_id, WorkspaceState::Free.as_str()],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(updated > 0)
     }
 
     /// Claim a specific workspace by `workspace_id`, atomically transitioning
@@ -555,7 +597,8 @@ impl Store {
                     lease_expires_at_epoch_s = ?6,
                     head_commit = NULL,
                     last_release_reason = NULL,
-                    health_status = NULL
+                    health_status = NULL,
+                    unhealthy_since_epoch_s = NULL
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
                 "#,
                 params![
@@ -592,7 +635,8 @@ impl Store {
                     lease_expires_at_epoch_s,
                     head_commit,
                     last_release_reason,
-                    health_status
+                    health_status,
+                    unhealthy_since_epoch_s
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -623,7 +667,8 @@ impl Store {
                     lease_expires_at_epoch_s,
                     head_commit,
                     last_release_reason,
-                    health_status
+                    health_status,
+                    unhealthy_since_epoch_s
                 FROM workspaces
                 WHERE workspace_path = ?1
                 "#,
@@ -653,7 +698,8 @@ impl Store {
                     lease_expires_at_epoch_s,
                     head_commit,
                     last_release_reason,
-                    health_status
+                    health_status,
+                    unhealthy_since_epoch_s
                 FROM workspaces
                 WHERE lease_id = ?1
                 "#,
@@ -700,7 +746,8 @@ impl Store {
                     lease_expires_at_epoch_s = NULL,
                     head_commit = NULL,
                     last_release_reason = ?3,
-                    health_status = NULL
+                    health_status = NULL,
+                    unhealthy_since_epoch_s = NULL
                 WHERE lease_id = ?1
                 "#,
                 params![lease_id, WorkspaceState::Free.as_str(), reason],
@@ -717,6 +764,7 @@ impl Store {
             head_commit: None,
             last_release_reason: reason.map(str::to_string),
             health_status: None,
+            unhealthy_since_epoch_s: None,
             ..record
         }))
     }
@@ -1025,6 +1073,7 @@ impl Store {
                     head_commit TEXT,
                     last_release_reason TEXT,
                     health_status TEXT,
+                    unhealthy_since_epoch_s INTEGER,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -1082,6 +1131,10 @@ impl Store {
         try_add_column(
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN health_status TEXT",
+        )?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN unhealthy_since_epoch_s INTEGER",
         )?;
         try_add_column(
             &self.connection,
@@ -1165,6 +1218,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         head_commit: row.get(9)?,
         last_release_reason: row.get(10)?,
         health_status: health_raw.as_deref().and_then(WorkspaceHealth::from_str),
+        unhealthy_since_epoch_s: row.get(12)?,
     })
 }
 
