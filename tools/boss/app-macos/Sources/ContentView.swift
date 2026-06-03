@@ -2119,6 +2119,14 @@ struct WorkBoardCardView: View {
                             }
                     }
                     Spacer(minLength: 0)
+                    if let id = task.shortID {
+                        Text("T" + String(id))
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .accessibilityLabel("T" + String(id))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
                 }
             }
 
@@ -2140,7 +2148,7 @@ struct WorkBoardCardView: View {
                 }
             }
 
-            if let id = task.shortID {
+            if task.prURL == nil || task.prURL!.isEmpty, let id = task.shortID {
                 HStack {
                     Spacer(minLength: 0)
                     Text("T" + String(id))
