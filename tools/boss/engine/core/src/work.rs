@@ -208,6 +208,7 @@ pub(crate) use exec_status_helpers::*;
 pub(crate) use insert_helpers::*;
 pub(crate) use mappers::*;
 pub(crate) use migrations_a::*;
+pub(crate) use exec_tail::content_checksum;
 pub(crate) use migrations_b::*;
 pub(crate) use query_ensure::*;
 pub(crate) use revision_helpers::*;

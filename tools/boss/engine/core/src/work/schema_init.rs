@@ -317,8 +317,19 @@ impl WorkDb {
         // already converts '' → None at read time, but canonical DB storage
         // should use NULL (consistent with schema intent and SQL IS NULL queries).
         migrate_tasks_empty_effort_to_null(&conn)?;
+        // Behavior 8: upstream title/body drift detection. Adds
+        // `external_ref_upstream_title` and `external_ref_upstream_body` to
+        // `tasks` so the reconciler can tell apart operator edits from upstream
+        // changes without parsing the description prose. Superseded by the
+        // checksum migration below but kept for safe forward compatibility.
+        migrate_external_tracker_upstream_content(&conn)?;
+        // Behavior 8 (revision): replace raw-content columns with SHA-256
+        // checksums. Adds `external_ref_upstream_checksum` and
+        // `external_ref_boss_checksum`; the old title/body columns remain in
+        // the schema but are no longer read or written.
+        migrate_external_tracker_content_checksums(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '16')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '18')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

@@ -1316,3 +1316,52 @@ pub(crate) fn migrate_tasks_empty_effort_to_null(conn: &Connection) -> Result<()
     )?;
     Ok(())
 }
+
+/// Adds `external_ref_upstream_title` and `external_ref_upstream_body` columns
+/// to the `tasks` table. These were the original Behavior 8 drift-detection
+/// columns; superseded by [`migrate_external_tracker_content_checksums`] which
+/// stores SHA-256 checksums instead of raw content. Kept for safe forward
+/// migration — the columns are still created if absent so an older engine that
+/// only knows about this migration can start without schema errors.
+pub(crate) fn migrate_external_tracker_upstream_content(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "external_ref_upstream_title",
+            "ALTER TABLE tasks ADD COLUMN external_ref_upstream_title TEXT",
+        ),
+        (
+            "external_ref_upstream_body",
+            "ALTER TABLE tasks ADD COLUMN external_ref_upstream_body TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
+/// Adds `external_ref_upstream_checksum` and `external_ref_boss_checksum`
+/// columns to `tasks`. These replace the raw-content columns from
+/// [`migrate_external_tracker_upstream_content`] with SHA-256 checksums
+/// (see `content_checksum` in `exec_tail.rs` for the canonical format).
+///
+/// `NULL` on existing rows means "no baseline yet"; the reconciler establishes
+/// the baseline on its next pass without auto-syncing.
+pub(crate) fn migrate_external_tracker_content_checksums(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "external_ref_upstream_checksum",
+            "ALTER TABLE tasks ADD COLUMN external_ref_upstream_checksum TEXT",
+        ),
+        (
+            "external_ref_boss_checksum",
+            "ALTER TABLE tasks ADD COLUMN external_ref_boss_checksum TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}

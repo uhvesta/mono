@@ -1,4 +1,19 @@
+use sha2::{Digest, Sha256};
+
 use super::*;
+
+/// Compute a SHA-256 checksum over a canonical combination of title and body.
+///
+/// Canonicalization: `title + "\n\n" + body`, no normalization. This is
+/// deterministic across runs and platforms — no trailing-newline stripping,
+/// no locale-sensitive transforms.
+pub(crate) fn content_checksum(title: &str, body: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(title.as_bytes());
+    h.update(b"\n\n");
+    h.update(body.as_bytes());
+    format!("{:x}", h.finalize())
+}
 
 impl WorkDb {
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
@@ -495,6 +510,92 @@ impl WorkDb {
                AND deleted_at IS NULL
                AND (pr_url IS NULL OR pr_url = '')",
             params![work_item_id, pr_url, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Return the stored Behavior 8 drift-detection checksums.
+    ///
+    /// Returns `Ok(None)` when either checksum column is `NULL` — this happens
+    /// for items imported before the checksum migration. The reconciler
+    /// establishes the baseline on the next pass without auto-syncing.
+    ///
+    /// The tuple is `(upstream_checksum, boss_checksum)` where each is a
+    /// SHA-256 hex string computed by [`content_checksum`].
+    pub fn reconciler_get_content_checksums(
+        &self,
+        work_item_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let conn = self.connect()?;
+        let result = conn
+            .query_row(
+                "SELECT external_ref_upstream_checksum, external_ref_boss_checksum
+                 FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+                params![work_item_id],
+                |row| {
+                    let upstream: Option<String> = row.get(0)?;
+                    let boss: Option<String> = row.get(1)?;
+                    Ok(upstream.zip(boss))
+                },
+            )
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Persist the drift-detection checksums without modifying the task name
+    /// or description.
+    ///
+    /// Called on the first reconcile tick for items imported before the
+    /// checksum migration (`external_ref_upstream_checksum IS NULL`).
+    pub fn reconciler_set_content_checksums_baseline(
+        &self,
+        work_item_id: &str,
+        upstream_title: &str,
+        upstream_body: &str,
+        boss_name: &str,
+        boss_description: &str,
+    ) -> Result<()> {
+        let upstream_checksum = content_checksum(upstream_title, upstream_body);
+        let boss_checksum = content_checksum(boss_name, boss_description);
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+             SET external_ref_upstream_checksum = ?2,
+                 external_ref_boss_checksum     = ?3
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![work_item_id, upstream_checksum, boss_checksum],
+        )?;
+        Ok(())
+    }
+
+    /// Update a work item's `name` and `description` from upstream and record
+    /// fresh checksums as the Behavior 8 sync baseline.
+    ///
+    /// Returns `true` if the row was found and updated, `false` if soft-deleted
+    /// or not found (idempotent-safe).
+    pub fn reconciler_update_name_and_description(
+        &self,
+        work_item_id: &str,
+        new_name: &str,
+        new_description: &str,
+        upstream_title: &str,
+        upstream_body: &str,
+    ) -> Result<bool> {
+        let upstream_checksum = content_checksum(upstream_title, upstream_body);
+        let boss_checksum = content_checksum(new_name, new_description);
+        let conn = self.connect()?;
+        let now = now_string();
+        let n = conn.execute(
+            "UPDATE tasks
+             SET name                               = ?2,
+                 description                        = ?3,
+                 external_ref_upstream_checksum     = ?4,
+                 external_ref_boss_checksum         = ?5,
+                 updated_at                         = ?6
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![work_item_id, new_name, new_description, upstream_checksum, boss_checksum, now],
         )?;
         Ok(n > 0)
     }

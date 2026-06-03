@@ -73,7 +73,6 @@ exclude_structs = [
   "engine/core/src/dispatch_reader.rs::StalledStage",
   "engine/core/src/external_tracker/github.rs::GitHubConfig",
   "engine/core/src/external_tracker/mod.rs::UpstreamItem",
-  "engine/core/src/external_tracker/reconcile.rs::PassOutcome",
   "engine/core/src/host_registry.rs::Host",
   "engine/core/src/live_status_loop.rs::SlotDebugSnapshot",
   "engine/core/src/live_status_loop.rs::DispatcherStatsSnapshot",

@@ -224,29 +224,40 @@ impl WorkDb {
     ///
     /// Also bumps `external_ref_synced_at` within the same transaction so the
     /// row is fully ready for the reconciler immediately after commit.
+    ///
+    /// `upstream_title` and `upstream_body` are the raw upstream issue title
+    /// and body (not the formatted description). SHA-256 checksums of both the
+    /// upstream content and the initial boss name/description are stored as
+    /// the Behavior 8 drift-detection baseline.
     pub fn import_chore_with_external_ref(
         &self,
         input: CreateChoreInput,
         kind: &str,
         canonical_id: &str,
         raw: &serde_json::Value,
+        upstream_title: &str,
+        upstream_body: &str,
     ) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let chore = insert_chore_in_tx(&tx, input)?;
+        let upstream_checksum = content_checksum(upstream_title, upstream_body);
+        let boss_checksum = content_checksum(&chore.name, &chore.description);
         let raw_json = serde_json::to_string(raw)
             .with_context(|| format!("failed to serialise external_ref raw for {}", chore.id))?;
         let now = now_string();
         tx.execute(
             "UPDATE tasks
-             SET external_ref_kind         = ?2,
-                 external_ref_canonical_id = ?3,
-                 external_ref_raw          = ?4,
-                 external_ref_synced_at    = ?5,
-                 external_ref_unbound_at   = NULL,
-                 updated_at                = ?5
+             SET external_ref_kind                  = ?2,
+                 external_ref_canonical_id          = ?3,
+                 external_ref_raw                   = ?4,
+                 external_ref_synced_at             = ?5,
+                 external_ref_unbound_at            = NULL,
+                 external_ref_upstream_checksum     = ?6,
+                 external_ref_boss_checksum         = ?7,
+                 updated_at                         = ?5
              WHERE id = ?1 AND deleted_at IS NULL",
-            params![chore.id, kind, canonical_id, raw_json, now],
+            params![chore.id, kind, canonical_id, raw_json, now, upstream_checksum, boss_checksum],
         )?;
         tx.commit()?;
         Ok(chore)

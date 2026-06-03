@@ -1,10 +1,9 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 rust_library(
     name = "engine_lib",
-    crate_name = "boss_engine",
     srcs = [
         "src/app.rs",
         "src/app/attentions.rs",
@@ -61,12 +60,13 @@ rust_library(
         "src/effort.rs",
         "src/engine_control.rs",
         "src/events_socket.rs",
-        "src/gh_invocation.rs",
         "src/external_tracker/credentials.rs",
         "src/external_tracker/github.rs",
         "src/external_tracker/github_oauth.rs",
         "src/external_tracker/mod.rs",
-        "src/external_tracker/reconcile.rs",
+        "src/external_tracker/reconcile/mod.rs",
+        "src/external_tracker/reconcile/tests/tests_drift.rs",
+        "src/gh_invocation.rs",
         "src/host_adapter.rs",
         "src/host_registry.rs",
         "src/host_scheduling.rs",
@@ -75,8 +75,8 @@ rust_library(
         "src/live_status.rs",
         "src/live_status_loop.rs",
         "src/live_status_redact.rs",
-        "src/magic_wand.rs",
         "src/live_worker_state.rs",
+        "src/magic_wand.rs",
         "src/merge_poller.rs",
         "src/merge_when_ready.rs",
         "src/metrics/mod.rs",
@@ -151,20 +151,22 @@ rust_library(
         "src/worker_setup.rs",
         "src/wrapper_distribution.rs",
     ],
-    crate_root = "src/lib.rs",
     compile_data = glob(["src/external_tracker/testdata/**"]) + [
         "remote/boss-remote-run.sh",
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
         "//tools/boss/installer:build_info_rs",
     ],
+    crate_name = "boss_engine",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
     rustc_env = {
         # Absolute path to the generated build-info constants file.
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
         # them to absolute filesystem paths before invoking rustc.
         "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
     },
-    edition = "2024",
     visibility = [
         "//tools/boss/bossctl:__pkg__",
         "//tools/boss/cli:__pkg__",
@@ -172,22 +174,20 @@ rust_library(
     ],
     deps = [
         "//tools/boss/engine/conflict-diagnosis",
-        "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/editorial",
         "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/pr-template",
+        "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/transcript-markdown:transcript_markdown",
+        "//tools/boss/engine/transcript-tail",
         "//tools/boss/log-files",
         "//tools/boss/protocol",
-        "//tools/boss/engine/ssh-transport",
-        "//tools/boss/engine/transcript-tail",
     ] + all_crate_deps(normal = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 rust_binary(
     name = "engine",
     srcs = ["src/main.rs"],
-    edition = "2024",
     # Ship the boss-event hook shim alongside the engine binary so
     # PaneSpawnRunner can resolve it via runfiles at runtime. Without
     # this dep, `bazel run //tools/boss/engine/core:engine` builds only
@@ -195,6 +195,8 @@ rust_binary(
     # `boss-event` as a bare name that isn't on the worker's
     # sanitized PATH — every hook fires `command not found`.
     data = ["//tools/boss/event-shim:boss-event"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/app-macos:__pkg__",
         "//tools/boss/installer:__pkg__",
@@ -202,7 +204,6 @@ rust_binary(
     deps = [
         ":engine_lib",
     ] + all_crate_deps(normal = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
 )
 
 # engine_lib_test is split into 4 parallel shards to cut wall time.
@@ -223,21 +224,25 @@ rust_binary(
 # Shard 1 — work module (~226 tests, the single heaviest slice ~7s on macOS)
 rust_test(
     name = "engine_lib_test_work",
-    crate = ":engine_lib",
-    edition = "2024",
     size = "small",
     timeout = "moderate",
     args = ["work::"],
+    crate = ":engine_lib",
+    edition = "2024",
     env = {"HOME": "/tmp"},
-    deps = all_crate_deps(normal = True, normal_dev = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # Shard 2 — app + dispatch + conflict + ci_log_reader (~164 tests, ~5s on macOS)
 rust_test(
     name = "engine_lib_test_a",
-    crate = ":engine_lib",
-    edition = "2024",
     size = "small",
     timeout = "moderate",
     args = [
@@ -247,17 +252,23 @@ rust_test(
         "conflict_watch::",
         "ci_log_reader::",
     ],
+    crate = ":engine_lib",
+    edition = "2024",
     env = {"HOME": "/tmp"},
-    deps = all_crate_deps(normal = True, normal_dev = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # Shard 3 — completion + coordinator + merge_poller + external_tracker +
 #           live_status* + runner + build_info (~358 tests, ~7s on macOS)
 rust_test(
     name = "engine_lib_test_b",
-    crate = ":engine_lib",
-    edition = "2024",
     size = "small",
     timeout = "moderate",
     args = [
@@ -276,39 +287,69 @@ rust_test(
         # global-state-sharing tests (audit/worker_setup).
         "nudge_breaker::",
     ],
+    crate = ":engine_lib",
+    edition = "2024",
     env = {"HOME": "/tmp"},
-    deps = all_crate_deps(normal = True, normal_dev = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # Shard 4 — everything not covered by shards 1-3 (~397 tests, ~2s on macOS)
 rust_test(
     name = "engine_lib_test_rest",
-    crate = ":engine_lib",
-    edition = "2024",
     size = "small",
     timeout = "moderate",
     args = [
-        "--skip", "work::",
-        "--skip", "app::",
-        "--skip", "dispatch_events::",
-        "--skip", "dispatch_reader::",
-        "--skip", "conflict_watch::",
-        "--skip", "ci_log_reader::",
-        "--skip", "completion::",
-        "--skip", "coordinator::",
-        "--skip", "merge_poller::",
-        "--skip", "external_tracker::",
-        "--skip", "live_status::",
-        "--skip", "live_status_loop::",
-        "--skip", "live_status_redact::",
-        "--skip", "runner::",
-        "--skip", "build_info::",
-        "--skip", "nudge_breaker::",
+        "--skip",
+        "work::",
+        "--skip",
+        "app::",
+        "--skip",
+        "dispatch_events::",
+        "--skip",
+        "dispatch_reader::",
+        "--skip",
+        "conflict_watch::",
+        "--skip",
+        "ci_log_reader::",
+        "--skip",
+        "completion::",
+        "--skip",
+        "coordinator::",
+        "--skip",
+        "merge_poller::",
+        "--skip",
+        "external_tracker::",
+        "--skip",
+        "live_status::",
+        "--skip",
+        "live_status_loop::",
+        "--skip",
+        "live_status_redact::",
+        "--skip",
+        "runner::",
+        "--skip",
+        "build_info::",
+        "--skip",
+        "nudge_breaker::",
     ],
+    crate = ":engine_lib",
+    edition = "2024",
     env = {"HOME": "/tmp"},
-    deps = all_crate_deps(normal = True, normal_dev = True),
-    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
 
 # Umbrella target: `bazel test //tools/boss/engine:engine_lib_test` runs all
@@ -316,23 +357,27 @@ rust_test(
 test_suite(
     name = "engine_lib_test",
     tests = [
-        ":engine_lib_test_work",
         ":engine_lib_test_a",
         ":engine_lib_test_b",
         ":engine_lib_test_rest",
+        ":engine_lib_test_work",
     ],
 )
 
 rust_test(
     name = "work_crud_test",
+    size = "small",
+    timeout = "moderate",
     srcs = [
         "tests/watcher_support.rs",
         "tests/work_crud.rs",
     ],
     crate_root = "tests/work_crud.rs",
     edition = "2024",
-    size = "small",
-    timeout = "moderate",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
@@ -341,18 +386,18 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
 )
 
 rust_test(
     name = "editorial_pretooluse_test",
-    srcs = ["tests/editorial_pretooluse.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/editorial_pretooluse.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/engine/editorial",
@@ -361,22 +406,22 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
 )
 
 rust_test(
     name = "comments_crud_test",
+    size = "small",
+    timeout = "moderate",
     srcs = [
         "tests/comments_crud.rs",
         "tests/watcher_support.rs",
     ],
     crate_root = "tests/comments_crud.rs",
     edition = "2024",
-    size = "small",
-    timeout = "moderate",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
@@ -384,19 +429,19 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
 rust_test(
     name = "magic_wand_dispatch_test",
-    srcs = ["tests/magic_wand_dispatch.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/magic_wand_dispatch.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
@@ -404,22 +449,22 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
 rust_test(
     name = "control_verbs_test",
-    srcs = ["tests/control_verbs.rs"],
-    edition = "2024",
     size = "small",
     # linux-amd64 CI runners run ~6-7x slower than macOS dev boxes; the 60s default
     # for size="small" is too tight when concurrent tests contend on the
     # binary_fingerprint OnceLock during startup. timeout="moderate" (300s) gives headroom.
     timeout = "moderate",
+    srcs = ["tests/control_verbs.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
@@ -427,19 +472,19 @@ rust_test(
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
 rust_test(
     name = "shutdown_rpc_test",
-    srcs = ["tests/shutdown_rpc.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/shutdown_rpc.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
@@ -448,70 +493,66 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
-    ),
 )
 
 rust_test(
     name = "stop_engine_runtime_test",
-    srcs = ["tests/stop_engine_runtime.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/stop_engine_runtime.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
 rust_test(
     name = "isolation_guard_test",
-    srcs = ["tests/isolation_guard.rs"],
-    edition = "2024",
     size = "small",
     timeout = "moderate",
+    srcs = ["tests/isolation_guard.rs"],
+    edition = "2024",
     env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
 rust_test(
     name = "orphan_reaping_test",
-    srcs = ["tests/orphan_reaping.rs"],
-    edition = "2024",
     size = "small",
     # The orphan-reap watcher polls every 1s; ORPHAN_TIMEOUT is 8s.
     # On slow CI runners allow plenty of headroom.
     timeout = "moderate",
+    srcs = ["tests/orphan_reaping.rs"],
+    edition = "2024",
     env = {"HOME": "/tmp"},
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
     deps = [
         ":engine_lib",
         "//tools/boss/client",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
-    proc_macro_deps = all_crate_deps(
-        proc_macro = True,
-        proc_macro_dev = True,
     ),
 )
 
@@ -523,7 +564,7 @@ filegroup(
 
 sh_test(
     name = "no_gh_pr_merge_test",
+    size = "small",
     srcs = ["tests/no_gh_pr_merge_test.sh"],
     data = [":engine_srcs"],
-    size = "small",
 )

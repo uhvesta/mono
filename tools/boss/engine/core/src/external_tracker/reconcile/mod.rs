@@ -25,7 +25,7 @@ use super::{
 };
 use super::credentials::{TrackerCredentialError, TrackerCredentialResolver};
 use crate::metrics::Registry;
-use crate::work::WorkDb;
+use crate::work::{content_checksum, WorkDb};
 
 // ── Work-invalidation publisher ───────────────────────────────────────────────
 
@@ -137,6 +137,16 @@ crate::register_counter!(
     "external_tracker.tracked_label_attach_failed",
     "add_label calls that failed when a fresh upstream item was imported.",
 );
+crate::register_counter!(
+    TITLE_BODY_SYNCED,
+    "external_tracker.title_body_synced",
+    "Boss work items whose name/description were auto-synced from upstream because only the upstream side changed (Behavior 8).",
+);
+crate::register_counter!(
+    TITLE_BODY_CONFLICT,
+    "external_tracker.title_body_conflict",
+    "Upstream title/body drift skipped because the Boss side was also edited since import — operator must reconcile (Behavior 8).",
+);
 
 /// Label that the reconciler attaches to upstream items it has imported,
 /// so users browsing the upstream tracker can see which issues Boss mirrors.
@@ -161,13 +171,16 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&IN_PROGRESS_SET_FAILED);
     registry.register_counter(&TRACKED_LABEL_ATTACH_SUCCEEDED);
     registry.register_counter(&TRACKED_LABEL_ATTACH_FAILED);
+    registry.register_counter(&TITLE_BODY_SYNCED);
+    registry.register_counter(&TITLE_BODY_CONFLICT);
 }
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
 
 /// Per-pass aggregate outcome.  Returned by [`run_one_pass`] for the caller
 /// (spawn loop, CLI verb) to emit into logs / metrics.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct PassOutcome {
     pub products_processed: usize,
     pub products_skipped: usize,
@@ -191,6 +204,10 @@ pub struct PassOutcome {
     pub tracked_label_attach_succeeded: usize,
     /// Behavior 7: tracked-label add_label calls that failed on import.
     pub tracked_label_attach_failed: usize,
+    /// Behavior 8: items whose name/description were auto-synced from upstream.
+    pub title_body_synced: usize,
+    /// Behavior 8: items where upstream drift was skipped because boss side was also edited.
+    pub title_body_conflict: usize,
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -304,6 +321,8 @@ pub fn spawn_loop(
                 || outcome.in_progress_set_failed > 0
                 || outcome.tracked_label_attach_succeeded > 0
                 || outcome.tracked_label_attach_failed > 0
+                || outcome.title_body_synced > 0
+                || outcome.title_body_conflict > 0
             {
                 tracing::info!(
                     products_processed = outcome.products_processed,
@@ -318,6 +337,8 @@ pub fn spawn_loop(
                     in_progress_set_failed = outcome.in_progress_set_failed,
                     tracked_label_attach_succeeded = outcome.tracked_label_attach_succeeded,
                     tracked_label_attach_failed = outcome.tracked_label_attach_failed,
+                    title_body_synced = outcome.title_body_synced,
+                    title_body_conflict = outcome.title_body_conflict,
                     "external tracker reconciler: pass complete",
                 );
             }
@@ -996,6 +1017,103 @@ async fn reconcile_existing(
         });
     }
 
+    // Behavior 8: upstream title/body drift — compare SHA-256 checksums of the
+    // current upstream content against the stored baseline and auto-sync or
+    // flag conflicts. Checksums avoid storing full content while preserving all
+    // three distinctions: upstream-only changed, both changed, nothing changed.
+    //
+    // Policy:
+    //   • Only upstream changed → auto-sync (title and description).
+    //   • Both sides changed → warn and emit a metric; operator must reconcile.
+    //   • No baseline (pre-migration import) → establish baseline silently.
+    //   • Only boss changed → operator edit; leave it alone.
+    match work_db.reconciler_get_content_checksums(work_item_id) {
+        Err(e) => {
+            warn!(work_item_id, error = %e, "reconciler_get_content_checksums failed (Behavior 8)");
+        }
+        Ok(None) => {
+            // Pre-migration item: no baseline yet. Record checksums of the
+            // current upstream and boss content without auto-syncing (we can't
+            // tell if the boss side has been edited since import).
+            if let Err(e) = work_db.reconciler_set_content_checksums_baseline(
+                work_item_id,
+                &upstream.title,
+                &upstream.body,
+                &task.name,
+                &task.description,
+            ) {
+                warn!(
+                    work_item_id,
+                    error = %e,
+                    "reconciler_set_content_checksums_baseline failed (Behavior 8)"
+                );
+            }
+        }
+        Ok(Some((stored_upstream_checksum, stored_boss_checksum))) => {
+            let current_upstream_checksum = content_checksum(&upstream.title, &upstream.body);
+            let upstream_changed = current_upstream_checksum != stored_upstream_checksum;
+
+            if upstream_changed {
+                // Check whether the boss side has diverged from the last-synced baseline.
+                let current_boss_checksum = content_checksum(&task.name, &task.description);
+                let boss_changed = current_boss_checksum != stored_boss_checksum;
+
+                if !boss_changed {
+                    // Only the upstream changed → auto-sync name and description.
+                    let new_name = upstream.title.clone();
+                    let new_desc = format!(
+                        "> Imported from {}\n\n{}",
+                        upstream.upstream_url, upstream.body
+                    );
+                    match work_db.reconciler_update_name_and_description(
+                        work_item_id,
+                        &new_name,
+                        &new_desc,
+                        &upstream.title,
+                        &upstream.body,
+                    ) {
+                        Ok(true) => {
+                            TITLE_BODY_SYNCED.inc(metrics);
+                            outcome.title_body_synced += 1;
+                            info!(
+                                work_item_id,
+                                canonical_id = %upstream.upstream_ref.canonical_id,
+                                "Behavior 8: upstream title/body changed → boss row auto-synced"
+                            );
+                            publisher
+                                .publish_work_item_invalidated(
+                                    product_id,
+                                    work_item_id,
+                                    "chore_updated",
+                                )
+                                .await;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(
+                                work_item_id,
+                                error = %e,
+                                "reconciler_update_name_and_description failed (Behavior 8)"
+                            );
+                        }
+                    }
+                } else {
+                    // Both sides changed → flag for operator attention, preserve boss edits.
+                    TITLE_BODY_CONFLICT.inc(metrics);
+                    outcome.title_body_conflict += 1;
+                    warn!(
+                        work_item_id,
+                        canonical_id = %upstream.upstream_ref.canonical_id,
+                        upstream_title = %upstream.title,
+                        boss_name = %task.name,
+                        "Behavior 8: upstream title/body drift detected but boss side was also \
+                         edited — skipping auto-sync; operator must reconcile manually"
+                    );
+                }
+            }
+        }
+    }
+
     // Bump synced_at every successful reconcile.
     if let Err(e) = work_db.touch_external_ref_synced_at(work_item_id) {
         warn!(work_item_id, error = %e, "touch_external_ref_synced_at failed");
@@ -1049,11 +1167,14 @@ async fn import_new(
     // binding are committed together. A plain create_chore + set_external_ref
     // pair leaves a crash window where the chore exists but has no ref,
     // making it invisible to the reconciler and breaking reverse_close.
+    // upstream.title and upstream.body seed the Behavior 8 drift baseline.
     let chore = match work_db.import_chore_with_external_ref(
         input,
         &upstream.upstream_ref.kind,
         &upstream.upstream_ref.canonical_id,
         &upstream.upstream_ref.raw,
+        &upstream.title,
+        &upstream.body,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -2801,4 +2922,8 @@ mod tests {
         let calls = tracker.set_project_status_calls();
         assert_eq!(calls, vec!["spy#35"]);
     }
+
+    // ── Tests: Behavior 8 (title/body drift) ─────────────────────────────────
+
+    mod tests_drift;
 }
