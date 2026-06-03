@@ -63,7 +63,7 @@ use boss_protocol::{WorkItemPatch, WorkerActivity};
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
-use crate::work::WorkDb;
+use crate::work::{WorkDb, execution_status_is_terminal};
 
 /// No hook event for this long while a worker is `working` with no tool
 /// in flight ⇒ presumed wedged. 30 minutes is deliberately generous: a
@@ -345,13 +345,6 @@ fn append_reconcile_audit(
         },
     )?;
     Ok(())
-}
-
-fn execution_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
-    )
 }
 
 #[cfg(test)]

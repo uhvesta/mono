@@ -80,7 +80,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::work::WorkDb;
+use crate::work::{WorkDb, execution_status_is_terminal};
 
 /// How often the pool-claim reconciler runs. 60s mirrors the dead-pid
 /// and stale-worker sweeps — fast enough that a leaked automation slot
@@ -286,16 +286,6 @@ pub async fn run_one_pass(
     }
 
     outcome
-}
-
-/// The terminal execution statuses. A claim held by an execution in any
-/// of these states, with no live pane, is leaked. Kept in sync with the
-/// same predicate in the other sweeps and `WorkDb`.
-fn execution_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
-    )
 }
 
 #[cfg(test)]

@@ -88,6 +88,7 @@ use crate::transient_error::{
 };
 use crate::work::{
     ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb,
+    execution_status_is_terminal,
 };
 
 /// How often the sweep runs.
@@ -585,13 +586,6 @@ fn clip(s: &str, max_bytes: usize) -> String {
         }
         format!("{}…", &one_line[..end])
     }
-}
-
-fn execution_status_is_terminal(status: &str) -> bool {
-    matches!(
-        status,
-        "completed" | "failed" | "abandoned" | "cancelled" | "orphaned"
-    )
 }
 
 pub fn current_epoch_s() -> i64 {
@@ -1403,19 +1397,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn execution_status_is_terminal_classifies_states() {
-        for status in ["completed", "failed", "abandoned", "cancelled", "orphaned"] {
-            assert!(
-                execution_status_is_terminal(status),
-                "{status} should be terminal",
-            );
-        }
-        for status in ["running", "queued", "ready", "", "something_new"] {
-            assert!(
-                !execution_status_is_terminal(status),
-                "{status} should not be terminal",
-            );
-        }
-    }
 }
