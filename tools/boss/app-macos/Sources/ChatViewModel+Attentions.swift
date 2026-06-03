@@ -173,6 +173,7 @@ extension ChatViewModel {
     /// disconnected or no product is selected.
     func refreshAutomations() {
         guard isConnected, let productID = currentSelectedProductID else { return }
+        automationsFetchStateByProductID[productID] = .loading
         engine.sendListAutomations(productId: productID)
     }
 

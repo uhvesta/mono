@@ -31,19 +31,44 @@ private struct AutomationsSidebar: View {
                 get: { model.selectedAutomationID },
                 set: { model.selectedAutomationID = $0 }
             )) {
-                if model.automationsForSelectedProduct.isEmpty {
-                    Text("No automations")
+                switch model.automationsFetchStateForSelectedProduct {
+                case .none, .loading:
+                    if model.automationsForSelectedProduct.isEmpty {
+                        ProgressView()
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .listRowBackground(Color.clear)
+                            .padding(.vertical, 8)
+                    } else {
+                        // Cached data visible while re-fetching
+                        ForEach(model.automationsForSelectedProduct) { automation in
+                            AutomationRowView(
+                                automation: automation,
+                                openCount: model.openTaskCountByAutomationID[automation.id],
+                                latestRun: model.automationRunsByID[automation.id]?.first
+                            )
+                            .tag(automation.id)
+                        }
+                    }
+                case .failed(_):
+                    Text("Load failed — tap Refresh to retry.")
                         .foregroundStyle(.secondary)
                         .font(.callout)
                         .listRowBackground(Color.clear)
-                } else {
-                    ForEach(model.automationsForSelectedProduct) { automation in
-                        AutomationRowView(
-                            automation: automation,
-                            openCount: model.openTaskCountByAutomationID[automation.id],
-                            latestRun: model.automationRunsByID[automation.id]?.first
-                        )
-                        .tag(automation.id)
+                case .loaded:
+                    if model.automationsForSelectedProduct.isEmpty {
+                        Text("No automations")
+                            .foregroundStyle(.secondary)
+                            .font(.callout)
+                            .listRowBackground(Color.clear)
+                    } else {
+                        ForEach(model.automationsForSelectedProduct) { automation in
+                            AutomationRowView(
+                                automation: automation,
+                                openCount: model.openTaskCountByAutomationID[automation.id],
+                                latestRun: model.automationRunsByID[automation.id]?.first
+                            )
+                            .tag(automation.id)
+                        }
                     }
                 }
             }
@@ -180,24 +205,45 @@ private struct AutomationsEmptyState: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if model.automationsForSelectedProduct.isEmpty {
-            VStack(spacing: 8) {
-                Image(systemName: "clock.badge.checkmark")
-                    .font(.system(size: 36))
-                    .foregroundStyle(.secondary)
-                Text("No automations yet")
-                    .font(.title3.weight(.semibold))
-                Text("Automations run on a schedule to check for maintenance work and spawn tasks automatically.")
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: 360)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(24)
         } else {
-            Text("Select an automation")
-                .foregroundStyle(.secondary)
+            switch model.automationsFetchStateForSelectedProduct {
+            case .none, .loading:
+                ProgressView("Loading automations…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .failed(let reason):
+                VStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.secondary)
+                    Text("Could not load automations")
+                        .font(.title3.weight(.semibold))
+                    Text(reason)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(24)
+            case .loaded:
+                if model.automationsForSelectedProduct.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "clock.badge.checkmark")
+                            .font(.system(size: 36))
+                            .foregroundStyle(.secondary)
+                        Text("No automations yet")
+                            .font(.title3.weight(.semibold))
+                        Text("Automations run on a schedule to check for maintenance work and spawn tasks automatically.")
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: 360)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(24)
+                } else {
+                    Text("Select an automation")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
         }
     }
 }

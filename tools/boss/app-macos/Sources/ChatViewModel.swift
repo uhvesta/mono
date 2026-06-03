@@ -88,6 +88,11 @@ final class ChatViewModel: ObservableObject {
     /// Automations keyed by product id. Loaded when the Automations tab is
     /// entered or the selected product changes while the tab is active.
     @Published var automationsByProductID: [String: [AppAutomation]] = [:]
+    /// Fetch state for the automations list keyed by product id. `nil` (absent)
+    /// means no fetch has been issued yet; `.loading` means a request is in
+    /// flight; `.loaded` means the response arrived; `.failed` means the fetch
+    /// failed (connection dropped while in flight).
+    @Published var automationsFetchStateByProductID: [String: AutomationsFetchState] = [:]
     /// Open-task counts keyed by automation id. Refreshed alongside the list.
     @Published var openTaskCountByAutomationID: [String: Int] = [:]
     /// Run history keyed by automation id. Fetched on selection and refreshed
@@ -559,6 +564,13 @@ final class ChatViewModel: ObservableObject {
     var automationsForSelectedProduct: [AppAutomation] {
         guard let productID = currentSelectedProductID else { return [] }
         return automationsByProductID[productID] ?? []
+    }
+
+    /// Fetch state for the currently selected product's automations list.
+    /// `nil` means no fetch has been issued for this product yet (treat like loading).
+    var automationsFetchStateForSelectedProduct: AutomationsFetchState? {
+        guard let productID = currentSelectedProductID else { return nil }
+        return automationsFetchStateByProductID[productID]
     }
 
     /// The currently selected automation, looked up from the per-product list.
@@ -1857,6 +1869,11 @@ final class ChatViewModel: ObservableObject {
             isConnected = false
             isAppSessionRegistered = false
             subscribedWorkTopics.removeAll()
+            for (productID, state) in automationsFetchStateByProductID {
+                if case .loading = state {
+                    automationsFetchStateByProductID[productID] = .failed("Connection lost")
+                }
+            }
         case .workInvalidated(let topic, let productId, _):
             if topic == "work.products" {
                 engine.sendListProducts()
@@ -2204,6 +2221,7 @@ final class ChatViewModel: ObservableObject {
         // MARK: Automation events
         case .automationsList(let productID, let automations):
             automationsByProductID[productID] = automations
+            automationsFetchStateByProductID[productID] = .loaded
             for automation in automations {
                 engine.sendGetAutomationOpenTaskCount(automationId: automation.id)
                 engine.sendListAutomationRuns(automationId: automation.id)

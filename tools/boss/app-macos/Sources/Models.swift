@@ -1688,6 +1688,15 @@ struct TranscriptDoc: Hashable {
     let complete: Bool
 }
 
+/// Fetch state for the automations list, keyed by product id in
+/// [[ChatViewModel.automationsFetchStateByProductID]]. `nil` (absent) means
+/// no fetch has been issued for that product yet.
+enum AutomationsFetchState {
+    case loading
+    case loaded
+    case failed(String)
+}
+
 /// Load state for one execution's transcript, keyed by execution id in
 /// [[ChatViewModel.transcriptsByExecutionID]]. `nil` (absent) means the
 /// transcript has not been requested yet.
