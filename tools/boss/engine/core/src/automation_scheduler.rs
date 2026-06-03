@@ -409,12 +409,21 @@ async fn evaluate_one(
     // 6. Fire.
     match dispatcher.dispatch_triage(automation, most_recent).await {
         TriageDispatch::Dispatched { execution_id } => {
+            // Record the pessimistic `failed_will_retry` default now; the
+            // task-6 outcome detector overwrites both `outcome` and `detail`
+            // when the triage worker's Stop fires. Seed a placeholder detail so
+            // a row left in this state (worker crashed/hung and never reached
+            // Stop, so `finished_at` is also still NULL) is distinguishable in
+            // the run history from a run that finalised with a real outcome —
+            // previously such rows carried an empty detail that gave the
+            // operator nothing to act on.
             work_db.record_automation_run_and_advance(
                 AutomationFireRecord::builder()
                     .automation_id(automation.id.clone())
                     .scheduled_for(most_recent)
                     .started_at(now)
                     .outcome(AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+                    .detail("dispatched; awaiting triage worker decision (Stop not yet received)")
                     .triage_execution_id(execution_id)
                     .maybe_next_due_at(following)
                     .build(),

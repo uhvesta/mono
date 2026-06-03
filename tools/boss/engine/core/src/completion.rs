@@ -2007,10 +2007,17 @@ must not be asked to open one",
         execution: &crate::work::WorkExecution,
     ) -> StopOutcome {
         let automation_id = execution.work_item_id.clone();
-        let final_message = self.read_final_triage_message(&execution.id).await;
-        let decision = match final_message.as_deref() {
-            Some(text) => parse_triage_decision(text),
-            None => TriageDecision::NoDecision,
+        let transcript = self.read_final_triage_message(&execution.id).await;
+        let decision = match &transcript {
+            TriageTranscript::FinalMessage(text) => parse_triage_decision(text),
+            // No path / unreadable / no assistant prose all mean we have no
+            // message to scan for a marker — treat as NoDecision, but the
+            // specific transcript state is folded into the detail below so the
+            // run history distinguishes "ran but emitted no marker" from
+            // "produced no transcript at all".
+            TriageTranscript::NoPath
+            | TriageTranscript::Unreadable
+            | TriageTranscript::NoAssistantText => TriageDecision::NoDecision,
         };
 
         let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) =
@@ -2021,7 +2028,15 @@ must not be asked to open one",
                             if t.source_automation_id.as_deref()
                                 == Some(automation_id.as_str()) =>
                         {
-                            (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(t.id.clone()), None)
+                            // Explicit success detail (not `None`): it overwrites
+                            // the pessimistic dispatch-time placeholder so a row
+                            // that still reads "dispatched; awaiting …" can only
+                            // mean the worker never reached Stop (crashed/hung).
+                            (
+                                AUTOMATION_OUTCOME_PRODUCED_TASK,
+                                Some(t.id.clone()),
+                                Some(format!("produced task {}", t.id)),
+                            )
                         }
                         other => {
                             tracing::warn!(
@@ -2054,7 +2069,7 @@ must not be asked to open one",
                 TriageDecision::NoDecision => (
                     AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
                     None,
-                    Some("triage ended without a decision marker".to_owned()),
+                    Some(triage_no_decision_detail(&transcript)),
                 ),
                 TriageDecision::Ambiguous(n) => (
                     AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
@@ -2140,6 +2155,7 @@ must not be asked to open one",
             automation_id = %automation_id,
             outcome,
             produced_task_id = ?produced_task_id,
+            detail = ?detail,
             "automation triage finalised",
         );
         StopOutcome::AutomationTriage {
@@ -2219,6 +2235,7 @@ must not be asked to open one",
         // apply the severity gate. Falls back gracefully (no revision) when the
         // reviewer produced no parseable JSON block.
         let review_result = self.read_final_triage_message(&execution.id).await
+            .into_message()
             .and_then(|text| {
                 let result = crate::pr_review::extract_review_result(&text);
                 if result.is_none() {
@@ -2382,7 +2399,13 @@ must not be asked to open one",
     /// Read the final assistant text of `execution_id`'s transcript, if any.
     /// Returns `None` when no transcript is recorded/readable or it contains
     /// no assistant turn — the caller treats that as "no decision".
-    async fn read_final_triage_message(&self, execution_id: &str) -> Option<String> {
+    /// Read a finished triage execution's final assistant message from its
+    /// transcript, returning a [`TriageTranscript`] that distinguishes the
+    /// failure-to-read cases (no path / unreadable / no assistant prose) from a
+    /// successful read. The caller folds these states into the run-history
+    /// `detail` so a `failed_will_retry` triage row is diagnosable instead of
+    /// collapsing to a bare "no decision marker".
+    async fn read_final_triage_message(&self, execution_id: &str) -> TriageTranscript {
         let path = match self.work_db.transcript_path_for_execution(execution_id) {
             Ok(Some(path)) => path,
             Ok(None) => {
@@ -2390,7 +2413,7 @@ must not be asked to open one",
                     execution_id,
                     "triage finalisation: no transcript path recorded; treating as no decision",
                 );
-                return None;
+                return TriageTranscript::NoPath;
             }
             Err(err) => {
                 tracing::warn!(
@@ -2398,18 +2421,38 @@ must not be asked to open one",
                     ?err,
                     "triage finalisation: transcript lookup failed",
                 );
-                return None;
+                return TriageTranscript::Unreadable;
             }
         };
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
                 let events = crate::transcript_markdown::parse_transcript(&content);
-                events.iter().rev().find_map(|e| match &e.kind {
+                let final_text = events.iter().rev().find_map(|e| match &e.kind {
                     crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => {
                         Some(t.clone())
                     }
                     _ => None,
-                })
+                });
+                match final_text {
+                    Some(text) => {
+                        tracing::debug!(
+                            execution_id,
+                            transcript_bytes = content.len(),
+                            event_count = events.len(),
+                            "triage finalisation: read final assistant message",
+                        );
+                        TriageTranscript::FinalMessage(text)
+                    }
+                    None => {
+                        tracing::warn!(
+                            execution_id,
+                            transcript_bytes = content.len(),
+                            event_count = events.len(),
+                            "triage finalisation: transcript had no assistant text event",
+                        );
+                        TriageTranscript::NoAssistantText
+                    }
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -2417,7 +2460,7 @@ must not be asked to open one",
                     ?err,
                     "triage finalisation: failed to read transcript file",
                 );
-                None
+                TriageTranscript::Unreadable
             }
         }
     }
@@ -4391,6 +4434,87 @@ pub enum StopOutcome {
     DbError,
 }
 
+/// Outcome of reading a finished triage execution's final assistant message
+/// from its transcript (see [`WorkerCompletionHandler::read_final_triage_message`]).
+///
+/// Distinguishing these states is what makes a `failed_will_retry` triage run
+/// diagnosable from the run-history `detail`: "produced no transcript" (worker
+/// session never started), "transcript unreadable", and "no assistant prose"
+/// are very different failures from "the worker spoke but emitted no marker",
+/// yet all four previously collapsed to the bare string
+/// "triage ended without a decision marker".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TriageTranscript {
+    /// The final assistant text message — the one the marker parser scans.
+    FinalMessage(String),
+    /// No `transcript_path` was recorded for the execution. The worker session
+    /// likely never started (or its run row was never linked to a transcript).
+    NoPath,
+    /// A transcript path was recorded but the file could not be read (lookup
+    /// error or filesystem read error).
+    Unreadable,
+    /// The transcript parsed but contained no assistant text event — the worker
+    /// emitted only tool calls / thinking, or crashed before any prose.
+    NoAssistantText,
+}
+
+impl TriageTranscript {
+    /// The final assistant message text, or `None` for any state in which no
+    /// message could be read. Lets callers that only need the text (e.g. the
+    /// `pr_review` finaliser) ignore the failure-state distinction.
+    fn into_message(self) -> Option<String> {
+        match self {
+            TriageTranscript::FinalMessage(text) => Some(text),
+            TriageTranscript::NoPath
+            | TriageTranscript::Unreadable
+            | TriageTranscript::NoAssistantText => None,
+        }
+    }
+}
+
+/// Build the `failed_will_retry` detail for a triage run that yielded no
+/// usable decision, from the transcript readback state.
+///
+/// The `FinalMessage` arm keeps the stable "triage ended without a decision
+/// marker" prefix (so existing log greps / dashboards keep matching) and
+/// appends a bounded, single-line tail of what the agent actually said — the
+/// single most useful breadcrumb when debugging why a marker was missing.
+fn triage_no_decision_detail(transcript: &TriageTranscript) -> String {
+    match transcript {
+        TriageTranscript::FinalMessage(text) => format!(
+            "triage ended without a decision marker; final message tail: {}",
+            tail_snippet(text, 200)
+        ),
+        TriageTranscript::NoPath => "triage produced no transcript (no transcript path \
+             recorded; the worker session may have failed to start)"
+            .to_owned(),
+        TriageTranscript::Unreadable => {
+            "triage transcript could not be read from disk".to_owned()
+        }
+        TriageTranscript::NoAssistantText => "triage transcript contained no assistant \
+             message (worker emitted no prose before stopping)"
+            .to_owned(),
+    }
+}
+
+/// Collapse `text` to a single-line tail of at most `max_chars` characters for
+/// embedding in a run-history `detail`. Whitespace runs (including newlines)
+/// collapse to single spaces; when truncated, the result is prefixed with `…`
+/// so it reads as a tail rather than a head.
+fn tail_snippet(text: &str, max_chars: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "(empty)".to_owned();
+    }
+    let chars: Vec<char> = one_line.chars().collect();
+    if chars.len() <= max_chars {
+        one_line
+    } else {
+        let tail: String = chars[chars.len() - max_chars..].iter().collect();
+        format!("…{tail}")
+    }
+}
+
 fn work_item_id(item: &WorkItem) -> String {
     match item {
         WorkItem::Product(product) => product.id.clone(),
@@ -4456,6 +4580,57 @@ mod tests {
         CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
         CubeWorkspaceStatus,
     };
+
+    #[test]
+    fn tail_snippet_collapses_whitespace_and_keeps_tail() {
+        // Short text passes through, single-lined.
+        assert_eq!(tail_snippet("hello world", 200), "hello world");
+        assert_eq!(tail_snippet("a\n\nb   c", 200), "a b c");
+        // Empty / whitespace-only → explicit marker, never a bare "".
+        assert_eq!(tail_snippet("", 200), "(empty)");
+        assert_eq!(tail_snippet("   \n  ", 200), "(empty)");
+        // Over-length is truncated to the TAIL (the marker would be at the end
+        // of a triage message) with a leading ellipsis.
+        let long = "x".repeat(50);
+        let snippet = tail_snippet(&long, 10);
+        assert_eq!(snippet, format!("…{}", "x".repeat(10)));
+        assert!(snippet.starts_with('…'));
+    }
+
+    #[test]
+    fn triage_no_decision_detail_distinguishes_transcript_states() {
+        // The "spoke but no marker" case keeps the stable prefix (so existing
+        // greps match) and appends the agent's actual final words.
+        let spoke = triage_no_decision_detail(&TriageTranscript::FinalMessage(
+            "I looked around and decided to open a PR instead.".to_owned(),
+        ));
+        assert!(spoke.starts_with("triage ended without a decision marker"));
+        assert!(spoke.contains("open a PR instead"));
+
+        // The other states each get their own actionable phrasing — and must
+        // NOT masquerade as "ended without a decision marker".
+        let no_path = triage_no_decision_detail(&TriageTranscript::NoPath);
+        assert!(no_path.contains("no transcript"));
+        assert!(!no_path.contains("without a decision marker"));
+
+        let unreadable = triage_no_decision_detail(&TriageTranscript::Unreadable);
+        assert!(unreadable.contains("could not be read"));
+
+        let no_prose = triage_no_decision_detail(&TriageTranscript::NoAssistantText);
+        assert!(no_prose.contains("no assistant"));
+    }
+
+    #[test]
+    fn triage_transcript_into_message_only_yields_final_message() {
+        assert_eq!(
+            TriageTranscript::FinalMessage("hi".to_owned()).into_message(),
+            Some("hi".to_owned())
+        );
+        assert_eq!(TriageTranscript::NoPath.into_message(), None);
+        assert_eq!(TriageTranscript::Unreadable.into_message(), None);
+        assert_eq!(TriageTranscript::NoAssistantText.into_message(), None);
+    }
+
     use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
     use crate::work::{
         CreateChoreInput, CreateExecutionInput, CreateProductInput, FakePrStateChecker, PrOpenState,

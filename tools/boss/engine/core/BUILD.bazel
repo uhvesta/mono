@@ -149,6 +149,7 @@ rust_library(
         "src/worker_registry.rs",
         "src/worker_sandbox_audit.rs",
         "src/worker_setup.rs",
+        "src/worker_setup_tests.rs",
         "src/wrapper_distribution.rs",
     ],
     compile_data = glob(["src/external_tracker/testdata/**"]) + [

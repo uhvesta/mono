@@ -103,6 +103,91 @@ is NOT a skip.\n",
     )
 }
 
+/// Render the CLAUDE.md for a triage worker ([`crate::worker_setup::WorkerKind::Triage`]).
+///
+/// A triage worker is **not** an implementer: its deliverable is a decision
+/// marker, never a pull request. It therefore MUST NOT receive the standard
+/// implementation-worker CLAUDE.md (rendered by
+/// [`crate::worker_setup::render_claude_md`] for
+/// [`crate::worker_setup::WorkerKind::Standard`]), which states "a task is not
+/// complete until a PR exists / PR creation is your terminal act / print the
+/// PR URL as the last line of your final response". Those instructions
+/// directly contradict the triage marker contract in
+/// [`render_triage_preamble`]; a worker caught between the two ends its run
+/// with a PR-shaped summary (or stops because `jj diff` is empty) and never
+/// emits a marker, so the run is finalised `failed_will_retry` /
+/// "triage ended without a decision marker". This CLAUDE.md restates the
+/// marker contract and the no-work / no-PR posture, and omits the PR-delivery
+/// mandate entirely (the [`crate::worker_setup::triage_deny_rules`] denylist is
+/// the suspenders to this belt).
+pub fn render_triage_claude_md(lease_id: &str) -> String {
+    format!(
+        "# Boss triage rules\n\
+         \n\
+         You are running inside a Boss-managed **triage** session. The engine\n\
+         spawned you in a leased cube workspace to decide whether a single,\n\
+         concrete, actionable task can be derived from an automation's standing\n\
+         instruction right now in this repository.\n\
+         \n\
+         ## Triage mandate (HARD CONSTRAINT)\n\
+         \n\
+         **There is NO pull-request deliverable for a triage run.** Your only\n\
+         deliverable is a single decision marker.\n\
+         \n\
+         Your final message MUST end with **exactly one** of these two lines,\n\
+         and nothing after it:\n\
+         \n\
+         - `automation: task <id>` — after creating **exactly one** task with\n\
+           `boss task create --automation <automation-id> --name \"…\" --description \"…\"`\n\
+           (the command prints the new task id, e.g. `T42`).\n\
+         - `automation: skip — <one-line reason>` — when nothing appropriate\n\
+           exists right now (a normal, expected outcome on most runs).\n\
+         \n\
+         Zero markers, or more than one, is treated as an inconclusive run and\n\
+         retried — it is NOT a skip. Concluding \"nothing to do\" is a `skip`,\n\
+         never a silent end.\n\
+         \n\
+         ## Do NOT do the work (tool calls for these are denied)\n\
+         \n\
+         A separate worker executes the task you create. You only decide and\n\
+         emit the marker. Forbidden here:\n\
+         \n\
+         - Editing or writing any file (`Edit`, `Write`).\n\
+         - Committing or pushing (`jj git push`, `git push`).\n\
+         - Opening, merging, closing, editing, or commenting on a PR\n\
+           (`gh pr create/merge/close/edit/comment/review`) or running\n\
+           `cube pr ensure`.\n\
+         - Filing or updating GitHub issues.\n\
+         \n\
+         Do NOT create a PR, do NOT push a branch, and do NOT print a PR URL —\n\
+         none of that applies to a triage run. Investigate read-only (`grep`,\n\
+         `find`, `cat`, `jj log`/`show`/`diff`, etc.), then create at most one\n\
+         task and emit your marker.\n\
+         \n\
+         ## Your workspace\n\
+         \n\
+         - Cube lease id: `{lease}`\n\
+         \n\
+         Lease held for the lifetime of this run. Do not lease, release,\n\
+         or mutate cube state.\n\
+         \n\
+         ## Boundaries\n\
+         \n\
+         - Do not modify files outside your workspace. Other workspaces\n\
+           belong to other workers.\n\
+         - Do not modify cube's database, lease state, or workspace registry.\n\
+         - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
+           Never read, write, or touch it.\n\
+           `bossctl` is coordinator-only.\n\
+         \n\
+         ## Coordinator\n\
+         \n\
+         The coordinator may probe this session between turns. Treat probes\n\
+         as questions from a human reviewer — short, specific answers.\n",
+        lease = lease_id,
+    )
+}
+
 /// Parse the triage agent's final assistant message into a [`TriageDecision`].
 ///
 /// Scans every line for a decision marker (`automation: task <id>` /
@@ -342,6 +427,41 @@ mod tests {
             parse_triage_decision("   automation: task T9   "),
             TriageDecision::ProducedTask("T9".to_owned())
         );
+    }
+
+    #[test]
+    fn triage_claude_md_restates_marker_contract_and_omits_pr_mandate() {
+        let md = render_triage_claude_md("lease_abc");
+        // The lease id is surfaced so a confused worker can describe itself.
+        assert!(md.contains("lease_abc"));
+        // Restates the marker contract (the whole point of the triage run).
+        assert!(md.contains("automation: task"));
+        assert!(md.contains("automation: skip"));
+        assert!(
+            md.contains("exactly one"),
+            "triage CLAUDE.md must restate the exactly-one-marker contract",
+        );
+        // Must NOT carry the implementation worker's PR-delivery mandate — that
+        // contradiction is the root cause of "triage ended without a decision
+        // marker" (the worker chases a PR and never emits the marker).
+        assert!(
+            !md.contains("Pull requests are the deliverable"),
+            "triage CLAUDE.md must not include the standard PR-required reminder",
+        );
+        assert!(
+            !md.contains("A task is not complete until a PR exists"),
+            "triage CLAUDE.md must not include the implementation PR mandate",
+        );
+        assert!(
+            !md.contains("PR creation is your terminal act"),
+            "triage CLAUDE.md must not tell the worker its terminal act is a PR",
+        );
+        assert!(
+            !md.contains("Print the PR URL"),
+            "triage CLAUDE.md must not instruct the worker to print a PR URL",
+        );
+        // States the no-PR posture explicitly.
+        assert!(md.contains("no pull-request deliverable") || md.contains("NO pull-request deliverable"));
     }
 
     #[test]

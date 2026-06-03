@@ -458,10 +458,15 @@ impl ExecutionRunner for PaneSpawnRunner {
                 draft_pr_mode: spawner.draft_pr_mode(),
                 execution_kind: execution.kind.as_str().to_owned(),
                 task_kind: work_item_task_kind(work_item).map(str::to_owned),
-                worker_kind: if execution.kind == ExecutionKind::PrReview {
-                    WorkerKind::Reviewer
-                } else {
-                    WorkerKind::Standard
+                // A triage worker's deliverable is a decision marker, not a
+                // PR — it must NOT get the Standard "PR is the deliverable"
+                // CLAUDE.md, which otherwise overrides the marker contract and
+                // leaves runs ending without a decision marker. A reviewer is
+                // read-only. Everything else is a Standard implementer.
+                worker_kind: match execution.kind {
+                    ExecutionKind::PrReview => WorkerKind::Reviewer,
+                    ExecutionKind::AutomationTriage => WorkerKind::Triage,
+                    _ => WorkerKind::Standard,
                 },
             },
             StdDuration::from_secs(30),
