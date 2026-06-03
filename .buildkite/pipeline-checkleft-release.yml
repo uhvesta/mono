@@ -13,22 +13,22 @@
 # Trigger model (enforced inside checkleft-release.sh, BUILDKITE_SOURCE):
 #   - scheduled (cron) builds  → skip unless checkleft changed since last tag.
 #   - manual builds (ui / api) → always release.
-# The pipeline should NOT be wired to build on push (the version-bump commit
-# carries `[skip ci]` and the idempotency guard no-ops a re-run regardless).
+# The pipeline should NOT be wired to build on push; releases come from the cron
+# schedule and manual triggers, and the idempotency guard no-ops a re-run on an
+# already-released commit.
 #
-# Queue overrides (Pipeline Settings → Environment Variables):
-#   BUILDKITE_LINUX_QUEUE  — Linux-only queue for the linux/musl builds + the
-#                            orchestrator. Default bazel-any has Linux agents but
-#                            is mixed; set a Linux-only queue to avoid landing on
-#                            a Mac (the linux phase hard-fails if it does).
-#   BUILDKITE_MACOS_QUEUE  — macOS queue for the darwin builds.
+# Agent targeting: both phases run on the bazel-any queue (the shared Mac/Linux
+# pool) and are pinned to their OS by agent tag (os: linux / os: darwin) —
+# otherwise a phase can land on the wrong OS (the linux phase hard-fails if it
+# lands on a Mac).
 
 steps:
   - label: ":rust: checkleft-release (linux)"
     key: "checkleft-release-linux"
     command: ".buildkite/steps/checkleft-release.sh linux"
     agents:
-      queue: "${BUILDKITE_LINUX_QUEUE:-bazel-any}"
+      queue: bazel-any
+      os: linux
     concurrency: 1
     concurrency_group: "checkleft-release"
     retry:
@@ -39,7 +39,8 @@ steps:
     command: ".buildkite/steps/checkleft-release.sh darwin"
     depends_on: "checkleft-release-linux"
     agents:
-      queue: "${BUILDKITE_MACOS_QUEUE:-macos-arm64}"
+      queue: bazel-any
+      os: darwin
     concurrency: 1
     concurrency_group: "checkleft-release"
     retry:

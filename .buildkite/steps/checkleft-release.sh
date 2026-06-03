@@ -266,7 +266,7 @@ cleanup() {
 # ── phases ────────────────────────────────────────────────────────────────────
 
 phase_linux() {
-  [[ "$(uname -s)" == "Linux" ]] || die "linux phase landed on $(uname -s); point BUILDKITE_LINUX_QUEUE at a Linux-only queue (see the release setup doc)"
+  [[ "$(uname -s)" == "Linux" ]] || die "linux phase landed on $(uname -s); the step must target an os=linux agent (see agents: in .buildkite/pipeline-checkleft-release.yml)"
 
   echo "[checkleft-release] agent: $(uname -a)"
   resolve_last_release
@@ -329,7 +329,7 @@ phase_linux() {
 }
 
 phase_darwin() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "darwin phase must run on a macOS agent (got $(uname -s)); set BUILDKITE_MACOS_QUEUE"
+  [[ "$(uname -s)" == "Darwin" ]] || die "darwin phase must run on a macOS agent (got $(uname -s)); the step must target an os=darwin agent (see agents: in .buildkite/pipeline-checkleft-release.yml)"
 
   echo "[checkleft-release] agent: $(uname -a)"
 

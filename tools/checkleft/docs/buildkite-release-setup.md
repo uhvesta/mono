@@ -55,12 +55,14 @@ This creates the pipeline and connects it to the GitHub repo (which provisions t
 
 ### 3. Point the pipeline at the release YAML
 
-`bk pipeline create` does not upload the steps; like every pipeline in this repo, the registered pipeline must run a single bootstrap step that uploads the in-repo definition. Set the pipeline's **Steps** (Buildkite UI → Pipeline → **Settings** → **Steps**, or via the REST API) to exactly:
+`bk pipeline create` does not upload the steps; like every pipeline in this repo, the registered pipeline must run a single bootstrap step that uploads the in-repo definition. The bootstrap step **must target a queue** (`bazel-any`) — the Default cluster has no default queue, so an untargeted step fails with "no queue has been targeted". Set the pipeline's **Steps** (Buildkite UI → Pipeline → **Settings** → **Steps**, or via the REST API) to exactly:
 
 ```yaml
 steps:
   - label: ":pipeline: upload"
     command: "buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release.yml"
+    agents:
+      queue: bazel-any
 ```
 
 (The default pipeline-upload command reads `.buildkite/pipeline.yml`; the explicit path is what makes this pipeline use the checkleft definition.)
@@ -68,9 +70,7 @@ steps:
 To do it via the API instead of the UI:
 
 ```sh
-bk api -X PATCH "organizations/flunge/pipelines/mono-checkleft-release" \
-  -F 'configuration=steps:
-  - command: "buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release.yml"'
+bk api --method PATCH /pipelines/mono-checkleft-release --data '{"configuration":"steps:\n  - label: \":pipeline:\"\n    command: buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release.yml\n    agents:\n      queue: bazel-any\n"}'
 ```
 
 ### 4. Disable push-triggered builds
