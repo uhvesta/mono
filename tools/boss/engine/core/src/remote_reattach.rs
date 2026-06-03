@@ -221,6 +221,14 @@ mod tests {
         async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
             unimplemented!()
         }
+        async fn checkout_pr_head_for_review(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> Result<String> {
+            unimplemented!()
+        }
         async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {
             unimplemented!()
         }

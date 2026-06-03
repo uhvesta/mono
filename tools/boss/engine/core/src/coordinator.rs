@@ -1181,97 +1181,6 @@ pub struct ExecutionCoordinator {
 /// `Err` so the dispatcher can record a start failure and retry.
 ///
 /// The caller is responsible for releasing the workspace on error.
-async fn checkout_pr_head_for_review_workspace(
-    workspace_path: &Path,
-    pr_url: &str,
-    repo_slug: &str,
-) -> Result<String> {
-    let pr_number = crate::completion::pr_number_from_url(pr_url)
-        .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-    let pr_str = pr_number.to_string();
-
-    // 1. Fetch the current head SHA from GitHub.
-    let head_sha = {
-        let output = Command::new("gh")
-            .args([
-                "pr",
-                "view",
-                &pr_str,
-                "-R",
-                repo_slug,
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| {
-                format!("failed to spawn `gh pr view {pr_number}` to fetch head SHA")
-            })?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`gh pr view {pr_number} -R {repo_slug} --json headRefOid` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if sha.is_empty() {
-            return Err(anyhow!(
-                "empty headRefOid for PR {pr_number} in {repo_slug}"
-            ));
-        }
-        sha
-    };
-
-    // 2. Fetch remote refs so jj knows about the head commit.
-    {
-        let output = Command::new("jj")
-            .args(["git", "fetch"])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .context("failed to spawn `jj git fetch`")?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`jj git fetch` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-
-    // 3. Move the workspace's working copy to the PR head.
-    {
-        let output = Command::new("jj")
-            .args(["edit", &head_sha])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn `jj edit {head_sha}`"))?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`jj edit {head_sha}` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-
-    Ok(head_sha)
-}
-
 impl ExecutionCoordinator {
     /// Convenience constructor for tests and simple callers. Wraps the
     /// provided `cube_client` and `execution_runner` in a
@@ -2374,12 +2283,9 @@ impl ExecutionCoordinator {
         let change: Option<CubeChangeHandle> = if let Some(pr_url) = pr_review_pr_url {
             let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
                 .unwrap_or_default();
-            match checkout_pr_head_for_review_workspace(
-                &lease.workspace_path,
-                pr_url,
-                &repo_slug,
-            )
-            .await
+            match adapter
+                .checkout_pr_head_for_review(&lease.workspace_path, pr_url, &repo_slug)
+                .await
             {
                 Ok(head_sha) => {
                     tracing::info!(
@@ -9246,6 +9152,406 @@ mod tests {
         assert_eq!(
             review_ready, 1,
             "the pr_review must be deferred while the review pool is full"
+        );
+    }
+
+    // ── Reviewer workspace checkout tests ─────────────────────────────────────
+
+    use crate::host_adapter::LocalHostAdapter;
+    use crate::work::WorkItemPatch;
+
+    /// A host adapter that delegates all workspace-lifecycle and spawn methods
+    /// to an inner `LocalHostAdapter` but intercepts
+    /// `checkout_pr_head_for_review` so tests can control its outcome and
+    /// verify it was called.
+    struct CheckoutControllingHostAdapter {
+        inner: Arc<dyn HostAdapter>,
+        /// `Some(sha)` → checkout succeeds and returns that SHA.
+        /// `None` → checkout fails with a canned error.
+        checkout_sha: Option<String>,
+        checkout_calls: Mutex<Vec<(PathBuf, String, String)>>,
+    }
+
+    #[async_trait]
+    impl HostAdapter for CheckoutControllingHostAdapter {
+        fn host_id(&self) -> &str {
+            self.inner.host_id()
+        }
+
+        async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
+            self.inner.ensure_repo(origin).await
+        }
+
+        async fn lease_workspace(
+            &self,
+            repo_id: &str,
+            task: &str,
+            prefer_workspace_id: Option<&str>,
+            allow_dirty: bool,
+        ) -> Result<CubeWorkspaceLease> {
+            self.inner
+                .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty)
+                .await
+        }
+
+        async fn release_workspace(&self, lease_id: &str) -> Result<()> {
+            self.inner.release_workspace(lease_id).await
+        }
+
+        async fn heartbeat_lease(
+            &self,
+            lease_id: &str,
+            ttl_seconds: Option<u64>,
+        ) -> Result<()> {
+            self.inner.heartbeat_lease(lease_id, ttl_seconds).await
+        }
+
+        async fn force_release_lease(
+            &self,
+            lease_id: &str,
+            reason: Option<&str>,
+        ) -> Result<()> {
+            self.inner.force_release_lease(lease_id, reason).await
+        }
+
+        async fn create_change(
+            &self,
+            workspace_path: &std::path::Path,
+            title: &str,
+        ) -> Result<CubeChangeHandle> {
+            self.inner.create_change(workspace_path, title).await
+        }
+
+        async fn checkout_pr_head_for_review(
+            &self,
+            workspace_path: &std::path::Path,
+            pr_url: &str,
+            repo_slug: &str,
+        ) -> Result<String> {
+            self.checkout_calls.lock().await.push((
+                workspace_path.to_path_buf(),
+                pr_url.to_owned(),
+                repo_slug.to_owned(),
+            ));
+            match &self.checkout_sha {
+                Some(sha) => Ok(sha.clone()),
+                None => Err(anyhow!("simulated reviewer checkout failure")),
+            }
+        }
+
+        async fn workspace_status(
+            &self,
+            workspace_path: &std::path::Path,
+        ) -> Result<CubeWorkspaceStatus> {
+            self.inner.workspace_status(workspace_path).await
+        }
+
+        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
+            self.inner.list_workspaces().await
+        }
+
+        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
+            self.inner.list_repos().await
+        }
+
+        fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
+            self.inner.command_repr(args)
+        }
+
+        async fn spawn_worker(
+            &self,
+            worker_id: &str,
+            execution: &crate::work::WorkExecution,
+            work_item: &crate::work::WorkItem,
+            workspace_path: &std::path::Path,
+            cube_change_id: Option<&str>,
+        ) -> Result<crate::runner::RunOutcome> {
+            self.inner
+                .spawn_worker(worker_id, execution, work_item, workspace_path, cube_change_id)
+                .await
+        }
+    }
+
+    /// A `HostAdapterProvider` that always returns the same adapter regardless
+    /// of which host is requested. Used in checkout tests to inject the
+    /// `CheckoutControllingHostAdapter`.
+    struct StaticHostAdapterProvider {
+        adapter: Arc<dyn HostAdapter>,
+    }
+
+    #[async_trait]
+    impl HostAdapterProvider for StaticHostAdapterProvider {
+        async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
+            Ok(Arc::clone(&self.adapter))
+        }
+    }
+
+    /// Helper: create a product + chore pair and return their ids. When
+    /// `pr_url` is `Some`, the chore's `pr_url` field is also set so that
+    /// `schedule_execution` picks it up for the reviewer checkout path.
+    fn make_pr_review_fixture(
+        db: &WorkDb,
+        pr_url: Option<&str>,
+    ) -> (String, String) {
+        let product = db
+            .create_product(CreateProductInput {
+                name: "TestProduct".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Test chore".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        if let Some(url) = pr_url {
+            db.update_work_item(
+                &chore.id,
+                WorkItemPatch {
+                    pr_url: Some(url.to_owned()),
+                    ..WorkItemPatch::default()
+                },
+            )
+            .unwrap();
+        }
+        (product.id, chore.id)
+    }
+
+    /// When a `pr_review` execution has a non-empty `pr_url` on its task,
+    /// `schedule_execution` must call `checkout_pr_head_for_review` and must
+    /// NOT call `create_change`.
+    #[tokio::test]
+    async fn pr_review_with_pr_url_calls_checkout_not_create_change() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/42";
+        let (_, chore_id) = make_pr_review_fixture(&db, Some(pr_url));
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+
+        let checkout_adapter = Arc::new(CheckoutControllingHostAdapter {
+            inner: Arc::new(LocalHostAdapter::new(
+                Arc::clone(&cube) as Arc<dyn CubeClient>,
+                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
+            )),
+            checkout_sha: Some("abc123deadbeef".to_owned()),
+            checkout_calls: Mutex::new(Vec::new()),
+        });
+
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        coord.set_review_pool(WorkerPool::new_review(1));
+        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
+            adapter: Arc::clone(&checkout_adapter) as Arc<dyn HostAdapter>,
+        }));
+        let coordinator = Arc::new(coord);
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("review pool slot available");
+
+        let result = coordinator
+            .schedule_execution(&execution, &worker_id)
+            .await;
+        assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
+
+        // Checkout was called with the correct pr_url.
+        let calls = checkout_adapter.checkout_calls.lock().await;
+        assert_eq!(calls.len(), 1, "checkout must be called exactly once");
+        assert_eq!(
+            calls[0].1, pr_url,
+            "checkout must receive the task's pr_url"
+        );
+
+        // create_change must NOT have been called — reviewer path skips it.
+        assert!(
+            cube.create_calls.lock().await.is_empty(),
+            "create_change must not be called for the reviewer checkout path"
+        );
+    }
+
+    /// When `checkout_pr_head_for_review` fails, `schedule_execution` must
+    /// record a `reviewer_pr_checkout_failed` start failure and release the
+    /// workspace.
+    #[tokio::test]
+    async fn pr_review_checkout_failure_records_start_failure_and_releases_workspace() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/7";
+        let (_, chore_id) = make_pr_review_fixture(&db, Some(pr_url));
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+
+        let checkout_adapter = Arc::new(CheckoutControllingHostAdapter {
+            inner: Arc::new(LocalHostAdapter::new(
+                Arc::clone(&cube) as Arc<dyn CubeClient>,
+                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
+            )),
+            checkout_sha: None, // fail
+            checkout_calls: Mutex::new(Vec::new()),
+        });
+
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        coord.set_review_pool(WorkerPool::new_review(1));
+        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
+            adapter: Arc::clone(&checkout_adapter) as Arc<dyn HostAdapter>,
+        }));
+        // Disable retries so the pre-start failure is terminal immediately.
+        let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("review pool slot available");
+
+        let result = coordinator
+            .schedule_execution(&execution, &worker_id)
+            .await;
+        assert!(
+            result.is_err(),
+            "schedule_execution must fail when checkout fails"
+        );
+
+        // The workspace lease must have been released.
+        assert_eq!(
+            cube.release_calls.lock().await.len(),
+            1,
+            "workspace must be released after checkout failure"
+        );
+
+        // A reviewer_pr_checkout_failed attention item must exist.
+        let items = db.list_attention_items(&execution.id).unwrap();
+        assert!(
+            items.iter().any(|i| i.kind == "reviewer_pr_checkout_failed"),
+            "expected a reviewer_pr_checkout_failed attention item, got {:?}",
+            items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
+        );
+    }
+
+    /// When a `pr_review` execution has no `pr_url` on its task, the normal
+    /// `create_change` path must be used and checkout must not be called.
+    #[tokio::test]
+    async fn pr_review_without_pr_url_uses_create_change_path() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        // No pr_url on the chore.
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::PrReview)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+
+        let checkout_adapter = Arc::new(CheckoutControllingHostAdapter {
+            inner: Arc::new(LocalHostAdapter::new(
+                Arc::clone(&cube) as Arc<dyn CubeClient>,
+                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
+            )),
+            checkout_sha: Some("would-not-be-called".to_owned()),
+            checkout_calls: Mutex::new(Vec::new()),
+        });
+
+        let mut coord = ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        );
+        coord.set_review_pool(WorkerPool::new_review(1));
+        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
+            adapter: Arc::clone(&checkout_adapter) as Arc<dyn HostAdapter>,
+        }));
+        let coordinator = Arc::new(coord);
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("review pool slot available");
+
+        let result = coordinator
+            .schedule_execution(&execution, &worker_id)
+            .await;
+        assert!(
+            result.is_ok(),
+            "schedule_execution must succeed on the create_change path: {result:?}"
+        );
+
+        // checkout must NOT have been called — no pr_url means create_change path.
+        assert!(
+            checkout_adapter.checkout_calls.lock().await.is_empty(),
+            "checkout_pr_head_for_review must not be called when pr_url is absent"
+        );
+
+        // create_change must have been called once.
+        assert_eq!(
+            cube.create_calls.lock().await.len(),
+            1,
+            "create_change must be called when pr_url is absent"
         );
     }
 }
