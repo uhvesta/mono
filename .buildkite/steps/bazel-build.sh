@@ -10,7 +10,7 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
-echo "--- [bazel-build] starting"
+echo "--- [bazel-build] building"
 echo "[bazel-build] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
 bazel build --verbose_failures --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...

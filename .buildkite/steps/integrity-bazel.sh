@@ -15,7 +15,7 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
-echo "--- [integrity-bazel] starting"
+echo "--- [integrity-bazel] verifying"
 echo "[integrity-bazel] agent: $(uname -a)"
 echo "[integrity-bazel] bazelisk: $(bazelisk version 2>&1 | head -1)"
 

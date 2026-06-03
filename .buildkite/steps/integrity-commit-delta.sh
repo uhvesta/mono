@@ -6,7 +6,7 @@
 # unconditionally; bazel caches make re-running cheap.
 set -euo pipefail
 
-echo "--- [commit-delta] starting"
+echo "--- [commit-delta] uploading"
 
 HEAD_SHA=$(git rev-parse HEAD)
 echo "[commit-delta] HEAD: ${HEAD_SHA}"

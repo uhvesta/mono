@@ -7,7 +7,7 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
-echo "--- [bazel-test] starting"
+echo "--- [bazel-test] testing"
 echo "[bazel-test] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
 bazel test --test_output=errors --keep_going -- //... -//tools/boss/app-macos/... -//tools/boss/installer/...

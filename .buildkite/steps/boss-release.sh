@@ -21,7 +21,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "--- $*"; }
 
-log "[boss-release] starting"
+log "[boss-release] releasing"
 echo "[boss-release] agent: $(uname -a)"
 echo "[boss-release] bazelisk: $(bazelisk version 2>&1 | head -1)"
 
