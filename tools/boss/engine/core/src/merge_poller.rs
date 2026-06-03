@@ -7081,4 +7081,175 @@ mod tests {
             OpenPrCiStatus::Clean,
         );
     }
+
+    /// Build a minimal `RequiredCheckFailure` for the pure-helper tests
+    /// below; only `name` and `conclusion` are meaningful to those helpers,
+    /// the rest are filler.
+    fn failure(name: &str, conclusion: &str) -> RequiredCheckFailure {
+        RequiredCheckFailure {
+            name: name.to_owned(),
+            conclusion: conclusion.to_owned(),
+            target_url: String::new(),
+            provider: CiProvider::Other,
+            provider_job_id: None,
+        }
+    }
+
+    #[test]
+    fn parse_pr_number_extracts_from_standard_url() {
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/123"),
+            Some(123),
+        );
+    }
+
+    #[test]
+    fn parse_pr_number_strips_query_and_fragment() {
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/123?foo=bar"),
+            Some(123),
+        );
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/123#issuecomment-1"),
+            Some(123),
+        );
+        // Query and fragment together.
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/123?foo=bar#frag"),
+            Some(123),
+        );
+    }
+
+    #[test]
+    fn parse_pr_number_stops_at_trailing_path() {
+        assert_eq!(
+            parse_pr_number("https://github.com/o/r/pull/123/files"),
+            Some(123),
+        );
+    }
+
+    #[test]
+    fn parse_pr_number_rejects_missing_pull_segment() {
+        assert_eq!(parse_pr_number("https://github.com/o/r/issues/123"), None);
+        assert_eq!(parse_pr_number("https://github.com/o/r"), None);
+    }
+
+    #[test]
+    fn parse_pr_number_rejects_non_numeric_tail() {
+        // No leading digits after `/pull/` → the digit split yields an empty
+        // first segment, which fails to parse.
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/abc"), None);
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/"), None);
+    }
+
+    #[test]
+    fn parse_pr_number_rejects_empty_or_garbage() {
+        assert_eq!(parse_pr_number(""), None);
+        assert_eq!(parse_pr_number("not a url at all"), None);
+    }
+
+    #[test]
+    fn ci_state_str_maps_each_variant() {
+        assert_eq!(ci_state_str(&OpenPrCiStatus::Clean), "success");
+        assert_eq!(ci_state_str(&OpenPrCiStatus::InFlight), "in_progress");
+        assert_eq!(
+            ci_state_str(&OpenPrCiStatus::Failing { failures: vec![] }),
+            "fail",
+        );
+    }
+
+    #[test]
+    fn ci_detail_json_serializes_failing_checks() {
+        let ci = OpenPrCiStatus::Failing {
+            failures: vec![
+                failure("ci/test", "FAILURE"),
+                failure("ci/lint", "TIMED_OUT"),
+            ],
+        };
+        let json = ci_detail_json(&ci).expect("non-empty failures → Some");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                {"name": "ci/test", "conclusion": "FAILURE"},
+                {"name": "ci/lint", "conclusion": "TIMED_OUT"},
+            ]),
+        );
+    }
+
+    #[test]
+    fn ci_detail_json_none_when_failures_empty() {
+        // Empty failure list → None so the DB column is NULL, not "[]".
+        let ci = OpenPrCiStatus::Failing { failures: vec![] };
+        assert_eq!(ci_detail_json(&ci), None);
+    }
+
+    #[test]
+    fn ci_detail_json_none_for_non_failing_variants() {
+        assert_eq!(ci_detail_json(&OpenPrCiStatus::Clean), None);
+        assert_eq!(ci_detail_json(&OpenPrCiStatus::InFlight), None);
+    }
+
+    #[test]
+    fn review_detail_json_none_when_empty() {
+        assert_eq!(review_detail_json(&[]), None);
+    }
+
+    #[test]
+    fn review_detail_json_serializes_logins() {
+        let reviewers = vec!["alice".to_owned(), "bob".to_owned()];
+        let json = review_detail_json(&reviewers).expect("non-empty → Some");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!(["alice", "bob"]));
+    }
+
+    #[test]
+    fn merge_queue_state_str_maps_flag() {
+        assert_eq!(merge_queue_state_str(true), Some("queued"));
+        assert_eq!(merge_queue_state_str(false), None);
+    }
+
+    #[test]
+    fn leaf_matches_check_name_empty_names_is_false() {
+        // Empty `names` short-circuits to false without inspecting the leaf —
+        // even a leaf that would otherwise match.
+        let leaf = serde_json::json!({"name": "anything"});
+        assert!(!leaf_matches_check_name(&leaf, &[]));
+    }
+
+    #[test]
+    fn leaf_matches_check_name_matches_on_name_field() {
+        let leaf = serde_json::json!({"name": "Visual Review"});
+        assert!(leaf_matches_check_name(&leaf, &["visual review"]));
+    }
+
+    #[test]
+    fn leaf_matches_check_name_falls_back_to_context() {
+        // No `name` field → uses `context` (StatusContext shape).
+        let leaf = serde_json::json!({"context": "ci/codecov"});
+        assert!(leaf_matches_check_name(&leaf, &["ci/codecov"]));
+    }
+
+    #[test]
+    fn leaf_matches_check_name_is_case_insensitive() {
+        let leaf = serde_json::json!({"name": "CI/Test"});
+        assert!(leaf_matches_check_name(&leaf, &["ci/test"]));
+    }
+
+    #[test]
+    fn leaf_matches_check_name_empty_or_absent_name_is_false() {
+        let empty_name = serde_json::json!({"name": ""});
+        assert!(!leaf_matches_check_name(&empty_name, &["something"]));
+
+        let no_name_field = serde_json::json!({"other": "x"});
+        assert!(!leaf_matches_check_name(&no_name_field, &["something"]));
+    }
+
+    #[test]
+    fn leaf_matches_check_name_no_match_is_false() {
+        let leaf = serde_json::json!({"name": "ci/test"});
+        assert!(!leaf_matches_check_name(&leaf, &["ci/lint", "ci/build"]));
+    }
 }
