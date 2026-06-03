@@ -670,6 +670,42 @@ fn actioned_group_cannot_be_actioned_again() {
     );
 }
 
+// ── Per-member vs group resolution (regression: accepting one closes all) ──
+
+#[test]
+fn accepting_one_followup_leaves_siblings_open_and_group_clears_only_on_last() {
+    let (db, _product, _project, task_id) = fixture();
+    let (a1, _) = db.create_attention(followup(&task_id, "task A")).unwrap();
+    let (a2, _) = db.create_attention(followup(&task_id, "task B")).unwrap();
+
+    // Accepting the first member must NOT close the group.
+    let group = db.answer_attention(&a1.id, None, false, false).unwrap();
+    assert_eq!(group.state, "partially_answered");
+    let members = db.list_attentions_for_group(&group.id).unwrap();
+    let sibling = members.iter().find(|m| m.id == a2.id).unwrap();
+    assert_eq!(sibling.answer_state, "open", "sibling must remain open");
+
+    // Action is refused while the sibling is still open.
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let err = db
+        .action_attention_group(&group.id, false, &checker)
+        .unwrap_err();
+    assert!(err.to_string().contains("unanswered"), "unexpected: {err}");
+
+    // Accept the second member — all members are now terminal.
+    let group = db.answer_attention(&a2.id, None, false, false).unwrap();
+    assert_eq!(group.state, "partially_answered");
+
+    // Only now can the group be closed; both accepted followups produce tasks.
+    let actioned = db.action_attention_group(&group.id, false, &checker).unwrap();
+    assert_eq!(actioned.group.state, "actioned");
+    assert_eq!(
+        actioned.produced_work_item_ids.len(),
+        2,
+        "both accepted followups produce tasks"
+    );
+}
+
 // --- reconcile_attentions (Attn 4 creation-pipeline upsert) --------------
 
 #[test]

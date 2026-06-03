@@ -287,6 +287,7 @@ pub(super) async fn handle_answer_attention(ctx: Dispatch, req: FrontendRequest)
         server_state,
         work_db,
         sink,
+        session_id,
         request_id,
         ..
     } = ctx;
@@ -304,6 +305,97 @@ pub(super) async fn handle_answer_attention(ctx: Dispatch, req: FrontendRequest)
             let members = work_db
                 .list_attentions_for_group(&group.id)
                 .unwrap_or_default();
+
+            // For followup groups: when the last open member is resolved,
+            // auto-action (if any accepted) or auto-dismiss (all rejected)
+            // so the group closes without a separate human gesture.
+            if group.kind == "followup" && members.iter().all(|m| m.answer_state != "open") {
+                if members.iter().any(|m| m.answer_state == "answered") {
+                    match work_db.action_attention_group(&group.id, false, &GhPrStateChecker) {
+                        Ok(ActionedAttentionGroup {
+                            group: actioned_group,
+                            produced_work_item_ids,
+                        }) => {
+                            let actioned_members = work_db
+                                .list_attentions_for_group(&actioned_group.id)
+                                .unwrap_or_default();
+                            server_state
+                                .publisher
+                                .publish_frontend_event_on_product(
+                                    &actioned_group.product_id,
+                                    FrontendEvent::AttentionGroupActioned {
+                                        group: actioned_group.clone(),
+                                        members: actioned_members.clone(),
+                                    },
+                                )
+                                .await;
+                            if !produced_work_item_ids.is_empty() {
+                                publish_work_invalidation(
+                                    &server_state,
+                                    &session_id,
+                                    &request_id,
+                                    vec![work_product_topic(&actioned_group.product_id)],
+                                    "attention_group_actioned",
+                                    Some(actioned_group.product_id.clone()),
+                                    produced_work_item_ids,
+                                )
+                                .await;
+                            }
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::AttentionGroupActioned {
+                                    group: actioned_group,
+                                    members: actioned_members,
+                                },
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                group_id = %group.id,
+                                "auto-action of fully-resolved followup group failed: {err}"
+                            );
+                        }
+                    }
+                } else {
+                    // All followups rejected — auto-dismiss so the group exits
+                    // the open list without the human having to dismiss it.
+                    match work_db.dismiss_attention(&group.id, None) {
+                        Ok(dismissed_group) => {
+                            let dismissed_members = work_db
+                                .list_attentions_for_group(&dismissed_group.id)
+                                .unwrap_or_default();
+                            server_state
+                                .publisher
+                                .publish_frontend_event_on_product(
+                                    &dismissed_group.product_id,
+                                    FrontendEvent::AttentionGroupUpdated {
+                                        group: dismissed_group.clone(),
+                                        members: dismissed_members.clone(),
+                                    },
+                                )
+                                .await;
+                            send_response(
+                                &sink,
+                                &request_id,
+                                FrontendEvent::AttentionGroupUpdated {
+                                    group: dismissed_group,
+                                    members: dismissed_members,
+                                },
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                group_id = %group.id,
+                                "auto-dismiss of fully-rejected followup group failed: {err}"
+                            );
+                        }
+                    }
+                }
+            }
+
             server_state
                 .publisher
                 .publish_frontend_event_on_product(

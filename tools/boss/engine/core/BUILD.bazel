@@ -291,7 +291,13 @@ rust_test(
     ],
     crate = ":engine_lib",
     edition = "2024",
-    env = {"HOME": "/tmp"},
+    env = {
+        "HOME": "/tmp",
+        # BOSS_EVENT_BIN is set at BUILD time so runner::pane_spawn_tests::
+        # settings_json_uses_absolute_boss_event_path can assert the absolute
+        # path without racing against other tests via std::env::set_var.
+        "BOSS_EVENT_BIN": "/opt/boss/bin/boss-event",
+    },
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

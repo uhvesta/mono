@@ -464,10 +464,8 @@ private struct AttentionMemberRow: View {
                 switch value {
                 case "accept":
                     model.acceptFollowup(member.id)
-                    model.actionAttentionGroup(group.id)
                 case "reject":
                     model.skipAttention(member.id)
-                    model.dismissAttentionGroup(group.id)
                 default: break
                 }
             }

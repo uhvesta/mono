@@ -4975,14 +4975,9 @@ mod pane_spawn_tests {
 
     #[tokio::test]
     async fn settings_json_uses_absolute_boss_event_path() {
-        // BOSS_EVENT_BIN takes precedence — set it to a known absolute
-        // path so we don't depend on the test runner's binary layout.
-        // SAFETY: setting env in a Rust test process is racy with other
-        // tests but this one isolates by writing files into a temp
-        // workspace, so a stale env from a prior parallel test would
-        // only confuse this test, not affect production code.
-        unsafe { std::env::set_var("BOSS_EVENT_BIN", "/opt/boss/bin/boss-event") };
-
+        // BOSS_EVENT_BIN is set to "/opt/boss/bin/boss-event" by the Bazel
+        // BUILD env for engine_lib_test_b, so boss_event_binary() returns
+        // that stable absolute path without racing against parallel tests.
         let workspace = TempDir::new().unwrap();
         let _spawner = run_once(&workspace).await.unwrap();
         // The settings file lives outside the workspace tree, keyed by
@@ -5008,8 +5003,6 @@ mod pane_spawn_tests {
             !settings.contains("\"boss-event\"") || settings.contains("/opt/boss/bin/boss-event"),
             "settings file must not invoke `boss-event` as a bare name",
         );
-
-        unsafe { std::env::remove_var("BOSS_EVENT_BIN") };
     }
 
     /// `BOSS_EVENT_BIN` short-circuits everything else.
