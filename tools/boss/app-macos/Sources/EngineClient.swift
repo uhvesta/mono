@@ -1828,7 +1828,8 @@ final class EngineClient: @unchecked Sendable {
             hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false,
             effortLevel: (payload["effort_level"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
-            sourceAutomationId: payload["source_automation_id"] as? String
+            sourceAutomationId: payload["source_automation_id"] as? String,
+            aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false
         )
     }
 

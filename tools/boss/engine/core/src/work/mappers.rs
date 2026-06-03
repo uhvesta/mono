@@ -194,6 +194,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // WorkDb::get_task_review_cycle_state for targeted reads (P992 task 9).
         review_cycle: 0,
         last_reviewed_sha: None,
+        // Computed by attach_ai_reviewing_flag in get_work_tree; always false
+        // in single-item query paths (get_work_item etc.) where the derived
+        // projection is not computed.
+        ai_reviewing: false,
     })
 }
 

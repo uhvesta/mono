@@ -1154,10 +1154,11 @@ impl WorkerCompletionHandler {
             return self.finalize_automation_triage(&execution).await;
         }
 
-        // P992 task 7: a `pr_review` reviewer execution never opens a PR.
-        // It reads the PR diff and emits structured findings; the Stop handler
-        // advances the producing task to `in_review` (task 8 will also parse
-        // the ReviewResult and enqueue revisions when warranted).
+        // P992: a `pr_review` reviewer execution never opens a PR. It reads
+        // the PR diff and emits structured findings; the producing task already
+        // advanced to `in_review` on PR-open, so the Stop handler just finalises
+        // the reviewer execution (task 8 will also parse the ReviewResult and
+        // enqueue revisions when warranted).
         if execution.kind == ExecutionKind::PrReview {
             return self.finalize_pr_review_pass(&execution).await;
         }
@@ -2068,14 +2069,18 @@ must not be asked to open one",
     /// 3. Applies the engine severity gate (design §3): any `critical`/`high`
     ///    finding, or any `regression` finding (regardless of severity), warrants
     ///    a revision. `revision_warranted = false` alone does not suppress the gate.
-    /// 4. Branches on the gate outcome:
-    ///    - If the gate passes: creates a revision task on the producing task
-    ///      with the rendered findings as `revision_instructions`, `source =
-    ///      pr_review`, dispatched on the general worker pool (`autostart = true`).
-    ///      The producing task still advances to `in_review`; the revision is
-    ///      an additional follow-up child task.
-    ///    - If the gate does not pass (no qualifying findings, or no parseable
-    ///      `ReviewResult`): the producing task simply advances to `in_review`.
+    /// 4a. If the gate passes: creates a revision task on the producing task
+    ///    with the rendered findings as `revision_instructions`, `source =
+    ///    pr_review`, dispatched on the general worker pool (`autostart = true`).
+    ///    The producing task advances from `active` → `in_review` at this point;
+    ///    the revision is an additional follow-up child task.
+    /// 4b. If the gate does not pass (no qualifying findings, or no parseable
+    ///    `ReviewResult`): the producing task advances to `in_review`.
+    ///
+    /// Until this handler fires, the producing task is held in `active` (Doing)
+    /// with `pr_url` stamped and `ai_reviewing = true` in the derived work-tree
+    /// projection. A fallback sweep in the merge poller ensures the hold always
+    /// resolves even if this Stop never arrives.
     ///
     /// In either case the reviewer execution is completed and its workspace
     /// released — it is always terminal after this handler runs.
@@ -2150,10 +2155,9 @@ must not be asked to open one",
             .as_ref()
             .is_some_and(crate::pr_review::passes_severity_gate);
 
-        // Atomically: advance producing task to in_review + complete the reviewer
-        // execution + clear its cube columns. This is the same path for both the
-        // revision and no-revision cases — the producing task's PR is ready for
-        // human review; the revision (if any) is a follow-up child task.
+        // Atomically: advance the producing task from active → in_review +
+        // complete the reviewer execution + clear its cube columns. Same path
+        // for both revision and no-revision cases.
         let completion = match self.work_db.record_worker_pr_completion(
             &execution.id,
             &pr_url,
@@ -4097,14 +4101,10 @@ fn work_item_product_id(item: &WorkItem) -> String {
     }
 }
 
-/// P992 task 7: execution kinds whose PR completions should be held for an
-/// independent reviewer pass before advancing to the human-Review column.
-/// Only primary implementation executions (task and chore workers that open
-/// the initial PR) are in scope for v1; revisions, CI-remediations, and
-/// conflict-resolution workers are intentionally excluded until the reviewer
-/// loop (tasks 8/9) is wired for the full update cycle.
 /// Whether completing a primary-implementation execution with a fresh PR
-/// should trigger an independent reviewer pass (P992 design §1).
+/// should trigger an independent reviewer pass (P992 design §1). When this
+/// returns true, the producing task's column transition is held in
+/// `PendingReview`/Doing until the reviewer finalises.
 ///
 /// `RevisionImplementation` is handled separately: only revisions that were
 /// created by the automated reviewer itself (`created_via` starts with
@@ -4639,8 +4639,8 @@ mod tests {
         );
         let outcome = handler.on_stop(&execution_id).await;
 
-        // P992 task 7: chore_implementation now enqueues an independent reviewer
-        // and holds the task in `active` until the reviewer resolves.
+        // P992 task 7: chore_implementation now enqueues a reviewer and holds
+        // the task in `active` until the reviewer resolves.
         assert!(
             matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
             "expected ReviewerEnqueued; got {outcome:?}",
@@ -4732,8 +4732,7 @@ mod tests {
         .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None)));
 
         let outcome = handler.on_stop(&execution_id).await;
-        // P992 task 7: chore_implementation now enqueues a reviewer and holds
-        // the task in `active` (not `in_review`).
+        // P992 task 7: chore_implementation holds the task and enqueues reviewer.
         assert!(
             matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
                 if pr_url == "https://github.com/spinyfin/mono/pull/458"),
@@ -4867,7 +4866,8 @@ mod tests {
         // shortcut, recheck must succeed without ever touching the
         // detector.
         let outcome = handler.recheck_for_pr(&execution_id).await;
-        // P992 task 7: chore_implementation holds task and enqueues reviewer.
+        // P992 (regression fix): chore_implementation advances to in_review and
+        // enqueues an async reviewer.
         assert!(
             matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
                 if pr_url == "https://github.com/spinyfin/mono/pull/458"),
@@ -5056,7 +5056,8 @@ mod tests {
         .with_branch_verifier(StubBranchVerifier::ok(&divergent_branch));
 
         let outcome = handler.on_stop(&execution_id).await;
-        // P992 task 7: chore_implementation holds task and enqueues reviewer.
+        // P992 (regression fix): chore_implementation advances to in_review and
+        // enqueues an async reviewer.
         assert!(
             matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
                 if pr_url == "https://github.com/spinyfin/mono/pull/458"),

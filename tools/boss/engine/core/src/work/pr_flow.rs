@@ -58,7 +58,7 @@ impl WorkDb {
             WorkerPrCompletionTarget::InReview if task.status == "in_review" => task.status.clone(),
             WorkerPrCompletionTarget::InReview => "in_review".to_owned(),
             WorkerPrCompletionTarget::Done => "done".to_owned(),
-            // P992 task 7: hold in current status while the reviewer runs.
+            // P992: hold in current status while the reviewer runs.
             WorkerPrCompletionTarget::PendingReview => task.status.clone(),
         };
         // Revision tasks do not own a PR — their `pr_url` must stay NULL
@@ -255,6 +255,83 @@ impl WorkDb {
             })
         })?;
         collect_rows(rows)
+    }
+
+    /// Tasks that are held in `active` (Doing) pending an AI reviewer pass
+    /// that has either finished (terminal `pr_review` execution) or timed out
+    /// (non-terminal `pr_review` execution older than `stale_secs` seconds).
+    ///
+    /// These are the candidates for the merge poller's reviewer-fallback sweep:
+    /// they should advance to `in_review` and release the hold, because either
+    /// the reviewer already finished (its Stop hook never fired or failed to
+    /// advance the task) or the reviewer is taking too long and we should
+    /// unblock the human review lane rather than stranding the card.
+    ///
+    /// Returns `(task_id, product_id, pr_url)` triples.
+    pub fn list_tasks_with_stalled_reviewer(
+        &self,
+        stale_secs: u64,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.connect()?;
+        let cutoff = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(stale_secs)
+            .to_string();
+        // Tasks in `active` with a `pr_url` that have a `pr_review` execution
+        // which is either:
+        //   1. Terminal (reviewer finished — should have advanced the task via
+        //      finalize_pr_review_pass but didn't, e.g. Stop hook was missed).
+        //   2. Non-terminal but created before the stale cutoff (timeout).
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT t.id, t.product_id, t.pr_url
+             FROM tasks t
+             JOIN work_executions we ON we.work_item_id = t.id AND we.kind = 'pr_review'
+             WHERE t.status = 'active'
+               AND t.pr_url IS NOT NULL
+               AND t.pr_url != ''
+               AND t.deleted_at IS NULL
+               AND (
+                 -- Reviewer finished but task was not advanced (missed Stop hook)
+                 we.status IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                 OR
+                 -- Reviewer still running but has been running too long (timeout)
+                 (we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')
+                  AND we.created_at < ?1)
+               )
+             ORDER BY t.updated_at ASC",
+        )?;
+        let rows = stmt.query_map([cutoff], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Advance a task from `active` to `in_review` as the reviewer-fallback
+    /// (the reviewer finished or timed out without advancing it). Idempotent:
+    /// no-ops if the task is already past `active`. Returns `true` if the task
+    /// was updated.
+    pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 updated_at        = ?2,
+                 last_status_actor = 'engine'
+             WHERE id = ?1
+               AND status = 'active'
+               AND pr_url IS NOT NULL
+               AND pr_url != ''
+               AND deleted_at IS NULL",
+            params![work_item_id, now],
+        )?;
+        Ok(rows_changed > 0)
     }
 
     /// Transition a task from `active` to `in_review` by binding a

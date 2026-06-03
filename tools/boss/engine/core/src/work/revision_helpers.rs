@@ -328,6 +328,76 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
     }
 }
 
+// ── AI reviewing flag ────────────────────────────────────────────────────────
+
+/// Set `ai_reviewing = true` on every task (and chore) that is currently held
+/// in `active` (Doing) with a `pr_url` AND has a non-terminal `pr_review`
+/// execution. Called from `get_work_tree` to surface the "Reviewing (AI)"
+/// badge on kanban cards while the reviewer pass is in flight.
+///
+/// The flag is derived — not a stored DB column — so it's always accurate: a
+/// task that never had a reviewer, or whose reviewer has already finalised,
+/// arrives with `ai_reviewing = false` (the default).
+pub(crate) fn attach_ai_reviewing_flag(
+    conn: &Connection,
+    tasks: &mut Vec<Task>,
+    chores: &mut Vec<Task>,
+) -> rusqlite::Result<()> {
+    // Collect IDs of tasks currently in `active` with a `pr_url` — these are
+    // the only candidates. If there are none we can skip the DB query entirely.
+    let candidate_ids: Vec<&str> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|t| t.status == "active" && t.pr_url.is_some())
+        .map(|t| t.id.as_str())
+        .collect();
+    if candidate_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Find which of those candidates have a non-terminal `pr_review` execution.
+    // Non-terminal = not in (completed, abandoned, failed, cancelled, orphaned).
+    // We use a single query with an IN clause built from the candidate IDs.
+    let placeholders = candidate_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT DISTINCT we.work_item_id
+         FROM work_executions we
+         WHERE we.work_item_id IN ({})
+           AND we.kind = 'pr_review'
+           AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = candidate_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let reviewing: std::collections::HashSet<String> = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if reviewing.is_empty() {
+        return Ok(());
+    }
+    for task in tasks.iter_mut() {
+        if reviewing.contains(&task.id) {
+            task.ai_reviewing = true;
+        }
+    }
+    for chore in chores.iter_mut() {
+        if reviewing.contains(&chore.id) {
+            chore.ai_reviewing = true;
+        }
+    }
+    Ok(())
+}
+
 // ── revision name helpers ────────────────────────────────────────────────────
 
 /// Extract a short display name from a revision description.

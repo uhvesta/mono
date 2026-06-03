@@ -366,6 +366,13 @@ impl WorkDb {
         // Compute has_in_progress_revision for every chain-root task that
         // has at least one todo/active descendant revision.
         attach_in_progress_revision_flag(&mut tasks, &mut chores);
+        // Compute ai_reviewing for tasks held in Doing while a pr_review
+        // execution is in flight. Surfaces the "Reviewing (AI)" badge on
+        // the kanban card. Errors are non-fatal — log and continue with
+        // the field defaulting to false.
+        if let Err(err) = attach_ai_reviewing_flag(&conn, &mut tasks, &mut chores) {
+            tracing::warn!(?err, "get_work_tree: failed to attach ai_reviewing flag; ignoring");
+        }
 
         Ok(WorkTree {
             product,

@@ -1442,13 +1442,16 @@ private struct WorkBoardCardItem: View {
             && task.status == "blocked"
             && task.blockedReason == "ci_failure"
 
+        let isAIReviewing = column == .doing && task.aiReviewing && task.status == "active"
+
         let activityState: AgentActivityState? = column == .doing
             ? .forDoingCard(
                 runtime: runtime,
                 liveState: liveState,
                 isDispatchPending: isDispatchPending,
                 isResolvingConflicts: isResolvingConflicts,
-                isRemediatingCI: isRemediatingCI)
+                isRemediatingCI: isRemediatingCI,
+                isAIReviewing: isAIReviewing)
             : nil
 
         let liveStatusForCard: String? = {
@@ -1456,6 +1459,7 @@ private struct WorkBoardCardItem: View {
             if isDispatchPending { return "Waiting for a slot" }
             if isResolvingConflicts { return nil }
             if isRemediatingCI { return nil }
+            if isAIReviewing { return nil }
             return liveState?.liveStatus
         }()
 
@@ -1999,6 +2003,9 @@ struct WorkBoardCardView: View {
                     }
                     if let projectName, !projectName.isEmpty {
                         WorkStatusBadge(text: projectName)
+                    }
+                    if task.aiReviewing && task.status == "active" {
+                        ReviewingAIBadge()
                     }
                     if isResolvingConflicts {
                         ResolvingConflictsBadge()
@@ -4413,6 +4420,31 @@ private struct ResolvingCIFailureBadge: View {
         .layoutPriority(-1)
         .help("A worker is actively resolving a CI failure on this PR.")
         .accessibilityLabel("Resolving CI failure")
+    }
+}
+
+/// "AI reviewing" card chip. Rendered on Doing-column cards held in `active`
+/// while a `pr_review` reviewer execution is in flight (P992). The badge
+/// distinguishes a card that is intentionally waiting for the AI review pass
+/// from one that appears stuck with no explanation.
+private struct ReviewingAIBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "brain")
+                .font(.caption2)
+            Text("AI reviewing")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.accentColor.opacity(0.10))
+        .clipShape(Capsule())
+        .layoutPriority(-1)
+        .help("An AI reviewer pass is running on this PR. The card will move to Review once the pass completes (typically within a minute).")
+        .accessibilityLabel("AI reviewing PR")
     }
 }
 

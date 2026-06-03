@@ -830,6 +830,13 @@ struct WorkTask: Identifiable, Hashable {
     /// the kanban — the purple wand icon distinguishes them from human-filed
     /// work so the operator can still review and merge their PRs.
     var sourceAutomationId: String? = nil
+    /// `true` while an independent `pr_review` reviewer execution is running
+    /// for this task. The task is held in the Doing column until the reviewer
+    /// finalises (or a timeout forces the advance). Surfaces as a
+    /// "Reviewing (AI)" badge on the card so the user can see the hold is
+    /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
+    /// absent (older engines / tasks not undergoing an AI review pass).
+    var aiReviewing: Bool = false
 
     var isChore: Bool {
         kind == "chore"
@@ -1855,7 +1862,8 @@ enum AgentActivityState {
         liveState: WorkerLiveState?,
         isDispatchPending: Bool,
         isResolvingConflicts: Bool,
-        isRemediatingCI: Bool
+        isRemediatingCI: Bool,
+        isAIReviewing: Bool = false
     ) -> AgentActivityState {
         if isDispatchPending {
             return .dispatchPending
@@ -1871,6 +1879,9 @@ enum AgentActivityState {
         }
         if isRemediatingCI {
             return .waiting(reason: "Resolving CI failure")
+        }
+        if isAIReviewing {
+            return .waiting(reason: "AI review in progress")
         }
         return AgentActivityState(runtime: runtime, liveState: liveState)
     }

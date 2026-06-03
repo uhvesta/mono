@@ -2681,6 +2681,19 @@ pub struct Task {
     /// automation's open-task limit. `None` on all pre-automation rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_automation_id: Option<String>,
+
+    /// `true` while an independent `pr_review` reviewer execution is
+    /// running for this task. The task is held in the Doing column
+    /// (`status = "active"`) until the reviewer finalises (or a timeout
+    /// forces the advance). Surfaces as a "Reviewing (AI)" badge on the
+    /// kanban card so the user can tell the hold is intentional.
+    ///
+    /// This is a derived projection set by the engine's `get_work_tree`
+    /// path (not a stored DB column). It is always `false` for tasks
+    /// not currently undergoing an AI review pass.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub ai_reviewing: bool,
 }
 
 fn is_false(b: &bool) -> bool {
