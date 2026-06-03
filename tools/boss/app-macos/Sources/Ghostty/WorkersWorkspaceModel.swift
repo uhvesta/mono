@@ -106,7 +106,7 @@ final class WorkersWorkspaceModel: ObservableObject {
             slots[index].taskTitle = request.taskTitle
         }
 
-        // TODO: use proc_listpids(PROC_PPID_ONLY, ...)
+        // TODO(@brian,2026-09-01): use proc_listpids(PROC_PPID_ONLY, ...)
         // right after surface init to find the shell pid. For now
         // return 0 and let the registry's ancestor walk fail
         // gracefully — the spawn flow plumbing is what we're proving

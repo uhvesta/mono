@@ -24,8 +24,8 @@
 #   AC_PASSWORD                    app-specific password
 #   AC_TEAM_ID                     10-character team ID
 #
-# TODO(task_18af2b6ce51452e0_1c): Replace env-var credential reads with
-# Boss-managed Keychain storage once the notary-credentials chore lands.
+# TODO(@brian,2026-09-01): (task_18af2b6ce51452e0_1c) Replace env-var credential
+# reads with Boss-managed Keychain storage once the notary-credentials chore lands.
 # That chore will add a `boss release-credentials store` command that calls
 # `xcrun notarytool store-credentials` and records the profile name in
 # ~/Library/Application Support/Boss/release-config.toml; this script will
@@ -254,8 +254,8 @@ if $SKIP_NOTARY; then
     cp "$SIGNED_PKG" "$OUTPUT_PKG"
   fi
 else
-  # TODO(task_18af2b6ce51452e0_1c): Replace env-var credential reads with a
-  # Keychain profile managed by `boss release-credentials store`.  Once that
+  # TODO(@brian,2026-09-01): (task_18af2b6ce51452e0_1c) Replace env-var credential
+  # reads with a Keychain profile managed by `boss release-credentials store`.  Once that
   # chore lands, prefer reading the profile name from
   # ~/Library/Application Support/Boss/release-config.toml and fall back to
   # AC_KEYCHAIN_PROFILE for CI / script overrides.

@@ -10,7 +10,7 @@ Let a human operator open and read the agent chat transcript of *any* execution 
 
 The transcript is the Claude Code JSONL session log. The engine converts JSONL → markdown (one converter, shared by two RPC callers), and the app renders that markdown by reusing the existing MarkdownUI rendering component — but composed as a *lazy list of per-event markdown segments* rather than one giant string, so large transcripts stay responsive and individual events (thinking, big tool results) can collapse.
 
-This is an advanced/power-user feature. It is the realization of work already named as "future work" in four existing design docs: [transcript-tail](transcript-tail.md) (`--format=markdown`, "a dedicated transcript viewer window"), [window-management](window-management.md) ("a window for browsing historical executions and their transcripts"), [kanban-board](kanban-board.md) ("a 'View transcripts' action"), and [markdown-viewer](markdown-viewer.md) (pagination for very large documents).
+This is an advanced/power-user feature. It is the realization of work related to "future work" in four existing design docs: [worker-live-status](worker-live-status.md) (the live transcript tail; `--format=markdown`, "a dedicated transcript viewer window"), [macos-modernization-audit](macos-modernization-audit.md) (window management — "a window for browsing historical executions and their transcripts"), [work-kanban](work-kanban.md) ("a 'View transcripts' action"), and [markdown-renderer-migration](markdown-renderer-migration.md) (the markdown renderer; pagination for very large documents).
 
 ## Goals
 
@@ -19,13 +19,13 @@ This is an advanced/power-user feature. It is the realization of work already na
 - **High-fidelity rendering.** Faithfully render every JSONL event type — user/assistant messages, thinking, tool_use, tool_result, system events, hook/pr-link/attachment events — preserving conversation order, timestamps, model, and code blocks.
 - **Stay performant on large transcripts.** Transcripts run to hundreds of messages and hundreds of KB+. Opening and scrolling one must not choke the UI.
 - **Engine owns conversion + listing; app is a thin client.** The JSONL → markdown conversion and the execution listing live in the engine. The app lists executions and renders returned markdown; it does not parse raw JSONL itself.
-- **Reuse, don't fork.** Reuse the existing markdown rendering component rather than standing up a second markdown renderer ([markdown-viewer](markdown-viewer.md)).
+- **Reuse, don't fork.** Reuse the existing markdown rendering component rather than standing up a second markdown renderer ([markdown-renderer-migration](markdown-renderer-migration.md)).
 - **Degrade gracefully.** Handle in-progress (partial), missing/rotated/GC'd, and zero-execution cases without erroring.
 
 ## Non-goals
 
 - **Editing, replaying, or re-running transcripts.** Read-only. No "resume from here", no annotation/commenting (that is design-renderer future work, not this).
-- **A new live-tail experience.** The live agent tail already exists ([transcript-tail](transcript-tail.md)); this viewer is execution-centric and history-first. It will *render* an in-progress execution's partial transcript, but it does not replace or restyle the existing 1 Hz tail view.
+- **A new live-tail experience.** The live agent tail already exists ([worker-live-status](worker-live-status.md)); this viewer is execution-centric and history-first. It will *render* an in-progress execution's partial transcript, but it does not replace or restyle the existing 1 Hz tail view.
 - **Cross-task / global transcript search or a global transcript browser.** Scope is "the executions of one task." A global browser is possible future work.
 - **Changing the JSONL transcript format or how agents emit it.** We consume what Claude Code writes.
 - **Exporting transcripts** (PDF/HTML/share). The markdown is already a portable artifact; export is out of scope for v1.
@@ -63,7 +63,7 @@ What exists today (verified against the code):
 
 Convert the whole transcript to a single markdown document and feed it to the existing `MarkdownDocView` via a new `MarkdownDocRef.Source.transcript(executionId:)` (or the existing `.engineText` coordinate). Smallest possible app change — a handful of lines in `EngineClient.fetchMarkdown` and a new window scene reusing `MarkdownDocView`.
 
-**Why not (as the whole answer):** `MarkdownDocView` hands the *entire* string to one `Markdown` view, and MarkdownUI builds the full AST eagerly. For a 300 KB / many-hundred-message transcript that means a multi-second hitch on open and sluggish scrolling — exactly the performance cliff [markdown-viewer](markdown-viewer.md) flags as unsolved. It also can't collapse verbose thinking blocks or truncate huge tool results: pure-markdown collapsing relies on HTML `<details>`, which the MarkdownUI theme does not render reliably. So this loses on two explicit goals (performance, collapsible thinking/large output). It is, however, a perfectly good *fallback/v0* and informs the chosen approach.
+**Why not (as the whole answer):** `MarkdownDocView` hands the *entire* string to one `Markdown` view, and MarkdownUI builds the full AST eagerly. For a 300 KB / many-hundred-message transcript that means a multi-second hitch on open and sluggish scrolling — exactly the performance cliff [markdown-renderer-migration](markdown-renderer-migration.md) flags as unsolved. It also can't collapse verbose thinking blocks or truncate huge tool results: pure-markdown collapsing relies on HTML `<details>`, which the MarkdownUI theme does not render reliably. So this loses on two explicit goals (performance, collapsible thinking/large output). It is, however, a perfectly good *fallback/v0* and informs the chosen approach.
 
 ### Alternative B — App parses JSONL and reuses the bespoke `MessageRowView` list (extend transcript-tail to history)
 
