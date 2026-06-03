@@ -256,12 +256,18 @@ should_skip() {
 # but the release never completed, deletes the leaked remote tag. No commit is
 # ever pushed to main, so there is nothing else to unwind. All state is read
 # defensively for `set -u` safety.
+#
+# `return 0` is REQUIRED: as the EXIT trap, this function's exit status becomes
+# the script's. Phases that never set STAGE (prepare; a skipped run; a build
+# phase that finds no tag) would otherwise end on the false `[[ -n "" ]]` test
+# and exit 1 despite succeeding.
 cleanup() {
   if [[ "${TAG_PUSHED}" == "1" && -n "${NEW_TAG}" ]]; then
     echo "[checkleft-release] release did not complete — deleting leaked tag ${NEW_TAG}" >&2
     git push origin ":refs/tags/${NEW_TAG}" 2>/dev/null || true
   fi
   [[ -n "${STAGE}" ]] && rm -rf "${STAGE}"
+  return 0
 }
 
 # ── phases ────────────────────────────────────────────────────────────────────
