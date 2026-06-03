@@ -346,7 +346,14 @@ pub(crate) fn revision_name_from_description(description: &str) -> String {
         return if trimmed.len() <= 120 {
             trimmed.to_owned()
         } else {
-            let cutoff = &trimmed[..120];
+            // Walk back to the largest char boundary <= 120 so slicing never
+            // splits a multi-byte UTF-8 scalar (a naive `&trimmed[..120]` panics
+            // when byte 120 lands mid-character).
+            let mut end = 120;
+            while !trimmed.is_char_boundary(end) {
+                end -= 1;
+            }
+            let cutoff = &trimmed[..end];
             match cutoff.rfind(' ') {
                 Some(pos) => format!("{}…", &cutoff[..pos]),
                 None => format!("{cutoff}…"),
@@ -593,4 +600,162 @@ pub(crate) fn insert_execution(
     )?;
 
     query_execution(conn, &id)?.with_context(|| format!("missing execution after insert: {id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── revision_name_from_description ──────────────────────────────────────
+
+    #[test]
+    fn revision_name_skips_leading_blank_and_whitespace_lines() {
+        let desc = "\n   \n\t\nFix the flaky retry loop\nmore detail";
+        assert_eq!(
+            revision_name_from_description(desc),
+            "Fix the flaky retry loop"
+        );
+    }
+
+    #[test]
+    fn revision_name_short_single_line_passes_through_trimmed() {
+        assert_eq!(
+            revision_name_from_description("  Tidy up the dispatcher  "),
+            "Tidy up the dispatcher"
+        );
+    }
+
+    #[test]
+    fn revision_name_exactly_120_chars_is_verbatim() {
+        let line = "a".repeat(120);
+        assert_eq!(revision_name_from_description(&line), line);
+    }
+
+    #[test]
+    fn revision_name_long_line_with_space_truncates_at_word_boundary() {
+        // 130 'a's, a space, then a tail word. The cutoff at 120 bytes lands in
+        // the run of 'a's; rfind(' ') finds no space before 120, so it hard
+        // cuts. Use a layout where a space *does* fall below 120 to exercise the
+        // word-boundary branch.
+        let head = "word ".repeat(30); // 150 bytes, spaces every 5 chars
+        let out = revision_name_from_description(&head);
+        // Truncated at the last space at or before byte 120 (byte 119 here:
+        // "word " * 24 = 120 bytes, last space at index 119).
+        assert!(out.ends_with('…'), "expected ellipsis, got {out:?}");
+        assert!(!out.contains("  "), "should cut cleanly at a space: {out:?}");
+        // The kept prefix must be whole words only (no trailing partial 'word').
+        let kept = out.trim_end_matches('…');
+        assert!(kept.split(' ').all(|w| w.is_empty() || w == "word"));
+        assert!(kept.len() <= 120);
+    }
+
+    #[test]
+    fn revision_name_long_line_without_space_hard_cuts() {
+        let line = "x".repeat(200);
+        let out = revision_name_from_description(&line);
+        assert_eq!(out, format!("{}…", "x".repeat(120)));
+    }
+
+    #[test]
+    fn revision_name_multibyte_straddling_120_byte_boundary_does_not_panic() {
+        // One ASCII byte followed by 3-byte scalars: char boundaries fall at
+        // bytes 1, 4, 7, ... = 1 + 3k. Byte 120 is *not* a boundary (119 is not
+        // divisible by 3), so a naive `&trimmed[..120]` byte-slice would panic.
+        let line = format!("a{}", "世".repeat(50)); // 1 + 150 = 151 bytes
+        let out = revision_name_from_description(&line);
+        // No spaces → hard-cut branch; must end with the ellipsis and stay valid.
+        assert!(out.ends_with('…'), "expected ellipsis, got {out:?}");
+        let kept = out.trim_end_matches('…');
+        // Cut at the largest char boundary <= 120, i.e. byte 118 (1 + 3*39).
+        assert_eq!(kept, &line[..118]);
+        // Sanity: the kept text is whole characters (String guarantees validity).
+        assert!(line.starts_with(kept));
+    }
+
+    // ── normalize_priority ──────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_priority_defaults_to_medium() {
+        assert_eq!(normalize_priority(None).unwrap(), "medium");
+        assert_eq!(normalize_priority(Some("")).unwrap(), "medium");
+        assert_eq!(normalize_priority(Some("   \t ")).unwrap(), "medium");
+    }
+
+    #[test]
+    fn normalize_priority_canonicalizes_case_and_whitespace() {
+        assert_eq!(normalize_priority(Some("  LOW ")).unwrap(), "low");
+        assert_eq!(normalize_priority(Some("Medium")).unwrap(), "medium");
+        assert_eq!(normalize_priority(Some("HIGH")).unwrap(), "high");
+    }
+
+    #[test]
+    fn normalize_priority_rejects_unknown_value() {
+        let err = normalize_priority(Some("urgent")).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid priority"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── normalize_model_override ────────────────────────────────────────────
+
+    #[test]
+    fn normalize_model_override_none_and_blank_collapse_to_none() {
+        assert_eq!(normalize_model_override(None), None);
+        assert_eq!(normalize_model_override(Some(String::new())), None);
+        assert_eq!(normalize_model_override(Some("   \t".to_owned())), None);
+    }
+
+    #[test]
+    fn normalize_model_override_trims_and_passes_through() {
+        assert_eq!(
+            normalize_model_override(Some("  opus  ".to_owned())),
+            Some("opus".to_owned())
+        );
+        assert_eq!(
+            normalize_model_override(Some("claude-sonnet-4-6".to_owned())),
+            Some("claude-sonnet-4-6".to_owned())
+        );
+    }
+
+    // ── canonicalize_created_via ────────────────────────────────────────────
+
+    #[test]
+    fn canonicalize_created_via_blank_falls_back_to_unknown() {
+        assert_eq!(
+            canonicalize_created_via(None, "task_x", "revision"),
+            CREATED_VIA_UNKNOWN
+        );
+        assert_eq!(
+            canonicalize_created_via(Some(""), "task_x", "revision"),
+            CREATED_VIA_UNKNOWN
+        );
+        assert_eq!(
+            canonicalize_created_via(Some("   "), "task_x", "revision"),
+            CREATED_VIA_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn canonicalize_created_via_known_values_returned_verbatim() {
+        assert_eq!(
+            canonicalize_created_via(Some(CREATED_VIA_ENGINE_AUTO), "task_x", "revision"),
+            CREATED_VIA_ENGINE_AUTO
+        );
+        let merge_conflict = "merge-conflict:crz_abc123";
+        assert_eq!(
+            canonicalize_created_via(Some(merge_conflict), "task_x", "revision"),
+            merge_conflict
+        );
+    }
+
+    #[test]
+    fn canonicalize_created_via_trims_and_stores_undocumented_value_as_is() {
+        // Surrounding whitespace is trimmed; an undocumented value is still
+        // stored verbatim (logged, not rejected).
+        assert_eq!(
+            canonicalize_created_via(Some("  some-future-source  "), "task_x", "revision"),
+            "some-future-source"
+        );
+    }
 }
