@@ -7,18 +7,19 @@
 # as assets on a GitHub Release.
 #
 # Unlike boss (a single macOS .app produced on one agent), checkleft needs
-# binaries for both Linux and macOS, so the work is split into two phases that
-# run on two agents:
+# binaries for both Linux and macOS, so the work is split into three phases:
 #
-#   linux   — the orchestrator. Runs the skip-logic, computes the alpha version,
-#             patches it into the release checkout, builds the Linux binaries,
-#             then tags the release commit, creates the GitHub Release, and
-#             uploads the binaries. Hands the tag to the darwin phase via
-#             buildkite-agent meta-data.
-#   darwin  — builds the macOS binaries and uploads them to the release the
-#             linux phase created.
+#   prepare — the orchestrator. Runs the skip-logic, computes the alpha version,
+#             tags the release commit, and creates the GitHub Release. Hands the
+#             tag to the build phases via buildkite-agent meta-data.
+#   linux   — builds the Linux binaries and uploads them to the release.
+#   darwin  — builds the macOS binaries and uploads them to the release.
 #
-# The version bump is NEVER committed to main. It is patched into the release
+# The linux and darwin build phases both depend only on `prepare`, so they run
+# in PARALLEL on separate agents; wall-clock is prepare + max(linux, darwin)
+# rather than the sum.
+#
+# The version bump is NEVER committed to main. It is patched into the build
 # checkout only (so the release builds from a tree carrying the new version) and
 # recorded in the git tag + GitHub Release. The tag points at the release commit
 # (BUILDKITE_COMMIT) itself, so pushing it needs only `contents: write` — no
@@ -26,7 +27,7 @@
 # off main therefore carry whatever (possibly stale) version Cargo.toml holds;
 # that is intentional and harmless: checkleft's CLI does not embed
 # CARGO_PKG_VERSION (no `#[command(version)]`), so the compiled binary is
-# byte-identical regardless of the version string. Both phases build from the
+# byte-identical regardless of the version string. All phases build from the
 # SAME commit (BUILDKITE_COMMIT) and need not share a checkout.
 #
 # Trigger model (see tools/checkleft/docs/buildkite-release-setup.md):
@@ -265,9 +266,7 @@ cleanup() {
 
 # ── phases ────────────────────────────────────────────────────────────────────
 
-phase_linux() {
-  [[ "$(uname -s)" == "Linux" ]] || die "linux phase landed on $(uname -s); the step must target an os=linux agent (see agents: in .buildkite/pipeline-checkleft-release.yml)"
-
+phase_prepare() {
   echo "[checkleft-release] agent: $(uname -a)"
   resolve_last_release
 
@@ -275,23 +274,63 @@ phase_linux() {
   skip_reason="$(should_skip)" || true
   if [[ -n "${skip_reason}" ]]; then
     echo "${skip_reason}"
-    exit 0  # darwin phase finds no tag in meta-data and skips too
+    exit 0  # no tag published to meta-data → the build phases skip too
   fi
 
   compute_next_version
   log "[checkleft-release] ${CUR_VERSION} -> ${NEW_VERSION} (tag ${NEW_TAG})"
 
-  # The tag will point at the existing source commit on main — no bump commit is
-  # created. Capture it before patching the tree.
+  # Tag the existing commit on main (no bump commit is created). Pushing a tag
+  # (unlike a commit to main) needs no branch-protection bypass.
   local release_sha
   release_sha="$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")"
   [[ -n "${release_sha}" ]] || die "could not resolve the commit to release/tag"
 
-  # Patch the version into the release checkout (NEVER committed — see header),
-  # then build from it. Building before any push means a build failure leaves no
-  # tag or release behind.
+  # ── point of no return: tag the release commit, push the tag, create release ─
+  # The cleanup trap deletes the tag if this phase dies before the release is
+  # created (the window guarded by TAG_PUSHED). Once the release exists, the
+  # build phases attach assets to it; a build failure is recoverable by retrying
+  # that job, so the tag/release are intentionally left in place.
+  log "[checkleft-release] tagging ${NEW_TAG} at ${release_sha:0:12}"
+  git tag "${NEW_TAG}" "${release_sha}"
+  git push origin "refs/tags/${NEW_TAG}" \
+    || die "tag push rejected for ${NEW_TAG}. The tag may already exist (a prior run pushed it — delete it and retry), or the agent's git credentials cannot push to ${REPO}."
+  TAG_PUSHED=1
+
+  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
+  gh release create "${NEW_TAG}" --repo "${REPO}" \
+    --title "checkleft ${NEW_VERSION}" --generate-notes
+
+  # Hand the tag to the parallel build phases.
+  meta_set "${META_TAG_KEY}" "${NEW_TAG}"
+  TAG_PUSHED=0  # release created; stop guarding the tag
+  log "[checkleft-release] prepare done — ${NEW_TAG} created; build phases will attach assets"
+}
+
+# resolve_release_tag — set NEW_TAG/NEW_VERSION from the tag prepare published to
+# meta-data (or a CHECKLEFT_RELEASE_TAG override for manual recovery). Exits 0
+# when there is no tag — prepare skipped this run, so the build phase is a no-op.
+resolve_release_tag() {
+  NEW_TAG="${CHECKLEFT_RELEASE_TAG:-$(meta_get "${META_TAG_KEY}")}"
+  if [[ -z "${NEW_TAG}" ]]; then
+    echo "[checkleft-release] no release tag from the prepare phase (it skipped or did not run) — nothing to do"
+    exit 0
+  fi
+  NEW_VERSION="${NEW_TAG#"${TAG_PREFIX}"}"
+}
+
+phase_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || die "linux phase landed on $(uname -s); the step must target an os=linux agent (see agents: in .buildkite/pipeline-checkleft-release.yml)"
+
+  echo "[checkleft-release] agent: $(uname -a)"
+  resolve_release_tag
+
+  # Patch the release version into the build checkout (NEVER committed; the
+  # binary is version-independent, so this is for tree self-consistency).
+  CUR_VERSION="$(grep -E '^version = "' "${CARGO_TOML}" | head -1 | sed -E 's/^version = "(.*)"/\1/')"
   apply_version_edits
 
+  log "[checkleft-release] building Linux assets for ${NEW_TAG}"
   STAGE="$(mktemp -d)"
 
   local gnu_path
@@ -306,41 +345,16 @@ phase_linux() {
     echo "[checkleft-release] WARNING: musl build unavailable (install musl-tools on the agent to enable); shipping without it"
   fi
 
-  # ── point of no return: tag the release commit, push the tag, release ───────
-  # Tag the existing commit on main; nothing is pushed to main. Pushing a tag
-  # (unlike a commit to main) needs no branch-protection bypass. From here the
-  # cleanup trap deletes the tag if a later step fails.
-  log "[checkleft-release] tagging ${NEW_TAG} at ${release_sha:0:12}"
-  git tag "${NEW_TAG}" "${release_sha}"
-  git push origin "refs/tags/${NEW_TAG}" \
-    || die "tag push rejected for ${NEW_TAG}. The tag may already exist (a prior run pushed it — delete it and retry), or the agent's git credentials cannot push to ${REPO}."
-  TAG_PUSHED=1
-
-  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
-  gh release create "${NEW_TAG}" --repo "${REPO}" \
-    --title "checkleft ${NEW_VERSION}" --generate-notes
-
   upload_release_assets
-
-  # Hand the tag to the darwin phase.
-  meta_set "${META_TAG_KEY}" "${NEW_TAG}"
-  TAG_PUSHED=0  # release published; stop guarding the tag
-  log "[checkleft-release] linux phase done — ${NEW_TAG} published with Linux assets"
+  log "[checkleft-release] linux phase done — Linux assets attached to ${NEW_TAG}"
 }
 
 phase_darwin() {
   [[ "$(uname -s)" == "Darwin" ]] || die "darwin phase must run on a macOS agent (got $(uname -s)); the step must target an os=darwin agent (see agents: in .buildkite/pipeline-checkleft-release.yml)"
 
   echo "[checkleft-release] agent: $(uname -a)"
-
-  # Tag comes from the linux phase (or an explicit override for manual recovery).
-  NEW_TAG="${CHECKLEFT_RELEASE_TAG:-$(meta_get "${META_TAG_KEY}")}"
-  if [[ -z "${NEW_TAG}" ]]; then
-    echo "[checkleft-release] no release tag from the linux phase (it skipped or did not run) — nothing to do"
-    exit 0
-  fi
-  NEW_VERSION="${NEW_TAG#"${TAG_PREFIX}"}"
-  log "[checkleft-release] uploading macOS assets to ${NEW_TAG}"
+  resolve_release_tag
+  log "[checkleft-release] building macOS assets for ${NEW_TAG}"
 
   STAGE="$(mktemp -d)"
 
@@ -367,9 +381,10 @@ main() {
   local phase="${1:-}"
   trap cleanup EXIT
   case "${phase}" in
-    linux)  phase_linux ;;
-    darwin) phase_darwin ;;
-    *) die "usage: $0 <linux|darwin>" ;;
+    prepare) phase_prepare ;;
+    linux)   phase_linux ;;
+    darwin)  phase_darwin ;;
+    *) die "usage: $0 <prepare|linux|darwin>" ;;
   esac
 }
 

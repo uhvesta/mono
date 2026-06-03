@@ -117,8 +117,8 @@ Because `BUILDKITE_SOURCE` is `api`/`ui`, change-detection is skipped and a rele
 ## Verifying the setup
 
 1. Trigger a manual build (above) and open the build URL.
-2. The **checkleft-release (linux)** step should compute the next version, build the Linux binaries, push the tag, create the release, and upload assets.
-3. The **checkleft-release (darwin)** step should attach the macOS binaries.
+2. The **prepare** step should compute the next version, push the tag, and create the GitHub Release.
+3. The **linux** and **darwin** steps then run in parallel, each building its binaries and uploading them to that release.
 4. Confirm the release and its assets:
 
 ```sh
@@ -136,24 +136,25 @@ Expected assets (named by Rust target triple, each with a `.sha256` sidecar):
 
 ## Recovering from a partial release
 
-The Linux phase is atomic: binaries are built **before** anything is pushed, so a Linux build failure leaves no tag or release behind (and nothing is ever pushed to `main`). The macOS phase runs after the release already exists, so a darwin failure leaves a release with Linux assets only. To recover:
+`prepare` creates the tag and the GitHub Release before any build runs, then the `linux` and `darwin` build steps attach their assets in parallel. If a build step fails, the release exists but is missing that platform's assets. To recover:
 
-- **Re-run the darwin job in the same build** (`bk job retry <job-id>`) — the tag is read from build meta-data, so it picks up where it left off.
-- **Or upload manually** from a Mac checked out at the tag:
+- **Re-run the failed build job** (`bk job retry <job-id>`) — it reads the tag from build meta-data and re-uploads, so it picks up where it left off.
+- **Or upload manually** from an agent of the right OS, checked out at the tag:
 
   ```sh
   CHECKLEFT_RELEASE_TAG=checkleft-v0.1.0-alpha.9 \
-    .buildkite/steps/checkleft-release.sh darwin
+    .buildkite/steps/checkleft-release.sh darwin   # or: linux
   ```
 
-A brand-new build will **not** redo a skipped darwin upload: the idempotency guard sees `HEAD` already at the release commit and no-ops. Use the job retry or the manual override above.
+A brand-new build will **not** redo a missing upload: the idempotency guard sees `HEAD` already at the release commit and no-ops. Use the job retry or the manual override above. (If `prepare` itself fails before the Release is created, its cleanup trap deletes any tag it pushed, so a fresh run starts clean.)
 
 ---
 
 ## How it works (summary)
 
 - **Version:** only the `-alpha.N` counter is revved (the base `X.Y.Z` is carried through). The next N is `max(Cargo.toml alpha, highest published checkleft-v* alpha) + 1`, so a stale Cargo.toml can never reuse a published alpha — which is exactly why the bump never has to be committed back to `main`. The new version is patched into `tools/checkleft/Cargo.toml` + `Cargo.lock` in the release checkout (never committed) and the release **commit** (`BUILDKITE_COMMIT`) is tagged `checkleft-vX.Y.Z-alpha.N`. `main`'s `Cargo.toml` stays at whatever version it last held, so developer builds carry a non-meaningful version — intentional and harmless (see Build tool).
-- **Build tool:** native binaries are built with `bazel build -c opt //tools/checkleft:checkleft` (matches how mono builds checkleft and reuses the CI disk cache); the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`, since those triples are not registered in mono's bazel toolchains. checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string — the patched-in version is for tree-consistency, not the artifact bytes; both phases build at `BUILDKITE_COMMIT`.
+- **Build tool:** native binaries are built with `bazel build -c opt //tools/checkleft:checkleft` (matches how mono builds checkleft and reuses the CI disk cache); the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`, since those triples are not registered in mono's bazel toolchains. checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string — the patched-in version is for tree-consistency, not the artifact bytes; all phases build at `BUILDKITE_COMMIT`.
+- **Structure:** a `prepare` step (skip-logic + version + tag + GitHub Release) fans out to the `linux` and `darwin` build steps, which depend only on `prepare` and run in **parallel** on separate agents — wall-clock is `prepare + max(linux, darwin)` rather than the sum. The `concurrency_group` lives on `prepare` so two release runs can't create tags at once.
 - **Loop prevention:** no commit is pushed to `main` (only a tag), so there is no self-trigger; push-triggered builds are disabled; and the idempotency guard no-ops any run whose `HEAD` is already the latest release commit.
 
 ---

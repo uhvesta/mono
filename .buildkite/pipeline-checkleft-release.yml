@@ -17,15 +17,21 @@
 # schedule and manual triggers, and the idempotency guard no-ops a re-run on an
 # already-released commit.
 #
-# Agent targeting: both phases run on the bazel-any queue (the shared Mac/Linux
-# pool) and are pinned to their OS by agent tag (os: linux / os: darwin) —
-# otherwise a phase can land on the wrong OS (the linux phase hard-fails if it
-# lands on a Mac).
+# Agent targeting: every phase runs on the bazel-any queue (the shared Mac/Linux
+# pool) pinned to its OS by agent tag (os: linux / os: darwin) — otherwise a
+# phase can land on the wrong OS (the linux phase hard-fails if it lands on a
+# Mac).
+#
+# Structure: a `prepare` step (skip-logic + version + tag + GitHub Release) fans
+# out to the `linux` and `darwin` build steps. They depend only on `prepare`, so
+# they run in PARALLEL on separate agents. The concurrency_group lives on
+# `prepare` so two release runs can't create tags at once; the build steps are
+# unconstrained (each run's builds attach to that run's own release).
 
 steps:
-  - label: ":rust: checkleft-release (linux)"
-    key: "checkleft-release-linux"
-    command: ".buildkite/steps/checkleft-release.sh linux"
+  - label: ":mag: checkleft-release (prepare)"
+    key: "checkleft-release-prepare"
+    command: ".buildkite/steps/checkleft-release.sh prepare"
     agents:
       queue: bazel-any
       os: linux
@@ -34,14 +40,22 @@ steps:
     retry:
       automatic: false
 
+  - label: ":rust: checkleft-release (linux)"
+    key: "checkleft-release-linux"
+    command: ".buildkite/steps/checkleft-release.sh linux"
+    depends_on: "checkleft-release-prepare"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
   - label: ":apple: checkleft-release (darwin)"
     key: "checkleft-release-darwin"
     command: ".buildkite/steps/checkleft-release.sh darwin"
-    depends_on: "checkleft-release-linux"
+    depends_on: "checkleft-release-prepare"
     agents:
       queue: bazel-any
       os: darwin
-    concurrency: 1
-    concurrency_group: "checkleft-release"
     retry:
       automatic: false
