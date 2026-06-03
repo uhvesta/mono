@@ -10,29 +10,34 @@
 # binaries for both Linux and macOS, so the work is split into two phases that
 # run on two agents:
 #
-#   linux   — the orchestrator. Runs the skip-logic, computes + commits the
-#             alpha version bump, creates and pushes the git tag, creates the
-#             GitHub Release, then builds the Linux binaries and uploads them.
-#             Hands the tag to the darwin phase via buildkite-agent meta-data.
+#   linux   — the orchestrator. Runs the skip-logic, computes the alpha version,
+#             patches it into the release checkout, builds the Linux binaries,
+#             then tags the release commit, creates the GitHub Release, and
+#             uploads the binaries. Hands the tag to the darwin phase via
+#             buildkite-agent meta-data.
 #   darwin  — builds the macOS binaries and uploads them to the release the
 #             linux phase created.
 #
-# Both phases build from the SAME commit (BUILDKITE_COMMIT). checkleft's CLI
-# does not embed CARGO_PKG_VERSION (no `#[command(version)]`), so the compiled
-# binary is byte-identical regardless of the version string in Cargo.toml — the
-# version lives only in the tag, the GitHub Release, and Cargo.toml metadata.
-# That is why the build can happen before the version-bump commit exists and why
-# the two phases need not share a checkout.
+# The version bump is NEVER committed to main. It is patched into the release
+# checkout only (so the release builds from a tree carrying the new version) and
+# recorded in the git tag + GitHub Release. The tag points at the release commit
+# (BUILDKITE_COMMIT) itself, so pushing it needs only `contents: write` — no
+# branch-protection bypass, unlike pushing a commit to main. Developer builds
+# off main therefore carry whatever (possibly stale) version Cargo.toml holds;
+# that is intentional and harmless: checkleft's CLI does not embed
+# CARGO_PKG_VERSION (no `#[command(version)]`), so the compiled binary is
+# byte-identical regardless of the version string. Both phases build from the
+# SAME commit (BUILDKITE_COMMIT) and need not share a checkout.
 #
 # Trigger model (see tools/checkleft/docs/buildkite-release-setup.md):
 #   - scheduled (cron) builds  → skip if nothing under checkleft changed since
 #                                the last checkleft-v* tag.
 #   - manual builds (ui / api) → always release.
 #
-# Auth: the bazel-any queue mixes Mac (personal-key write) and Linux (read-only
-# deploy-key) agents, so git pushes via the agent's ambient credentials flap by
-# assignment. We instead push over HTTPS with a release token supplied as a
-# secret, which works on every agent. The same token authenticates `gh`.
+# Auth: releases run on the CI agents' ambient git + `gh` credentials (every
+# worker can push to the repo), exactly like boss-release.sh — the tag is pushed
+# with `git push origin` and the GitHub Release is created with `gh`. No
+# dedicated release token is needed.
 set -euo pipefail
 
 # ── configuration ─────────────────────────────────────────────────────────────
@@ -49,7 +54,6 @@ META_TAG_KEY="checkleft-release-tag"
 STAGE=""
 TAG_PUSHED=0
 NEW_TAG=""
-RELEASE_TOKEN=""
 
 # checkleft-affecting paths for change-detection. Mirrors boss-release.sh's
 # scoping: the binary's source, the release script, and the pipeline wiring.
@@ -60,54 +64,6 @@ source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "--- $*"; }
-
-# ── secret + auth helpers ─────────────────────────────────────────────────────
-
-# _read_secret NAME — env var first (Pipeline Settings), then the Buildkite
-# native secrets store. Same precedence as boss-release.sh.
-_read_secret() {
-  local name="$1"
-  if [[ -n "${!name:-}" ]]; then
-    printf '%s' "${!name}"
-    return 0
-  fi
-  if command -v buildkite-agent &>/dev/null; then
-    buildkite-agent secret get "$name" 2>/dev/null || true
-  fi
-}
-
-# resolve_gh_token — populate RELEASE_TOKEN + export GH_TOKEN for `gh`.
-# Tries a checkleft-specific secret first, then generic GitHub token env vars.
-resolve_gh_token() {
-  RELEASE_TOKEN="$(_read_secret CHECKLEFT_RELEASE_GH_TOKEN)"
-  [[ -z "${RELEASE_TOKEN}" ]] && RELEASE_TOKEN="${GH_TOKEN:-}"
-  [[ -z "${RELEASE_TOKEN}" ]] && RELEASE_TOKEN="${GITHUB_TOKEN:-}"
-  if [[ -z "${RELEASE_TOKEN}" ]]; then
-    die "No release token found. Set the CHECKLEFT_RELEASE_GH_TOKEN secret (or GH_TOKEN/GITHUB_TOKEN).
-It needs 'contents: write' on ${REPO} and permission to push to main (branch-protection bypass).
-See tools/checkleft/docs/buildkite-release-setup.md."
-  fi
-  # `gh` reads GH_TOKEN; export it so release create/upload authenticate.
-  export GH_TOKEN="${RELEASE_TOKEN}"
-}
-
-# git_push REFSPEC... — push to GitHub over HTTPS using the release token in an
-# Authorization header (never in the URL or argv), so it works regardless of the
-# agent's ambient git credentials and never leaks the token into logs.
-git_push() {
-  local auth
-  auth="Authorization: Basic $(printf 'x-access-token:%s' "${RELEASE_TOKEN}" | base64 | tr -d '\n')"
-  git -c "http.https://github.com/.extraheader=${auth}" \
-    push "https://github.com/${REPO}.git" "$@"
-}
-
-# git_fetch REFSPEC... — authenticated fetch over HTTPS (same header trick).
-git_fetch() {
-  local auth
-  auth="Authorization: Basic $(printf 'x-access-token:%s' "${RELEASE_TOKEN}" | base64 | tr -d '\n')"
-  git -c "http.https://github.com/.extraheader=${auth}" \
-    fetch "https://github.com/${REPO}.git" "$@"
-}
 
 # ── buildkite meta-data helpers (env-overridable for local dry runs) ──────────
 
@@ -167,8 +123,10 @@ compute_next_version() {
   NEW_TAG="${TAG_PREFIX}${NEW_VERSION}"
 }
 
-# apply_version_edits — rewrite the version in Cargo.toml and Cargo.lock so the
-# committed tree is self-consistent (cargo --locked / crate_universe stay happy).
+# apply_version_edits — rewrite the version in Cargo.toml and Cargo.lock in the
+# release checkout so the binaries build from a tree carrying NEW_VERSION and
+# `cargo --locked` / crate_universe stay self-consistent. This edit is NEVER
+# committed — it lives only in the CI working copy for the duration of the build.
 apply_version_edits() {
   # Package version line in Cargo.toml (anchored; deps use indented `version =`).
   sed -i.bak -E "s|^version = \"${CUR_VERSION}\"|version = \"${NEW_VERSION}\"|" "${CARGO_TOML}"
@@ -244,7 +202,7 @@ resolve_last_release() {
     --jq "[.[] | select(.tagName | startswith(\"${TAG_PREFIX}\"))] | .[0].tagName" 2>/dev/null || true)"
   LAST_SHA=""
   if [[ -n "${LAST_TAG}" ]]; then
-    git_fetch "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
+    git fetch origin "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
     LAST_SHA="$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)"
     if [[ -z "${LAST_SHA}" ]]; then
       LAST_SHA="$(gh api "repos/${REPO}/commits/${LAST_TAG}" --jq '.sha' 2>/dev/null || true)"
@@ -279,7 +237,7 @@ should_skip() {
   fi
 
   if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
-    git_fetch --unshallow 2>/dev/null || true
+    git fetch --unshallow origin 2>/dev/null || true
   fi
 
   local touched checkleft_touched
@@ -294,14 +252,13 @@ should_skip() {
 }
 
 # cleanup — single EXIT trap. Removes the staging dir and, if a tag was pushed
-# but the release never completed, deletes the leaked remote tag. The version-
-# bump commit on main is deliberately NOT unwound (force-pushing main is unsafe);
-# a stranded bump is harmless — the next run no-ops on it via the idempotency
-# guard. All state is read defensively for `set -u` safety.
+# but the release never completed, deletes the leaked remote tag. No commit is
+# ever pushed to main, so there is nothing else to unwind. All state is read
+# defensively for `set -u` safety.
 cleanup() {
-  if [[ "${TAG_PUSHED}" == "1" && -n "${NEW_TAG}" && -n "${RELEASE_TOKEN}" ]]; then
+  if [[ "${TAG_PUSHED}" == "1" && -n "${NEW_TAG}" ]]; then
     echo "[checkleft-release] release did not complete — deleting leaked tag ${NEW_TAG}" >&2
-    git_push ":refs/tags/${NEW_TAG}" 2>/dev/null || true
+    git push origin ":refs/tags/${NEW_TAG}" 2>/dev/null || true
   fi
   [[ -n "${STAGE}" ]] && rm -rf "${STAGE}"
 }
@@ -312,7 +269,6 @@ phase_linux() {
   [[ "$(uname -s)" == "Linux" ]] || die "linux phase landed on $(uname -s); point BUILDKITE_LINUX_QUEUE at a Linux-only queue (see the release setup doc)"
 
   echo "[checkleft-release] agent: $(uname -a)"
-  resolve_gh_token
   resolve_last_release
 
   local skip_reason
@@ -325,8 +281,17 @@ phase_linux() {
   compute_next_version
   log "[checkleft-release] ${CUR_VERSION} -> ${NEW_VERSION} (tag ${NEW_TAG})"
 
-  # Build BEFORE mutating the repo: a build failure must never leave a pushed
-  # commit or tag behind. Binaries are version-independent (see header).
+  # The tag will point at the existing source commit on main — no bump commit is
+  # created. Capture it before patching the tree.
+  local release_sha
+  release_sha="$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")"
+  [[ -n "${release_sha}" ]] || die "could not resolve the commit to release/tag"
+
+  # Patch the version into the release checkout (NEVER committed — see header),
+  # then build from it. Building before any push means a build failure leaves no
+  # tag or release behind.
+  apply_version_edits
+
   STAGE="$(mktemp -d)"
 
   local gnu_path
@@ -341,26 +306,14 @@ phase_linux() {
     echo "[checkleft-release] WARNING: musl build unavailable (install musl-tools on the agent to enable); shipping without it"
   fi
 
-  # ── point of no return: commit, tag, push, release ──────────────────────────
-  apply_version_edits
-
-  log "[checkleft-release] committing version bump"
-  git add "${CARGO_TOML}" "${CARGO_LOCK}"
-  # `[skip ci]` keeps this commit from triggering any pipeline (loop guard).
-  git -c user.name="checkleft-release" -c user.email="checkleft-release@users.noreply.github.com" \
-    commit -m "chore(checkleft): release ${NEW_VERSION} [skip ci]"
-  local release_sha
-  release_sha="$(git rev-parse HEAD)"
-
-  log "[checkleft-release] pushing version bump to main"
-  git_push "${release_sha}:refs/heads/main" \
-    || die "push to main rejected. Either main advanced during this run (re-run the pipeline) or the release token cannot push to main (grant branch-protection bypass; see the setup doc)."
-
-  # Tag the bump commit. From here the cleanup trap will delete the tag if a
-  # later step fails (the main commit is left in place — see cleanup()).
-  log "[checkleft-release] tagging ${NEW_TAG}"
+  # ── point of no return: tag the release commit, push the tag, release ───────
+  # Tag the existing commit on main; nothing is pushed to main. Pushing a tag
+  # (unlike a commit to main) needs no branch-protection bypass. From here the
+  # cleanup trap deletes the tag if a later step fails.
+  log "[checkleft-release] tagging ${NEW_TAG} at ${release_sha:0:12}"
   git tag "${NEW_TAG}" "${release_sha}"
-  git_push "refs/tags/${NEW_TAG}"
+  git push origin "refs/tags/${NEW_TAG}" \
+    || die "tag push rejected for ${NEW_TAG}. The tag may already exist (a prior run pushed it — delete it and retry), or the agent's git credentials cannot push to ${REPO}."
   TAG_PUSHED=1
 
   log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
@@ -379,7 +332,6 @@ phase_darwin() {
   [[ "$(uname -s)" == "Darwin" ]] || die "darwin phase must run on a macOS agent (got $(uname -s)); set BUILDKITE_MACOS_QUEUE"
 
   echo "[checkleft-release] agent: $(uname -a)"
-  resolve_gh_token
 
   # Tag comes from the linux phase (or an explicit override for manual recovery).
   NEW_TAG="${CHECKLEFT_RELEASE_TAG:-$(meta_get "${META_TAG_KEY}")}"

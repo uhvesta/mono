@@ -17,7 +17,7 @@ It is modeled on the Boss release pipeline; for that reference see [`../../boss/
 | Buildkite cron schedule | e.g. daily | Skips if nothing under checkleft changed since the last `checkleft-v*` tag |
 | Manual build (`bk build create`, BK UI **New Build**, or REST API) | On demand | Always releases (skips change-detection) |
 
-The pipeline should **not** be wired to build on push. The version-bump commit it creates carries `[skip ci]`, and an idempotency guard no-ops any run whose `HEAD` is already the latest release commit — but the cleanest configuration is push-builds disabled, schedule + manual only.
+The pipeline should **not** be wired to build on push. It pushes only a tag, never a commit to `main` (the version bump is patched into the release checkout, never committed), and an idempotency guard no-ops any run whose `HEAD` is already the latest release commit — but the cleanest configuration is push-builds disabled, schedule + manual only.
 
 The org slug is `flunge`; the GitHub repo is `spinyfin/mono`. (Boss's release build URLs look like `https://buildkite.com/flunge/mono/builds/N`.)
 
@@ -40,7 +40,7 @@ New pipelines must be created in the same cluster as the existing `mono` pipelin
 bk cluster list
 ```
 
-Note the cluster name (or ID). It is passed as `-c` below and is also needed for the secret step.
+Note the cluster name (or ID). It is passed as `-c` when creating the pipeline below.
 
 ### 2. Create the pipeline
 
@@ -75,7 +75,7 @@ bk api -X PATCH "organizations/flunge/pipelines/mono-checkleft-release" \
 
 ### 4. Disable push-triggered builds
 
-In Pipeline **Settings** → **GitHub**, turn **off** "Trigger builds when branches are pushed" (and any PR triggers). Releases come only from the cron schedule and manual builds. This — together with the `[skip ci]` bump commit and the idempotency guard — prevents the version-bump commit from triggering the pipeline in a loop.
+In Pipeline **Settings** → **GitHub**, turn **off** "Trigger builds when branches are pushed" (and any PR triggers). Releases come only from the cron schedule and manual builds. The release pushes only a tag (never a commit to `main`), so there is no self-trigger to guard against — push-builds-off simply keeps the pipeline schedule/manual-only.
 
 ### 5. Create the cron schedule
 
@@ -89,24 +89,11 @@ In Pipeline **Settings** → **Schedules** → **New Schedule**:
 
 If a scheduled run finds no checkleft-affecting changes since the last `checkleft-v*` tag, the build logs `release skipped: ...` and exits 0 without cutting a release.
 
-### 6. Provision the release token
+### 6. GitHub authentication — nothing to provision
 
-The pipeline pushes the version-bump commit + tag and creates the GitHub Release. The `bazel-any` queue mixes Mac (personal-key write) and Linux (read-only deploy-key) agents, so the agent's ambient git credentials are unreliable. The script therefore pushes over **HTTPS with a token in an `Authorization` header**, which works on any agent. The same token authenticates `gh`.
+No release token or secret is needed. The release pushes the tag with `git push origin` and creates the GitHub Release with `gh`, both authenticating via the CI agents' **ambient credentials** — exactly like the boss release step in the `mono` pipeline. Every CI worker already has push-capable git auth and `gh` access to `spinyfin/mono`, so the pipeline works without any pipeline-specific token.
 
-Provide it as the `CHECKLEFT_RELEASE_GH_TOKEN` secret (the script also accepts `GH_TOKEN` / `GITHUB_TOKEN`):
-
-```sh
-bk secret create \
-  --cluster-id "<cluster-name-or-id>" \
-  --key CHECKLEFT_RELEASE_GH_TOKEN \
-  --description "checkleft release: push tag/commit + create GitHub Release" \
-  --value "<token>"
-```
-
-**Required token scopes / permissions:**
-
-- **Contents: write** on `spinyfin/mono` — push the bump commit and tag, create the release, upload assets.
-- **Push to `main`** — the bump commit is pushed directly to `main`. If `main` is a protected branch, the token's identity must be allowed to bypass branch protection. Use a GitHub App installation token (App added to the repo's branch-protection bypass list) or a fine-grained PAT owned by an account with that bypass. A classic PAT with `repo` scope works only if the account can push to protected `main`.
+No branch-protection bypass is involved either: the release only pushes a **tag** (which protected branches permit) and never a commit to `main`.
 
 ### 7. (If musl is wanted) ensure the Linux agents have musl tooling
 
@@ -149,7 +136,7 @@ Expected assets (named by Rust target triple, each with a `.sha256` sidecar):
 
 ## Recovering from a partial release
 
-The Linux phase is atomic: binaries are built **before** anything is pushed, so a Linux build failure leaves no tag, commit, or release behind. The macOS phase runs after the release already exists, so a darwin failure leaves a release with Linux assets only. To recover:
+The Linux phase is atomic: binaries are built **before** anything is pushed, so a Linux build failure leaves no tag or release behind (and nothing is ever pushed to `main`). The macOS phase runs after the release already exists, so a darwin failure leaves a release with Linux assets only. To recover:
 
 - **Re-run the darwin job in the same build** (`bk job retry <job-id>`) — the tag is read from build meta-data, so it picks up where it left off.
 - **Or upload manually** from a Mac checked out at the tag:
@@ -165,9 +152,9 @@ A brand-new build will **not** redo a skipped darwin upload: the idempotency gua
 
 ## How it works (summary)
 
-- **Version:** only the `-alpha.N` counter is revved (the base `X.Y.Z` is carried through). The next N is `max(Cargo.toml alpha, highest published checkleft-v* alpha) + 1`, so a stale Cargo.toml can never reuse a published alpha. The bump is committed to `tools/checkleft/Cargo.toml` + `Cargo.lock` and the commit is tagged `checkleft-vX.Y.Z-alpha.N`.
-- **Build tool:** native binaries are built with `bazel build -c opt //tools/checkleft:checkleft` (matches how mono builds checkleft and reuses the CI disk cache); the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`, since those triples are not registered in mono's bazel toolchains. checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string — both phases build at `BUILDKITE_COMMIT` and the version-bump commit never has to be built.
-- **Loop prevention:** the bump commit carries `[skip ci]`; push-triggered builds are disabled; and the idempotency guard no-ops any run whose `HEAD` is already the latest release commit.
+- **Version:** only the `-alpha.N` counter is revved (the base `X.Y.Z` is carried through). The next N is `max(Cargo.toml alpha, highest published checkleft-v* alpha) + 1`, so a stale Cargo.toml can never reuse a published alpha — which is exactly why the bump never has to be committed back to `main`. The new version is patched into `tools/checkleft/Cargo.toml` + `Cargo.lock` in the release checkout (never committed) and the release **commit** (`BUILDKITE_COMMIT`) is tagged `checkleft-vX.Y.Z-alpha.N`. `main`'s `Cargo.toml` stays at whatever version it last held, so developer builds carry a non-meaningful version — intentional and harmless (see Build tool).
+- **Build tool:** native binaries are built with `bazel build -c opt //tools/checkleft:checkleft` (matches how mono builds checkleft and reuses the CI disk cache); the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`, since those triples are not registered in mono's bazel toolchains. checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string — the patched-in version is for tree-consistency, not the artifact bytes; both phases build at `BUILDKITE_COMMIT`.
+- **Loop prevention:** no commit is pushed to `main` (only a tag), so there is no self-trigger; push-triggered builds are disabled; and the idempotency guard no-ops any run whose `HEAD` is already the latest release commit.
 
 ---
 
