@@ -754,7 +754,8 @@ impl HostAdapter for SshHostAdapter {
             // `false` preserves the original behavior. Wire feature flags into
             // the remote path alongside the cross-host config work (PR3/PR4).
             false,
-        );
+        )
+        .await;
         // `compose_execution_prompt` decides the Bazel pre-push gate by
         // probing the LOCAL filesystem, which never matches a remote
         // workspace path — so probe the remote and append it ourselves.

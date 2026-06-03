@@ -27,6 +27,27 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Authoritative PR metadata fetched from GitHub at reviewer-spawn time.
+///
+/// Pre-fetched before the reviewer worker starts so the reviewer prompt
+/// contains the correct base/head SHAs and changed-file list upfront —
+/// orientation context the reviewer receives before touching any files.
+/// The reviewer workspace is already checked out to the PR head, so file
+/// reads go directly against the working tree.
+#[derive(Debug, Clone)]
+pub struct PrReviewContext {
+    /// GitHub PR number (the integer, e.g. `42` for `.../pull/42`).
+    pub pr_number: u64,
+    /// Full SHA of the base commit the PR is diffed against.
+    pub base_sha: String,
+    /// Full SHA of the PR's current HEAD commit. The reviewer workspace is
+    /// checked out to this SHA, so `Read`/`cat`/`grep` on workspace files
+    /// reflect the PR head directly.
+    pub head_sha: String,
+    /// Paths of every file changed by the PR, relative to the repo root.
+    pub changed_files: Vec<String>,
+}
+
 /// Which review rubric to apply to a PR.
 ///
 /// The reviewer renders a scope-specific initial prompt so the rubric is
@@ -498,8 +519,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
 /// description — they tell the reviewer what the PR was *supposed* to do,
 /// which is the baseline for the regression/deletion check.
 ///
-/// `pr_url` is the PR to review. The reviewer fetches the diff via
-/// `gh pr diff` and reads changed files for context.
+/// `pr_url` is the PR to review.
 ///
 /// `scope` controls which rubric is rendered:
 /// - [`ReviewScope::Code`] — the full code rubric (correctness, regressions,
@@ -507,6 +527,11 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
 ///   docs rubric if all changed files turn out to be documentation files.
 /// - [`ReviewScope::DocsOnly`] — only the light docs rubric (structure,
 ///   completeness, required-sections). The code rubric is omitted entirely.
+///
+/// `ctx` is the pre-fetched PR metadata. When `Some`, the prompt embeds the
+/// base/head SHAs and changed-file list as orientation context. When `None`
+/// (fetch failed), the prompt falls back to URL-only framing. In both cases
+/// the reviewer workspace is at the PR head and can read files directly.
 ///
 /// When the engine cannot pre-classify the PR (no file list available),
 /// pass [`ReviewScope::Code`]; the self-detection fallback in the code rubric
@@ -516,8 +541,49 @@ pub fn render_reviewer_initial_prompt(
     task_description: &str,
     pr_url: &str,
     scope: ReviewScope,
+    ctx: Option<&PrReviewContext>,
 ) -> String {
     let rubric = render_rubric_section(&scope);
+
+    // Extended PR metadata block — only present when we have pre-fetched context.
+    let pr_metadata_block = match ctx {
+        Some(ctx) => {
+            let files = if ctx.changed_files.is_empty() {
+                "*(unavailable)*".to_owned()
+            } else {
+                ctx.changed_files
+                    .iter()
+                    .map(|f| format!("- `{f}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "**Base commit:** `{base}`  \n\
+                 **Head commit:** `{head}`  \n\
+                 **Changed files ({n}):**\n\
+                 {files}\n",
+                base = ctx.base_sha,
+                head = ctx.head_sha,
+                n = ctx.changed_files.len(),
+                files = files,
+            )
+        }
+        None => String::new(),
+    };
+
+    // Short reference for `gh` commands — PR number is cleaner than the full
+    // URL and avoids `gh` having to parse it, but fall back to URL when the
+    // number is unavailable.
+    let pr_ref = ctx
+        .map(|c| c.pr_number.to_string())
+        .unwrap_or_else(|| pr_url.to_owned());
+
+    // Head SHA for the ReviewResult schema example — use the known SHA when
+    // available so the reviewer can copy it directly rather than fetching it.
+    let schema_head_sha = ctx
+        .map(|c| c.head_sha.as_str())
+        .unwrap_or("<sha from gh pr view --json headRefOid>");
+
     format!(
         "# PR review\n\
          \n\
@@ -537,13 +603,13 @@ pub fn render_reviewer_initial_prompt(
          {task_description}\n\
          \n\
          **PR:** {pr_url}\n\
-         \n\
+         {pr_metadata_block}\n\
          ## Review steps\n\
          \n\
-         1. Your workspace is already checked out to the PR head — you can \
-            read any file in the workspace directly with `Read`, `cat`, `grep`, etc.\n\
-         2. Get the diff: `gh pr diff {pr_url}`\n\
-         3. Get the PR description: `gh pr view {pr_url}`\n\
+         1. Your workspace is already checked out to the PR head — read \
+            changed files directly with `Read`, `cat`, `grep`, etc.\n\
+         2. Get the diff for the annotated view: `gh pr diff {pr_ref}`\n\
+         3. Get the PR description: `gh pr view {pr_ref}`\n\
          4. Read changed files and surrounding context using `Read`, `cat`, \
             `grep`, `jj show`, etc. — no writes.\n\
          5. Produce the `ReviewResult` JSON (schema below) in a fenced \
@@ -577,7 +643,7 @@ pub fn render_reviewer_initial_prompt(
          ```jsonc\n\
          {{\n\
            \"pr_url\": \"{pr_url}\",\n\
-           \"head_sha\": \"<sha from gh pr view --json headRefOid>\",\n\
+           \"head_sha\": \"{schema_head_sha}\",\n\
            \"summary\": \"<one-paragraph overall assessment>\",\n\
            \"revision_warranted\": true,\n\
            \"findings\": [\n\
@@ -617,6 +683,9 @@ pub fn render_reviewer_initial_prompt(
         task_name = task_name,
         task_description = task_description,
         pr_url = pr_url,
+        pr_metadata_block = pr_metadata_block,
+        pr_ref = pr_ref,
+        schema_head_sha = schema_head_sha,
         rubric = rubric,
     )
 }
@@ -756,6 +825,7 @@ mod tests {
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
             ReviewScope::Code,
+            None,
         );
         assert!(prompt.contains("https://github.com/org/repo/pull/99"));
         assert!(prompt.contains("Fix the auth bug"));
@@ -769,12 +839,70 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_initial_prompt_states_workspace_at_pr_head() {
+        let prompt = render_reviewer_initial_prompt(
+            "Fix the auth bug",
+            "Auth middleware drops sessions on timeout.",
+            "https://github.com/org/repo/pull/99",
+            ReviewScope::Code,
+            None,
+        );
+        assert!(
+            prompt.contains("already checked out to the PR head"),
+            "prompt must state workspace is at PR head"
+        );
+        assert!(
+            !prompt.contains("DO THIS FIRST"),
+            "prompt must not have defensive 'do this first' emphasis"
+        );
+        assert!(
+            !prompt.contains("git show"),
+            "prompt must not instruct anchoring reads via git show"
+        );
+    }
+
+    #[test]
+    fn reviewer_initial_prompt_with_context_embeds_metadata() {
+        let ctx = PrReviewContext {
+            pr_number: 99,
+            base_sha: "base000".to_owned(),
+            head_sha: "head999".to_owned(),
+            changed_files: vec!["src/main.rs".to_owned(), "tests/test.rs".to_owned()],
+        };
+        let prompt = render_reviewer_initial_prompt(
+            "Fix the auth bug",
+            "Auth middleware drops sessions on timeout.",
+            "https://github.com/org/repo/pull/99",
+            ReviewScope::Code,
+            Some(&ctx),
+        );
+        assert!(prompt.contains("base000"), "prompt must include base SHA");
+        assert!(prompt.contains("head999"), "prompt must include head SHA");
+        assert!(prompt.contains("src/main.rs"), "prompt must list changed files");
+        assert!(prompt.contains("tests/test.rs"), "prompt must list changed files");
+        assert!(prompt.contains("gh pr diff 99"), "prompt must use PR number in diff command");
+        assert!(
+            prompt.contains("already checked out to the PR head"),
+            "prompt must state workspace is at PR head"
+        );
+        assert!(
+            !prompt.contains("git show head999:"),
+            "prompt must not instruct reads via git show"
+        );
+        assert!(
+            !prompt.contains("NOT at the PR head"),
+            "prompt must not warn that working tree is stale"
+        );
+    }
+
+    #[test]
     fn code_scope_prompt_contains_code_rubric_and_docs_fallback() {
         let prompt = render_reviewer_initial_prompt(
             "Fix the auth bug",
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
             ReviewScope::Code,
+            None,
         );
         assert!(prompt.contains("code PR"));
         assert!(prompt.contains("Docs-only fallback"));
@@ -793,6 +921,7 @@ mod tests {
             "Write a design doc for feature X.",
             "https://github.com/org/repo/pull/100",
             ReviewScope::DocsOnly,
+            None,
         );
         assert!(prompt.contains("docs-only PR"));
         assert!(prompt.contains("light rubric"));
@@ -805,8 +934,13 @@ mod tests {
 
     #[test]
     fn reviewer_initial_prompt_states_speed_balance() {
-        let prompt =
-            render_reviewer_initial_prompt("T", "D", "https://github.com/pr/1", ReviewScope::Code);
+        let prompt = render_reviewer_initial_prompt(
+            "T",
+            "D",
+            "https://github.com/pr/1",
+            ReviewScope::Code,
+            None,
+        );
         assert!(prompt.contains("fast, high-signal"));
         assert!(prompt.contains("scrutiny budget"));
     }

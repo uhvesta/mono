@@ -370,7 +370,8 @@ impl ExecutionRunner for PaneSpawnRunner {
             workspace_path,
             cube_change_id,
             editorial_enabled,
-        );
+        )
+        .await;
 
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
         if let Some(parent) = prompt_path.parent() {
@@ -555,6 +556,77 @@ pub(crate) struct ComposedWorkerSpawn {
     pub spawn_config: SpawnConfig,
 }
 
+/// Fetch authoritative PR metadata for a reviewer worker's initial prompt.
+///
+/// Calls `gh pr view <pr_url> --json baseRefOid,headRefOid,files` and returns
+/// a [`crate::pr_review::PrReviewContext`] on success. Returns `None` on any
+/// network or parse error — callers fall back to the URL-only prompt
+/// gracefully without blocking the spawn.
+async fn fetch_pr_review_context(
+    pr_url: &str,
+) -> Option<crate::pr_review::PrReviewContext> {
+    use std::process::Stdio;
+
+    #[derive(serde::Deserialize)]
+    struct PrViewResponse {
+        #[serde(rename = "baseRefOid")]
+        base_ref_oid: String,
+        #[serde(rename = "headRefOid")]
+        head_ref_oid: String,
+        files: Vec<PrFile>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PrFile {
+        path: String,
+    }
+
+    let pr_number: u64 = pr_url.split('/').next_back()?.parse().ok()?;
+
+    let output = tokio::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "baseRefOid,headRefOid,files",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::warn!(
+            pr_url,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "fetch_pr_review_context: gh pr view failed; reviewer will use URL-only prompt",
+        );
+        return None;
+    }
+
+    let response: PrViewResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|e| {
+            tracing::warn!(
+                pr_url,
+                error = %e,
+                "fetch_pr_review_context: failed to parse gh pr view JSON",
+            );
+            e
+        })
+        .ok()?;
+
+    Some(crate::pr_review::PrReviewContext {
+        pr_number,
+        base_sha: response.base_ref_oid,
+        head_sha: response.head_ref_oid,
+        changed_files: response.files.into_iter().map(|f| f.path).collect(),
+    })
+}
+
 /// Per-execution prompt + spawn-config composition shared by every
 /// worker transport.
 ///
@@ -568,9 +640,10 @@ pub(crate) struct ComposedWorkerSpawn {
 /// prepends the effort addendum and the product dispatch preamble exactly
 /// as the local runner historically did.
 ///
-/// Transport-agnostic: it reads only from `work_db`, so the SSH adapter
-/// reuses it without a libghostty pane or a `WorkerSpawner`.
-pub(crate) fn compose_worker_spawn(
+/// Transport-agnostic: it reads only from `work_db` (and, for `pr_review`
+/// executions, calls `gh pr view` to pre-fetch the PR metadata for the
+/// reviewer's initial prompt).
+pub(crate) async fn compose_worker_spawn(
     work_db: &WorkDb,
     worker_id: &str,
     execution: &WorkExecution,
@@ -775,11 +848,43 @@ pub(crate) fn compose_worker_spawn(
                     .build(),
             )
         } else {
+            // Pre-fetch PR metadata so the reviewer starts with the full diff
+            // context (base/head SHAs, changed files) rather than discovering
+            // it turn-by-turn. Fail open on error — the URL-only prompt is
+            // still functional.
+            let pr_review_context = fetch_pr_review_context(pr_url).await;
+            if let Some(ref ctx) = pr_review_context {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    pr_url,
+                    pr_number = ctx.pr_number,
+                    head_sha = %ctx.head_sha,
+                    changed_files = ctx.changed_files.len(),
+                    "pr_review execution: pre-fetched PR metadata for reviewer context",
+                );
+            } else {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    pr_url,
+                    "pr_review execution: PR metadata fetch failed; reviewer will use URL-only prompt",
+                );
+            }
+            // Use the changed-file list (when available) to classify the review
+            // scope accurately, instead of always defaulting to Code.
+            let scope = match &pr_review_context {
+                Some(ctx) => {
+                    let files: Vec<&str> =
+                        ctx.changed_files.iter().map(String::as_str).collect();
+                    crate::pr_review::classify_changed_files(&files)
+                }
+                None => crate::pr_review::ReviewScope::Code,
+            };
             crate::pr_review::render_reviewer_initial_prompt(
                 task_name,
                 task_description,
                 pr_url,
-                crate::pr_review::ReviewScope::Code,
+                scope,
+                pr_review_context.as_ref(),
             )
         }
     } else {
