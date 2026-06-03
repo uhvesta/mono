@@ -11,9 +11,7 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
-echo "--- [integrity-checkleft] checking"
-
-echo "--- [integrity-checkleft] installing repobin tools into bin/"
+echo "+++ installing repobin tools into bin/"
 bazel build //tools/repobin:repobin
 
 export REPOBIN_BAZEL_FLAGS="--config=ci"
