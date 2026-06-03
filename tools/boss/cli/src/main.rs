@@ -2551,6 +2551,7 @@ fn build_cli_reference() -> Result<CliReferenceDocument, CliError> {
             "If it does not fit an existing project and is small and self-contained, create a chore.",
             "If it does not fit an existing project and is broad, ambiguous, investigative, or multi-stage, create a project.",
             "`boss project create` auto-spawns a `kind=design` seed task under the new project (surfaced as `design_task` in the --json response). Do NOT follow up by filing a parallel \"Design\" task; populate the brief by running `boss task update <design_task.id> --description ...` on the seed task. Use `--no-autostart` on `project create` if you want to author the brief before the engine dispatches a worker against the seed task. Use `--no-design-task` for non-design-shaped projects (postmortems, checklists, milestone aggregators) where no seed task is needed; the project is filed with zero child tasks.",
+            "Revision tasks (`boss task create-revision`): the engine auto-sequences revisions on the same parent PR — filing a new revision while a prior one is still in flight is SAFE; they run in order with no workspace clobbering. File revisions normally and let them autostart. Do NOT defensively pass `--no-autostart` on `create-revision`, and do NOT wait for the prior revision to land before filing the next, UNLESS the user explicitly asked to queue without dispatching. The pre-filing check (parent PR still open and unmerged) remains required as always.",
         ],
         commands,
     })
