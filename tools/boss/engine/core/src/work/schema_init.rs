@@ -328,8 +328,11 @@ impl WorkDb {
         // `external_ref_boss_checksum`; the old title/body columns remain in
         // the schema but are no longer read or written.
         migrate_external_tracker_content_checksums(&conn)?;
+        // P992 task 9: loop termination & bounds — per-PR review cycle
+        // counter and last-reviewed SHA for the no-op skip gate.
+        migrate_tasks_review_cycle_columns(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '18')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '19')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

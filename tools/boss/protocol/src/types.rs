@@ -2642,6 +2642,23 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_required_state: Option<String>,
 
+    /// How many automated reviewer passes have completed for this PR.
+    /// Starts at 0; incremented after each `pr_review` execution finishes.
+    /// The engine skips enqueueing a new reviewer pass when this value
+    /// reaches `max_review_cycles` (config knob; default 3). Only
+    /// meaningful on tasks that carry a `pr_url`. P992 design §7.
+    #[serde(default)]
+    #[builder(default)]
+    pub review_cycle: i64,
+
+    /// HEAD SHA of the PR at the time the most recent reviewer pass
+    /// completed. Used by the no-op skip gate (P992 design §8, task 10)
+    /// to detect pure rebases and skip re-review when nothing meaningful
+    /// changed since the last pass. `None` until at least one reviewer
+    /// pass has finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reviewed_sha: Option<String>,
+
     /// Denormalised PR URL of the chain-root task for fast revision-card
     /// rendering. `None` for non-revision rows and for revisions whose chain
     /// root has no PR yet (rare — the create gate normally blocks that).

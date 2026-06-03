@@ -487,6 +487,8 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         revision_parent_pr_url: None,
         has_in_progress_revision: false,
         source_automation_id: None,
+        review_cycle: 0,
+        last_reviewed_sha: None,
     }
 }
 

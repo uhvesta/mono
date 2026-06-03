@@ -189,6 +189,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // Populated by map_task_with_source_automation_id when the SELECT
         // includes that column; None for all standard task queries.
         source_automation_id: None,
+        // review_cycle and last_reviewed_sha are not included in the standard
+        // SELECT to avoid bumping all mapper column indices. Use
+        // WorkDb::get_task_review_cycle_state for targeted reads (P992 task 9).
+        review_cycle: 0,
+        last_reviewed_sha: None,
     })
 }
 

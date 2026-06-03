@@ -929,7 +929,8 @@ impl ServerState {
             .with_staged_pr_urls(staged_pr_urls.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
-            .with_metrics(metrics_for_completion),
+            .with_metrics(metrics_for_completion)
+            .with_max_review_cycles(cfg.work.max_review_cycles),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>

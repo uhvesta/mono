@@ -7,6 +7,10 @@ use crate::coordinator::{
     DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
 };
 
+/// Default value for [`WorkConfig::max_review_cycles`]. Matches the
+/// "~3 cycles at worst" mental model from P992 design §7.
+pub const DEFAULT_MAX_REVIEW_CYCLES: usize = 3;
+
 // Bare name used as the PATH fallback. In installed Boss.app the engine
 // resolves cube from the bundle first (see resolve_cube_command); this
 // constant is only reached in dev mode or when the bundle copy is absent.
@@ -18,29 +22,35 @@ pub struct CubeConfig {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 #[non_exhaustive]
 pub struct WorkConfig {
     pub cwd: PathBuf,
     pub db_path: PathBuf,
+    /// Defaults to 1 so test call sites don't need updating when new pool
+    /// fields are added.
+    #[builder(default = 1)]
     pub worker_pool_size: usize,
     /// Size of the dedicated automation worker pool. Configured via
     /// `BOSS_AUTOMATION_POOL_SIZE`; defaults to [`MAX_AUTOMATION_POOL_SIZE`].
+    #[builder(default = 1)]
     pub automation_pool_size: usize,
     /// Size of the dedicated review worker pool. Configured via
     /// `BOSS_REVIEW_POOL_SIZE`; defaults to [`DEFAULT_REVIEW_POOL_SIZE`]
     /// (deliberately small to bound always-Opus review spend).
+    #[builder(default = 1)]
     pub review_pool_size: usize,
+    /// Maximum number of automated reviewer passes to run per PR.
+    /// When a producing task's `review_cycle` reaches this value the engine
+    /// skips the next reviewer pass and advances the task to human Review
+    /// directly. Configured via `BOSS_MAX_REVIEW_CYCLES`; defaults to
+    /// [`DEFAULT_MAX_REVIEW_CYCLES`] (3). P992 design §7.
+    #[builder(default = DEFAULT_MAX_REVIEW_CYCLES)]
+    pub max_review_cycles: usize,
 }
 
 impl WorkConfig {
-    /// Start building a [`WorkConfig`]. `cwd` and `db_path` are required; all
-    /// pool sizes default to 1 so call sites (especially tests) don't have to
-    /// be updated every time a new pool field is added.
-    pub fn builder() -> WorkConfigBuilder {
-        WorkConfigBuilder::new()
-    }
-
     pub fn load_from_env() -> Result<Self> {
         let cwd = resolve_runtime_cwd()?;
         let db_path = match std::env::var_os("BOSS_DB_PATH") {
@@ -76,66 +86,22 @@ impl WorkConfig {
             })
             .transpose()?
             .unwrap_or(DEFAULT_REVIEW_POOL_SIZE);
+        let max_review_cycles = std::env::var("BOSS_MAX_REVIEW_CYCLES")
+            .ok()
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .with_context(|| format!("could not parse BOSS_MAX_REVIEW_CYCLES: {raw}"))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_MAX_REVIEW_CYCLES);
         Ok(WorkConfig::builder()
             .cwd(cwd)
             .db_path(db_path)
             .worker_pool_size(worker_pool_size)
             .automation_pool_size(automation_pool_size)
             .review_pool_size(review_pool_size)
+            .max_review_cycles(max_review_cycles)
             .build())
-    }
-}
-
-/// Builder for [`WorkConfig`]. Pool sizes default to 1; `cwd` and `db_path`
-/// must be set before [`build`](WorkConfigBuilder::build).
-#[derive(Debug, Clone, Default)]
-pub struct WorkConfigBuilder {
-    cwd: Option<PathBuf>,
-    db_path: Option<PathBuf>,
-    worker_pool_size: Option<usize>,
-    automation_pool_size: Option<usize>,
-    review_pool_size: Option<usize>,
-}
-
-impl WorkConfigBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-
-    pub fn db_path(mut self, db_path: impl Into<PathBuf>) -> Self {
-        self.db_path = Some(db_path.into());
-        self
-    }
-
-    pub fn worker_pool_size(mut self, size: usize) -> Self {
-        self.worker_pool_size = Some(size);
-        self
-    }
-
-    pub fn automation_pool_size(mut self, size: usize) -> Self {
-        self.automation_pool_size = Some(size);
-        self
-    }
-
-    pub fn review_pool_size(mut self, size: usize) -> Self {
-        self.review_pool_size = Some(size);
-        self
-    }
-
-    /// Build the [`WorkConfig`]. Panics if `cwd` or `db_path` were not set.
-    pub fn build(self) -> WorkConfig {
-        WorkConfig {
-            cwd: self.cwd.expect("WorkConfig::builder requires cwd"),
-            db_path: self.db_path.expect("WorkConfig::builder requires db_path"),
-            worker_pool_size: self.worker_pool_size.unwrap_or(1),
-            automation_pool_size: self.automation_pool_size.unwrap_or(1),
-            review_pool_size: self.review_pool_size.unwrap_or(1),
-        }
     }
 }
 
@@ -285,8 +251,8 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig,
-        resolve_runtime_cwd,
+        DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE,
+        MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd,
     };
     use std::path::PathBuf;
 
@@ -427,6 +393,43 @@ mod tests {
             match original_pool {
                 Some(value) => std::env::set_var("BOSS_REVIEW_POOL_SIZE", value),
                 None => std::env::remove_var("BOSS_REVIEW_POOL_SIZE"),
+            }
+            match original_db {
+                Some(value) => std::env::set_var("BOSS_DB_PATH", value),
+                None => std::env::remove_var("BOSS_DB_PATH"),
+            }
+        }
+    }
+
+    // Default-and-override are in a single test to avoid parallelism races
+    // on the shared BOSS_MAX_REVIEW_CYCLES env var (same pattern as
+    // review_pool_size_defaults_and_reads_from_env).
+    #[test]
+    fn max_review_cycles_defaults_and_reads_from_env() {
+        let original_cycles = std::env::var_os("BOSS_MAX_REVIEW_CYCLES");
+        let original_db = std::env::var_os("BOSS_DB_PATH");
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("state.db");
+
+        // Unset → falls back to the hardcoded default (3).
+        unsafe {
+            std::env::remove_var("BOSS_MAX_REVIEW_CYCLES");
+            std::env::set_var("BOSS_DB_PATH", &db_path);
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.max_review_cycles, DEFAULT_MAX_REVIEW_CYCLES);
+
+        // Set → the env value wins.
+        unsafe {
+            std::env::set_var("BOSS_MAX_REVIEW_CYCLES", "5");
+        }
+        let config = WorkConfig::load_from_env().expect("config loads");
+        assert_eq!(config.max_review_cycles, 5);
+
+        unsafe {
+            match original_cycles {
+                Some(value) => std::env::set_var("BOSS_MAX_REVIEW_CYCLES", value),
+                None => std::env::remove_var("BOSS_MAX_REVIEW_CYCLES"),
             }
             match original_db {
                 Some(value) => std::env::set_var("BOSS_DB_PATH", value),

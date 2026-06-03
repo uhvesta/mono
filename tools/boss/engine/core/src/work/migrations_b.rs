@@ -1365,3 +1365,28 @@ pub(crate) fn migrate_external_tracker_content_checksums(conn: &Connection) -> R
     }
     Ok(())
 }
+
+/// Adds `review_cycle` and `last_reviewed_sha` to `tasks`.
+///
+/// `review_cycle` counts completed `pr_review` passes for a producing task;
+/// the engine skips further reviewer passes once it reaches `max_review_cycles`.
+/// `last_reviewed_sha` records the PR HEAD SHA at the time of the most recent
+/// completed pass (consumed by the no-op skip gate, P992 design §8 / task 10).
+/// P992 design §7, task 9 (loop termination & bounds).
+pub(crate) fn migrate_tasks_review_cycle_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "review_cycle",
+            "ALTER TABLE tasks ADD COLUMN review_cycle INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "last_reviewed_sha",
+            "ALTER TABLE tasks ADD COLUMN last_reviewed_sha TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}

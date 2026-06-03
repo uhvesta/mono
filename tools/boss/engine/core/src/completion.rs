@@ -898,6 +898,13 @@ pub struct WorkerCompletionHandler {
     /// trips. Defaults to [`DEFAULT_MAX_UNPRODUCTIVE_NUDGES`]; tests
     /// override it via [`Self::with_max_unproductive_nudges`].
     max_unproductive_nudges: u32,
+    /// Maximum number of automated reviewer passes per PR (P992 design §7).
+    /// When a producing task's `review_cycle` reaches this value the engine
+    /// skips the next reviewer pass and advances to human Review directly.
+    /// Defaults to [`crate::config::DEFAULT_MAX_REVIEW_CYCLES`]; production
+    /// wires in the value from `WorkConfig` via
+    /// [`Self::with_max_review_cycles`].
+    max_review_cycles: usize,
 }
 
 impl WorkerCompletionHandler {
@@ -930,6 +937,7 @@ impl WorkerCompletionHandler {
             merge_probe: Arc::new(NoopMergeProbe),
             nudge_breaker: Arc::new(NudgeBreaker::new()),
             max_unproductive_nudges: DEFAULT_MAX_UNPRODUCTIVE_NUDGES,
+            max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
         }
     }
 
@@ -946,6 +954,14 @@ impl WorkerCompletionHandler {
     /// default.
     pub fn with_max_unproductive_nudges(mut self, max: u32) -> Self {
         self.max_unproductive_nudges = max;
+        self
+    }
+
+    /// Override the automated-reviewer cycle cap (P992 design §7).
+    /// Production wires in `WorkConfig.max_review_cycles` via `app.rs`;
+    /// tests that need to exercise the cycle-bound path set it low.
+    pub fn with_max_review_cycles(mut self, max: usize) -> Self {
+        self.max_review_cycles = max;
         self
     }
 
@@ -2061,6 +2077,13 @@ must not be asked to open one",
                 result
             });
 
+        // P992 task 9: extract head_sha before review_result is (potentially)
+        // consumed by the revision path below. Used to update last_reviewed_sha.
+        let head_sha_for_cycle: Option<String> = review_result
+            .as_ref()
+            .map(|r| r.head_sha.clone())
+            .filter(|s| !s.is_empty());
+
         let revision_warranted = review_result
             .as_ref()
             .is_some_and(|r| crate::pr_review::passes_severity_gate(r));
@@ -2087,6 +2110,23 @@ must not be asked to open one",
                 return StopOutcome::DbError;
             }
         };
+
+        // P992 task 9: increment the review cycle counter and record
+        // last_reviewed_sha. This happens regardless of whether a revision
+        // was warranted — the cycle ticks on every completed reviewer pass.
+        // A failure here is non-fatal (the task is already in in_review).
+        if let Err(err) = self
+            .work_db
+            .increment_task_review_cycle(producing_task_id, head_sha_for_cycle.as_deref())
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                producing_task_id,
+                ?err,
+                "pr_review finalize: failed to increment review_cycle; \
+                 cycle-bound enforcement may be off by one",
+            );
+        }
 
         if let Some(lease_id) = completion.released_lease_id.as_deref() {
             if let Err(err) = self.cube_client.release_workspace(lease_id).await {
@@ -2241,48 +2281,110 @@ must not be asked to open one",
     ) -> StopOutcome {
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
-        // P992 task 7: for primary implementation executions with a fresh
+        // P992 tasks 7 & 9: for reviewer-triggering executions with a fresh
         // (non-merged) PR, try to enqueue an independent reviewer pass
         // instead of immediately advancing to human Review (design §1).
+        // Task 9 adds: check the cycle bound first — if review_cycle has
+        // already reached max_review_cycles, skip the reviewer and proceed
+        // to InReview with a sticky attention item for the human.
         // If the pr_review execution cannot be created (DB error), fall back
         // to the normal InReview path so the task is never left stuck.
         let enqueued_reviewer = if !merged
             && matches!(target, WorkerPrCompletionTarget::InReview)
         {
             match self.work_db.get_execution(execution_id) {
-                Ok(ref producing) if is_primary_implementation_kind(&producing.kind) => {
-                    match self.work_db.create_execution(
-                        CreateExecutionInput::builder()
-                            .work_item_id(producing.work_item_id.clone())
-                            .kind(ExecutionKind::PrReview)
-                            .status("ready")
-                            .repo_remote_url(producing.repo_remote_url.clone())
-                            .build(),
-                    ) {
-                        Ok(review_exec) => {
-                            tracing::info!(
-                                execution_id,
-                                review_execution_id = %review_exec.id,
-                                pr_url = %pr_url,
-                                producing_kind = %producing.kind,
-                                "pr_review execution enqueued; \
-                                 holding producing task for reviewer pass",
-                            );
-                            self.publisher.kick_scheduler();
-                            true
-                        }
+                Ok(ref producing)
+                    if should_enqueue_reviewer_for_primary(&producing.kind)
+                        || (producing.kind == ExecutionKind::RevisionImplementation
+                            && should_enqueue_reviewer_for_revision(
+                                &producing.work_item_id,
+                                &self.work_db,
+                            )) =>
+                {
+                    // P992 task 9: cycle bound check.
+                    let max_cycles = self.max_review_cycles;
+                    let cycle_bound_reached = match self
+                        .work_db
+                        .get_task_review_cycle_state(&producing.work_item_id)
+                    {
+                        Ok((cycle, _)) => cycle as usize >= max_cycles,
                         Err(err) => {
+                            // Treat as "bound not reached" so the reviewer still
+                            // runs; a stale or missing row is not a reason to skip.
                             tracing::warn!(
                                 execution_id,
+                                work_item_id = %producing.work_item_id,
                                 ?err,
-                                "failed to create pr_review execution; \
-                                 falling back to immediate in_review",
+                                "could not read review_cycle; assuming bound not reached",
                             );
                             false
                         }
+                    };
+
+                    if cycle_bound_reached {
+                        tracing::info!(
+                            execution_id,
+                            work_item_id = %producing.work_item_id,
+                            max_review_cycles = max_cycles,
+                            "pr_review cycle bound reached; skipping reviewer \
+                             and advancing to in_review",
+                        );
+                        // Surface a sticky attention item so the human can see
+                        // the cycle limit was hit when they open the PR card.
+                        let _ = self.work_db.create_attention_item(
+                            CreateAttentionItemInput {
+                                work_item_id: Some(producing.work_item_id.clone()),
+                                kind: "pr_review_cycle_bound".to_owned(),
+                                title: format!(
+                                    "Automated reviewer: cycle limit ({max_cycles}) reached"
+                                ),
+                                body_markdown: format!(
+                                    "The automated reviewer completed {max_cycles} \
+                                     cycle(s) on this PR without resolving all findings. \
+                                     The PR has been advanced to human Review.\n\n\
+                                     See the most recent revision task for the outstanding \
+                                     findings from the last automated review cycle."
+                                ),
+                                execution_id: None,
+                                status: None,
+                                resolved_at: None,
+                            },
+                        );
+                        false
+                    } else {
+                        match self.work_db.create_execution(
+                            CreateExecutionInput::builder()
+                                .work_item_id(producing.work_item_id.clone())
+                                .kind(ExecutionKind::PrReview)
+                                .status("ready")
+                                .repo_remote_url(producing.repo_remote_url.clone())
+                                .build(),
+                        ) {
+                            Ok(review_exec) => {
+                                tracing::info!(
+                                    execution_id,
+                                    review_execution_id = %review_exec.id,
+                                    pr_url = %pr_url,
+                                    producing_kind = %producing.kind,
+                                    "pr_review execution enqueued; \
+                                     holding producing task for reviewer pass",
+                                );
+                                self.publisher.kick_scheduler();
+                                true
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    execution_id,
+                                    ?err,
+                                    "failed to create pr_review execution; \
+                                     falling back to immediate in_review",
+                                );
+                                false
+                            }
+                        }
                     }
                 }
-                Ok(_) => false, // non-primary kind; advance to in_review as normal
+                Ok(_) => false, // non-reviewer-triggering execution; advance to in_review as normal
                 Err(err) => {
                     tracing::warn!(
                         execution_id,
@@ -3807,11 +3909,36 @@ fn work_item_product_id(item: &WorkItem) -> String {
 /// the initial PR) are in scope for v1; revisions, CI-remediations, and
 /// conflict-resolution workers are intentionally excluded until the reviewer
 /// loop (tasks 8/9) is wired for the full update cycle.
-fn is_primary_implementation_kind(kind: &ExecutionKind) -> bool {
+/// Whether completing a primary-implementation execution with a fresh PR
+/// should trigger an independent reviewer pass (P992 design §1).
+///
+/// `RevisionImplementation` is handled separately: only revisions that were
+/// created by the automated reviewer itself (`created_via` starts with
+/// [`CREATED_VIA_PR_REVIEW_PREFIX`]) feed back into the review loop. CI-fix,
+/// conflict-resolution, and human-initiated revisions do NOT re-trigger a
+/// reviewer pass; they advance directly to human Review. That distinction is
+/// applied in [`should_enqueue_reviewer_for_revision`].
+fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
     matches!(
         kind,
         ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation
     )
+}
+
+/// Whether a `RevisionImplementation` execution should re-trigger a reviewer
+/// pass (P992 design §7). Returns `true` when the revision task's `created_via`
+/// field carries the [`CREATED_VIA_PR_REVIEW_PREFIX`] prefix, meaning it was
+/// spawned by the automated reviewer. Returns `false` for CI-fix, conflict-
+/// resolution, and human-initiated revisions (those advance directly to
+/// human Review without another automated pass).
+fn should_enqueue_reviewer_for_revision(task_id: &str, work_db: &crate::work::WorkDb) -> bool {
+    use boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX;
+    match work_db.get_work_item(task_id) {
+        Ok(crate::work::WorkItem::Task(t)) | Ok(crate::work::WorkItem::Chore(t)) => {
+            t.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

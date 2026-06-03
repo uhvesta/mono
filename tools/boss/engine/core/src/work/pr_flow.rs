@@ -431,3 +431,58 @@ pub struct PrPollStateOutcome {
     /// a `fail → success` transition and clear a stale "ci failing" badge.
     pub prior_ci_state: Option<String>,
 }
+
+impl WorkDb {
+    /// Return `(review_cycle, last_reviewed_sha)` for `task_id`.
+    ///
+    /// `review_cycle` is the number of `pr_review` passes that have completed
+    /// for this task's PR. `last_reviewed_sha` is the PR HEAD SHA recorded at
+    /// the end of the most recent pass, or `None` if no pass has completed yet.
+    ///
+    /// Used by the cycle-bound check in [`crate::completion::WorkerCompletionHandler`]
+    /// before enqueuing a new `pr_review` execution. P992 design §7, task 9.
+    pub fn get_task_review_cycle_state(
+        &self,
+        task_id: &str,
+    ) -> Result<(i64, Option<String>)> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT review_cycle, last_reviewed_sha FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .with_context(|| format!("unknown task: {task_id}"))
+    }
+
+    /// Atomically increment `review_cycle` by 1 and set `last_reviewed_sha`.
+    ///
+    /// Called from [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]
+    /// after a `pr_review` execution completes, regardless of whether a
+    /// revision was warranted. A missing or empty `last_reviewed_sha` records
+    /// `NULL` (the reviewer could not determine the HEAD SHA).
+    /// P992 design §7, task 9.
+    pub fn increment_task_review_cycle(
+        &self,
+        task_id: &str,
+        last_reviewed_sha: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let rows = conn.execute(
+            "UPDATE tasks
+             SET review_cycle      = review_cycle + 1,
+                 last_reviewed_sha = ?2,
+                 updated_at        = ?3
+             WHERE id = ?1
+               AND deleted_at IS NULL",
+            params![
+                task_id,
+                last_reviewed_sha.filter(|s| !s.is_empty()),
+                now_string(),
+            ],
+        )?;
+        if rows == 0 {
+            bail!("unknown or deleted task: {task_id}");
+        }
+        Ok(())
+    }
+}
