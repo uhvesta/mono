@@ -350,12 +350,21 @@ phase_linux() {
   gnu_path="$(build_native_bazel "--define=CHECKLEFT_VERSION=${NEW_VERSION}")"
   stage_asset "${gnu_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-gnu"
 
-  # musl is best-effort: a static build is nice-to-have, not release-blocking.
+  # musl — now pure Bazel via //tools/checkleft:checkleft_musl.
+  # Still best-effort (non-release-blocking) but no longer depends on
+  # musl-tools or cargo being present on the agent.
   local musl_path
-  if musl_path="$(build_cross_cargo x86_64-unknown-linux-musl)"; then
-    stage_asset "${musl_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-musl"
+  local musl_target="//tools/checkleft:checkleft_musl"
+  log "[checkleft-release] bazel build -c opt ${musl_target}" >&2
+  if bazel build -c opt "${musl_target}" >&2; then
+    musl_path="$(bazel cquery -c opt --output=files "${musl_target}" 2>/dev/null | head -1 || true)"
+    if [[ -n "${musl_path}" && -f "${musl_path}" ]]; then
+      stage_asset "${musl_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-musl"
+    else
+      echo "[checkleft-release] WARNING: musl bazel build succeeded but binary not found; skipping"
+    fi
   else
-    echo "[checkleft-release] WARNING: musl build unavailable (install musl-tools on the agent to enable); shipping without it"
+    echo "[checkleft-release] WARNING: musl bazel build failed; shipping without it"
   fi
 
   upload_release_assets

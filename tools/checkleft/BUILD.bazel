@@ -1,5 +1,6 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//tools/checkleft/musl:transition.bzl", "musl_binary")
 
 exports_files(["Cargo.toml"])
 
@@ -34,6 +35,21 @@ rust_binary(
     deps = [
         ":checkleft_lib",
     ] + all_crate_deps(normal = True),
+)
+
+# Statically-linked Linux binary via musl cross-compilation.
+# Builds checkleft for x86_64-unknown-linux-musl using the musl Rust toolchain
+# registered in MODULE.bazel plus the hermetic_cc_toolchain (Zig CC) for any
+# C deps (tree-sitter, wasmtime).  Output: a static ELF with no glibc dependency.
+#
+# Usage:
+#   bazel build //tools/checkleft:checkleft_musl
+#   file $(bazel cquery --output=files //tools/checkleft:checkleft_musl)
+#     → should report "ELF 64-bit ... statically linked"
+musl_binary(
+    name = "checkleft_musl",
+    binary = ":checkleft",
+    visibility = ["//visibility:public"],
 )
 
 rust_test(

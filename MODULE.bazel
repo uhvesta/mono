@@ -2,6 +2,7 @@ module(
     name = "mono",
 )
 
+bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
 bazel_dep(name = "rules_nodejs", version = "6.7.3")
 bazel_dep(name = "aspect_rules_js", version = "2.8.2")
@@ -11,6 +12,11 @@ bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_ap
 bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rules_swift")
 bazel_dep(name = "rules_apple", version = "4.5.1", repo_name = "build_bazel_rules_apple")
 bazel_dep(name = "rules_swift_package_manager", version = "1.13.0")
+
+# Zig-based hermetic CC toolchain used for musl cross-compilation.
+# Provides @zig_sdk//libc_aware/toolchain:linux_amd64_musl (and arm64 variant)
+# which cross-compile C/C++ code from any host to a fully-static musl binary.
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.1.0")
 
 apple_cc_configure = use_extension(
     "@build_bazel_apple_support//crosstool:setup.bzl",
@@ -23,6 +29,21 @@ use_repo(
 )
 
 register_toolchains("@local_config_apple_cc_toolchains//:all")
+
+# Zig-based hermetic C/C++ toolchain for musl cross-compilation.
+# Only the libc_aware musl toolchains are registered here (they require
+# @zig_sdk//libc:musl in the target platform, so they cannot accidentally
+# match regular glibc Linux builds).
+hermetic_cc_toolchain_config = use_extension(
+    "@hermetic_cc_toolchain//toolchain:ext.bzl",
+    "toolchains",
+)
+use_repo(hermetic_cc_toolchain_config, "zig_sdk")
+
+register_toolchains(
+    "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
+    "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
+)
 
 node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
 node.toolchain(
@@ -51,6 +72,34 @@ rust.toolchain(
     versions = ["1.95.0"],
 )
 use_repo(rust, "rust_toolchains")
+
+# Musl Rust toolchains — registered BEFORE @rust_toolchains//:all so they win
+# during toolchain resolution for platforms that carry @zig_sdk//libc:musl.
+# For the default linux platform (no @zig_sdk//libc:musl), these are filtered
+# out and the standard GNU toolchain from @rust_toolchains//:all is used.
+musl_rust = use_extension("//tools/checkleft/musl:ext.bzl", "musl_rust_toolchain")
+use_repo(
+    musl_rust,
+    "rust_musl_aarch64_apple_darwin_aarch64_unknown_linux_musl",
+    "rust_musl_aarch64_apple_darwin_x86_64_unknown_linux_musl",
+    "rust_musl_aarch64_unknown_linux_gnu_aarch64_unknown_linux_musl",
+    "rust_musl_aarch64_unknown_linux_gnu_x86_64_unknown_linux_musl",
+    "rust_musl_x86_64_apple_darwin_aarch64_unknown_linux_musl",
+    "rust_musl_x86_64_apple_darwin_x86_64_unknown_linux_musl",
+    "rust_musl_x86_64_unknown_linux_gnu_aarch64_unknown_linux_musl",
+    "rust_musl_x86_64_unknown_linux_gnu_x86_64_unknown_linux_musl",
+)
+
+register_toolchains(
+    "@rust_musl_aarch64_apple_darwin_x86_64_unknown_linux_musl//:toolchain",
+    "@rust_musl_aarch64_apple_darwin_aarch64_unknown_linux_musl//:toolchain",
+    "@rust_musl_x86_64_apple_darwin_x86_64_unknown_linux_musl//:toolchain",
+    "@rust_musl_x86_64_apple_darwin_aarch64_unknown_linux_musl//:toolchain",
+    "@rust_musl_aarch64_unknown_linux_gnu_x86_64_unknown_linux_musl//:toolchain",
+    "@rust_musl_aarch64_unknown_linux_gnu_aarch64_unknown_linux_musl//:toolchain",
+    "@rust_musl_x86_64_unknown_linux_gnu_x86_64_unknown_linux_musl//:toolchain",
+    "@rust_musl_x86_64_unknown_linux_gnu_aarch64_unknown_linux_musl//:toolchain",
+)
 
 register_toolchains("@rust_toolchains//:all")
 

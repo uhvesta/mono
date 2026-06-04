@@ -1,0 +1,5 @@
+"""Build support for checkleft musl cross-compilation."""
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files(["ext.bzl"])
