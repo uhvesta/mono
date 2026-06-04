@@ -321,13 +321,8 @@ pub(crate) fn apply_optional_patch(target: &mut Option<String>, patch: Option<St
 /// deliberately not validated — claude is the source of truth on
 /// what `--model` accepts (design §Q3).
 pub(crate) fn apply_optional_string_patch(target: &mut Option<String>, patch: Option<String>) {
-    if let Some(value) = patch {
-        let trimmed = value.trim();
-        *target = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        };
+    if patch.is_some() {
+        *target = normalize_optional_text(patch);
     }
 }
 

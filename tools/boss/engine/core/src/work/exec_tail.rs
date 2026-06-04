@@ -427,10 +427,7 @@ impl WorkDb {
         let mut result = Vec::new();
         for row in rows {
             let (id, kind, canonical_id, raw_json, synced_at, unbound_at) = row?;
-            let raw: serde_json::Value = raw_json
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(serde_json::Value::Null);
+            let raw: serde_json::Value = deserialize_json_or_default(raw_json.as_deref());
             result.push((
                 id,
                 StoredExternalRef {

@@ -29,6 +29,18 @@ where
     })
 }
 
+/// Deserialize an optional JSON text column into `T`, falling back to
+/// `T::default()` when the column is NULL or the JSON fails to parse.
+/// Centralizes the `as_deref().and_then(from_str).unwrap_or_default()`
+/// chain shared by the `map_*` mappers and a few ad-hoc row readers.
+/// Note `serde_json::Value::default()` is `Value::Null`, so this covers
+/// the `Value` call sites that previously wrote `unwrap_or(Value::Null)`.
+pub(crate) fn deserialize_json_or_default<T: serde::de::DeserializeOwned + Default>(
+    json: Option<&str>,
+) -> T {
+    json.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
+}
+
 pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
     let external_tracker_kind: Option<String> =
         row.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty());
@@ -246,10 +258,7 @@ pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task
     let canonical_id: Option<String> = row.get(31)?;
     if let (Some(kind), Some(canonical_id)) = (kind, canonical_id) {
         let raw_json: Option<String> = row.get(32)?;
-        let raw: serde_json::Value = raw_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or(serde_json::Value::Null);
+        let raw: serde_json::Value = deserialize_json_or_default(raw_json.as_deref());
         let web_url = derive_external_ref_web_url(&kind, &canonical_id);
         task.external_ref = Some(WorkItemExternalRef {
             kind,
@@ -287,11 +296,8 @@ pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(
 }
 
 pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
-    let branch_naming: BranchNaming = row
-        .get::<_, Option<String>>(22)?
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+    let branch_naming: BranchNaming =
+        deserialize_json_or_default(row.get::<_, Option<String>>(22)?.as_deref());
     let kind_raw: String = row.get(2)?;
     let kind = parse_text_column::<ExecutionKind>(2, &kind_raw)?;
     let status_raw: String = row.get(3)?;

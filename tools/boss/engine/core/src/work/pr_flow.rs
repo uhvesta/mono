@@ -239,11 +239,8 @@ impl WorkDb {
              ORDER BY we.finished_at DESC, we.id DESC",
         )?;
         let rows = stmt.query_map([cutoff], |row| {
-            let branch_naming: BranchNaming = row
-                .get::<_, Option<String>>(3)?
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
+            let branch_naming: BranchNaming =
+                deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
             Ok(LatePrCandidate {
                 execution_id: row.get(0)?,
                 work_item_id: row.get(1)?,
