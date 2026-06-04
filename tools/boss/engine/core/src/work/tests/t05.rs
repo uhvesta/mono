@@ -2585,3 +2585,242 @@ fn ci_flaky_retrigger_signal_clears_on_resolve_and_supersede() {
         "a new remediation attempt must supersede the stale flaky verdict",
     );
 }
+
+/// Helper: collect the `reason` of every active blocked signal for a
+/// work item (cleared signals are excluded by `active_blocked_signals`).
+#[cfg(test)]
+fn active_signal_reasons(db: &WorkDb, work_item_id: &str) -> Vec<String> {
+    db.active_blocked_signals(work_item_id)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.reason)
+        .collect()
+}
+
+/// Helper: read a chore/task work item and unwrap to its `Task`.
+#[cfg(test)]
+fn task_of(db: &WorkDb, work_item_id: &str) -> Task {
+    match db.get_work_item(work_item_id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected a chore/task work item, got {other:?}"),
+    }
+}
+
+/// `effective_ci_budget` resolves the per-PR override first, falls back
+/// to the parent product's default, returns the hard default `3` for an
+/// unknown work item, and clamps the resolved value to `0..=10`.
+///
+/// The unknown-item branch deliberately diverges from
+/// `ci_budget_snapshot` (which returns `None`); this test pins both
+/// behaviours side by side so the divergence is intentional, not drift.
+#[test]
+fn effective_ci_budget_resolves_override_default_and_clamps() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "eff-budget");
+    let pr = "https://github.com/spinyfin/mono/pull/900";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    // (b) No per-PR override → the product default applies. Use a value
+    // that is NOT the documented hard default of 3, so a regression that
+    // ignores the product column and hard-codes 3 would be caught.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE products SET ci_attempt_budget = 5 WHERE id = ?1",
+            [&product_id],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        db.effective_ci_budget(&chore).unwrap(),
+        5,
+        "falls back to the product default when no per-PR override is set",
+    );
+
+    // (a) A per-PR override wins over the product default.
+    db.set_ci_attempt_budget(&chore, Some(7))
+        .unwrap()
+        .expect("override write");
+    assert_eq!(
+        db.effective_ci_budget(&chore).unwrap(),
+        7,
+        "the per-PR override takes precedence over the product default",
+    );
+
+    // (d) The resolved value is clamped to `0..=10`. `set_ci_attempt_budget`
+    // already clamps on write, so poke the raw column past the bounds to
+    // exercise the read-side clamp inside `effective_ci_budget` itself.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET ci_attempt_budget = 99 WHERE id = ?1",
+            [&chore],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        db.effective_ci_budget(&chore).unwrap(),
+        10,
+        "an over-cap override clamps up to the hard ceiling of 10",
+    );
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET ci_attempt_budget = -4 WHERE id = ?1",
+            [&chore],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        db.effective_ci_budget(&chore).unwrap(),
+        0,
+        "a negative override clamps up to the floor of 0",
+    );
+
+    // (c) Unknown work item → the hard default of 3, which diverges from
+    // `ci_budget_snapshot` returning `None` for the same missing id.
+    assert_eq!(
+        db.effective_ci_budget("chr_does_not_exist").unwrap(),
+        3,
+        "an unknown work item returns the hard default budget of 3",
+    );
+    assert!(
+        db.ci_budget_snapshot("chr_does_not_exist")
+            .unwrap()
+            .is_none(),
+        "ci_budget_snapshot diverges: it returns None for the same unknown item",
+    );
+}
+
+/// Full CI-failure block lifecycle through the public API:
+/// `mark_chore_blocked_ci_failure` blocks the parent and arms the
+/// `ci_failure` signal; `clear_chore_blocked_ci_failure` flips it back
+/// to `in_review` and clears the signal; and
+/// `rearm_blocked_ci_failure_signal` reactivates a signal that was
+/// cleared out from under a still-blocked parent (while staying a no-op
+/// when the parent is no longer blocked). Assertions observe the public
+/// task status / active-signal projection, never internal columns.
+#[test]
+fn ci_failure_block_mark_clear_rearm_lifecycle() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "ci-block-lifecycle");
+    let pr = "https://github.com/spinyfin/mono/pull/901";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    // mark: in_review → blocked: ci_failure, with the signal armed.
+    db.mark_chore_blocked_ci_failure(&chore, pr, None)
+        .unwrap()
+        .expect("flip to blocked: ci_failure");
+    let t = task_of(&db, &chore);
+    assert_eq!(t.status, TaskStatus::Blocked);
+    assert_eq!(t.blocked_reason.as_deref(), Some("ci_failure"));
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure"]);
+
+    // clear: blocked → in_review, and the active signal is cleared too.
+    db.clear_chore_blocked_ci_failure(&chore, pr)
+        .unwrap()
+        .expect("clear the ci_failure block");
+    let t = task_of(&db, &chore);
+    assert_eq!(t.status, TaskStatus::InReview);
+    assert!(t.blocked_reason.is_none());
+    assert!(
+        active_signal_reasons(&db, &chore).is_empty(),
+        "clearing the block also clears the active ci_failure signal",
+    );
+
+    // rearm is a no-op while the parent is not blocked.
+    assert!(
+        !db.rearm_blocked_ci_failure_signal(&chore).unwrap(),
+        "rearm must not arm a signal on a parent that is no longer blocked",
+    );
+    assert!(active_signal_reasons(&db, &chore).is_empty());
+
+    // Re-block, then simulate a premature polymorphic clear that drops the
+    // signal row but leaves the parent blocked. rearm must reactivate it.
+    db.mark_chore_blocked_ci_failure(&chore, pr, None)
+        .unwrap()
+        .expect("re-block: ci_failure");
+    assert!(
+        db.clear_ci_failure_signal_only(&chore).unwrap(),
+        "signal-only clear deactivates the signal",
+    );
+    assert!(
+        active_signal_reasons(&db, &chore).is_empty(),
+        "the signal is inactive after the signal-only clear",
+    );
+    assert_eq!(
+        task_of(&db, &chore).status,
+        TaskStatus::Blocked,
+        "the parent stays blocked through a signal-only clear",
+    );
+    assert!(
+        db.rearm_blocked_ci_failure_signal(&chore).unwrap(),
+        "rearm reactivates a cleared signal while the parent is still blocked",
+    );
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["ci_failure"]);
+}
+
+/// Merge-conflict counterpart of the CI-failure lifecycle test, exercising
+/// `clear_chore_blocked_merge_conflict` and
+/// `rearm_blocked_merge_conflict_signal` (both live, previously untested):
+/// mark → clear (block + signal) → no-op rearm when in_review →
+/// re-block → signal-only clear → rearm reactivates.
+#[test]
+fn merge_conflict_block_mark_clear_rearm_lifecycle() {
+    let db = WorkDb::open(PathBuf::from(":memory:")).unwrap();
+    let product_id = make_revision_product(&db, "mc-block-lifecycle");
+    let pr = "https://github.com/spinyfin/mono/pull/902";
+    let chore = make_in_review_chore(&db, &product_id, pr);
+
+    // mark: in_review → blocked: merge_conflict, with the signal armed.
+    db.mark_chore_blocked_merge_conflict(&chore, pr)
+        .unwrap()
+        .expect("flip to blocked: merge_conflict");
+    let t = task_of(&db, &chore);
+    assert_eq!(t.status, TaskStatus::Blocked);
+    assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["merge_conflict"]);
+
+    // clear: blocked → in_review, and the active signal is cleared too.
+    db.clear_chore_blocked_merge_conflict(&chore, pr)
+        .unwrap()
+        .expect("clear the merge_conflict block");
+    let t = task_of(&db, &chore);
+    assert_eq!(t.status, TaskStatus::InReview);
+    assert!(t.blocked_reason.is_none());
+    assert!(
+        active_signal_reasons(&db, &chore).is_empty(),
+        "clearing the block also clears the active merge_conflict signal",
+    );
+
+    // rearm is a no-op while the parent is not blocked.
+    assert!(
+        !db.rearm_blocked_merge_conflict_signal(&chore).unwrap(),
+        "rearm must not arm a signal on a parent that is no longer blocked",
+    );
+    assert!(active_signal_reasons(&db, &chore).is_empty());
+
+    // Re-block, drop only the signal (premature polymorphic clear), then
+    // confirm rearm reactivates it while the parent stays blocked.
+    db.mark_chore_blocked_merge_conflict(&chore, pr)
+        .unwrap()
+        .expect("re-block: merge_conflict");
+    assert!(
+        db.clear_merge_conflict_signal_only(&chore).unwrap(),
+        "signal-only clear deactivates the signal",
+    );
+    assert!(
+        active_signal_reasons(&db, &chore).is_empty(),
+        "the signal is inactive after the signal-only clear",
+    );
+    assert_eq!(
+        task_of(&db, &chore).status,
+        TaskStatus::Blocked,
+        "the parent stays blocked through a signal-only clear",
+    );
+    assert!(
+        db.rearm_blocked_merge_conflict_signal(&chore).unwrap(),
+        "rearm reactivates a cleared signal while the parent is still blocked",
+    );
+    assert_eq!(active_signal_reasons(&db, &chore), vec!["merge_conflict"]);
+}
