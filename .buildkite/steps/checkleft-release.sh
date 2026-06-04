@@ -53,6 +53,7 @@ META_TAG_KEY="checkleft-release-tag"
 # can reference them under `set -u` after the phase function has returned.
 STAGE=""
 TAG_PUSHED=0
+LOCAL_TAG_CREATED=0
 NEW_TAG=""
 
 # checkleft-affecting paths for change-detection. Mirrors boss-release.sh's
@@ -105,14 +106,17 @@ compute_next_version() {
   BASE="${BASH_REMATCH[1]}"
   local cargo_alpha="${BASH_REMATCH[2]}"
 
-  # Highest existing alpha among published releases for this base version.
+  # Highest existing alpha among git tags for this base version.
+  # Requires the caller to have run `git fetch --tags --prune --prune-tags` first
+  # so local tags mirror the current remote state. This avoids silently falling
+  # back to the Cargo.toml alpha counter when a `gh` API call fails.
   local release_max=-1 tag n
   while IFS= read -r tag; do
     if [[ "${tag}" =~ ^${TAG_PREFIX}${BASE}-alpha\.([0-9]+)$ ]]; then
       n="${BASH_REMATCH[1]}"
       if (( n > release_max )); then release_max="${n}"; fi
     fi
-  done < <(gh release list --repo "${REPO}" --limit 300 --json tagName --jq '.[].tagName' 2>/dev/null || true)
+  done < <(git tag -l "${TAG_PREFIX}${BASE}-alpha.*")
 
   local highest="${cargo_alpha}"
   if (( release_max > highest )); then highest="${release_max}"; fi
@@ -265,8 +269,14 @@ should_skip() {
 # and exit 1 despite succeeding.
 cleanup() {
   if [[ "${TAG_PUSHED}" == "1" && -n "${NEW_TAG}" ]]; then
-    echo "[checkleft-release] release did not complete — deleting leaked tag ${NEW_TAG}" >&2
+    echo "[checkleft-release] release did not complete — deleting leaked remote tag ${NEW_TAG}" >&2
     git push origin ":refs/tags/${NEW_TAG}" 2>/dev/null || true
+    git tag -d "${NEW_TAG}" 2>/dev/null || true
+  elif [[ "${LOCAL_TAG_CREATED}" == "1" && -n "${NEW_TAG}" ]]; then
+    # git tag ran but the push failed; clean up the local tag so a re-run of
+    # the pipeline on a warm workspace doesn't hit "tag already exists".
+    echo "[checkleft-release] cleaning up local tag ${NEW_TAG} after push failure" >&2
+    git tag -d "${NEW_TAG}" 2>/dev/null || true
   fi
   [[ -n "${STAGE}" ]] && rm -rf "${STAGE}"
   return 0
@@ -276,6 +286,12 @@ cleanup() {
 
 phase_prepare() {
   echo "[checkleft-release] agent: $(uname -a)"
+  # Sync remote tags before any version resolution. Warm agent workspaces can
+  # have a stale tag set, causing the resolver to compute a version that was
+  # already published. --prune-tags also removes locally-cached tags that have
+  # been deleted from the remote since the last checkout.
+  git fetch --tags --prune --prune-tags origin \
+    || die "git fetch --tags failed; aborting release to avoid computing a stale next version"
   resolve_last_release
 
   local skip_reason
@@ -295,14 +311,26 @@ phase_prepare() {
   [[ -n "${release_sha}" ]] || die "could not resolve the commit to release/tag"
 
   # ── point of no return: tag the release commit, push the tag, create release ─
+  # Re-fetch tags immediately before tagging to close the race window between the
+  # initial fetch at the start of this phase and now. If the computed tag already
+  # exists it was published (by this or a concurrent run) since our initial fetch;
+  # fail with an actionable message rather than a raw git exit 128.
+  git fetch --tags --prune --prune-tags origin \
+    || die "git fetch --tags failed before tagging; aborting to avoid a duplicate-tag collision"
+  if git rev-parse --verify "refs/tags/${NEW_TAG}" &>/dev/null; then
+    local existing_sha
+    existing_sha="$(git rev-list -n 1 "${NEW_TAG}" 2>/dev/null || echo '(unknown)')"
+    die "computed tag ${NEW_TAG} already exists on remote (at commit ${existing_sha:0:12}); our HEAD is ${release_sha:0:12}. The version resolver produced a stale or already-published result — re-run the pipeline to retry with a fresh tag set."
+  fi
   # The cleanup trap deletes the tag if this phase dies before the release is
   # created (the window guarded by TAG_PUSHED). Once the release exists, the
   # build phases attach assets to it; a build failure is recoverable by retrying
   # that job, so the tag/release are intentionally left in place.
   log "[checkleft-release] tagging ${NEW_TAG} at ${release_sha:0:12}"
   git tag "${NEW_TAG}" "${release_sha}"
+  LOCAL_TAG_CREATED=1
   git push origin "refs/tags/${NEW_TAG}" \
-    || die "tag push rejected for ${NEW_TAG}. The tag may already exist (a prior run pushed it — delete it and retry), or the agent's git credentials cannot push to ${REPO}."
+    || die "tag push rejected for ${NEW_TAG}; the agent's git credentials may not be able to push to ${REPO}."
   TAG_PUSHED=1
 
   log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
