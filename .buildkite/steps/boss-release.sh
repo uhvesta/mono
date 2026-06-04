@@ -295,10 +295,19 @@ echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 # selective retry on the (flaky) asset-upload step.
 
 log "[boss-release] creating GitHub Release ${VERSION}"
+# Explicitly anchor the changelog range to the previous boss-v* tag so that
+# --generate-notes doesn't fall back to whatever tag is globally newest (which
+# may belong to a different product like checkleft-v*).  When LAST_TAG is
+# empty (first-ever boss release) we omit the flag and let GitHub default.
+NOTES_START_ARG=()
+if [[ -n "${LAST_TAG}" ]]; then
+  NOTES_START_ARG=(--notes-start-tag "${LAST_TAG}")
+fi
 gh release create "${VERSION}" \
   --repo spinyfin/mono \
   --title "Boss ${VERSION#boss-v}" \
-  --generate-notes
+  --generate-notes \
+  "${NOTES_START_ARG[@]}"
 
 log "[boss-release] uploading asset with retry"
 UPLOAD_OK=0

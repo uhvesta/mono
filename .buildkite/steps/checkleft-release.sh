@@ -306,8 +306,17 @@ phase_prepare() {
   TAG_PUSHED=1
 
   log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
+  # Explicitly anchor the changelog range to the previous checkleft-v* tag so
+  # that --generate-notes doesn't fall back to whatever tag is globally newest
+  # (which may belong to a different product like boss-v*).  When LAST_TAG is
+  # empty (first-ever checkleft release) we omit the flag and let GitHub default.
+  local notes_start_arg=()
+  if [[ -n "${LAST_TAG}" ]]; then
+    notes_start_arg=(--notes-start-tag "${LAST_TAG}")
+  fi
   gh release create "${NEW_TAG}" --repo "${REPO}" \
-    --title "checkleft ${NEW_VERSION}" --generate-notes
+    --title "checkleft ${NEW_VERSION}" --generate-notes \
+    "${notes_start_arg[@]}"
 
   # Hand the tag to the parallel build phases.
   meta_set "${META_TAG_KEY}" "${NEW_TAG}"
