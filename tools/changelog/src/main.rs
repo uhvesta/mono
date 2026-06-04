@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::Parser;
 use git_changelog::{
-    extract_changelog, repo_slug_from_remote, ChangelogRenderer, ExtractionConfig,
-    GithubMarkdownRenderer,
+    derive_paths_from_project, extract_changelog, repo_slug_from_remote, ChangelogRenderer,
+    ExtractionConfig, GithubMarkdownRenderer,
 };
 
 #[derive(Debug, Parser)]
@@ -28,6 +28,11 @@ struct Cli {
     /// File containing glob patterns (one per line; '#' comments ok).
     #[arg(long)]
     paths_file: Option<PathBuf>,
+
+    /// PROJECT.yaml whose directory (implicit) and `paths` entries define owned paths.
+    /// May be combined with --path / --paths-file; all sources are unioned.
+    #[arg(long)]
+    project: Option<PathBuf>,
 
     /// GitHub repo slug `owner/name`. Derived from git remote `origin` if omitted.
     #[arg(long)]
@@ -59,6 +64,12 @@ fn run(cli: Cli) -> Result<()> {
             }
             globs.push(line.to_string());
         }
+    }
+
+    if let Some(project_file) = cli.project {
+        let project_globs = derive_paths_from_project(&project_file, &repo_path)
+            .with_context(|| format!("could not derive paths from --project {}", project_file.display()))?;
+        globs.extend(project_globs);
     }
 
     let repo_slug = match cli.repo {

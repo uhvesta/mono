@@ -23,6 +23,8 @@ anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 globset = { workspace = true }
 regex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

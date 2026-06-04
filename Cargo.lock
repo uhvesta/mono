@@ -1424,6 +1424,8 @@ dependencies = [
  "clap",
  "globset",
  "regex",
+ "serde",
+ "serde_yaml",
  "tempfile",
  "thiserror 1.0.69",
 ]
