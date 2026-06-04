@@ -51,6 +51,12 @@ final class WorkersWorkspaceModel: ObservableObject {
         }
     }
 
+    /// Called after a worker pane's libghostty surface attaches and the
+    /// shell pid becomes available. `ContentView` installs this closure to
+    /// forward the pid to the engine via `sendUpdateWorkerShellPid`. The
+    /// `runId` is the raw execution id (without the "run-" session prefix).
+    var onShellPidAvailable: ((String, Int32) -> Void)?
+
     /// Update pool capacities from the engine's EnginePoolConfig push.
     /// Called every time the app registers a session, so the slot ranges
     /// always mirror the live engine rather than independently-maintained
@@ -132,11 +138,29 @@ final class WorkersWorkspaceModel: ObservableObject {
             slots[index].taskTitle = request.taskTitle
         }
 
-        // TODO(@brian,2026-09-01): use proc_listpids(PROC_PPID_ONLY, ...)
-        // right after surface init to find the shell pid. For now
-        // return 0 and let the registry's ancestor walk fail
-        // gracefully — the spawn flow plumbing is what we're proving
-        // out at this layer; richer pid correlation lands as a follow-up.
+        // Return shell_pid 0 now — the libghostty surface is created
+        // asynchronously by SwiftUI after this RPC returns. Once the surface
+        // attaches, onSurfaceAttached fires and we read foregroundPid (which
+        // calls ghostty_surface_foreground_pid) to get the real shell pid,
+        // then forward it to the engine via update_worker_shell_pid.
+        let capturedRunId = request.runId
+        session.onSurfaceAttached = { [weak self, weak session] in
+            guard let self = self else { return }
+            let pid = session?.shellPid ?? 0
+            if pid > 0 {
+                self.onShellPidAvailable?(capturedRunId, pid)
+            } else {
+                // Shell may not have called tcsetpgrp yet — retry after a
+                // short delay to let it become the foreground process group.
+                Task { @MainActor [weak self, weak session] in
+                    try? await Task.sleep(nanoseconds: 250_000_000) // 250ms
+                    guard let self = self else { return }
+                    let retryPid = session?.shellPid ?? 0
+                    guard retryPid > 0 else { return }
+                    self.onShellPidAvailable?(capturedRunId, retryPid)
+                }
+            }
+        }
         return .success(slotId: slotId, shellPid: 0)
     }
 

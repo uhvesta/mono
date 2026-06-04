@@ -150,6 +150,13 @@ struct ContentView: View {
             if bossPane.session.terminalReady {
                 model.bossPaneShellPidAvailable()
             }
+            // Forward worker-pane shell pids to the engine once surfaces
+            // attach. WorkersWorkspaceModel fires onShellPidAvailable after
+            // ghostty_surface_foreground_pid returns a valid pid so the
+            // engine can wire process tracking for reviewer and other panes.
+            workersWorkspace.onShellPidAvailable = { [model] runId, shellPid in
+                model.workerPaneShellPidAvailable(runId: runId, shellPid: shellPid)
+            }
         }
         #endif
         .frame(minWidth: 860, minHeight: 560)

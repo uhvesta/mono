@@ -1302,6 +1302,17 @@ pub enum FrontendRequest {
         patch: AutomationPatch,
     },
 
+    /// App reports the real shell pid for a worker pane after the
+    /// libghostty surface initializes. The engine stores this in
+    /// `WorkerRegistry` and `LiveWorkerStateRegistry` so process
+    /// tracking, dead-pid sweep, and `bossctl agents stop` work for
+    /// reviewer and other shell_pid-0 spawns. Fire-and-forget; no
+    /// response expected.
+    UpdateWorkerShellPid {
+        run_id: String,
+        shell_pid: i32,
+    },
+
     UpdateWorkItem {
         id: String,
         patch: WorkItemPatch,

@@ -359,9 +359,10 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             .worker_registry()
             .register(shell_pid, input.run_id.clone());
     } else {
-        tracing::warn!(
+        tracing::info!(
             slot_id,
-            "spawn returned shell_pid 0; hook-event correlation will fail until a real pid is wired (TODO: proc_listpids in app)",
+            run_id = %input.run_id,
+            "spawn returned shell_pid 0; awaiting update_worker_shell_pid from app once surface initializes",
         );
     }
 

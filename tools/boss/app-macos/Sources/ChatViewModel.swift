@@ -1769,6 +1769,15 @@ final class ChatViewModel: ObservableObject {
         engine.sendRegisterBossSession(shellPid: pid)
     }
 
+    /// Called by ContentView when a worker pane's libghostty surface attaches
+    /// and the shell pid becomes available. Forwards the real pid to the engine
+    /// so process tracking, dead-pid sweep, and `bossctl agents stop` work for
+    /// reviewer and other shell_pid-0 spawns.
+    func workerPaneShellPidAvailable(runId: String, shellPid: Int32) {
+        guard isAppSessionRegistered else { return }
+        engine.sendUpdateWorkerShellPid(runId: runId, shellPid: shellPid)
+    }
+
     // MARK: - Event Handling
 
     var paneSpawnHandler: ((EngineSpawnRequest) -> EngineSpawnResult)?

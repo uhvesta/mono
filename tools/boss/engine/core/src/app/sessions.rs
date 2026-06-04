@@ -146,6 +146,71 @@ pub(super) async fn handle_register_boss_session(ctx: Dispatch, req: FrontendReq
     }
 }
 
+/// Handle the app reporting the real shell pid for a worker pane.
+///
+/// The app returns `shell_pid = 0` from `SpawnWorkerPane` because the
+/// libghostty surface is created asynchronously by SwiftUI after the RPC
+/// returns. Once the surface attaches and the shell pid is available, the
+/// app sends this message so the engine can wire process tracking.
+///
+/// Registers the pid in both `WorkerRegistry` (for ancestor-walk correlation
+/// on hook events) and `LiveWorkerStateRegistry` (for dead-pid sweep and
+/// `bossctl agents stop` reaping). Fire-and-forget: the app does not wait
+/// for a response.
+pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        peer_pid,
+        ..
+    } = ctx;
+    let FrontendRequest::UpdateWorkerShellPid { run_id, shell_pid } = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "update_worker_shell_pid rejected: caller not in app/Boss subtree",
+        );
+        return;
+    }
+    if shell_pid <= 0 {
+        tracing::warn!(
+            run_id = %run_id,
+            shell_pid,
+            "update_worker_shell_pid: received non-positive pid; ignoring",
+        );
+        return;
+    }
+    // Update the pid→run_id registry so hook-event ancestor walk works.
+    server_state
+        .worker_registry
+        .register(shell_pid, run_id.clone());
+    // Update the live-state registry so dead-pid sweep and bossctl reaping
+    // can signal the process when needed.
+    match server_state
+        .live_worker_states
+        .update_shell_pid(&run_id, shell_pid)
+    {
+        Some(slot_id) => {
+            tracing::info!(
+                run_id = %run_id,
+                slot_id,
+                shell_pid,
+                "update_worker_shell_pid: registered real shell pid for worker pane",
+            );
+            server_state.broadcast_live_worker_states().await;
+        }
+        None => {
+            tracing::warn!(
+                run_id = %run_id,
+                shell_pid,
+                "update_worker_shell_pid: no live slot found for run_id (already released?)",
+            );
+        }
+    }
+}
+
 pub(super) async fn handle_engine_response(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

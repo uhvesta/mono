@@ -99,6 +99,22 @@ impl LiveWorkerStateRegistry {
         out
     }
 
+    /// Update the shell pid for the slot that owns `run_id`. Returns
+    /// the slot id if the entry was found and updated, or `None` if
+    /// no live slot matches. Called when the app sends
+    /// `UpdateWorkerShellPid` after the libghostty surface initializes.
+    pub fn update_shell_pid(&self, run_id: &str, shell_pid: i32) -> Option<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        for state in guard.by_slot.values_mut() {
+            if state.run_id == run_id {
+                let slot_id = state.slot_id;
+                state.shell_pid = shell_pid;
+                return Some(slot_id);
+            }
+        }
+        None
+    }
+
     /// Look up the state for one slot.
     pub fn get(&self, slot_id: u8) -> Option<LiveWorkerState> {
         self.inner
@@ -455,6 +471,26 @@ mod tests {
             stop_hook_active: false,
             stop_reason: StopReason::Completed,
         }
+    }
+
+    #[test]
+    fn update_shell_pid_finds_slot_by_run_id() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(3, "run-abc", "claude-opus-4-7", 0, None);
+        let slot = reg.update_shell_pid("run-abc", 55555);
+        assert_eq!(slot, Some(3));
+        let state = reg.get(3).unwrap();
+        assert_eq!(state.shell_pid, 55555);
+    }
+
+    #[test]
+    fn update_shell_pid_returns_none_for_unknown_run_id() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(3, "run-abc", "claude-opus-4-7", 0, None);
+        let slot = reg.update_shell_pid("run-xyz", 99999);
+        assert_eq!(slot, None);
+        let state = reg.get(3).unwrap();
+        assert_eq!(state.shell_pid, 0, "unmatched run must not be modified");
     }
 
     #[test]

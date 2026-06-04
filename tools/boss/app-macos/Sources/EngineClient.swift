@@ -725,6 +725,18 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Report the real shell pid for a worker pane after the libghostty
+    /// surface initializes. The engine uses this to wire process tracking
+    /// so the dead-pid sweep and `bossctl agents stop` can observe and
+    /// reap reviewer and other pane-spawned workers.
+    func sendUpdateWorkerShellPid(runId: String, shellPid: Int32) {
+        sendLine([
+            "type": "update_worker_shell_pid",
+            "run_id": runId,
+            "shell_pid": Int(shellPid),
+        ])
+    }
+
     /// Ask the engine for all historical executions of `taskId`, newest-first.
     /// The engine replies with `executions_list`. The wire field is
     /// `work_item_id` — the engine's `ListExecutions` request and
