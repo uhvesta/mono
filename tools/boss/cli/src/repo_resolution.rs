@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::io::{self, Write};
 
 use boss_client::BossClient;
+use boss_github::repo_slug::short_name_for;
 use boss_protocol::{FrontendEvent, FrontendRequest, Product, Task};
 
 use crate::CliError;
@@ -364,15 +365,6 @@ fn owner_repo_for(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{repo}"))
-}
-
-/// Basename of the path minus `.git`. Re-implemented here so the
-/// module is self-contained for tests; mirrors `short_name_for` in
-/// `main.rs` and `engine/src/work.rs`.
-fn short_name_for(url: &str) -> &str {
-    let after_slash = url.rsplit('/').next().unwrap_or(url);
-    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
-    after_colon.trim_end_matches(".git")
 }
 
 fn non_empty(value: &str) -> Option<&str> {

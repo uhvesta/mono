@@ -48,9 +48,34 @@ pub fn parse_github_owner_repo(url: &str) -> Result<(&str, &str), ParseError> {
     Ok((owner, repo))
 }
 
+/// Short name of a repo URL: the path basename minus a trailing `.git`.
+///
+/// Strips protocol + host and takes the final path segment, handling
+/// both remote shapes:
+///   `git@github.com:foo/bar.git` → `bar`
+///   `https://github.com/foo/bar.git` → `bar`
+///
+/// Pure-string parse — no registry lookup. Used to match a `--repo`
+/// short-name selector against a resolved repo URL.
+pub fn short_name_for(url: &str) -> &str {
+    let after_slash = url.rsplit('/').next().unwrap_or(url);
+    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
+    after_colon.trim_end_matches(".git")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_name_for_handles_ssh_and_https() {
+        assert_eq!(short_name_for("git@github.com:spinyfin/mono.git"), "mono");
+        assert_eq!(
+            short_name_for("https://github.com/spinyfin/mono.git"),
+            "mono"
+        );
+        assert_eq!(short_name_for("https://github.com/foo/bar"), "bar");
+    }
 
     #[test]
     fn parse_github_owner_repo_handles_every_shape() {

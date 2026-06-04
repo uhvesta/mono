@@ -28,6 +28,7 @@ use serde::Serialize;
 mod buildkite_release;
 mod repo_resolution;
 use boss_github as github_app;
+use boss_github::repo_slug::short_name_for;
 
 #[derive(Debug, Parser)]
 #[command(name = "boss", about = "Boss work CLI")]
@@ -7802,14 +7803,6 @@ impl RepoSelector {
     }
 }
 
-/// Match `short_name_for` from the design — basename of the path
-/// minus `.git`. Pure string parse, no registry lookup.
-fn short_name_for(url: &str) -> &str {
-    let after_slash = url.rsplit('/').next().unwrap_or(url);
-    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
-    after_colon.trim_end_matches(".git")
-}
-
 /// Resolve a task / chore's effective repo: its own override wins;
 /// fall back to the product's default. Used by the `--repo` filter
 /// so `--repo nimbus` finds inherited matches too (design R10 / Q3).
@@ -8911,8 +8904,7 @@ mod tests {
         decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
         format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
         lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
-        short_name_for, split_shake_report, status_vocab, validate_github_pr_url,
-        with_display_status,
+        split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc,
@@ -10420,19 +10412,6 @@ mod tests {
             }
             _ => panic!("expected task list command"),
         }
-    }
-
-    #[test]
-    fn short_name_for_handles_ssh_and_https() {
-        assert_eq!(
-            short_name_for("git@github.com:spinyfin/mono.git"),
-            "mono"
-        );
-        assert_eq!(
-            short_name_for("https://github.com/spinyfin/mono.git"),
-            "mono"
-        );
-        assert_eq!(short_name_for("https://github.com/foo/bar"), "bar");
     }
 
     #[test]

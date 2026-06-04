@@ -206,18 +206,6 @@ pub(crate) fn enforce_task_repo_invariant(
     }
 }
 
-/// Per design Q3 (`tools/boss/docs/designs/multi-repo-work-modeling.md`):
-/// strip protocol + host, take the path basename minus `.git`.
-///   `git@github.com:foo/bar.git` → `bar`
-///   `https://github.com/foo/bar.git` → `bar`
-/// Pure-string parse — no registry. Used by the CLI to match
-/// `--repo <selector>` against a resolved repo URL.
-pub fn short_name_for(url: &str) -> &str {
-    let after_slash = url.rsplit('/').next().unwrap_or(url);
-    let after_colon = after_slash.rsplit(':').next().unwrap_or(after_slash);
-    after_colon.trim_end_matches(".git")
-}
-
 /// Thin wrapper kept for the design-doc call sites until they migrate
 /// to [`canonicalize_repo_remote_url`] directly.
 pub(crate) fn canonicalize_design_doc_repo_remote_url(value: Option<String>) -> Option<String> {
