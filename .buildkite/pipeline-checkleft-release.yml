@@ -23,10 +23,14 @@
 # Mac).
 #
 # Structure: a `prepare` step (skip-logic + version + tag + GitHub Release) fans
-# out to the `linux` and `darwin` build steps. They depend only on `prepare`, so
-# they run in PARALLEL on separate agents. The concurrency_group lives on
-# `prepare` so two release runs can't create tags at once; the build steps are
-# unconstrained (each run's builds attach to that run's own release).
+# out to the `linux`, `musl`, and `darwin` build steps. They depend only on
+# `prepare`, so they run in PARALLEL on separate agents. The concurrency_group
+# lives on `prepare` so two release runs can't create tags at once; the build
+# steps are unconstrained (each run's builds attach to that run's own release).
+#
+# musl step: runs concurrently with linux/darwin; a musl failure fails the
+# release (release-blocking, not soft_fail). The musl binary ships on the GitHub
+# Release as checkleft-x86_64-unknown-linux-musl.
 
 steps:
   - label: ":mag: checkleft-release (prepare)"
@@ -43,6 +47,16 @@ steps:
   - label: ":rust: checkleft-release (linux)"
     key: "checkleft-release-linux"
     command: ".buildkite/steps/checkleft-release.sh linux"
+    depends_on: "checkleft-release-prepare"
+    agents:
+      queue: bazel-any
+      os: linux
+    retry:
+      automatic: false
+
+  - label: ":linux: checkleft-release (musl)"
+    key: "checkleft-release-musl"
+    command: ".buildkite/steps/checkleft-release.sh musl"
     depends_on: "checkleft-release-prepare"
     agents:
       queue: bazel-any

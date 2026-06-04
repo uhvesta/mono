@@ -387,25 +387,34 @@ phase_linux() {
   gnu_path="$(build_native_bazel "--define=CHECKLEFT_VERSION=${NEW_VERSION}")"
   stage_asset "${gnu_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-gnu"
 
-  # musl — now pure Bazel via //tools/checkleft:checkleft_musl.
-  # Still best-effort (non-release-blocking) but no longer depends on
-  # musl-tools or cargo being present on the agent.
-  local musl_path
-  local musl_target="//tools/checkleft:checkleft_musl"
-  log "[checkleft-release] bazel build -c opt ${musl_target}" >&2
-  if bazel build -c opt "${musl_target}" >&2; then
-    musl_path="$(bazel cquery -c opt --output=files "${musl_target}" 2>/dev/null | head -1 || true)"
-    if [[ -n "${musl_path}" && -f "${musl_path}" ]]; then
-      stage_asset "${musl_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-musl"
-    else
-      echo "[checkleft-release] WARNING: musl bazel build succeeded but binary not found; skipping"
-    fi
-  else
-    echo "[checkleft-release] WARNING: musl bazel build failed; shipping without it"
-  fi
-
   upload_release_assets
   log "[checkleft-release] linux phase done — Linux assets attached to ${NEW_TAG}"
+}
+
+phase_musl() {
+  [[ "$(uname -s)" == "Linux" ]] || die "musl phase must run on a Linux agent (got $(uname -s)); the step must target an os=linux agent (see agents: in .buildkite/pipeline-checkleft-release.yml)"
+
+  echo "[checkleft-release] agent: $(uname -a)"
+  resolve_release_tag
+
+  CUR_VERSION="$(grep -E '^version = "' "${CARGO_TOML}" | head -1 | sed -E 's/^version = "(.*)"/\1/')"
+  apply_version_edits
+
+  export CHECKLEFT_VERSION="${NEW_VERSION}"
+
+  log "[checkleft-release] building musl asset for ${NEW_TAG}"
+  STAGE="$(mktemp -d)"
+
+  local musl_target="//tools/checkleft:checkleft_musl"
+  log "[checkleft-release] bazel build -c opt --define=CHECKLEFT_VERSION=${NEW_VERSION} ${musl_target}"
+  bazel build -c opt "--define=CHECKLEFT_VERSION=${NEW_VERSION}" "${musl_target}"
+  local musl_path
+  musl_path="$(bazel cquery -c opt "--define=CHECKLEFT_VERSION=${NEW_VERSION}" --output=files "${musl_target}" 2>/dev/null | head -1 || true)"
+  [[ -n "${musl_path}" && -f "${musl_path}" ]] || die "musl build succeeded but binary not found; check bazel cquery output for ${musl_target}"
+
+  stage_asset "${musl_path}" "${ASSET_PREFIX}-x86_64-unknown-linux-musl"
+  upload_release_assets
+  log "[checkleft-release] musl phase done — musl asset attached to ${NEW_TAG}"
 }
 
 phase_darwin() {
@@ -453,8 +462,9 @@ main() {
   case "${phase}" in
     prepare) phase_prepare ;;
     linux)   phase_linux ;;
+    musl)    phase_musl ;;
     darwin)  phase_darwin ;;
-    *) die "usage: $0 <prepare|linux|darwin>" ;;
+    *) die "usage: $0 <prepare|linux|musl|darwin>" ;;
   esac
 }
 
