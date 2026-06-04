@@ -1430,6 +1430,7 @@ private struct WorkBoardCardItem: View {
     @ObservedObject var model: ChatViewModel
     @ObservedObject var liveStates: LiveWorkerStateStore
     @Environment(\.openWindow) private var openWindow
+    @State private var showingDeleteConfirmation = false
 
     var body: some View {
         let liveState: WorkerLiveState? = {
@@ -1593,6 +1594,10 @@ private struct WorkBoardCardItem: View {
                 Button("View transcripts…") {
                     openWindow(id: "transcript-viewer", value: TranscriptViewerRef(taskId: task.id))
                 }
+                Divider()
+                Button("Delete", role: .destructive) {
+                    showingDeleteConfirmation = true
+                }
             }
             .popover(
                 isPresented: Binding(
@@ -1616,6 +1621,18 @@ private struct WorkBoardCardItem: View {
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
+        .confirmationDialog(
+            "Delete \"\(task.name)\"?",
+            isPresented: $showingDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                model.deleteWorkItem(id: task.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This is a soft-delete and can be recovered with: boss task restore")
+        }
     }
 
     // Emits a debug log entry capturing the full doc-link render state for

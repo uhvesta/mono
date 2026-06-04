@@ -1355,6 +1355,10 @@ final class ChatViewModel: ObservableObject {
         engine.sendDeleteWorkItem(id: task.id)
     }
 
+    func deleteWorkItem(id: String) {
+        engine.sendDeleteWorkItem(id: id)
+    }
+
     func moveSelectedTask(offset: Int) {
         guard let task = selectedTask,
               !task.isChore,
