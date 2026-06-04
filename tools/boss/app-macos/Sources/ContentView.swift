@@ -5091,7 +5091,7 @@ private struct UpdateBadgePopover: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
                 }
-                .frame(maxHeight: 220)
+                .frame(minHeight: 120, maxHeight: 320)
 
                 Divider()
             }
