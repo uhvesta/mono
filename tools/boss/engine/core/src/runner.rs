@@ -2908,7 +2908,7 @@ mod compose_prompt_tests {
                 .name("My Project")
                 .description("")
                 .goal("")
-                .status("active")
+                .status(crate::work::ProjectStatus::Active)
                 .slug("my-project")
                 .created_at("2026-05-15T00:00:00Z")
                 .updated_at("2026-05-15T00:00:00Z")

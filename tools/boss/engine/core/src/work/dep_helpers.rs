@@ -110,7 +110,7 @@ pub(crate) fn resolve_dependency_edge(
                 relation: relation.to_owned(),
                 kind: "project".to_owned(),
                 name: project.name,
-                status: project.status,
+                status: project.status.to_string(),
             });
         }
     } else if peer_id.starts_with("task_")

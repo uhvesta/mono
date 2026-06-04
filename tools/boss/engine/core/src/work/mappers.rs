@@ -68,6 +68,7 @@ pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
 }
 
 pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
+    let status_raw: String = row.get(6)?;
     Ok(Project {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -75,7 +76,7 @@ pub(crate) fn map_project(row: &Row<'_>) -> rusqlite::Result<Project> {
         slug: row.get(3)?,
         description: row.get(4)?,
         goal: row.get(5)?,
-        status: row.get(6)?,
+        status: parse_text_column(6, &status_raw)?,
         priority: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,

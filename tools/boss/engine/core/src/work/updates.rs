@@ -62,20 +62,23 @@ impl WorkDb {
         let tx = conn.transaction()?;
         let mut project =
             query_project(&tx, id).require("project", id)?;
-        let previous_status = project.status.clone();
+        let previous_status = project.status;
         let status_changed = patch.status.is_some();
 
         apply_text_patch(&mut project.name, patch.name);
         apply_text_patch(&mut project.description, patch.description);
         apply_text_patch(&mut project.goal, patch.goal);
-        apply_text_patch(&mut project.status, patch.status);
+        if let Some(status_str) = patch.status {
+            project.status = status_str.parse::<ProjectStatus>()
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
         apply_text_patch(&mut project.priority, patch.priority);
         project.slug =
             unique_project_slug_for_update(&tx, &project.product_id, id, &slugify(&project.name))?;
         project.updated_at = now_string();
 
         if status_changed {
-            refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &project.status)?;
+            refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), project.status.as_str())?;
         }
         let actor_stamp = if status_changed && previous_status != project.status {
             actor
@@ -94,7 +97,7 @@ impl WorkDb {
                 project.slug,
                 project.description,
                 project.goal,
-                project.status,
+                project.status.as_str(),
                 project.priority,
                 project.updated_at,
                 actor_stamp,
@@ -105,7 +108,7 @@ impl WorkDb {
             cascade_dependents_after_prereq_status_change(
                 &tx,
                 id,
-                &project.status,
+                project.status.as_str(),
                 &project.updated_at,
             )?;
         }

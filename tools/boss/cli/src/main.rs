@@ -1400,7 +1400,7 @@ struct ProjectListArgs {
 
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
-    status: Vec<ProjectStatus>,
+    status: Vec<ProjectStatusArg>,
 
     /// Case-insensitive substring match against name and description.
     #[arg(long = "match")]
@@ -1458,7 +1458,7 @@ struct ProjectUpdateArgs {
     goal: Option<String>,
 
     #[arg(long)]
-    status: Option<ProjectStatus>,
+    status: Option<ProjectStatusArg>,
 
     #[arg(long)]
     priority: Option<ProjectPriority>,
@@ -2069,7 +2069,7 @@ struct ProjectMoveArgs {
     selector: String,
 
     #[arg(long = "to")]
-    target: ProjectStatus,
+    target: ProjectStatusArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2107,7 +2107,7 @@ enum ProductStatus {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum ProjectStatus {
+enum ProjectStatusArg {
     Planned,
     Active,
     Blocked,
@@ -2257,7 +2257,7 @@ impl ProductStatus {
     }
 }
 
-impl ProjectStatus {
+impl ProjectStatusArg {
     fn as_str(self) -> &'static str {
         match self {
             Self::Planned => "planned",
@@ -2983,7 +2983,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             let project =
                 resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
-                status: Some(ProjectStatus::Archived.as_str().to_owned()),
+                status: Some(ProjectStatusArg::Archived.as_str().to_owned()),
                 ..WorkItemPatch::default()
             };
             let archived =
@@ -7864,7 +7864,7 @@ fn apply_task_list_filters(
 
 fn apply_project_list_filters(
     items: Vec<Project>,
-    statuses: &[ProjectStatus],
+    statuses: &[ProjectStatusArg],
     match_term: Option<&str>,
     ids: &[String],
     limit: Option<usize>,
@@ -7976,7 +7976,7 @@ fn print_projects_table(projects: &[Project], with_primary_id: bool) {
         }
         row.push(project.slug.clone());
         row.push(project.name.clone());
-        row.push(project.status.clone());
+        row.push(project.status.to_string());
         row.push(project.priority.clone());
         row.push(project.goal.clone());
         table.add_row(row);
@@ -8906,7 +8906,7 @@ mod tests {
     use super::{
         AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem,
         ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction,
-        ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, RunContext,
+        ProductCommand, ProductStatus, ProjectCommand, ProjectStatusArg, RepoSelector, RunContext,
         TaskCommand, TaskStatusArg, classify_bind_pr, classify_lint_finding, compile_schedule,
         decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
         format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
@@ -8915,8 +8915,8 @@ mod tests {
         with_display_status,
     };
     use boss_protocol::{
-        Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
-        TaskKind, TaskStatus, WorkItem,
+        Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc,
+        ResolvedDesignDocKind, Task, TaskKind, TaskStatus, WorkItem,
     };
 
     #[test]
@@ -9166,7 +9166,7 @@ mod tests {
             .slug("n")
             .description("")
             .goal("")
-            .status("planned")
+            .status(ProjectStatus::Planned)
             .created_at("")
             .updated_at("")
             .build();
@@ -9348,7 +9348,7 @@ mod tests {
             } => {
                 assert_eq!(args.selector, "work-cli");
                 assert_eq!(args.product.as_deref(), Some("boss"));
-                assert!(matches!(args.target, ProjectStatus::Done));
+                assert!(matches!(args.target, ProjectStatusArg::Done));
             }
             _ => panic!("expected project move command"),
         }
@@ -9363,9 +9363,9 @@ mod tests {
 
     #[test]
     fn project_status_archived_serializes_to_archived() {
-        assert_eq!(ProjectStatus::Archived.as_str(), "archived");
-        assert_eq!(ProjectStatus::Done.as_str(), "done");
-        assert_eq!(ProjectStatus::Planned.as_str(), "planned");
+        assert_eq!(ProjectStatusArg::Archived.as_str(), "archived");
+        assert_eq!(ProjectStatusArg::Done.as_str(), "done");
+        assert_eq!(ProjectStatusArg::Planned.as_str(), "planned");
     }
 
     #[test]
@@ -9901,7 +9901,7 @@ mod tests {
             slug: slug.to_owned(),
             description: String::new(),
             goal: String::new(),
-            status: "planned".to_owned(),
+            status: ProjectStatus::Planned,
             priority: "medium".to_owned(),
             created_at: String::new(),
             updated_at: String::new(),

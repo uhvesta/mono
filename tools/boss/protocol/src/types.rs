@@ -1832,6 +1832,56 @@ impl std::str::FromStr for EffortLevel {
 
 
 
+/// Typed status for a [`Project`]. The five values mirror the
+/// free-form strings that were stored before this enum was introduced
+/// (`planned`, `active`, `blocked`, `done`, `archived`); the mapping
+/// is 1:1 and round-trips through serde and `FromStr`/`Display`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectStatus {
+    Planned,
+    Active,
+    Blocked,
+    Done,
+    Archived,
+}
+
+impl ProjectStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectStatus::Planned => "planned",
+            ProjectStatus::Active => "active",
+            ProjectStatus::Blocked => "blocked",
+            ProjectStatus::Done => "done",
+            ProjectStatus::Archived => "archived",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProjectStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "planned" => Ok(ProjectStatus::Planned),
+            "active" => Ok(ProjectStatus::Active),
+            "blocked" => Ok(ProjectStatus::Blocked),
+            "done" => Ok(ProjectStatus::Done),
+            "archived" => Ok(ProjectStatus::Archived),
+            other => Err(format!(
+                "unknown project status `{other}`; expected one of: planned, active, blocked, done, archived"
+            )),
+        }
+    }
+}
+
+
+
 /// One row in the unified `boss engine attempts list` v2 result —
 /// design Phase 11 #36. A small projection across three attempt
 /// subsystems (`conflict_resolutions`, `rebase_attempts`,
@@ -2168,7 +2218,7 @@ pub struct Project {
     pub priority: String,
 
     pub slug: String,
-    pub status: String,
+    pub status: ProjectStatus,
     pub updated_at: String,
     /// Branch the design doc lives on. `None` → inherit from the
     /// product's docs branch (or `"main"` if no per-product default).
@@ -3391,7 +3441,7 @@ mod tests {
             "slug": "demo",
             "description": "",
             "goal": "",
-            "status": "todo",
+            "status": "planned",
             "priority": "medium",
             "created_at": "2026-05-11T00:00:00Z",
             "updated_at": "2026-05-11T00:00:00Z",

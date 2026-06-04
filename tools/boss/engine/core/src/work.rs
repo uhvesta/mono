@@ -80,7 +80,7 @@ pub use boss_protocol::{
     MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED,
     MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
     PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
+    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
     RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
     ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime,
     TaskStatus,

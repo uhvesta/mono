@@ -2072,7 +2072,7 @@ fn noop_status_patch_preserves_last_status_actor_for_project() {
     }
 
     // No-op status patch: project default status is 'planned'.
-    let current_status = project.status.clone();
+    let current_status = project.status.to_string();
     db.update_work_item(
         &project.id,
         WorkItemPatch {

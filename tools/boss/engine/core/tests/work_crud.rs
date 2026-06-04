@@ -14,10 +14,10 @@ use boss_protocol::{
     AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
     FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
-    Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskStatus, TopicEventPayload,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
-    work_product_topic,
+    Product, Project, ProjectDesignDocState, ProjectStatus, RemoveDependencyInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind,
+    TaskStatus, TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch, work_product_topic,
 };
 
 mod watcher_support;
@@ -194,7 +194,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
         )
         .await?,
     )?;
-    assert_eq!(archived_project.status, "archived");
+    assert_eq!(archived_project.status, ProjectStatus::Archived);
 
     let archived_product = expect_product(
         update_work_item(
