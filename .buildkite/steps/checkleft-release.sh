@@ -55,6 +55,7 @@ STAGE=""
 TAG_PUSHED=0
 LOCAL_TAG_CREATED=0
 NEW_TAG=""
+NOTES_FILE=""
 
 # checkleft-affecting paths for change-detection. Mirrors boss-release.sh's
 # scoping: the binary's source, the release script, and the pipeline wiring.
@@ -278,6 +279,7 @@ cleanup() {
     echo "[checkleft-release] cleaning up local tag ${NEW_TAG} after push failure" >&2
     git tag -d "${NEW_TAG}" 2>/dev/null || true
   fi
+  [[ -n "${NOTES_FILE}" ]] && rm -f "${NOTES_FILE}"
   [[ -n "${STAGE}" ]] && rm -rf "${STAGE}"
   return 0
 }
@@ -333,18 +335,31 @@ phase_prepare() {
     || die "tag push rejected for ${NEW_TAG}; the agent's git credentials may not be able to push to ${REPO}."
   TAG_PUSHED=1
 
-  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
-  # Explicitly anchor the changelog range to the previous checkleft-v* tag so
-  # that --generate-notes doesn't fall back to whatever tag is globally newest
-  # (which may belong to a different product like boss-v*).  When LAST_TAG is
-  # empty (first-ever checkleft release) we omit the flag and let GitHub default.
-  local notes_start_arg=()
+  log "[checkleft-release] generating release notes for ${NEW_TAG}"
+  NOTES_FILE="$(mktemp /tmp/checkleft-release-notes-XXXXXX.md)"
   if [[ -n "${LAST_TAG}" ]]; then
-    notes_start_arg=(--notes-start-tag "${LAST_TAG}")
+    # Ensure full history for git log — a shallow clone silently truncates the
+    # commit range returned by changelog, including on manual (ui/api) triggers
+    # where the change-detection unshallow inside should_skip() is skipped.
+    if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+      echo "[checkleft-release] unshallowing repo for changelog"
+      git fetch --unshallow origin 2>/dev/null || true
+    fi
+    bin/changelog \
+      --project tools/checkleft/PROJECT.yaml \
+      --from "${LAST_TAG}" \
+      --to "${NEW_TAG}" \
+      --repo "${REPO}" \
+      --enrich \
+      > "${NOTES_FILE}"
+  else
+    printf 'Initial checkleft release.\n' > "${NOTES_FILE}"
   fi
+
+  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
   gh release create "${NEW_TAG}" --repo "${REPO}" \
-    --title "checkleft ${NEW_VERSION}" --generate-notes \
-    "${notes_start_arg[@]}"
+    --title "checkleft ${NEW_VERSION}" \
+    --notes-file "${NOTES_FILE}"
 
   # Hand the tag to the parallel build phases.
   meta_set "${META_TAG_KEY}" "${NEW_TAG}"

@@ -183,16 +183,23 @@ echo "[boss-release] version: ${VERSION}  artifact: ${ARTIFACT}"
 # Push the release tag to the remote BEFORE building so that
 # workspace-status.sh can resolve it via `git describe --exact-match` and
 # stamp the binary with the clean "1.0.N" version string.
-# Register a trap so a failed build cleans up the leaked tag.
 TAG_PUSHED=0
-_cleanup_tag() {
-  if (( TAG_PUSHED == 1 )); then
-    echo "[boss-release] build failed after tagging — deleting remote tag ${VERSION}"
+NOTES_FILE=""
+WORK_DIR=""
+RELEASE_CREATED=0
+
+# Single EXIT trap — handles every failure path after the tag is pushed.
+# Mirrors checkleft-release.sh's TAG_PUSHED-guarded cleanup pattern.
+_cleanup() {
+  [[ -n "${NOTES_FILE}" ]] && rm -f "${NOTES_FILE}"
+  if [[ "${TAG_PUSHED}" == "1" && "${RELEASE_CREATED}" == "0" ]]; then
+    echo "[boss-release] release not completed — deleting leaked remote tag ${VERSION}" >&2
     git push origin ":refs/tags/${VERSION}" 2>/dev/null || true
     git tag -d "${VERSION}" 2>/dev/null || true
   fi
+  [[ -n "${WORK_DIR}" ]] && rm -rf "${WORK_DIR}"
 }
-trap '_cleanup_tag' ERR
+trap '_cleanup' EXIT
 
 log "[boss-release] creating and pushing release tag ${VERSION} (before build)"
 git tag "${VERSION}" HEAD
@@ -276,16 +283,12 @@ fi
 [[ -f "${ZIP_PATH}" ]] || die "Boss.zip not found at discovered path: ${ZIP_PATH}"
 echo "[boss-release] Boss.zip: ${ZIP_PATH}"
 
-# The build succeeded; cancel the tag-cleanup trap.
-trap - ERR
-
 # ── prepare the pre-zipped artifact ────────────────────────────────────────────
 # The macos_application rule pre-zips the bundle, so we just rename it to the
 # release version and prepare it for publication.
 
 log "[boss-release] preparing ${ARTIFACT}"
 WORK_DIR=$(mktemp -d -t boss-release)
-trap 'rm -rf "${WORK_DIR}"' EXIT
 
 cp "${ZIP_PATH}" "${WORK_DIR}/${ARTIFACT}"
 echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
@@ -294,20 +297,33 @@ echo "[boss-release] artifact: $(du -sh "${WORK_DIR}/${ARTIFACT}" | cut -f1)"
 # Split into three independent steps to isolate failure modes and enable
 # selective retry on the (flaky) asset-upload step.
 
-log "[boss-release] creating GitHub Release ${VERSION}"
-# Explicitly anchor the changelog range to the previous boss-v* tag so that
-# --generate-notes doesn't fall back to whatever tag is globally newest (which
-# may belong to a different product like checkleft-v*).  When LAST_TAG is
-# empty (first-ever boss release) we omit the flag and let GitHub default.
-NOTES_START_ARG=()
+log "[boss-release] generating release notes for ${VERSION}"
+NOTES_FILE="$(mktemp /tmp/boss-release-notes-XXXXXX.md)"
 if [[ -n "${LAST_TAG}" ]]; then
-  NOTES_START_ARG=(--notes-start-tag "${LAST_TAG}")
+  # Ensure full history for git log — a shallow clone silently truncates the
+  # commit range returned by changelog, including on manual (ui/api) triggers
+  # where the change-detection unshallow is skipped.
+  if git rev-parse --is-shallow-repository 2>/dev/null | grep -q true; then
+    echo "[boss-release] unshallowing repo for changelog"
+    git fetch --unshallow origin 2>/dev/null || true
+  fi
+  bin/changelog \
+    --project tools/boss/PROJECT.yaml \
+    --from "${LAST_TAG}" \
+    --to "${VERSION}" \
+    --repo spinyfin/mono \
+    --enrich \
+    > "${NOTES_FILE}"
+else
+  printf 'Initial Boss release.\n' > "${NOTES_FILE}"
 fi
+
+log "[boss-release] creating GitHub Release ${VERSION}"
 gh release create "${VERSION}" \
   --repo spinyfin/mono \
   --title "Boss ${VERSION#boss-v}" \
-  --generate-notes \
-  "${NOTES_START_ARG[@]}"
+  --notes-file "${NOTES_FILE}"
+RELEASE_CREATED=1
 
 log "[boss-release] uploading asset with retry"
 UPLOAD_OK=0

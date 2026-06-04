@@ -24,3 +24,7 @@ bazel() {
     --config="ci-${OS_TYPE}" \
     "$@"
 }
+
+echo "+++ installing repobin tools into bin/"
+bazel build //tools/repobin:repobin
+./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
