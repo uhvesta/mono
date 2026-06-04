@@ -2299,3 +2299,283 @@ fn redispatch_preserves_investigation_execution_kind() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// RECURRING REGRESSION LOCK (T756 / T926 / T928 / T1205 / T1310): an
+/// investigation task whose worker has opened its doc PR must expose a
+/// doc link on the kanban card. Post-T928 the card derives that link
+/// *live* from the task's `pr_url` (T926's stored doc-pointer was ripped
+/// out — `investigation_detector.rs` and the `doc_url` / `investigation_doc_*`
+/// columns are gone), so the single load-bearing invariant is:
+///
+///   investigation worker opens a PR  ⟹  `pr_url` is stamped on the TASK
+///   and that task is delivered by `get_work_tree`.
+///
+/// This is the source the macOS card reads to render the link. It kept
+/// regressing because the stamping depends on a chain of execution-kind-keyed
+/// steps and nothing asserted the end result. This test drives the standard
+/// dispatch chain end to end and pins the invariant.
+#[test]
+fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
+    let path = temp_db_path("investigation-doc-link-standard");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let investigation = db
+        .create_investigation(boss_protocol::CreateInvestigationInput {
+            product_id: product.id.clone(),
+            autostart: true,
+            force_duplicate: false,
+            name: "Feasibility: source checkleft from a prebuilts repo".to_owned(),
+            created_via: None,
+            description: None,
+            effort_level: None,
+            model_override: None,
+            priority: None,
+            project_id: None,
+            repo_remote_url: None,
+        })
+        .unwrap();
+
+    let exec = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(investigation.id.clone())
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        exec.kind,
+        ExecutionKind::InvestigationImplementation,
+        "dispatch must keep the investigation kind so the PR-association path runs"
+    );
+
+    // Drive the execution live, like a real dispatch, so the worker's
+    // PR-open signal is accepted.
+    db.start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+        .unwrap();
+
+    // The worker opens the doc PR and stops. This is the PR-open signal
+    // that stamps `pr_url` on the task — the doc-link source.
+    let pr = "https://github.com/spinyfin/mono/pull/1324";
+    db.record_worker_pr_completion(&exec.id, pr, None, WorkerPrCompletionTarget::InReview)
+        .expect("PR completion must succeed")
+        .expect("execution must not already be terminal");
+
+    // The kanban reads `get_work_tree`; the investigation must arrive in
+    // the `tasks` array carrying its `pr_url` (the live doc-link source)
+    // and sitting in Review.
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let found = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == investigation.id)
+        .expect("investigation must be delivered in the work tree's tasks array");
+    assert_eq!(found.kind, TaskKind::Investigation);
+    assert_eq!(found.status, "in_review", "an open doc PR moves the card to Review");
+    assert_eq!(
+        found.pr_url.as_deref(),
+        Some(pr),
+        "the card derives its doc link from this pr_url — it MUST be present, \
+         or the Review-lane doc affordance silently disappears (the recurring bug)"
+    );
+
+    // Wire-format assertion: verify that the pr_url value actually appears in
+    // the JSON serialization of the work tree — the IPC payload the macOS app
+    // receives. The existing assertion above checks the Rust struct; this
+    // checks the wire path so a serde annotation that silently drops pr_url
+    // (e.g. a mistaken skip_serializing_if) would also fail here. This is the
+    // T1310 gap-hunt addition: if this passes but the live card shows no link,
+    // the gap is in the app's IPC reception (parseTask) or render path.
+    let tasks_json = serde_json::to_value(&tree.tasks)
+        .expect("work tree tasks must be JSON-serializable");
+    let inv_json = tasks_json
+        .as_array()
+        .expect("tasks is an array")
+        .iter()
+        .find(|t| t["id"].as_str() == Some(investigation.id.as_str()))
+        .expect("investigation must appear in the serialized tasks array");
+    assert_eq!(
+        inv_json["pr_url"].as_str(),
+        Some(pr),
+        "pr_url must be present and non-null in the JSON wire payload — \
+         if this passes but the macOS card shows no link, the gap is in \
+         parseTask() or the render path, not in get_work_tree delivery"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Recurrence lock, redispatch variant (the T1205 / #1257 path): an
+/// investigation that was dispatched, abandoned, then redispatched must
+/// STILL expose a derived doc link once its PR opens. T1205 fixed the
+/// execution kind on redispatch, but only asserted the kind — not that a
+/// doc link ultimately materialises. This drives the abandon-and-redispatch
+/// path all the way through PR completion and pins the end result, so a
+/// future regression anywhere downstream of the kind fix is caught.
+#[test]
+fn redispatched_investigation_open_pr_exposes_derived_doc_link() {
+    let path = temp_db_path("investigation-doc-link-redispatch");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let investigation = db
+        .create_investigation(boss_protocol::CreateInvestigationInput {
+            product_id: product.id.clone(),
+            autostart: true,
+            force_duplicate: false,
+            name: "Feasibility redispatch".to_owned(),
+            created_via: None,
+            description: None,
+            effort_level: None,
+            model_override: None,
+            priority: None,
+            project_id: None,
+            repo_remote_url: None,
+        })
+        .unwrap();
+
+    let first = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(investigation.id.clone())
+                .build(),
+        )
+        .unwrap();
+    // Original worker died → abandon-and-redispatch.
+    let redispatched = db
+        .request_execution_with_live_check(
+            RequestExecutionInput::builder()
+                .work_item_id(investigation.id.clone())
+                .build(),
+            |_| false,
+        )
+        .unwrap();
+    assert_ne!(redispatched.id, first.id, "redispatch must create a fresh execution");
+    assert_eq!(
+        redispatched.kind,
+        ExecutionKind::InvestigationImplementation,
+        "redispatch must NOT downgrade the kind, or PR association never runs"
+    );
+
+    db.start_execution_run(&redispatched.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+        .unwrap();
+    let pr = "https://github.com/spinyfin/mono/pull/1324";
+    db.record_worker_pr_completion(&redispatched.id, pr, None, WorkerPrCompletionTarget::InReview)
+        .expect("PR completion must succeed")
+        .expect("execution must not already be terminal");
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let found = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == investigation.id)
+        .expect("redispatched investigation must be delivered in the work tree");
+    assert_eq!(
+        found.pr_url.as_deref(),
+        Some(pr),
+        "a redispatched investigation's doc link must derive from pr_url just like a first dispatch"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Recurrence lock for the COLD-PATH PR detector. The on-Stop hook is the
+/// primary way `pr_url` gets stamped, but it can miss (transient `gh`
+/// failure, a Stop that never reached the engine). The merge poller's
+/// fallback sweep re-detects the PR for any execution surfaced by
+/// `list_executions_pending_pr_detection` /
+/// `list_recently_terminal_executions_pending_pr_detection`. Both queries
+/// gate on a stringly-typed `kind IN (...)` allowlist that is NOT covered
+/// by the exhaustive-enum hardening (#1266) — drop `'investigation'` from
+/// either and investigations silently stop getting a `pr_url`, so the doc
+/// link never appears. This pins `'investigation'` into both allowlists.
+#[test]
+fn cold_path_pr_detection_covers_investigations() {
+    let path = temp_db_path("investigation-doc-link-coldpath");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let investigation = db
+        .create_investigation(boss_protocol::CreateInvestigationInput {
+            product_id: product.id.clone(),
+            autostart: true,
+            force_duplicate: false,
+            name: "Feasibility cold-path".to_owned(),
+            created_via: None,
+            description: None,
+            effort_level: None,
+            model_override: None,
+            priority: None,
+            project_id: None,
+            repo_remote_url: None,
+        })
+        .unwrap();
+
+    let exec = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(investigation.id.clone())
+                .build(),
+        )
+        .unwrap();
+    // Start (task → active, workspace recorded) then park at a Stop with
+    // no PR detected: task active, pr_url NULL, execution waiting_human.
+    let (exec, run) = db
+        .start_execution_run(&exec.id, "agent", "repo", "lease", "ws", "/workspaces/ws")
+        .unwrap();
+    db.finish_execution_run(
+        &exec.id,
+        &run.id,
+        ExecutionStatus::WaitingHuman,
+        "completed",
+        None,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+
+    // Primary fallback set (waiting_human) must include the investigation.
+    let pending = db.list_executions_pending_pr_detection().unwrap();
+    assert!(
+        pending.contains(&exec.id),
+        "cold-path PR detection must cover investigations (waiting_human sweep); \
+         dropping 'investigation' from the allowlist silently kills the doc link"
+    );
+
+    // Late-PR fallback set (recently-terminal) must also include it.
+    db.mark_execution_redundant(&exec.id).unwrap();
+    let late = db
+        .list_recently_terminal_executions_pending_pr_detection(3600)
+        .unwrap();
+    assert!(
+        late.iter().any(|c| c.execution_id == exec.id),
+        "cold-path late-PR detection must cover investigations (recently-terminal sweep)"
+    );
+
+    let _ = std::fs::remove_file(path);
+}

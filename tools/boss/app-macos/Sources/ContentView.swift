@@ -1,8 +1,19 @@
 import AppKit
+import os.log
 import SwiftUI
 import UpdateCore
 
 private let workBoardColumnWidth: CGFloat = 280
+
+// Debug logger for the investigation doc-link render path. Uses .debug() so
+// it is silent in normal use; enable via Console.app subsystem filter or
+// Xcode debug console. Surfaces work_item_id, kind, pr_url value, column,
+// and whether PRURLLink will render — letting the operator identify which
+// of the three known gap sites (delivery, render, stale build) is live.
+private let kanbanDocLinkLog = Logger(
+    subsystem: "dev.spinyfin.bossmacapp",
+    category: "kanban-doc-link"
+)
 private let workBoardColumnWidthWide: CGFloat = 340
 private let workBoardColumnWidthMax: CGFloat = 420
 private let workBoardWideThreshold: CGFloat = 1400
@@ -1603,6 +1614,50 @@ private struct WorkBoardCardItem: View {
                 }
             }
         }
+        .onAppear { logDocLinkState("appeared") }
+        .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
+    }
+
+    // Emits a debug log entry capturing the full doc-link render state for
+    // this card. Gated at .debug() so it is silent in normal builds; surface
+    // via Console.app (filter subsystem "dev.spinyfin.bossmacapp", category
+    // "kanban-doc-link") or the Xcode debug console.
+    //
+    // Captured fields:
+    //   event    — what triggered the log ("appeared" or "prURL-changed")
+    //   id       — work_item_id (T-number correlates with engine logs)
+    //   kind     — task kind ("investigation", "design", …)
+    //   column   — board column the card routes to ("review", "doing", …)
+    //   prURL    — the exact pr_url value the app received from the engine
+    //              ("<nil>" = field absent/null on the wire; "empty" = "")
+    //   link     — whether PRURLLink will render ("shown" or "skipped")
+    //   skipReason — when link == "skipped", why (nil_or_empty vs none)
+    private func logDocLinkState(_ event: String) {
+        let prURLDesc: String
+        let linkShown: Bool
+        let skipReason: String
+
+        if let u = task.prURL {
+            prURLDesc = u.isEmpty ? "empty" : u
+            linkShown = !u.isEmpty
+            skipReason = u.isEmpty ? "empty_string" : "none"
+        } else {
+            prURLDesc = "<nil>"
+            linkShown = false
+            skipReason = "nil"
+        }
+
+        kanbanDocLinkLog.debug(
+            """
+            \(event, privacy: .public) \
+            id=\(task.id, privacy: .public) \
+            kind=\(task.kind, privacy: .public) \
+            column=\(column.rawValue, privacy: .public) \
+            prURL=\(prURLDesc, privacy: .public) \
+            link=\(linkShown ? "shown" : "skipped", privacy: .public) \
+            skipReason=\(skipReason, privacy: .public)
+            """
+        )
     }
 }
 

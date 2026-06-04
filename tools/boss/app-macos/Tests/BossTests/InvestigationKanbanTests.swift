@@ -183,6 +183,55 @@ final class InvestigationKanbanTests: XCTestCase {
         )
     }
 
+    /// RECURRENCE LOCK for the render surface (T1310). An investigation
+    /// whose doc PR is open arrives over the work tree as `status ==
+    /// "in_review"` carrying `prURL`. Two things must hold for the Review-lane
+    /// doc link to appear, and both have silently broken before:
+    ///   1. the card routes to the Review column (status → board column), and
+    ///   2. the card's PR-link branch (`if let prURL = task.prURL`) has a
+    ///      live, non-empty source — there is no kind gate, so it derives
+    ///      identically to a design task with the same PR.
+    /// This drives the real reception path and pins both, so a future change
+    /// that mis-routes in_review investigations OR kind-gates the PR link
+    /// fails here instead of shipping a sixth silent regression.
+    func testInReviewInvestigationRoutesToReviewAndExposesDocLink() {
+        let model = makeModel()
+        let prURL = "https://github.com/spinyfin/mono/pull/1324"
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeInvestigation(id: "T1310", status: "in_review", prURL: prURL)
+        ]))
+
+        // (1) Routes to Review — not stranded in Doing/Backlog.
+        XCTAssertTrue(
+            model.workItems(in: .review).contains { $0.id == "T1310" },
+            "an investigation with an open doc PR must land in the Review column"
+        )
+
+        // (2) The doc-link source is present and derivable. The card's
+        // PR-link branch fires on a non-empty prURL and renders this label.
+        let task = model.workTask(withID: "T1310")
+        XCTAssertEqual(task?.prURL, prURL, "the live pr_url is the sole doc-link source")
+        XCTAssertEqual(
+            pullRequestLinkLabel(for: task?.prURL ?? "", ambiguousRepoNames: []),
+            "mono#1324",
+            "the Review-lane card must expose a derived doc link, never a blank affordance"
+        )
+        XCTAssertNotNil(parseGitHubPRURL(task?.prURL ?? ""))
+    }
+
+    /// The doc link is strictly pr_url-derived: before the worker opens the
+    /// PR there is simply no source, so no link is exposed. This pins the
+    /// "live derived, never a stale stored pointer" contract (T928) — the
+    /// affordance must appear exactly when `pr_url` does, no sooner.
+    func testInvestigationWithoutPrURLExposesNoDocLink() {
+        let model = makeModel()
+        model.applyEventForTest(makeWorkTreeEvent(tasks: [
+            makeInvestigation(id: "T1310", status: "active", prURL: nil)
+        ]))
+        let task = model.workTask(withID: "T1310")
+        XCTAssertNil(task?.prURL, "no PR yet → no doc-link source → no link")
+    }
+
     // MARK: - Helpers
 
     private func makeInvestigation(

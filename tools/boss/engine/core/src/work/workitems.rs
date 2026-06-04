@@ -374,6 +374,23 @@ impl WorkDb {
             tracing::warn!(?err, "get_work_tree: failed to attach ai_reviewing flag; ignoring");
         }
 
+        // Debug: log pr_url delivery for investigation tasks so the delivered
+        // value can be compared against what the macOS card actually receives.
+        // Gated at tracing::debug!; enable with RUST_LOG=boss_engine=debug or
+        // equivalent. This surface is the engine half of the doc-link gap hunt
+        // (T1310): if pr_url is Some here but the card shows no link, the gap
+        // is in the IPC wire format or the app's reception path, not the DB.
+        for task in &tasks {
+            if task.kind == TaskKind::Investigation {
+                tracing::debug!(
+                    task_id = %task.id,
+                    status = %task.status,
+                    pr_url = ?task.pr_url,
+                    "get_work_tree: investigation task delivery"
+                );
+            }
+        }
+
         Ok(WorkTree {
             product,
             projects,
