@@ -57,6 +57,29 @@ pub enum Stage {
     /// Worker pool returned a free slot (or skipped because every
     /// slot was busy).
     WorkerClaimed,
+    /// The dispatch picked the host this execution will run on (and
+    /// built its host adapter). Emitted between `worker_claimed` and
+    /// `cube_repo_ensured` to close a silent gap: before this stage
+    /// existed, the work-item resolution, host pick, and adapter build
+    /// that happen right after a claim produced NO event, so when any
+    /// of them failed — `no_eligible_host`, `host_adapter_unavailable`,
+    /// or an unresolved work item — the per-execution timeline went
+    /// silent after `worker_claimed` and the stall watchdog reaped the
+    /// execution ~30s later mislabelling `stalled_stage="worker_claimed"`
+    /// (see the automation-pool stall, 2026-06-03). `outcome=ok` carries
+    /// the chosen `host_id` in `details`; `outcome=error` carries a
+    /// `reason` (`work_item_unresolved` / `no_eligible_host` /
+    /// `host_adapter_unavailable`) so a diagnose verb names the real
+    /// blocker instead of pointing at the claim.
+    HostSelected,
+    /// Engine is about to call `cube repo ensure`. Emitted *before* the
+    /// subprocess (same rationale as `cube_workspace_lease_attempted`):
+    /// `cube repo ensure` on a cold/large repo can run for tens of
+    /// seconds, and if it exceeds the `worker_claimed` stall threshold
+    /// before returning, the watchdog would otherwise blame the claim.
+    /// With this marker the stall is attributed to the repo-ensure
+    /// subprocess. `details` carries the origin URL and the timeout.
+    CubeRepoEnsureAttempted,
     /// `cube repo ensure` returned a repo handle.
     CubeRepoEnsured,
     /// Engine is about to call `cube workspace lease`. Emitted *before*
@@ -181,6 +204,8 @@ impl Stage {
             Stage::StatusTransition => "status_transition",
             Stage::RequestRecorded => "request_recorded",
             Stage::WorkerClaimed => "worker_claimed",
+            Stage::HostSelected => "host_selected",
+            Stage::CubeRepoEnsureAttempted => "cube_repo_ensure_attempted",
             Stage::CubeRepoEnsured => "cube_repo_ensured",
             Stage::CubeWorkspaceLeaseAttempted => "cube_workspace_lease_attempted",
             Stage::CubeWorkspaceLeased => "cube_workspace_leased",

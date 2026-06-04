@@ -2085,9 +2085,41 @@ impl ExecutionCoordinator {
             }
         }
 
-        let work_item = self
+        let work_item = match self
             .resolve_execution_work_item(execution)
-            .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))?;
+            .with_context(|| format!("failed to resolve work item {}", execution.work_item_id))
+        {
+            Ok(work_item) => work_item,
+            Err(err) => {
+                // Previously a bare `?`: the execution returned to the
+                // drain loop with no dispatch event and no start-failure
+                // record, so it sat at `worker_claimed` until the stall
+                // watchdog reaped it ~30s later. Emit a terminal
+                // `host_selected:error` so the timeline names the blocker
+                // and the watchdog stops re-flagging it, then record the
+                // start failure so the row flips out of `worker_claimed`
+                // immediately.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({ "reason": "work_item_unresolved" })),
+                    )
+                    .await;
+                self.record_start_failure(
+                    Arc::clone(self),
+                    execution,
+                    worker_id,
+                    None,
+                    "work_item_unresolved",
+                    "Could not resolve work item for execution",
+                    &err,
+                )?;
+                return Err(err);
+            }
+        };
         let task = execution_task_summary(execution, &work_item);
 
         // Host selection (distributed-execution PR3): pick the host this
@@ -2099,6 +2131,20 @@ impl ExecutionCoordinator {
         let selected_host = match self.select_host_for_execution(execution, &work_item) {
             Ok(host) => host,
             Err(err) => {
+                // No event was emitted here before, so a `no_eligible_host`
+                // failure was invisible in the per-execution timeline — the
+                // watchdog reaped it as a `worker_claimed` stall. Emit a
+                // terminal `host_selected:error` so the blocker is named in
+                // dispatch.jsonl before recording the start failure.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({ "reason": "no_eligible_host" })),
+                    )
+                    .await;
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -2114,6 +2160,21 @@ impl ExecutionCoordinator {
         let adapter = match self.host_adapter_provider.adapter_for(&selected_host).await {
             Ok(adapter) => adapter,
             Err(err) => {
+                // Same silent-gap fix as the host-selection branch above:
+                // a host was chosen but its adapter could not be built
+                // (e.g. SSH unreachable). Make it observable + terminal.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "reason": "host_adapter_unavailable",
+                                "host_id": selected_host.id.clone(),
+                            })),
+                    )
+                    .await;
                 self.record_start_failure(
                     Arc::clone(self),
                     execution,
@@ -2126,6 +2187,17 @@ impl ExecutionCoordinator {
                 return Err(err);
             }
         };
+        // Host chosen and adapter ready: emit the success milestone so the
+        // claimed -> repo-ensure handoff is no longer a blind spot in the
+        // timeline (closes the gap that hid the automation-pool stall).
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_details(serde_json::json!({ "host_id": selected_host.id.clone() })),
+            )
+            .await;
         tracing::info!(
             execution_id = %execution.id,
             work_item_id = %execution.work_item_id,
@@ -2137,6 +2209,27 @@ impl ExecutionCoordinator {
         // `cube_command` is reproducible from a terminal: a bare resolver
         // slug goes positionally (`repo ensure <name>`), a URL via `--origin`.
         let ensure_args = crate::repo_slug::repo_ensure_args(&execution.repo_remote_url);
+        // Record the attempt *before* the subprocess, mirroring
+        // `cube_workspace_lease_attempted`. `cube repo ensure` on a cold
+        // repo can outrun the `worker_claimed` stall threshold; with this
+        // marker the watchdog attributes such a stall to the ensure
+        // subprocess instead of the (already-completed) worker claim.
+        self.dispatch_events
+            .emit(
+                DispatchEvent::new(
+                    Stage::CubeRepoEnsureAttempted,
+                    DispatchOutcome::Ok,
+                    &execution.id,
+                )
+                .with_work_item(&execution.work_item_id)
+                .with_worker(worker_id)
+                .with_cube_invocation(adapter.command_repr(&ensure_args))
+                .with_details(serde_json::json!({
+                    "repo_remote_url": execution.repo_remote_url,
+                    "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                })),
+            )
+            .await;
         let repo = match tokio::time::timeout(
             CUBE_REPO_ENSURE_TIMEOUT,
             adapter.ensure_repo(&execution.repo_remote_url),
@@ -4818,6 +4911,101 @@ mod tests {
         );
     }
 
+    /// The `no_eligible_host` pre-start failure used to emit NO dispatch
+    /// event, so the per-execution timeline went silent after
+    /// `worker_claimed` and the stall watchdog mislabelled it a
+    /// `worker_claimed` stall ~30s later (the exact shape that hid the
+    /// automation-pool stall). It must now emit a terminal
+    /// `host_selected:error` carrying the reason, so the blocker is named
+    /// in dispatch.jsonl and — because the watchdog treats any `error`
+    /// outcome as terminal — it is never re-flagged as a stall.
+    #[tokio::test]
+    async fn no_eligible_host_emits_terminal_host_selected_error_event() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        db.add_host("zakalwe", "user@zakalwe", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Pinned to disabled".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        db.set_execution_pinned_host(&execution.id, Some("zakalwe"))
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker available");
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
+        assert!(result.is_err(), "no eligible host must fail the dispatch");
+
+        let events = recording.events_for(&execution.id).await;
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .unwrap_or_else(|| panic!("expected a host_selected event; got {events:#?}"));
+        assert_eq!(
+            host_selected.outcome, "error",
+            "no_eligible_host must surface as host_selected:error",
+        );
+        assert_eq!(
+            host_selected
+                .details
+                .get("reason")
+                .and_then(|v| v.as_str()),
+            Some("no_eligible_host"),
+            "host_selected:error must name the blocker reason",
+        );
+        assert!(
+            host_selected.error_message.is_some(),
+            "host_selected:error must carry the ineligibility detail",
+        );
+        // Terminal for the stall watchdog (any error outcome is terminal),
+        // so the silent `worker_claimed` stall can never re-present.
+        assert!(
+            crate::dispatch_reader::is_terminal_event(host_selected),
+            "host_selected:error must be a terminal dispatch event",
+        );
+        // The failure short-circuited before any cube repo work.
+        assert_eq!(cube.ensure_calls.lock().await.len(), 0);
+    }
+
     /// `cube_default_workspace_root_for_test` mirrors the production
     /// helper so tests can construct a `workspace_root` value that
     /// `workspace_root_is_cube_default` would accept, without
@@ -5933,6 +6121,119 @@ mod tests {
              got `{status}` — the skip-demote guard for pr_review is absent or broken",
         );
     }
+
+    /// Regression for the automation-pool dispatch stall (2026-06-03):
+    /// an `automation_triage` execution must drive PAST `worker_claimed`
+    /// — through host selection and the cube repo-ensure handoff — to the
+    /// `cube_workspace_lease_attempted` stage, exactly like every other
+    /// pool. The original symptom was the execution sitting silently at
+    /// `worker_claimed` with no further dispatch event until the stall
+    /// watchdog reaped it ~30s later. This test pins that the
+    /// previously-silent gap now emits `host_selected:ok` and
+    /// `cube_repo_ensure_attempted`, and that the lease stage is reached.
+    #[tokio::test]
+    async fn automation_triage_execution_advances_past_worker_claimed_to_lease() {
+        use crate::work::CreateAutomationInput;
+        use boss_protocol::AutomationTrigger;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let automation = db
+            .create_automation(CreateAutomationInput {
+                product_id: product.id.clone(),
+                name: "Nightly check".to_owned(),
+                repo_remote_url: None,
+                trigger: AutomationTrigger::Schedule {
+                    cron: "0 2 * * *".to_owned(),
+                    timezone: "UTC".to_owned(),
+                },
+                standing_instruction: "audit the repo".to_owned(),
+                open_task_limit: 1,
+                catch_up_window_secs: None,
+                enabled: true,
+                created_via: None,
+            })
+            .unwrap();
+        let triage_exec = db
+            .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let mut coord =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone());
+        // Wire a 1-slot automation pool so the triage execution (which
+        // targets the automation pool, not the main pool) is dispatched.
+        coord.set_automation_pool(WorkerPool::new_automation(1));
+        let coordinator = Arc::new(coord);
+        coordinator.kick();
+
+        // Poll the dispatch stream directly rather than a specific
+        // execution status: the contract under test is "advances to the
+        // lease stage", independent of the final run state.
+        let mut reached_lease = false;
+        for _ in 0..200 {
+            let events = recording.events_for(&triage_exec.id).await;
+            if events
+                .iter()
+                .any(|e| e.stage == "cube_workspace_lease_attempted")
+            {
+                reached_lease = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let events = recording.events_for(&triage_exec.id).await;
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(
+            reached_lease,
+            "automation execution never reached `cube_workspace_lease_attempted` \
+             (stalled at worker_claimed?); timeline was {stages:?}",
+        );
+
+        // The previously-silent claimed -> repo-ensure handoff now emits
+        // explicit milestones.
+        for expected in [
+            "worker_claimed",
+            "host_selected",
+            "cube_repo_ensure_attempted",
+            "cube_workspace_lease_attempted",
+        ] {
+            assert!(
+                stages.contains(&expected),
+                "automation execution must advance through `{expected}`; got {stages:?}",
+            );
+        }
+
+        // Host selection resolved successfully — it did not fail out.
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .expect("host_selected event present");
+        assert_eq!(
+            host_selected.outcome, "ok",
+            "automation host selection must succeed; got {host_selected:?}",
+        );
+
+        // The watchdog signature we are fixing must be absent.
+        assert!(
+            !stages.contains(&"stage_stalled"),
+            "automation execution must not stall; got {stages:?}",
+        );
+    }
+
 
     /// The `pane_spawned: ok` event must carry the resolved spawn
     /// knobs (effort level, claude effort value, model) so
