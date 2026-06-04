@@ -1225,3 +1225,206 @@ pub(super) fn tail_lines_from_content(contents: &str, lines: usize) -> (Vec<Stri
         .collect();
     (tail, truncated)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_epoch_iso8601 ────────────────────────────────────────────────
+    //
+    // Expected strings are taken from an independent epoch->UTC converter,
+    // NOT derived by re-reading the civil-date algorithm under test.
+
+    #[test]
+    fn format_epoch_unix_epoch_is_1970() {
+        assert_eq!(format_epoch_iso8601(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_epoch_known_modern_instant() {
+        // 1700000000 == 2023-11-14T22:13:20Z (a well-known round epoch).
+        assert_eq!(format_epoch_iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn format_epoch_leap_day() {
+        // 2024 is a leap year; 1709164800 is exactly midnight of Feb 29.
+        // Also exercises the m <= 2 February year-adjustment branch.
+        assert_eq!(format_epoch_iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn format_epoch_year_month_boundary() {
+        // One second before 2024-01-01T00:00:00Z (1704067200) rolls the
+        // year, month, and day all back to the final second of 2023.
+        assert_eq!(format_epoch_iso8601(1_704_067_199), "2023-12-31T23:59:59Z");
+        assert_eq!(format_epoch_iso8601(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn format_epoch_january_year_adjust_branch() {
+        // A January instant exercises the m <= 2 branch with a non-zero
+        // time-of-day. 1736944245 == 2025-01-15T12:30:45Z.
+        assert_eq!(format_epoch_iso8601(1_736_944_245), "2025-01-15T12:30:45Z");
+    }
+
+    #[test]
+    fn format_epoch_negative_pre_1970_wraps_time_of_day() {
+        // Negative epochs must use Euclidean div/rem so the time-of-day
+        // wraps to a positive value rather than going negative. One second
+        // before the epoch is 1969-12-31T23:59:59Z.
+        assert_eq!(format_epoch_iso8601(-1), "1969-12-31T23:59:59Z");
+        // A full day before the epoch is exactly midnight of 1969-12-31.
+        assert_eq!(format_epoch_iso8601(-86_400), "1969-12-31T00:00:00Z");
+    }
+
+    // ── validate_external_tracker_config ────────────────────────────────────
+
+    #[test]
+    fn validate_tracker_valid_github_is_ok() {
+        let config = serde_json::json!({
+            "org": "acme",
+            "repo": "widgets",
+            "project_number": 7,
+        });
+        assert_eq!(validate_external_tracker_config("github", &config), Ok(()));
+    }
+
+    #[test]
+    fn validate_tracker_missing_org() {
+        let config = serde_json::json!({ "repo": "widgets", "project_number": 7 });
+        assert_eq!(
+            validate_external_tracker_config("github", &config),
+            Err("missing required field 'org' for kind=github".to_owned()),
+        );
+    }
+
+    #[test]
+    fn validate_tracker_missing_repo() {
+        let config = serde_json::json!({ "org": "acme", "project_number": 7 });
+        assert_eq!(
+            validate_external_tracker_config("github", &config),
+            Err("missing required field 'repo' for kind=github".to_owned()),
+        );
+    }
+
+    #[test]
+    fn validate_tracker_empty_org_treated_as_missing() {
+        let config = serde_json::json!({ "org": "", "repo": "widgets", "project_number": 7 });
+        assert_eq!(
+            validate_external_tracker_config("github", &config),
+            Err("missing required field 'org' for kind=github".to_owned()),
+        );
+    }
+
+    #[test]
+    fn validate_tracker_empty_repo_treated_as_missing() {
+        let config = serde_json::json!({ "org": "acme", "repo": "", "project_number": 7 });
+        assert_eq!(
+            validate_external_tracker_config("github", &config),
+            Err("missing required field 'repo' for kind=github".to_owned()),
+        );
+    }
+
+    #[test]
+    fn validate_tracker_missing_project_number() {
+        let config = serde_json::json!({ "org": "acme", "repo": "widgets" });
+        assert_eq!(
+            validate_external_tracker_config("github", &config),
+            Err("missing required field 'project_number' for kind=github".to_owned()),
+        );
+    }
+
+    #[test]
+    fn validate_tracker_non_numeric_project_number() {
+        let config = serde_json::json!({
+            "org": "acme",
+            "repo": "widgets",
+            "project_number": "7",
+        });
+        assert_eq!(
+            validate_external_tracker_config("github", &config),
+            Err("'project_number' must be a number for kind=github".to_owned()),
+        );
+    }
+
+    #[test]
+    fn validate_tracker_unknown_kind() {
+        let config = serde_json::json!({});
+        assert_eq!(
+            validate_external_tracker_config("jira", &config),
+            Err("unknown tracker kind 'jira'; supported: github".to_owned()),
+        );
+    }
+
+    // ── task_transitioned_to_active ─────────────────────────────────────────
+
+    fn task_with_status(status: &str) -> WorkItem {
+        let task = boss_protocol::Task::builder()
+            .id("task_test")
+            .product_id("prod_test")
+            .kind(boss_protocol::TaskKind::Task)
+            .name("Test task")
+            .description("desc")
+            .status(status)
+            .autostart(false)
+            .created_at("2026-01-01T00:00:00Z")
+            .updated_at("2026-01-01T00:00:00Z")
+            .build();
+        WorkItem::Task(task)
+    }
+
+    fn non_task_work_item() -> WorkItem {
+        let product = boss_protocol::Product::builder()
+            .id("prod_test")
+            .name("Test product")
+            .slug("test-product")
+            .description("")
+            .status("active")
+            .created_at("2026-01-01T00:00:00Z")
+            .updated_at("2026-01-01T00:00:00Z")
+            .build();
+        WorkItem::Product(product)
+    }
+
+    #[test]
+    fn transitioned_non_task_is_false() {
+        // Even with a "from non-active" previous status, a Product never
+        // counts as a task transition.
+        assert!(!task_transitioned_to_active(
+            &Some("doing".to_owned()),
+            &non_task_work_item(),
+        ));
+    }
+
+    #[test]
+    fn transitioned_status_not_active_is_false() {
+        assert!(!task_transitioned_to_active(
+            &Some("doing".to_owned()),
+            &task_with_status("doing"),
+        ));
+    }
+
+    #[test]
+    fn transitioned_previous_none_is_true() {
+        // No prior row seen → treat as a real transition into active.
+        assert!(task_transitioned_to_active(&None, &task_with_status("active")));
+    }
+
+    #[test]
+    fn transitioned_previous_active_is_false() {
+        // Idempotent retry: active-on-active is not a transition.
+        assert!(!task_transitioned_to_active(
+            &Some("active".to_owned()),
+            &task_with_status("active"),
+        ));
+    }
+
+    #[test]
+    fn transitioned_previous_other_is_true() {
+        assert!(task_transitioned_to_active(
+            &Some("doing".to_owned()),
+            &task_with_status("active"),
+        ));
+    }
+}
