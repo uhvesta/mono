@@ -3678,6 +3678,214 @@ mod compose_prompt_tests {
 }
 
 #[cfg(test)]
+mod compose_worker_spawn_tests {
+    //! Targeted tests for `compose_worker_spawn` covering the `pr_review`
+    //! branch: branch selection (PrReview vs. other kinds), the no-pr-url
+    //! fallback to the generic implementer prompt, and the URL-only reviewer
+    //! prompt rendered when the PR metadata fetch fails.
+    use super::*;
+    use crate::work::Task;
+    use tempfile::TempDir;
+
+    fn pr_review_execution() -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_rev123_01")
+            .work_item_id("task-pr-1")
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    fn chore_execution() -> WorkExecution {
+        WorkExecution::builder()
+            .id("exec_chore123_01")
+            .work_item_id("task-chore-1")
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .repo_remote_url("git@github.com:org/repo.git")
+            .workspace_path("/tmp/workspace")
+            .created_at("2026-05-15T00:00:00Z")
+            .build()
+    }
+
+    fn task_without_pr(task_id: &str) -> WorkItem {
+        WorkItem::Chore(
+            Task::builder()
+                .id(task_id)
+                .product_id("prod-1")
+                .kind(TaskKind::Chore)
+                .name("Add a new feature")
+                .description("Feature description.")
+                .status("todo")
+                .created_at("2026-05-15T00:00:00Z")
+                .updated_at("2026-05-15T00:00:00Z")
+                .autostart(false)
+                .build(),
+        )
+    }
+
+    fn task_with_pr(task_id: &str, pr_url: &str) -> WorkItem {
+        match task_without_pr(task_id) {
+            WorkItem::Chore(mut task) => {
+                task.pr_url = Some(pr_url.into());
+                WorkItem::Chore(task)
+            }
+            other => other,
+        }
+    }
+
+    fn open_memory_db() -> WorkDb {
+        WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// When a `pr_review` execution's producing task has no `pr_url`, the
+    /// branch falls back to the generic implementer prompt rather than
+    /// rendering a reviewer prompt with no target PR.
+    #[tokio::test]
+    async fn pr_review_no_pr_url_falls_back_to_generic_prompt() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = pr_review_execution();
+        let work_item = task_without_pr("task-pr-1");
+
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            false,
+            0,
+        )
+        .await;
+
+        assert!(
+            !composed.prompt_text.contains("# PR review"),
+            "pr_review with no pr_url must not render the reviewer prompt:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains("exec_rev123_01"),
+            "fallback generic prompt must contain the execution id:\n{}",
+            composed.prompt_text,
+        );
+    }
+
+    /// When a `pr_review` execution has a `pr_url`, `compose_worker_spawn`
+    /// calls `render_reviewer_initial_prompt` even when the upstream
+    /// `fetch_pr_review_context` fails (no real `gh` in tests) — the
+    /// URL-only reviewer prompt is still correctly formatted.
+    #[tokio::test]
+    async fn pr_review_with_pr_url_renders_reviewer_prompt() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = pr_review_execution();
+        let pr_url = "https://github.com/org/repo/pull/42";
+        let work_item = task_with_pr("task-pr-1", pr_url);
+
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            false,
+            0,
+        )
+        .await;
+
+        assert!(
+            composed.prompt_text.contains("# PR review"),
+            "pr_review with pr_url must render the reviewer prompt header:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains("independent PR reviewer"),
+            "reviewer prompt must identify the agent role:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains(pr_url),
+            "reviewer prompt must include the PR URL:\n{}",
+            composed.prompt_text,
+        );
+    }
+
+    /// A non-`pr_review` execution kind (e.g. `ChoreImplementation`) must not
+    /// enter the `pr_review` branch at all and must produce the generic
+    /// implementer prompt.
+    #[tokio::test]
+    async fn non_pr_review_execution_routes_to_generic_prompt() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = chore_execution();
+        let work_item = task_without_pr("task-chore-1");
+
+        let composed = compose_worker_spawn(
+            &db,
+            "worker-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            false,
+            0,
+        )
+        .await;
+
+        assert!(
+            !composed.prompt_text.contains("# PR review"),
+            "non-pr_review execution must not render the reviewer prompt:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            !composed.prompt_text.contains("independent PR reviewer"),
+            "non-pr_review execution must not contain reviewer role text:\n{}",
+            composed.prompt_text,
+        );
+        assert!(
+            composed.prompt_text.contains("exec_chore123_01"),
+            "generic prompt must contain the execution id:\n{}",
+            composed.prompt_text,
+        );
+    }
+
+    /// The reviewer prompt must not include implementer-only directives like
+    /// "expected branch name" — reviewers must not commit or push anything.
+    #[tokio::test]
+    async fn pr_review_prompt_omits_branch_push_directives() {
+        let workspace = TempDir::new().unwrap();
+        let db = open_memory_db();
+        let execution = pr_review_execution();
+        let pr_url = "https://github.com/org/repo/pull/99";
+        let work_item = task_with_pr("task-pr-1", pr_url);
+
+        let composed = compose_worker_spawn(
+            &db,
+            "review-1",
+            &execution,
+            &work_item,
+            workspace.path(),
+            None,
+            false,
+            0,
+        )
+        .await;
+
+        assert!(
+            !composed.prompt_text.contains("expected branch name"),
+            "reviewer prompt must not include the expected branch name directive:\n{}",
+            composed.prompt_text,
+        );
+    }
+}
+
+#[cfg(test)]
 mod pane_spawn_tests {
     //! End-to-end-ish tests for `PaneSpawnRunner`: drive `run_execution`
     //! against a stub `WorkerSpawner`, then assert on what was actually
