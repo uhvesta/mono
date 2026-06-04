@@ -4108,10 +4108,14 @@ mod tests {
         CreateTaskInput, RequestExecutionInput, WorkDb, WorkExecution, WorkItem,
     };
 
+    /// Recorded args for each `lease_workspace` call:
+    /// `(repo_id, task, prefer_workspace_id, allow_dirty)`.
+    type LeaseCall = (String, String, Option<String>, bool);
+
     #[derive(Default)]
     struct FakeCubeClient {
         ensure_calls: Mutex<Vec<String>>,
-        lease_calls: Mutex<Vec<(String, String, Option<String>, bool)>>,
+        lease_calls: Mutex<Vec<LeaseCall>>,
         create_calls: Mutex<Vec<(String, String)>>,
         release_calls: Mutex<Vec<String>>,
         status_calls: Mutex<Vec<PathBuf>>,
@@ -4291,8 +4295,12 @@ mod tests {
         }
     }
 
+    /// Recorded args for each `run` call:
+    /// `(worker_id, execution_id, workspace_path, cube_change_id)`.
+    type RunnerCall = (String, String, String, Option<String>);
+
     struct FakeExecutionRunner {
-        calls: Mutex<Vec<(String, String, String, Option<String>)>>,
+        calls: Mutex<Vec<RunnerCall>>,
         fail: bool,
         pending: bool,
         /// If `Some`, the runner reports this slot id back to the

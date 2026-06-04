@@ -916,30 +916,29 @@ pub(crate) async fn compose_worker_spawn(
             // directly in the reviewer's initial prompt so the reviewer
             // skips one `gh pr diff` tool call. Disabled when
             // max_embed_diff_lines is 0.
-            if max_embed_diff_lines > 0 {
-                if let Some(ref mut ctx) = pr_review_context {
-                    if let Some(diff) = fetch_pr_diff(pr_url).await {
-                        let line_count = diff.lines().count() as u64;
-                        if line_count <= max_embed_diff_lines {
-                            tracing::info!(
-                                execution_id = %execution.id,
-                                pr_url,
-                                line_count,
-                                max_embed_diff_lines,
-                                "pr_review execution: embedding diff in reviewer prompt",
-                            );
-                            ctx.diff_content = Some(diff);
-                        } else {
-                            tracing::debug!(
-                                execution_id = %execution.id,
-                                pr_url,
-                                line_count,
-                                max_embed_diff_lines,
-                                "pr_review execution: diff too large to embed; \
-                                 reviewer will fetch it",
-                            );
-                        }
-                    }
+            if max_embed_diff_lines > 0
+                && let Some(ref mut ctx) = pr_review_context
+                && let Some(diff) = fetch_pr_diff(pr_url).await
+            {
+                let line_count = diff.lines().count() as u64;
+                if line_count <= max_embed_diff_lines {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        pr_url,
+                        line_count,
+                        max_embed_diff_lines,
+                        "pr_review execution: embedding diff in reviewer prompt",
+                    );
+                    ctx.diff_content = Some(diff);
+                } else {
+                    tracing::debug!(
+                        execution_id = %execution.id,
+                        pr_url,
+                        line_count,
+                        max_embed_diff_lines,
+                        "pr_review execution: diff too large to embed; \
+                         reviewer will fetch it",
+                    );
                 }
             }
             // Use the changed-file list (when available) to classify the review

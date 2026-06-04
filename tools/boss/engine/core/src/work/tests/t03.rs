@@ -1166,7 +1166,7 @@ fn prereq_regression_does_not_re_block_dependents() {
     let gating = deps::gating_prereqs_for(&conn, &dependent.id).unwrap();
     assert_eq!(
         gating,
-        [prereq.id.clone()],
+        std::slice::from_ref(&prereq.id),
         "regressed prereq must re-appear in gating_prereqs_for",
     );
     let _ = std::fs::remove_file(path);

@@ -5342,8 +5342,6 @@ mod tests {
         assert!(publisher.lifecycle_reasons().await.is_empty());
     }
 
-    /// Helper: seed a chore into `blocked: merge_conflict` with a pending
-
     /// T230 scenario integration test: worker B resolved against stale main
     /// SHA (already-succeeded crz), but PR is still CONFLICTING. The next
     /// merge-poller sweep must:

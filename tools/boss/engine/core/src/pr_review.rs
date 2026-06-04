@@ -309,15 +309,15 @@ fn extract_review_result_from_bare_json(text: &str) -> Option<ReviewResult> {
     let mut last_result: Option<ReviewResult> = None;
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(json_str) = extract_balanced_object(&text[i..]) {
-                if let Ok(result) = ReviewResult::from_json(json_str) {
-                    last_result = Some(result);
-                }
-                // Advance past this object to find any later one
-                i += json_str.len();
-                continue;
+        if bytes[i] == b'{'
+            && let Some(json_str) = extract_balanced_object(&text[i..])
+        {
+            if let Ok(result) = ReviewResult::from_json(json_str) {
+                last_result = Some(result);
             }
+            // Advance past this object to find any later one
+            i += json_str.len();
+            continue;
         }
         i += 1;
     }

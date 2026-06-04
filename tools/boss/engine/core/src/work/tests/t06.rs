@@ -2373,14 +2373,14 @@ fn abandoned_conflict_resolution_revision_execution_has_no_run_row() {
 
     // No work_runs row — the scheduler never called start_execution_run.
     assert!(
-        !db.has_run_row_for_execution(&exec_id).unwrap(),
+        !db.has_run_row_for_execution(exec_id).unwrap(),
         "abandoned execution must have no work_runs row; the TailRunTranscript handler \
          must surface NeverDispatched rather than KnownNoTranscript",
     );
 
     // transcript_path_for_execution must return None (consistent with current behaviour).
     assert!(
-        db.transcript_path_for_execution(&exec_id).unwrap().is_none(),
+        db.transcript_path_for_execution(exec_id).unwrap().is_none(),
         "no transcript path must be recorded for an execution that was never dispatched",
     );
 }

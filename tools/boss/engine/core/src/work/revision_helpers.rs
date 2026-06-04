@@ -340,8 +340,8 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
 /// arrives with `ai_reviewing = false` (the default).
 pub(crate) fn attach_ai_reviewing_flag(
     conn: &Connection,
-    tasks: &mut Vec<Task>,
-    chores: &mut Vec<Task>,
+    tasks: &mut [Task],
+    chores: &mut [Task],
 ) -> rusqlite::Result<()> {
     // Collect IDs of tasks currently in `active` with a `pr_url` — these are
     // the only candidates. If there are none we can skip the DB query entirely.

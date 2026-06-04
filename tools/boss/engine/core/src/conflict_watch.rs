@@ -1885,11 +1885,8 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(all_started.len(), 1, "no second started event from idempotent no-op");
-        match &all_started[0].1 {
-            FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } => {
-                assert_eq!(a, &first_attempt_id);
-            }
-            _ => {}
+        if let FrontendEvent::ConflictResolutionStarted { attempt_id: a, .. } = &all_started[0].1 {
+            assert_eq!(a, &first_attempt_id);
         }
         let crz_count = db
             .list_conflict_resolutions(None, &[], Some(&chore), None)

@@ -333,8 +333,10 @@ fn cube_pr_ensure_applies_template_policy() {
     // Body that is missing the required sections.
     let cmd = "cube pr ensure --branch feat/foo --title t --body 'Just a sentence, no sections.'";
     let rules = {
-        let mut r = EditorialRules::default();
-        r.template_policy = TemplatePolicy::Enforce;
+        let r = EditorialRules {
+            template_policy: TemplatePolicy::Enforce,
+            ..Default::default()
+        };
         CompiledRules::compile(r).unwrap()
     };
     let outcome = evaluate_gh_pretooluse(

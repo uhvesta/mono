@@ -963,8 +963,10 @@ mod tests {
     #[test]
     fn template_enforce_missing_section_denies_on_pr_create() {
         let tmp = TempDir::new().unwrap();
-        let mut rules = EditorialRules::default();
-        rules.template_policy = TemplatePolicy::Enforce;
+        let rules = EditorialRules {
+            template_policy: TemplatePolicy::Enforce,
+            ..Default::default()
+        };
         let compiled = CompiledRules::compile(rules).unwrap();
         let template = "## Summary\n\n## Test plan\n";
         let out = evaluate_gh_pretooluse(
@@ -988,8 +990,10 @@ mod tests {
         // template_policy applies only to pr create/edit; a comment with a
         // missing section is fine.
         let tmp = TempDir::new().unwrap();
-        let mut rules = EditorialRules::default();
-        rules.template_policy = TemplatePolicy::Enforce;
+        let rules = EditorialRules {
+            template_policy: TemplatePolicy::Enforce,
+            ..Default::default()
+        };
         let compiled = CompiledRules::compile(rules).unwrap();
         let template = "## Summary\n\n## Test plan\n";
         let out = evaluate_gh_pretooluse(

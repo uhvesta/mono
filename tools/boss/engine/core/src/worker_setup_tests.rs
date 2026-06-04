@@ -332,7 +332,7 @@ fn settings_json_denies_bossctl_and_engine_lifecycle_verbs() {
         "Bash(boss engine stop:*)",
     ] {
         assert!(
-            deny.iter().any(|r| *r == rule),
+            deny.contains(&rule),
             "expected deny rule {rule} in {deny:?}",
         );
     }

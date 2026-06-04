@@ -428,9 +428,10 @@ impl std::str::FromStr for ExecutionKind {
 /// match enforces that every callsite handles new variants explicitly —
 /// adding a new status here produces a compile error at every status-keyed
 /// branch that must reason about it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
+    #[default]
     Queued,
     Ready,
     WaitingDependency,
@@ -476,12 +477,6 @@ impl ExecutionStatus {
 
     pub fn can_reconcile(&self) -> bool {
         matches!(self, Self::Queued | Self::Ready | Self::WaitingDependency)
-    }
-}
-
-impl Default for ExecutionStatus {
-    fn default() -> Self {
-        Self::Queued
     }
 }
 
@@ -1423,20 +1418,14 @@ pub struct CreateTaskInput {
 
 /// Direction of a dependency listing — incoming (prereqs of the
 /// named row), outgoing (dependents), or both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyDirection {
     Prereqs,
     Dependents,
+    #[default]
     Both,
 }
-
-impl Default for DependencyDirection {
-    fn default() -> Self {
-        Self::Both
-    }
-}
-
 
 
 /// One enriched dependency edge as displayed by `boss <kind> show`.
@@ -2077,6 +2066,7 @@ pub struct Project {
     ///   where Claude Code runs as coordinator).
     /// - `'engine'` — the engine wrote the status itself (dependency
     ///   auto-block/unblock, merge poller, CI watch, etc.).
+    ///
     /// The auto-unblock path only flips a `blocked` row back to `todo`
     /// when this is `'engine'` — manual and Boss-driven blocks stick.
     #[serde(default = "default_human_actor")]

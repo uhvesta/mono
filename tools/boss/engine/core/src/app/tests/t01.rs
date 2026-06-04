@@ -869,7 +869,7 @@ async fn send_input_to_worker_unknown_run_returns_unknown_run() {
         .register_app_session("session-app".into(), sink)
         .await;
     let err = server_state
-        .send_input_to_worker("never-allocated".into(), "/help\n".into())
+        .send_input_to_worker("never-allocated", "/help\n".into())
         .await
         .expect_err("unknown run should fail");
     assert!(matches!(err, SendInputError::UnknownRun));
@@ -894,7 +894,7 @@ async fn send_input_to_worker_round_trips_to_app() {
     let server_clone = server_state.clone();
     let send = tokio::spawn(async move {
         server_clone
-            .send_input_to_worker("run-send".into(), "/help\n".into())
+            .send_input_to_worker("run-send", "/help\n".into())
             .await
     });
 
@@ -946,7 +946,7 @@ async fn send_input_to_worker_surfaces_app_error() {
     let server_clone = server_state.clone();
     let send = tokio::spawn(async move {
         server_clone
-            .send_input_to_worker("run-send".into(), "hi\n".into())
+            .send_input_to_worker("run-send", "hi\n".into())
             .await
     });
 
@@ -1593,12 +1593,9 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
             .append(true)
             .open(&transcript_path)
             .unwrap();
-        writeln!(
-            file,
-            "{}",
-            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the answer\"}]}}",
-        )
-        .unwrap();
+        let line =
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the answer\"}]}}";
+        writeln!(file, "{line}").unwrap();
     }
 
     // Second Stop: the engine should see the in-flight probe,

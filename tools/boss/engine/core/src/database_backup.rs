@@ -217,8 +217,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn open_file_db(dir: &Path) -> WorkDb {
-        let db = WorkDb::open(dir.join("state.db")).expect("open test db");
-        db
+        WorkDb::open(dir.join("state.db")).expect("open test db")
     }
 
     // ── take_backup ───────────────────────────────────────────────

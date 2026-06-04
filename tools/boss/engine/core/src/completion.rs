@@ -2173,12 +2173,12 @@ must not be asked to open one",
     /// 3. Applies the engine severity gate (design §3): any `critical`/`high`
     ///    finding, or any `regression` finding (regardless of severity), warrants
     ///    a revision. `revision_warranted = false` alone does not suppress the gate.
-    /// 4a. If the gate passes: creates a revision task on the producing task
+    ///    4a. If the gate passes: creates a revision task on the producing task
     ///    with the rendered findings as `revision_instructions`, `source =
     ///    pr_review`, dispatched on the general worker pool (`autostart = true`).
     ///    The producing task advances from `active` → `in_review` at this point;
     ///    the revision is an additional follow-up child task.
-    /// 4b. If the gate does not pass (no qualifying findings, or no parseable
+    ///    4b. If the gate does not pass (no qualifying findings, or no parseable
     ///    `ReviewResult`): the producing task advances to `in_review`.
     ///
     /// Until this handler fires, the producing task is held in `active` (Doing)

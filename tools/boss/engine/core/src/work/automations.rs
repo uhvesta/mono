@@ -120,8 +120,7 @@ impl WorkDb {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
-        let sql = format!(
-            "SELECT id, short_id, product_id, name, repo_remote_url,
+        let sql = "SELECT id, short_id, product_id, name, repo_remote_url,
                     trigger_kind, trigger_config, standing_instruction,
                     open_task_limit, catch_up_window_secs, enabled,
                     created_via, created_at, updated_at,
@@ -132,9 +131,8 @@ impl WorkDb {
                         AND deleted_at IS NULL) AS open_task_count
              FROM automations
              WHERE product_id = ?1
-             ORDER BY created_at ASC, id ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
+             ORDER BY created_at ASC, id ASC";
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([product_id], |row| {
             let automation = map_automation(row)?;
             let count: i64 = row.get(17)?;
