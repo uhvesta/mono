@@ -1,0 +1,45 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:private"])
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "git_changelog_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "git_changelog",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = ["//tools/changelog:__pkg__"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_binary(
+    name = "changelog",
+    srcs = glob(["src/**/*.rs"]),
+    crate_root = "src/main.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    deps = [
+        ":git_changelog_lib",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "git_changelog_lib_test",
+    size = "small",
+    crate = ":git_changelog_lib",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

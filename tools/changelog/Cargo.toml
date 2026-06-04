@@ -1,0 +1,29 @@
+[package]
+name = "git_changelog"
+version = "0.1.0"
+edition.workspace = true
+workspace = "../.."
+description = "Path-scoped, GitHub-matching changelog generator"
+license = "Apache-2.0"
+repository = "https://github.com/spinyfin/mono"
+homepage = "https://github.com/spinyfin/mono"
+keywords = ["cli", "changelog", "git", "github"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "git_changelog"
+path = "src/lib.rs"
+
+[[bin]]
+name = "changelog"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+globset = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
