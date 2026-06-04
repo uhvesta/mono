@@ -490,4 +490,68 @@ mod tests {
         assert!(preamble.contains("automation: skip"));
         assert!(preamble.contains("Do NOT do the work"));
     }
+
+    /// Regression test: when the triage agent calls `boss task create` the
+    /// decision marker appears in the SECOND assistant turn (after the tool
+    /// result). The previous `iter().rev().find_map(AssistantText)` approach
+    /// returned only the last AssistantText event; if the Stop hook fires
+    /// before that post-tool turn is fully flushed to disk, the engine read
+    /// the pre-tool analysis text (no marker) instead, recording
+    /// `failed_will_retry`. The fix concatenates ALL AssistantText turns so
+    /// the marker is detected regardless of which turn contains it.
+    #[test]
+    fn marker_detected_from_concatenated_multi_turn_transcript() {
+        use boss_transcript_markdown::{TranscriptEventKind, parse_transcript};
+
+        // Simulate the JSONL transcript for a task-creating triage run:
+        //   Turn 1: analysis prose + boss task create tool call
+        //   (tool result from the tool)
+        //   Turn 2: post-tool summary with the decision marker
+        let jsonl = concat!(
+            // Turn 1: analysis + tool_use
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I found work to do. Let me create a task."},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"boss task create --automation auto_xxx --name \"Fix tests\""}}]}}"#,
+            "\n",
+            // Tool result
+            r#"{"type":"tool_result","toolUseId":"t1","content":[{"type":"text","text":"Created task T1330"}],"isError":false}"#,
+            "\n",
+            // Turn 2: post-tool marker (the critical turn)
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Created task T1330.\n\nautomation: task T1330"}]}}"#,
+            "\n",
+        );
+
+        let events = parse_transcript(jsonl);
+
+        // Collect all AssistantText events (the fix's approach).
+        let all_text: Vec<String> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                TranscriptEventKind::AssistantText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // There are two assistant text turns.
+        assert_eq!(all_text.len(), 2, "should have two assistant text turns");
+
+        // The OLD code: find the last AssistantText.
+        // When the post-tool turn IS present, even the old code would work.
+        // The bug manifested when the post-tool turn was MISSING from the
+        // transcript (timing race). Simulate that by taking only the first turn:
+        let only_pre_tool = &all_text[..1];
+        let pre_tool_decision = parse_triage_decision(&only_pre_tool[0]);
+        assert_eq!(
+            pre_tool_decision,
+            TriageDecision::NoDecision,
+            "pre-tool analysis text has no marker — this is what the old code saw when Turn 2 was missing"
+        );
+
+        // The NEW code: join all turns and parse the combined text.
+        let combined = all_text.join("\n");
+        let decision = parse_triage_decision(&combined);
+        assert_eq!(
+            decision,
+            TriageDecision::ProducedTask("T1330".to_owned()),
+            "concatenating all turns finds the marker in the post-tool turn"
+        );
+    }
 }

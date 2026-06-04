@@ -2403,31 +2403,45 @@ must not be asked to open one",
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
                 let events = crate::transcript_markdown::parse_transcript(&content);
-                let final_text = events.iter().rev().find_map(|e| match &e.kind {
-                    crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => {
-                        Some(t.clone())
-                    }
-                    _ => None,
-                });
-                match final_text {
-                    Some(text) => {
-                        tracing::debug!(
-                            execution_id,
-                            transcript_bytes = content.len(),
-                            event_count = events.len(),
-                            "triage finalisation: read final assistant message",
-                        );
-                        TriageTranscript::FinalMessage(text)
-                    }
-                    None => {
-                        tracing::warn!(
-                            execution_id,
-                            transcript_bytes = content.len(),
-                            event_count = events.len(),
-                            "triage finalisation: transcript had no assistant text event",
-                        );
-                        TriageTranscript::NoAssistantText
-                    }
+                // Collect ALL assistant text turns, not just the last one.
+                //
+                // The triage agent emits its decision marker in the turn AFTER the
+                // `boss task create` Bash call.  The Stop hook can fire before that
+                // post-tool turn is fully flushed to disk, so `iter().rev().find_map`
+                // (which returned only the last AssistantText) would land on the
+                // pre-tool analysis message — which has no marker — and record
+                // `failed_will_retry` even though the task was successfully created.
+                //
+                // Joining all turns mirrors `attentions_detector::extract_assistant_text`
+                // and ensures the marker is found regardless of which turn contains it.
+                // The "exactly one marker" contract still holds: `parse_triage_decision`
+                // enforces it across the combined text.
+                let all_text: Vec<String> = events
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => {
+                            Some(t.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if all_text.is_empty() {
+                    tracing::warn!(
+                        execution_id,
+                        transcript_bytes = content.len(),
+                        event_count = events.len(),
+                        "triage finalisation: transcript had no assistant text event",
+                    );
+                    TriageTranscript::NoAssistantText
+                } else {
+                    tracing::debug!(
+                        execution_id,
+                        transcript_bytes = content.len(),
+                        event_count = events.len(),
+                        assistant_turns = all_text.len(),
+                        "triage finalisation: read all assistant turns for marker scan",
+                    );
+                    TriageTranscript::FinalMessage(all_text.join("\n"))
                 }
             }
             Err(err) => {
