@@ -18,7 +18,7 @@ use boss_protocol::{
     OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, TaskStatus, WorkExecution, WorkItem, WorkItemDependency,
+    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};

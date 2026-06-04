@@ -33,9 +33,9 @@ use boss_protocol::{ExecutionKind, TaskKind};
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
-use crate::work::{
-    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, TaskStatus, WorkDb,
-};
+use crate::work::{ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb};
+#[cfg(test)]
+use crate::work::TaskStatus;
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
 /// (per-product flag or per-PR label) suppresses this conflict-watch

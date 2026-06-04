@@ -65,9 +65,11 @@ use crate::merge_poller::{
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, TaskStatus, WorkDb,
-    WorkItem, WorkerPrCompletionTarget,
+    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
+    WorkerPrCompletionTarget,
 };
+#[cfg(test)]
+use crate::work::TaskStatus;
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
 // fires when the PostToolUse staging cache already holds the URL; the

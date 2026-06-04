@@ -26,7 +26,9 @@
 //! The shared driver only owns the parent's `tasks.status` /
 //! `task_blocked_signals` transitions, which are identical across signals.
 
-use crate::work::{PendingMergeCheck, TaskStatus, WorkDb};
+use crate::work::{PendingMergeCheck, WorkDb};
+#[cfg(test)]
+use crate::work::TaskStatus;
 
 /// Which blocking signal a remediation flow is handling. The variants map to
 /// the `tasks.blocked_reason` / `task_blocked_signals.reason` literals and

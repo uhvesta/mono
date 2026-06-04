@@ -46,7 +46,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::Registry;
-use crate::work::{TaskStatus, WorkDb};
+use crate::work::WorkDb;
+#[cfg(test)]
+use crate::work::TaskStatus;
 
 /// Interval between sweep passes.
 pub const DEP_UNBLOCK_SWEEP_INTERVAL_SECS: u64 = 30;

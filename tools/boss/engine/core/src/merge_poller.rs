@@ -53,7 +53,9 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
-use crate::work::{LatePrCandidate, PendingMergeCheck, TaskStatus, WorkDb};
+use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
+#[cfg(test)]
+use crate::work::TaskStatus;
 use boss_protocol::{self, TaskKind};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
