@@ -272,7 +272,7 @@ fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
         WorkItem::Chore(t) => t,
         other => panic!("expected Chore, got {other:?}"),
     };
-    assert_eq!(task.status, "in_review");
+    assert_eq!(task.status, TaskStatus::InReview);
     assert!(
         task.blocked_reason.is_none(),
         "blocked_reason must be NULL after unblock; got {:?}",
@@ -419,7 +419,7 @@ fn bind_pr_to_active_task_transitions_to_in_review() {
         WorkItem::Chore(t) | WorkItem::Task(t) => t,
         other => panic!("expected chore or task, got {other:?}"),
     };
-    assert_eq!(task.status, "in_review");
+    assert_eq!(task.status, TaskStatus::InReview);
     assert_eq!(
         task.pr_url.as_deref(),
         Some("https://github.com/foo/bar/pull/99")
@@ -753,7 +753,7 @@ fn create_revision_succeeds_for_open_pr() {
     assert_eq!(revision.kind, TaskKind::Revision);
     assert_eq!(revision.parent_task_id.as_deref(), Some(parent_id.as_str()));
     assert_eq!(revision.product_id, product_id);
-    assert_eq!(revision.status, "todo");
+    assert_eq!(revision.status, TaskStatus::Todo);
     assert!(
         revision.pr_url.is_none(),
         "revision must not inherit parent pr_url"
@@ -1178,7 +1178,7 @@ fn create_revision_with_autostart_false_stores_zero() {
         )
         .unwrap();
 
-    assert_eq!(revision.status, "todo");
+    assert_eq!(revision.status, TaskStatus::Todo);
     assert!(
         !revision.autostart,
         "revision created with autostart=false must have autostart=false on the row"
@@ -1321,7 +1321,7 @@ fn get_work_tree_two_revisions_get_distinct_seqs() {
 fn in_progress_flag_set_for_todo_revision() {
     let root = make_bare_task("root", "chore", None, Some("https://gh/pull/1"), "2026-01-01");
     let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
-    rev.status = "todo".to_owned();
+    rev.status = TaskStatus::Todo;
 
     let mut tasks = vec![rev];
     let mut chores = vec![root];
@@ -1337,7 +1337,7 @@ fn in_progress_flag_set_for_todo_revision() {
 fn in_progress_flag_set_for_active_revision() {
     let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2"), "2026-01-01");
     let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
-    rev.status = "active".to_owned();
+    rev.status = TaskStatus::Active;
 
     let mut tasks = vec![rev];
     let mut chores = vec![root];
@@ -1353,7 +1353,7 @@ fn in_progress_flag_set_for_active_revision() {
 fn in_progress_flag_clear_for_in_review_revision() {
     let root = make_bare_task("root", "chore", None, Some("https://gh/pull/3"), "2026-01-01");
     let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
-    rev.status = "in_review".to_owned();
+    rev.status = TaskStatus::InReview;
 
     let mut tasks = vec![rev];
     let mut chores = vec![root];
@@ -1369,7 +1369,7 @@ fn in_progress_flag_clear_for_in_review_revision() {
 fn in_progress_flag_clear_for_done_revision() {
     let root = make_bare_task("root", "chore", None, Some("https://gh/pull/4"), "2026-01-01");
     let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
-    rev.status = "done".to_owned();
+    rev.status = TaskStatus::Done;
 
     let mut tasks = vec![rev];
     let mut chores = vec![root];
@@ -1388,9 +1388,9 @@ fn in_progress_flag_chain_revision_of_revision() {
     let r1 = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
     // r1 is done; r2 (chained) is todo
     let mut r1 = r1;
-    r1.status = "done".to_owned();
+    r1.status = TaskStatus::Done;
     let mut r2 = make_bare_task("r2", "revision", Some("r1"), None, "2026-01-03");
-    r2.status = "todo".to_owned();
+    r2.status = TaskStatus::Todo;
 
     let mut tasks = vec![r1, r2];
     let mut chores = vec![root];
@@ -1406,9 +1406,9 @@ fn in_progress_flag_chain_revision_of_revision() {
 fn in_progress_flag_project_task_root() {
     // Chain root is a project_task in the tasks slice (not in chores).
     let mut root = make_bare_task("root", "project_task", None, Some("https://gh/pull/6"), "2026-01-01");
-    root.status = "in_review".to_owned();
+    root.status = TaskStatus::InReview;
     let mut rev = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
-    rev.status = "todo".to_owned();
+    rev.status = TaskStatus::Todo;
 
     let mut tasks = vec![root, rev];
     let mut chores = vec![];
@@ -1486,7 +1486,7 @@ fn create_revision_first_has_no_auto_dep() {
 
     // R1 has no prior revision — status must still be `todo`.
     assert_eq!(
-        r1.status, "todo",
+        r1.status, TaskStatus::Todo,
         "first revision must stay todo (no auto-block)"
     );
 
@@ -1518,7 +1518,7 @@ fn create_revision_second_auto_blocks_on_first() {
 
     // R2 must be blocked because R1 is still active.
     assert_eq!(
-        r2.status, "blocked",
+        r2.status, TaskStatus::Blocked,
         "second revision must be auto-blocked by first"
     );
 
@@ -1596,7 +1596,7 @@ fn create_revision_skips_done_revision_as_tail() {
         .create_revision(revision_input(&parent_id), &checker)
         .unwrap();
     assert_eq!(
-        r2.status, "todo",
+        r2.status, TaskStatus::Todo,
         "second revision must stay todo when the only prior revision is done"
     );
     let conn = db.connect().unwrap();
@@ -1623,7 +1623,7 @@ fn mark_chore_pr_merged_blocks_todo_revision() {
     let revision = db
         .create_revision(revision_input(&parent_id), &checker)
         .unwrap();
-    assert_eq!(revision.status, "todo");
+    assert_eq!(revision.status, TaskStatus::Todo);
 
     // Simulate the parent PR merging.
     db.mark_chore_pr_merged(&parent_id, pr_url).unwrap();
@@ -1634,7 +1634,7 @@ fn mark_chore_pr_merged_blocks_todo_revision() {
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
-        rev_after.status, "blocked",
+        rev_after.status, TaskStatus::Blocked,
         "todo revision must be blocked after parent PR merges"
     );
     assert_eq!(
@@ -1681,7 +1681,7 @@ fn mark_chore_pr_merged_keeps_in_review_revision_done_not_blocked() {
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
-        rev_after.status, "done",
+        rev_after.status, TaskStatus::Done,
         "in_review revision must become done (not blocked) when parent PR merges"
     );
 }
@@ -1714,7 +1714,7 @@ fn mark_chore_pr_merged_does_not_re_block_done_revision() {
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
-        rev_after.status, "done",
+        rev_after.status, TaskStatus::Done,
         "already-done revision must not be touched"
     );
     assert_eq!(

@@ -413,7 +413,7 @@ fn clean_summary(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::work::WorkDb;
-    use boss_protocol::{Task, TaskKind};
+    use boss_protocol::{Task, TaskKind, TaskStatus};
     use tempfile::TempDir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -426,7 +426,7 @@ mod tests {
                 .kind(TaskKind::Task)
                 .name(name)
                 .description(description)
-                .status("active")
+                .status(TaskStatus::Active)
                 .created_at("2026-01-01T00:00:00Z")
                 .updated_at("2026-01-01T00:00:00Z")
                 .build(),

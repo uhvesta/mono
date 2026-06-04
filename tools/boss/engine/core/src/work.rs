@@ -83,6 +83,7 @@ pub use boss_protocol::{
     ProjectDesignDocState, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
     RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
     ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime,
+    TaskStatus,
     WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
     WorkTree, is_known_created_via,

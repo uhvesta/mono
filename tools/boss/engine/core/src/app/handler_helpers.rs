@@ -781,7 +781,7 @@ pub(super) fn work_item_product_id(item: &WorkItem) -> String {
 /// `id` does not name a task/chore or the work item can't be loaded
 /// (already deleted, garbled id). Used by the UpdateWorkItem handler
 /// to detect a transition into `active` so it can auto-dispatch.
-pub(super) fn task_status_for_id(work_db: &WorkDb, id: &str) -> Option<String> {
+pub(super) fn task_status_for_id(work_db: &WorkDb, id: &str) -> Option<TaskStatus> {
     match work_db.get_work_item(id) {
         Ok(WorkItem::Task(task)) | Ok(WorkItem::Chore(task)) => Some(task.status),
         Ok(_) => None,
@@ -818,16 +818,19 @@ pub(super) fn work_item_needs_dispatch(work_db: &WorkDb, work_item_id: &str) -> 
 /// True iff `item` is a task/chore whose status just flipped from
 /// something other than `active` to `active`. Re-applying an `active`
 /// status on top of `active` (idempotent client retry) does not count.
-pub(super) fn task_transitioned_to_active(previous_status: &Option<String>, item: &WorkItem) -> bool {
+pub(super) fn task_transitioned_to_active(
+    previous_status: &Option<TaskStatus>,
+    item: &WorkItem,
+) -> bool {
     let task = match item {
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return false,
     };
-    if task.status != "active" {
+    if task.status != TaskStatus::Active {
         return false;
     }
     match previous_status {
-        Some(prev) => prev != "active",
+        Some(prev) => prev != &TaskStatus::Active,
         // We didn't see the row before the update — assume this is the
         // first time the engine has rendered it and treat it as a real
         // transition. Idempotent `request_execution_with_live_check`
@@ -846,7 +849,10 @@ pub(super) fn terminal_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Opt
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return None,
     };
-    if !matches!(task.status.as_str(), "done" | "archived" | "cancelled") {
+    if !matches!(
+        task.status,
+        TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled
+    ) {
         return None;
     }
     match work_db.latest_execution_for_work_item(&task.id) {
@@ -877,7 +883,7 @@ pub(super) fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Op
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return None,
     };
-    if task.status != "in_review" {
+    if task.status != TaskStatus::InReview {
         return None;
     }
     match work_db.latest_execution_for_work_item(&task.id) {
@@ -904,17 +910,17 @@ pub(super) fn in_review_chore_execution(work_db: &WorkDb, item: &WorkItem) -> Op
 /// work item has no executions.
 pub(super) fn active_to_todo_execution(
     work_db: &WorkDb,
-    previous_status: &Option<String>,
+    previous_status: &Option<TaskStatus>,
     item: &WorkItem,
 ) -> Option<String> {
     let task = match item {
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return None,
     };
-    if task.status != "todo" {
+    if task.status != TaskStatus::Todo {
         return None;
     }
-    if previous_status.as_deref() != Some("active") {
+    if previous_status.as_ref() != Some(&TaskStatus::Active) {
         return None;
     }
     match work_db.latest_execution_for_work_item(&task.id) {
@@ -996,7 +1002,7 @@ pub(super) fn active_chore_run_id(server_state: &ServerState, item: &WorkItem) -
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return None,
     };
-    if task.status != "active" {
+    if task.status != TaskStatus::Active {
         return None;
     }
     server_state
@@ -1359,7 +1365,7 @@ mod tests {
 
     // ── task_transitioned_to_active ─────────────────────────────────────────
 
-    fn task_with_status(status: &str) -> WorkItem {
+    fn task_with_status(status: TaskStatus) -> WorkItem {
         let task = boss_protocol::Task::builder()
             .id("task_test")
             .product_id("prod_test")
@@ -1392,7 +1398,7 @@ mod tests {
         // Even with a "from non-active" previous status, a Product never
         // counts as a task transition.
         assert!(!task_transitioned_to_active(
-            &Some("doing".to_owned()),
+            &Some(TaskStatus::Blocked),
             &non_task_work_item(),
         ));
     }
@@ -1400,31 +1406,31 @@ mod tests {
     #[test]
     fn transitioned_status_not_active_is_false() {
         assert!(!task_transitioned_to_active(
-            &Some("doing".to_owned()),
-            &task_with_status("doing"),
+            &Some(TaskStatus::Blocked),
+            &task_with_status(TaskStatus::Blocked),
         ));
     }
 
     #[test]
     fn transitioned_previous_none_is_true() {
         // No prior row seen → treat as a real transition into active.
-        assert!(task_transitioned_to_active(&None, &task_with_status("active")));
+        assert!(task_transitioned_to_active(&None, &task_with_status(TaskStatus::Active)));
     }
 
     #[test]
     fn transitioned_previous_active_is_false() {
         // Idempotent retry: active-on-active is not a transition.
         assert!(!task_transitioned_to_active(
-            &Some("active".to_owned()),
-            &task_with_status("active"),
+            &Some(TaskStatus::Active),
+            &task_with_status(TaskStatus::Active),
         ));
     }
 
     #[test]
     fn transitioned_previous_other_is_true() {
         assert!(task_transitioned_to_active(
-            &Some("doing".to_owned()),
-            &task_with_status("active"),
+            &Some(TaskStatus::Blocked),
+            &task_with_status(TaskStatus::Active),
         ));
     }
 }

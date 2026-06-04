@@ -97,7 +97,7 @@ pub(crate) fn assert_parent_revisable_and_insert(
     };
 
     // ── 3. Cached: task done → PR merged ────────────────────────────────────
-    if root.status == "done" {
+    if root.status == TaskStatus::Done {
         return Err(anyhow::Error::new(RevisionGateError::merged(
             &root, &pr_url,
         )));
@@ -306,7 +306,7 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
     let mut in_progress_roots: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for t in tasks.iter() {
-        if t.kind == TaskKind::Revision && (t.status == "todo" || t.status == "active")
+        if t.kind == TaskKind::Revision && (t.status == TaskStatus::Todo || t.status == TaskStatus::Active)
             && let Some(root_id) = walk_to_root(&t.id, &lookup) {
                 in_progress_roots.insert(root_id);
             }
@@ -348,7 +348,7 @@ pub(crate) fn attach_ai_reviewing_flag(
     let candidate_ids: Vec<&str> = tasks
         .iter()
         .chain(chores.iter())
-        .filter(|t| t.status == "active" && t.pr_url.is_some())
+        .filter(|t| t.status == TaskStatus::Active && t.pr_url.is_some())
         .map(|t| t.id.as_str())
         .collect();
     if candidate_ids.is_empty() {

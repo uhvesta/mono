@@ -15,8 +15,8 @@ use boss_protocol::{
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
     FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
     Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TopicEventPayload, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskStatus, TopicEventPayload,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
     work_product_topic,
 };
 
@@ -120,7 +120,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
     )
     .await?;
     assert_eq!(task.kind, TaskKind::ProjectTask);
-    assert_eq!(task.status, "todo");
+    assert_eq!(task.status, TaskStatus::Todo);
     assert_eq!(task.project_id.as_deref(), Some(project.id.as_str()));
 
     let chore = create_chore(
@@ -170,7 +170,7 @@ async fn product_project_task_chore_crud_round_trip() -> Result<()> {
     )
     .await?;
     let updated_task = expect_task(updated)?;
-    assert_eq!(updated_task.status, "in_review");
+    assert_eq!(updated_task.status, TaskStatus::InReview);
     assert_eq!(
         updated_task.pr_url.as_deref(),
         Some("https://github.com/example/repo/pull/1")

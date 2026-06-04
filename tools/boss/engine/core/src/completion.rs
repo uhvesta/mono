@@ -65,8 +65,8 @@ use crate::merge_poller::{
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
 use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
-    WorkerPrCompletionTarget,
+    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, TaskStatus, WorkDb,
+    WorkItem, WorkerPrCompletionTarget,
 };
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
@@ -5140,7 +5140,7 @@ mod tests {
             WorkItem::Chore(t) => {
                 // Task is held in `active` (not advanced to `in_review`) while
                 // the independent reviewer pass runs.
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 // pr_url IS stamped so the reviewer can find the PR.
                 assert_eq!(t.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/42"));
             }
@@ -5237,7 +5237,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 // Held in `active` while reviewer runs; pr_url is stamped.
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/spinyfin/mono/pull/458"),
@@ -5310,7 +5310,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/12"));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -5371,7 +5371,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/spinyfin/mono/pull/458"),
@@ -5426,7 +5426,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, "active",
+                    t.status, TaskStatus::Active,
                     "branch-mismatched PR must NOT advance the chore to in_review",
                 );
                 assert!(t.pr_url.is_none(), "branch-mismatched PR must not bind pr_url");
@@ -5487,7 +5487,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, "active",
+                    t.status, TaskStatus::Active,
                     "wrong-branch PR must NOT move chore to in_review",
                 );
                 assert!(t.pr_url.is_none());
@@ -5561,7 +5561,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/spinyfin/mono/pull/458"),
@@ -5596,7 +5596,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active", "no PR must NOT move to in_review");
+                assert_eq!(t.status, TaskStatus::Active, "no PR must NOT move to in_review");
                 assert!(t.pr_url.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -5664,7 +5664,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, "active",
+                    t.status, TaskStatus::Active,
                     "stale PR must NOT move the work item to in_review",
                 );
                 assert!(t.pr_url.is_none(), "stale PR must NOT stamp pr_url yet");
@@ -5972,7 +5972,7 @@ mod tests {
         assert_eq!(cube.release_calls.lock().await.len(), 1);
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
-            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -6013,7 +6013,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "done", "merged-at-stop must skip in_review");
+                assert_eq!(t.status, TaskStatus::Done, "merged-at-stop must skip in_review");
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some("https://github.com/foo/bar/pull/42"),
@@ -6075,7 +6075,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert!(t.pr_url.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6328,7 +6328,7 @@ mod tests {
         // Its chore is not pushed to in_review and no lease is released.
         match db.get_work_item(&stale_chore).unwrap() {
             WorkItem::Chore(t) => assert_ne!(
-                t.status, "in_review",
+                t.status, TaskStatus::InReview,
                 "the stale occupant's task must not transition on a leaked Stop",
             ),
             other => panic!("expected chore, got {other:?}"),
@@ -6445,7 +6445,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert!(t.pr_url.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6532,7 +6532,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, "active",
+                    t.status, TaskStatus::Active,
                     "empty-diff PR must NOT move the work item to in_review",
                 );
                 assert!(t.pr_url.is_none(), "empty-diff PR must NOT stamp pr_url");
@@ -6667,7 +6667,7 @@ PR #379. PR #379.";
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, "active",
+                    t.status, TaskStatus::Active,
                     "chore with PR refs in description must stay active when the worker exits without a PR",
                 );
                 assert!(
@@ -6806,7 +6806,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let item = db.get_work_item(&chore.id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(
                     t.pr_url.as_deref(),
                     Some(workers_actual_pr),
@@ -6907,7 +6907,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(t.pr_url.as_deref(), Some(workers_pr));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6973,7 +6973,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert!(t.pr_url.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -7232,7 +7232,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             let item = db.get_work_item(chore_id).unwrap();
             match item {
                 WorkItem::Chore(t) => {
-                    assert_eq!(t.status, "active");
+                    assert_eq!(t.status, TaskStatus::Active);
                     assert!(t.pr_url.is_none());
                 }
                 other => panic!("expected chore, got {other:?}"),
@@ -7289,7 +7289,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             match item {
                 WorkItem::Chore(t) => {
                     assert_eq!(
-                        t.status, "active",
+                        t.status, TaskStatus::Active,
                         "chore {chore_id} must be held in active (reviewer enqueued)",
                     );
                     assert_eq!(
@@ -7394,7 +7394,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         match item {
             WorkItem::Chore(t) => {
                 // Chore stays put — no transition to `in_review` or anything else.
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert!(t.pr_url.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -7500,7 +7500,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         assert_eq!(detector.call_count(), 1);
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
-            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -7602,7 +7602,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         match item {
             WorkItem::Chore(t) => {
                 // Task held in active (reviewer enqueued); pr_url stamped.
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(t.pr_url.as_deref(), Some(pr_url));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -7677,7 +7677,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         match item {
             // Chore stays put — no finalize.
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(t.pr_url.as_deref(), Some(pr_url));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -7722,7 +7722,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "active");
+                assert_eq!(t.status, TaskStatus::Active);
                 assert_eq!(t.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/42"));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -7992,7 +7992,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         // Chore is untouched (no false finalize); execution stays parked.
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected chore, got {other:?}"),
         }
         let items = db.list_attention_items(&execution_id).unwrap();
@@ -8335,7 +8335,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "the worker's real PR must finalize; got {final_outcome:?}",
         );
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -8519,7 +8519,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(task.status, "in_review");
+        assert_eq!(task.status, TaskStatus::InReview);
         assert_eq!(
             task.pr_url.as_deref(),
             Some("https://github.com/spinyfin/mono/pull/42")
@@ -8558,7 +8558,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(task.status, "active");
+        assert_eq!(task.status, TaskStatus::Active);
         assert!(task.pr_url.is_none());
     }
 
@@ -8725,7 +8725,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let item = db.get_work_item(&revision_id).unwrap();
         match item {
             WorkItem::Task(t) => {
-                assert_eq!(t.status, "in_review", "revision must move to in_review");
+                assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
                 assert!(
                     t.pr_url.is_none(),
                     "revision pr_url must stay NULL; parent owns the PR"
@@ -8796,7 +8796,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         let item = db.get_work_item(&revision_id).unwrap();
         match item {
-            WorkItem::Task(t) => assert_eq!(t.status, "active"),
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected task, got {other:?}"),
         }
         assert!(
@@ -8900,7 +8900,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Revision advanced out of Doing to Review (revisions never own a pr_url).
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.pr_url.is_none(), "revision tasks must not own a pr_url");
             }
             other => panic!("expected revision task, got {other:?}"),
@@ -8972,7 +8972,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         // Revision stays in Doing; lease held; no nudge (nothing to push).
         match db.get_work_item(&revision_id).unwrap() {
-            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, "active"),
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected task, got {other:?}"),
         }
         assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
@@ -9024,7 +9024,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
-                t.status, "active",
+                t.status, TaskStatus::Active,
                 "a no-contribution run must not be finalized as a metadata-only fix",
             ),
             other => panic!("expected task, got {other:?}"),
@@ -9076,7 +9076,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
              got {outcome:?}",
         );
         match db.get_work_item(&revision_id).unwrap() {
-            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected task, got {other:?}"),
         }
         assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Completed);
@@ -9131,7 +9131,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
-                t.status, "active",
+                t.status, TaskStatus::Active,
                 "the #1262 regression must stay fixed: no marker means no finalize",
             ),
             other => panic!("expected task, got {other:?}"),
@@ -9202,7 +9202,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Revision task must be in_review; task.pr_url stays NULL (parent owns it).
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) => {
-                assert_eq!(t.status, "in_review", "revision must move to in_review");
+                assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
                 assert!(t.pr_url.is_none(), "revision task.pr_url must stay NULL");
             }
             other => panic!("expected task, got {other:?}"),
@@ -9496,7 +9496,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            parent.status, "in_review",
+            parent.status, TaskStatus::InReview,
             "parent chore must be snapped back to in_review",
         );
 
@@ -9841,7 +9841,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            parent.status, "in_review",
+            parent.status, TaskStatus::InReview,
             "parent chore must be snapped back to in_review",
         );
 
@@ -10884,7 +10884,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected task/chore, got {other:?}"),
         };
-        assert_eq!(task.status, "in_review", "chore must advance to in_review after reviewer approves");
+        assert_eq!(task.status, TaskStatus::InReview, "chore must advance to in_review after reviewer approves");
 
         // review_cycle must be incremented (0 → 1) by the completion handler.
         let (review_cycle, last_sha) = db.get_task_review_cycle_state(&chore_id).unwrap();
@@ -10953,7 +10953,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            task.status, "in_review",
+            task.status, TaskStatus::InReview,
             "producing task must advance to in_review after reviewer pass",
         );
     }
@@ -11021,7 +11021,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            task.status, "in_review",
+            task.status, TaskStatus::InReview,
             "producing task must advance to in_review even when reviewer produced no transcript",
         );
     }
@@ -11075,7 +11075,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(task.status, "in_review", "task must be in_review after cycle bound");
+        assert_eq!(task.status, TaskStatus::InReview, "task must be in_review after cycle bound");
 
         // The attention item is created on the task (work_item_id), not on
         // the execution, so we query it via the task.
@@ -11193,7 +11193,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(chore_task.status, "in_review", "step 2: chore must be in_review");
+        assert_eq!(chore_task.status, TaskStatus::InReview, "step 2: chore must be in_review");
         let (cycle_after_r1, _) = db.get_task_review_cycle_state(&chore_id).unwrap();
         assert_eq!(cycle_after_r1, 1, "step 2: review_cycle must be 1 after first reviewer pass");
 
@@ -11316,7 +11316,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected task, got {other:?}"),
         };
         assert_eq!(
-            rev_task.status, "in_review",
+            rev_task.status, TaskStatus::InReview,
             "step 4: revision task must be in_review after clean reviewer pass",
         );
     }

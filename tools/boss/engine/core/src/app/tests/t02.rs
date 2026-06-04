@@ -1655,7 +1655,7 @@ fn active_to_todo_execution_returns_none_when_not_todo() {
         )
         .unwrap();
     assert!(
-        active_to_todo_execution(&db, &Some("todo".into()), &item).is_none(),
+        active_to_todo_execution(&db, &Some(TaskStatus::Todo), &item).is_none(),
         "must return None when the current status is not todo"
     );
 }
@@ -1674,7 +1674,7 @@ fn active_to_todo_execution_returns_none_when_prev_not_active() {
         )
         .unwrap();
     assert!(
-        active_to_todo_execution(&db, &Some("todo".into()), &item).is_none(),
+        active_to_todo_execution(&db, &Some(TaskStatus::Todo), &item).is_none(),
         "must return None when the previous status was not active"
     );
     assert!(
@@ -1697,7 +1697,7 @@ fn active_to_todo_execution_returns_none_when_no_execution() {
         )
         .unwrap();
     assert!(
-        active_to_todo_execution(&db, &Some("active".into()), &item).is_none(),
+        active_to_todo_execution(&db, &Some(TaskStatus::Active), &item).is_none(),
         "must return None when the chore has no executions"
     );
 }
@@ -1725,7 +1725,7 @@ fn active_to_todo_execution_returns_execution_id() {
             },
         )
         .unwrap();
-    let found = active_to_todo_execution(&db, &Some("active".into()), &item);
+    let found = active_to_todo_execution(&db, &Some(TaskStatus::Active), &item);
     assert_eq!(
         found.as_deref(),
         Some(execution.id.as_str()),
@@ -1752,7 +1752,7 @@ fn active_to_todo_execution_returns_none_for_product() {
         .unwrap();
     let item = WorkItem::Product(product_item);
     assert!(
-        active_to_todo_execution(&db, &Some("active".into()), &item).is_none(),
+        active_to_todo_execution(&db, &Some(TaskStatus::Active), &item).is_none(),
         "must return None for non-task work items"
     );
 }

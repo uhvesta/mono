@@ -124,7 +124,7 @@ pub(crate) fn resolve_dependency_edge(
                 relation: relation.to_owned(),
                 kind: kind.to_owned(),
                 name: task.name,
-                status: task.status,
+                status: task.status.to_string(),
             });
         }
     Ok(DependencyEdge {

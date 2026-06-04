@@ -508,7 +508,7 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
         WorkItem::Chore(t) | WorkItem::Task(t) => t,
         other => panic!("expected Task/Chore, got {other:?}"),
     };
-    assert_eq!(task_before.status, "blocked");
+    assert_eq!(task_before.status, TaskStatus::Blocked);
     assert_eq!(task_before.blocked_reason.as_deref(), Some("ci_failure"));
 
     // ci_remediation execution was created and ran, but worker is now gone.
@@ -547,7 +547,7 @@ fn request_execution_requeues_ci_remediation_from_blocked_bossctl_path() {
         other => panic!("expected Task/Chore, got {other:?}"),
     };
     assert_eq!(
-        task_after.status, "todo",
+        task_after.status, TaskStatus::Todo,
         "ci_failure block cleared to todo"
     );
     assert!(task_after.blocked_reason.is_none());
@@ -959,13 +959,13 @@ fn demote_active_work_item_to_todo_resets_active_card() {
     // First demote returns true and resets to todo + engine actor.
     assert!(db.demote_active_work_item_to_todo(&chore.id).unwrap());
     let (status, actor) = status_and_actor(&db);
-    assert_eq!(status, "todo");
+    assert_eq!(status, TaskStatus::Todo);
     assert_eq!(actor, "engine");
 
     // Idempotent: a second demote finds no `active` row → false,
     // and does not touch the now-`todo` row.
     assert!(!db.demote_active_work_item_to_todo(&chore.id).unwrap());
-    assert_eq!(status_and_actor(&db).0, "todo");
+    assert_eq!(status_and_actor(&db).0, TaskStatus::Todo);
 
     // Guard: a `done` card is never stomped back to todo.
     db.update_work_item(
@@ -977,7 +977,7 @@ fn demote_active_work_item_to_todo_resets_active_card() {
     )
     .unwrap();
     assert!(!db.demote_active_work_item_to_todo(&chore.id).unwrap());
-    assert_eq!(status_and_actor(&db).0, "done");
+    assert_eq!(status_and_actor(&db).0, TaskStatus::Done);
 
     let _ = std::fs::remove_file(path);
 }
@@ -1412,7 +1412,7 @@ fn reconcile_skips_in_review_chore() {
         WorkItem::Chore(t) | WorkItem::Task(t) => t,
         _ => panic!("expected chore"),
     };
-    assert_eq!(updated_task.status, "in_review");
+    assert_eq!(updated_task.status, TaskStatus::InReview);
 
     // reconcile_product_executions must NOT create an execution.
     let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -1572,7 +1572,7 @@ fn cancel_running_execution_demotes_active_task() {
         WorkItem::Chore(t) | WorkItem::Task(t) => t,
         _ => panic!("expected chore"),
     };
-    assert_eq!(updated_task.status, "todo");
+    assert_eq!(updated_task.status, TaskStatus::Todo);
 
     // Second call: both ops must be no-ops (idempotent).
     let (cancelled2, demoted2) = db
@@ -1793,7 +1793,7 @@ fn create_project_spawns_design_task_dispatched_as_project_design() {
         .find(|t| t.kind == TaskKind::Design)
         .expect("project should have an auto-created design task");
     assert_eq!(design.name, "Design Engine dispatch instrumentation");
-    assert_eq!(design.status, "todo");
+    assert_eq!(design.status, TaskStatus::Todo);
     assert_eq!(design.ordinal, Some(0));
     assert_eq!(design.project_id.as_deref(), Some(project.id.as_str()));
 
@@ -1972,7 +1972,7 @@ fn migration_backfills_design_tasks_for_existing_projects() {
         .iter()
         .find(|t| t.kind == TaskKind::Design)
         .expect("migration should backfill a design task");
-    assert_eq!(design.status, "todo");
+    assert_eq!(design.status, TaskStatus::Todo);
     // Backfilled design tasks land parked: an existing project
     // may already be mid-flight under the old project-id-keyed
     // execution, so we don't auto-dispatch.
@@ -2097,7 +2097,7 @@ fn start_execution_run_clears_autostart() {
 
     match db.get_work_item(&chore.id).unwrap() {
         WorkItem::Chore(t) | WorkItem::Task(t) => {
-            assert_eq!(t.status, "active");
+            assert_eq!(t.status, TaskStatus::Active);
             assert!(
                 !t.autostart,
                 "autostart must be cleared after first Doing transition"

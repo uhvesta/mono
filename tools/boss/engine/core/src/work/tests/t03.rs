@@ -760,7 +760,7 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
     // Sanity: A starts as `todo` (default).
     let a0 = db.get_work_item(&a.id).unwrap();
     let WorkItem::Chore(t) = a0 else { panic!() };
-    assert_eq!(t.status, "todo");
+    assert_eq!(t.status, TaskStatus::Todo);
 
     // Adding A → B (B not satisfied) auto-blocks A.
     db.add_dependency(AddDependencyInput {
@@ -771,7 +771,7 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
     .unwrap();
     let a1 = db.get_work_item(&a.id).unwrap();
     let WorkItem::Chore(t1) = a1 else { panic!() };
-    assert_eq!(t1.status, "blocked");
+    assert_eq!(t1.status, TaskStatus::Blocked);
     assert_eq!(t1.last_status_actor, "engine");
 
     // Removing the edge auto-unblocks A back to `todo`.
@@ -783,7 +783,7 @@ fn auto_block_and_unblock_follow_edge_lifecycle() {
     .unwrap();
     let a2 = db.get_work_item(&a.id).unwrap();
     let WorkItem::Chore(t2) = a2 else { panic!() };
-    assert_eq!(t2.status, "todo");
+    assert_eq!(t2.status, TaskStatus::Todo);
     let _ = std::fs::remove_file(path);
 }
 
@@ -853,7 +853,7 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
     let WorkItem::Chore(t) = a_after else {
         panic!()
     };
-    assert_eq!(t.status, "todo");
+    assert_eq!(t.status, TaskStatus::Todo);
     assert_eq!(t.last_status_actor, "engine");
     let _ = std::fs::remove_file(path);
 }
@@ -925,7 +925,7 @@ fn auto_unblock_creates_ready_execution() {
     let WorkItem::Chore(t) = dep_after else {
         panic!()
     };
-    assert_eq!(t.status, "todo", "dependent must be unblocked to todo");
+    assert_eq!(t.status, TaskStatus::Todo, "dependent must be unblocked to todo");
 
     // Key assertion: the execution must be `ready` so the coordinator
     // can dispatch it on the next kick — no external reconcile needed.
@@ -1020,7 +1020,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
     let WorkItem::Chore(t) = blocked else {
         panic!()
     };
-    assert_eq!(t.status, "blocked");
+    assert_eq!(t.status, TaskStatus::Blocked);
     assert_eq!(t.last_status_actor, "engine");
 
     // First prereq lands. The dependent must stay blocked
@@ -1038,7 +1038,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
         panic!()
     };
     assert_eq!(
-        t.status, "blocked",
+        t.status, TaskStatus::Blocked,
         "dependent must stay blocked while at least one prereq is still gating",
     );
     assert_eq!(t.last_status_actor, "engine");
@@ -1057,7 +1057,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
         panic!()
     };
     assert_eq!(
-        t.status, "todo",
+        t.status, TaskStatus::Todo,
         "all prereqs done — dependent must auto-unblock"
     );
     assert_eq!(t.last_status_actor, "engine");
@@ -1136,7 +1136,7 @@ fn prereq_regression_does_not_re_block_dependents() {
     let WorkItem::Chore(t) = unblocked else {
         panic!()
     };
-    assert_eq!(t.status, "todo");
+    assert_eq!(t.status, TaskStatus::Todo);
     assert_eq!(t.last_status_actor, "engine");
 
     // Regression: prereq goes back to `backlog`. The dependent
@@ -1146,7 +1146,7 @@ fn prereq_regression_does_not_re_block_dependents() {
     db.update_work_item(
         &prereq.id,
         WorkItemPatch {
-            status: Some("backlog".to_owned()),
+            status: Some("todo".to_owned()),
             ..WorkItemPatch::default()
         },
     )
@@ -1156,7 +1156,7 @@ fn prereq_regression_does_not_re_block_dependents() {
         panic!()
     };
     assert_eq!(
-        t.status, "todo",
+        t.status, TaskStatus::Todo,
         "prereq regressing out of `done` must NOT yank the dependent back to `blocked`",
     );
     // The dispatcher gate must still see the regressed prereq as
@@ -1252,7 +1252,7 @@ fn cyclic_edges_do_not_loop_the_cascade() {
     let WorkItem::Chore(t) = b_after else {
         panic!()
     };
-    assert_eq!(t.status, "done");
+    assert_eq!(t.status, TaskStatus::Done);
     let _ = std::fs::remove_file(path);
 }
 
@@ -1351,7 +1351,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!("expected WorkItem::Task for revision")
     };
     assert_eq!(
-        rev_t.status, "blocked",
+        rev_t.status, TaskStatus::Blocked,
         "revision must be auto-blocked after add_dependency"
     );
 
@@ -1360,7 +1360,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!()
     };
     assert_eq!(
-        chore_t.status, "blocked",
+        chore_t.status, TaskStatus::Blocked,
         "chore dependent must be auto-blocked after add_dependency"
     );
 
@@ -1380,7 +1380,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!()
     };
     assert_eq!(
-        rev_a.status, "todo",
+        rev_a.status, TaskStatus::Todo,
         "revision must unblock when prereq reaches in_review",
     );
     assert!(
@@ -1394,7 +1394,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!()
     };
     assert_eq!(
-        chore_a.status, "blocked",
+        chore_a.status, TaskStatus::Blocked,
         "non-revision chore must remain blocked when prereq is only in_review",
     );
 
@@ -1412,7 +1412,7 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!()
     };
     assert_eq!(
-        chore_d.status, "todo",
+        chore_d.status, TaskStatus::Todo,
         "chore must unblock when prereq reaches done",
     );
 }
@@ -1458,7 +1458,7 @@ fn manual_block_is_not_auto_unblocked() {
     .unwrap();
     let a1 = db.get_work_item(&a.id).unwrap();
     let WorkItem::Chore(t1) = a1 else { panic!() };
-    assert_eq!(t1.status, "blocked");
+    assert_eq!(t1.status, TaskStatus::Blocked);
     assert_eq!(t1.last_status_actor, "human");
 
     // Adding then removing an edge against an already-satisfied
@@ -1503,7 +1503,7 @@ fn manual_block_is_not_auto_unblocked() {
     let WorkItem::Chore(t) = a_after else {
         panic!()
     };
-    assert_eq!(t.status, "blocked");
+    assert_eq!(t.status, TaskStatus::Blocked);
     assert_eq!(t.last_status_actor, "human");
     let _ = std::fs::remove_file(path);
 }
@@ -1770,7 +1770,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
         panic!()
     };
     assert_eq!(
-        t.status, "blocked",
+        t.status, TaskStatus::Blocked,
         "engine should have auto-blocked dependent"
     );
     assert_eq!(t.blocked_reason.as_deref(), Some("dependency"));
@@ -1810,7 +1810,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     let WorkItem::Chore(stuck) = still_stuck else {
         panic!()
     };
-    assert_eq!(stuck.status, "blocked", "cascade skipped — still stuck");
+    assert_eq!(stuck.status, TaskStatus::Blocked, "cascade skipped — still stuck");
     assert_eq!(stuck.blocked_reason, None);
 
     // RequestExecution (the user-override path) must succeed and
@@ -1830,7 +1830,7 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
         panic!()
     };
     assert_eq!(
-        final_task.status, "todo",
+        final_task.status, TaskStatus::Todo,
         "blocked_reason=dependency must be cleared to todo on RequestExecution"
     );
     assert!(
@@ -2379,7 +2379,7 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
         .find(|t| t.id == investigation.id)
         .expect("investigation must be delivered in the work tree's tasks array");
     assert_eq!(found.kind, TaskKind::Investigation);
-    assert_eq!(found.status, "in_review", "an open doc PR moves the card to Review");
+    assert_eq!(found.status, TaskStatus::InReview, "an open doc PR moves the card to Review");
     assert_eq!(
         found.pr_url.as_deref(),
         Some(pr),

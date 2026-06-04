@@ -467,7 +467,10 @@ impl WorkDb {
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(false);
         };
-        if task.deleted_at.is_some() || task.status == "done" || task.status == "archived" {
+        if task.deleted_at.is_some()
+            || task.status == TaskStatus::Done
+            || task.status == TaskStatus::Archived
+        {
             return Ok(false);
         }
         let now = now_string();

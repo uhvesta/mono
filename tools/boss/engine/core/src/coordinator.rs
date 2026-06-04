@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use boss_protocol::{ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind};
+use boss_protocol::{ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind, TaskStatus};
 use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -1924,7 +1924,7 @@ impl ExecutionCoordinator {
             .kind(TaskKind::Chore)
             .name(format!("Automation triage: {}", automation.name))
             .description(automation.standing_instruction.clone())
-            .status("active")
+            .status(TaskStatus::Active)
             .repo_remote_url(execution.repo_remote_url.clone())
             .created_at(automation.created_at.clone())
             .updated_at(automation.updated_at.clone())
@@ -4105,7 +4105,7 @@ mod tests {
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
         CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
-        CreateTaskInput, RequestExecutionInput, WorkDb, WorkExecution, WorkItem,
+        CreateTaskInput, RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
     };
 
     /// Recorded args for each `lease_workspace` call:
@@ -5841,7 +5841,8 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         };
         assert_ne!(
-            status, "todo",
+            status,
+            TaskStatus::Todo,
             "pr_review spawn failure must not demote the work item to `todo`; \
              got `{status}` — the skip-demote guard for pr_review is absent or broken",
         );
@@ -7422,7 +7423,7 @@ mod tests {
         let advanced = db.get_work_item(&chore.id).unwrap();
         match advanced {
             WorkItem::Chore(t) | WorkItem::Task(t) => {
-                assert_eq!(t.status, "active", "chore should auto-advance to active");
+                assert_eq!(t.status, TaskStatus::Active, "chore should auto-advance to active");
             }
             other => panic!("expected chore, got {other:?}"),
         }
@@ -7801,7 +7802,7 @@ mod tests {
         for id in &[&ghost_a.id, &ghost_b.id] {
             match db.get_work_item(id).unwrap() {
                 WorkItem::Chore(t) | WorkItem::Task(t) => {
-                    assert_eq!(t.status, "todo");
+                    assert_eq!(t.status, TaskStatus::Todo);
                     assert_eq!(t.last_status_actor, "engine");
                 }
                 other => panic!("expected chore/task, got {other:?}"),
@@ -7818,7 +7819,7 @@ mod tests {
         // The real chore stays `active` with its `running` execution
         // intact — heal is conservative.
         match db.get_work_item(&real.id).unwrap() {
-            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected chore/task, got {other:?}"),
         }
         let real_execs = db.list_executions(Some(&real.id)).unwrap();

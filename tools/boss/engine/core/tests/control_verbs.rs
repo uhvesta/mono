@@ -31,7 +31,7 @@ use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
 use boss_protocol::{
     CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent,
-    FrontendRequest, RequestExecutionInput, WorkItem, WorkItemPatch,
+    FrontendRequest, RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
 };
 
 // linux-amd64 CI runners run ~6-7x slower than macOS dev boxes. Under
@@ -173,7 +173,7 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
     })
 }
 
-async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Result<String> {
+async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Result<TaskStatus> {
     let response = client
         .send_request(&FrontendRequest::GetWorkItem {
             id: work_item_id.to_owned(),
@@ -211,7 +211,7 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
             },
         })
         .await?;
-    assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, "active");
+    assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, TaskStatus::Active);
 
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
@@ -228,7 +228,7 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
 
     // Active → todo: the kanban card returns to To-Do because the
     // execution backing it is gone.
-    assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, "todo");
+    assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, TaskStatus::Todo);
 
     // Cancelling a row that's already terminal should error rather than
     // silently no-op — this is what guards the engine against double
@@ -900,7 +900,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
         } => t,
         other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
     };
-    assert_eq!(chore.status, "todo");
+    assert_eq!(chore.status, TaskStatus::Todo);
     assert!(!chore.autostart);
 
     // No execution at create time — autostart=false means the
@@ -929,7 +929,7 @@ async fn kanban_drag_to_doing_dispatches_autostart_false_chore() -> Result<()> {
         other => return Err(anyhow!("unexpected response to UpdateWorkItem: {other:?}")),
     };
     match updated {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
         other => return Err(anyhow!("unexpected item kind: {other:?}")),
     }
 
@@ -1176,7 +1176,7 @@ async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     let chore = seed_unresolvable_chore(&mut client).await?;
-    assert_eq!(chore.status, "todo");
+    assert_eq!(chore.status, TaskStatus::Todo);
 
     // The drag. Without the fix this returns WorkItemUpdated with
     // status=active and only a tracing WARN records the failure.
@@ -1208,7 +1208,7 @@ async fn kanban_drag_to_doing_rejects_chore_with_no_resolvable_repo() -> Result<
     }
 
     // Status stayed in `todo` — the rejection blocked the patch.
-    assert_eq!(fetch_task_status(&mut client, &chore.id).await?, "todo");
+    assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::Todo);
 
     // No execution row was created.
     let execs = list_executions_for(&mut client, &chore.id).await?;

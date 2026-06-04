@@ -43,7 +43,8 @@ use crate::protocol::{
 use crate::repo_slug;
 use crate::work::{
     ActionedAttentionGroup, COMMENT_STATUS_DISPATCHED, CreateChoreInput, DuplicateTaskError,
-    ExecutionStatus, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, WorkDb, WorkItem,
+    ExecutionStatus, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, TaskStatus, WorkDb,
+    WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;

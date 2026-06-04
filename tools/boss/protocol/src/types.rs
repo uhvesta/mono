@@ -512,6 +512,96 @@ impl std::str::FromStr for ExecutionStatus {
     }
 }
 
+/// Discriminator for the `tasks.status` column. Exhaustive match enforces
+/// that every callsite handles new variants explicitly — adding a new status
+/// here produces a compile error at every status-keyed branch that must
+/// reason about it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Todo,
+    Active,
+    Blocked,
+    InReview,
+    Done,
+    Archived,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::InReview => "in_review",
+            Self::Done => "done",
+            Self::Archived => "archived",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// True for statuses that represent terminal/closed states where no further
+    /// engine action is expected.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Done | Self::Archived | Self::Cancelled)
+    }
+
+    /// True for statuses that represent work in progress (engine-owned dispatch
+    /// slot is live or a PR is open awaiting review).
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Active | Self::InReview)
+    }
+
+    /// Board (UI) display label — the human-facing name shown on the kanban
+    /// board. Distinct from [`as_str`] for the three statuses whose UI name
+    /// differs from the stored name (`todo` → `backlog`, `active` → `doing`,
+    /// `in_review` → `review`). Use this method at CLI display boundaries;
+    /// use [`as_str`] for DB writes and wire comparisons.
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Todo => "backlog",
+            Self::Active => "doing",
+            Self::Blocked => "blocked",
+            Self::InReview => "review",
+            Self::Done => "done",
+            Self::Archived => "archived",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl Default for TaskStatus {
+    fn default() -> Self {
+        Self::Todo
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "todo" => Ok(Self::Todo),
+            "active" => Ok(Self::Active),
+            "blocked" => Ok(Self::Blocked),
+            "in_review" => Ok(Self::InReview),
+            "done" => Ok(Self::Done),
+            "archived" => Ok(Self::Archived),
+            "cancelled" => Ok(Self::Cancelled),
+            other => Err(format!(
+                "unknown task status: `{other}`; expected one of: \
+                 todo, active, blocked, in_review, done, archived, cancelled"
+            )),
+        }
+    }
+}
+
 /// `work_executions.kind` discriminator for an automation triage execution
 /// (Maint task 6). Kept as a constant alias; prefer `ExecutionKind::AutomationTriage`
 /// in new code.
@@ -2612,7 +2702,7 @@ pub struct Task {
     #[builder(default = default_priority())]
     pub priority: String,
 
-    pub status: String,
+    pub status: TaskStatus,
     pub updated_at: String,
     /// Soft FK to the attempt row currently trying to clear the block —
     /// `conflict_resolutions.id` when `blocked_reason = 'merge_conflict'`,

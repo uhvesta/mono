@@ -18,7 +18,7 @@ use boss_protocol::{
     OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
+    Task, TaskRuntime, TaskStatus, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -1624,7 +1624,7 @@ struct TaskListArgs {
 
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
-    status: Vec<TaskStatus>,
+    status: Vec<TaskStatusArg>,
 
     /// Filter by priority. Repeat the flag or use a comma-separated list.
     /// e.g. `--priority high` shows only high-priority work.
@@ -1845,7 +1845,7 @@ struct ChoreListArgs {
 
     /// Filter by status. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
-    status: Vec<TaskStatus>,
+    status: Vec<TaskStatusArg>,
 
     /// Filter by priority. Repeat the flag or use a comma-separated list.
     #[arg(long, value_delimiter = ',')]
@@ -1959,7 +1959,7 @@ struct TaskUpdateArgs {
     description: Option<String>,
 
     #[arg(long)]
-    status: Option<TaskStatus>,
+    status: Option<TaskStatusArg>,
 
     #[arg(long)]
     priority: Option<TaskPriority>,
@@ -2177,7 +2177,7 @@ impl From<EffortLevelArg> for boss_protocol::EffortLevel {
 /// the taxonomy-alignment change the CLI speaks the board's vocabulary
 /// everywhere a human or `--json` consumer can see it, while the engine
 /// and stored rows keep the legacy strings untouched. The legacy names
-/// remain accepted on input as aliases (see [`TaskStatus`] /
+/// remain accepted on input as aliases (see [`TaskStatusArg`] /
 /// [`MoveTarget`]) so old scripts and stored data keep working.
 mod status_vocab {
     /// `(stored, ui)` pairs for every status whose name differs between
@@ -2199,24 +2199,19 @@ mod status_vocab {
     }
 }
 
-/// Return a copy of `task` with its `status` rewritten to the board (UI)
-/// name. Applied at every display boundary (human output and `--json`)
-/// after any status filtering, which still runs against the stored
-/// vocabulary. See [`status_vocab`].
-fn with_display_status(mut task: Task) -> Task {
-    task.status = status_vocab::to_ui(&task.status).to_owned();
+/// Identity function kept for call-site symmetry: all display boundaries
+/// call `with_display_status` to mark the intent. The actual board (UI)
+/// label is produced at each display site via
+/// `task.status.display_label()` rather than by mutating the typed field.
+fn with_display_status(task: Task) -> Task {
     task
 }
 
-/// [`with_display_status`] for the `WorkItem` envelope: rewrites the
-/// status of the leaf (task/chore) variants and leaves products /
-/// projects (which have their own taxonomies) untouched.
+/// [`with_display_status`] for the `WorkItem` envelope: passes through
+/// task/chore variants unchanged (display transformation happens at each
+/// display site); leaves products / projects untouched.
 fn work_item_with_display_status(item: WorkItem) -> WorkItem {
-    match item {
-        WorkItem::Task(task) => WorkItem::Task(with_display_status(task)),
-        WorkItem::Chore(chore) => WorkItem::Chore(with_display_status(chore)),
-        other => other,
-    }
+    item
 }
 
 /// `boss task|chore update --status` and `--status` list filters.
@@ -2226,7 +2221,7 @@ fn work_item_with_display_status(item: WorkItem) -> WorkItem {
 /// always returns the stored string, so both the wire patch sent to the
 /// engine and the status-filter comparison stay in the stored vocabulary.
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum TaskStatus {
+enum TaskStatusArg {
     #[value(alias = "todo")]
     Backlog,
     #[value(alias = "active")]
@@ -2238,7 +2233,7 @@ enum TaskStatus {
 }
 
 /// `boss task|chore move --to`. Same board-name-primary,
-/// legacy-name-alias scheme as [`TaskStatus`]; [`Self::as_status`]
+/// legacy-name-alias scheme as [`TaskStatusArg`]; [`Self::as_status`]
 /// returns the stored string.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum MoveTarget {
@@ -2294,7 +2289,7 @@ impl TaskPriority {
     }
 }
 
-impl TaskStatus {
+impl TaskStatusArg {
     /// The stored status string sent to the engine and used for
     /// status-filter comparisons. Maps the board (UI) variant name back
     /// to the legacy stored vocabulary.
@@ -7824,7 +7819,7 @@ fn resolved_repo_for_task<'a>(task: &'a Task, product_repo: Option<&'a str>) -> 
 
 fn apply_task_list_filters(
     items: Vec<Task>,
-    statuses: &[TaskStatus],
+    statuses: &[TaskStatusArg],
     priorities: &[TaskPriority],
     match_term: Option<&str>,
     ids: &[String],
@@ -8035,7 +8030,7 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
             row.push(task.id.clone());
         }
         row.push(task.name.clone());
-        row.push(task.status.clone());
+        row.push(task.status.display_label().to_owned());
         row.push(task.priority.clone());
         if show_effort {
             row.push(effort_str);
@@ -8577,7 +8572,7 @@ fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>
     }
     println!("Name: {}", task.name);
     println!("Kind: {}", task.kind);
-    println!("Status: {}", task.status);
+    println!("Status: {}", task.status.display_label());
     if let Some(product) = parent_product {
         println!(
             "Repo: {}",
@@ -8912,7 +8907,7 @@ mod tests {
         AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem,
         ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction,
         ProductCommand, ProductStatus, ProjectCommand, ProjectStatus, RepoSelector, RunContext,
-        TaskCommand, TaskStatus, classify_bind_pr, classify_lint_finding, compile_schedule,
+        TaskCommand, TaskStatusArg, classify_bind_pr, classify_lint_finding, compile_schedule,
         decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
         format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
         lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
@@ -8921,7 +8916,7 @@ mod tests {
     };
     use boss_protocol::{
         Product, Project, ProjectDesignDocState, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
-        TaskKind, WorkItem,
+        TaskKind, TaskStatus, WorkItem,
     };
 
     #[test]
@@ -8934,14 +8929,14 @@ mod tests {
     }
 
     #[test]
-    fn task_status_maps_board_names_to_stored() {
+    fn task_status_arg_maps_board_names_to_stored() {
         // `--status`/filter values are the board names; the stored
         // string sent to the engine stays in the legacy vocabulary.
-        assert_eq!(TaskStatus::Backlog.as_str(), "todo");
-        assert_eq!(TaskStatus::Doing.as_str(), "active");
-        assert_eq!(TaskStatus::Review.as_str(), "in_review");
-        assert_eq!(TaskStatus::Done.as_str(), "done");
-        assert_eq!(TaskStatus::Blocked.as_str(), "blocked");
+        assert_eq!(TaskStatusArg::Backlog.as_str(), "todo");
+        assert_eq!(TaskStatusArg::Doing.as_str(), "active");
+        assert_eq!(TaskStatusArg::Review.as_str(), "in_review");
+        assert_eq!(TaskStatusArg::Done.as_str(), "done");
+        assert_eq!(TaskStatusArg::Blocked.as_str(), "blocked");
     }
 
     #[test]
@@ -8957,19 +8952,22 @@ mod tests {
     }
 
     #[test]
-    fn with_display_status_rewrites_only_the_status_field() {
+    fn display_label_maps_stored_to_board_names() {
+        // `with_display_status` is now an identity function; display
+        // transformation happens at each display site via `display_label()`.
         let task = Task::builder()
             .id("task_1")
             .product_id("prod_1")
             .name("n")
             .description("d")
             .kind(TaskKind::Task)
-            .status("in_review")
+            .status(TaskStatus::InReview)
             .created_at("t")
             .updated_at("t")
             .build();
         let shown = with_display_status(task);
-        assert_eq!(shown.status, "review");
+        assert_eq!(shown.status.display_label(), "review");
+        assert_eq!(shown.status, TaskStatus::InReview);
     }
 
     #[test]
@@ -8979,7 +8977,7 @@ mod tests {
         match cli.command {
             Commands::Task {
                 command: TaskCommand::List(args),
-            } => assert!(matches!(args.status.as_slice(), [TaskStatus::Backlog])),
+            } => assert!(matches!(args.status.as_slice(), [TaskStatusArg::Backlog])),
             _ => panic!("expected task list command"),
         }
         // ...and so does the legacy stored name as an alias.
@@ -8987,7 +8985,7 @@ mod tests {
         match cli.command {
             Commands::Task {
                 command: TaskCommand::List(args),
-            } => assert!(matches!(args.status.as_slice(), [TaskStatus::Review])),
+            } => assert!(matches!(args.status.as_slice(), [TaskStatusArg::Review])),
             _ => panic!("expected task list command"),
         }
     }
@@ -9129,7 +9127,7 @@ mod tests {
             .kind(kind)
             .name("n")
             .description("")
-            .status("todo")
+            .status(TaskStatus::Todo)
             .created_at("")
             .updated_at("")
             .build()

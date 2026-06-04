@@ -26,7 +26,7 @@
 //! The shared driver only owns the parent's `tasks.status` /
 //! `task_blocked_signals` transitions, which are identical across signals.
 
-use crate::work::{PendingMergeCheck, WorkDb};
+use crate::work::{PendingMergeCheck, TaskStatus, WorkDb};
 
 /// Which blocking signal a remediation flow is handling. The variants map to
 /// the `tasks.blocked_reason` / `task_blocked_signals.reason` literals and
@@ -193,7 +193,7 @@ mod tests {
         (product.id, chore.id)
     }
 
-    fn status_of(db: &WorkDb, id: &str) -> (String, Option<String>) {
+    fn status_of(db: &WorkDb, id: &str) -> (TaskStatus, Option<String>) {
         match db.get_work_item(id).unwrap() {
             WorkItem::Chore(t) => (t.status, t.blocked_reason),
             other => panic!("expected chore, got {other:?}"),
@@ -240,13 +240,13 @@ mod tests {
             let (product, chore) = in_review_chore(&db, pr);
             block_parent(&db, kind, &chore, pr);
             let (status, _) = status_of(&db, &chore);
-            assert_eq!(status, "blocked", "{kind:?}: precondition blocked");
+            assert_eq!(status, TaskStatus::Blocked, "{kind:?}: precondition blocked");
 
             let cleared =
                 unblock_for_revision(&db, kind, &candidate(&product, &chore, pr), "att-1");
             assert!(cleared, "{kind:?}: parent must clear back to in_review");
             let (status, reason) = status_of(&db, &chore);
-            assert_eq!(status, "in_review", "{kind:?}");
+            assert_eq!(status, TaskStatus::InReview, "{kind:?}");
             assert!(reason.is_none(), "{kind:?}");
             assert!(
                 signal_active(&db, &chore, kind.reason()),
@@ -274,7 +274,7 @@ mod tests {
                 "{kind:?}: pre-blocked parent must reconcile to in_review",
             );
             let (status, _) = status_of(&db, &chore);
-            assert_eq!(status, "in_review", "{kind:?}");
+            assert_eq!(status, TaskStatus::InReview, "{kind:?}");
             assert!(signal_active(&db, &chore, kind.reason()), "{kind:?}");
         }
     }

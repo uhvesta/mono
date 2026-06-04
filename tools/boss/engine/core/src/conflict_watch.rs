@@ -34,7 +34,7 @@ use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
-    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb,
+    ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, TaskStatus, WorkDb,
 };
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
@@ -889,7 +889,7 @@ mod tests {
         (product.id, chore.id)
     }
 
-    fn chore_status(db: &WorkDb, id: &str) -> (String, Option<String>) {
+    fn chore_status(db: &WorkDb, id: &str) -> (TaskStatus, Option<String>) {
         match db.get_work_item(id).unwrap() {
             WorkItem::Chore(t) => (t.status, t.blocked_reason),
             other => panic!("expected chore, got {other:?}"),
@@ -969,7 +969,7 @@ mod tests {
 
         // Parent stays in Review — not blocked.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
 
         // Event emitted is "conflict_revision_in_flight", not "blocked_merge_conflict".
@@ -1013,7 +1013,7 @@ mod tests {
 
         // Parent is blocked since there is no active fix vehicle.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "blocked");
+        assert_eq!(status, TaskStatus::Blocked);
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
 
         let events = pub_.events.lock().await.clone();
@@ -1066,7 +1066,7 @@ mod tests {
         // back — returns true again because task_unblocked_for_revision=true.
         // The important invariant: parent ends up in_review, exactly one crz.
         let (status, _) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review", "parent must stay in_review after repeated probes");
+        assert_eq!(status, TaskStatus::InReview, "parent must stay in_review after repeated probes");
         let attempts = db
             .list_conflict_resolutions(None, &[], Some(&chore), None)
             .unwrap();
@@ -1117,14 +1117,14 @@ mod tests {
         .await;
         // Parent is in_review (revision spawned). Verify, then resolve.
         let (status_before, _) = chore_status(&db, &chore);
-        assert_eq!(status_before, "in_review");
+        assert_eq!(status_before, TaskStatus::InReview);
 
         let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(resolved, "on_resolved must return true (attempt was retired)");
 
         // Parent still in_review — didn't change status.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
 
         // No "merge_conflict_resolved" work-item event (parent didn't transition).
@@ -1165,7 +1165,7 @@ mod tests {
         )
         .await;
         let (status_before, reason_before) = chore_status(&db, &chore);
-        assert_eq!(status_before, "blocked");
+        assert_eq!(status_before, TaskStatus::Blocked);
         assert_eq!(reason_before.as_deref(), Some("merge_conflict"));
 
         // Now manually install a running attempt (simulates legacy worker) and resolve.
@@ -1174,7 +1174,7 @@ mod tests {
         assert!(resolved);
 
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
 
         let events = pub_.events.lock().await.clone();
@@ -1240,12 +1240,12 @@ mod tests {
             .await
         );
         let (s, _) = chore_status(&db, &chore);
-        assert_eq!(s, "in_review");
+        assert_eq!(s, TaskStatus::InReview);
 
         // Resolve: PR goes clean, attempt retired, signal cleared.
         assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await);
         let (s, _) = chore_status(&db, &chore);
-        assert_eq!(s, "in_review");
+        assert_eq!(s, TaskStatus::InReview);
 
         // 2nd conflict: same base sha → UNIQUE collision. The previous crz is
         // now succeeded (no active crz). The upfront flip goes to blocked and
@@ -1262,7 +1262,7 @@ mod tests {
             .await
         );
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "blocked");
+        assert_eq!(status, TaskStatus::Blocked);
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
 
         let reasons: Vec<String> = pub_
@@ -1311,7 +1311,7 @@ mod tests {
         .await;
         assert!(!transitioned, "WHERE guard protects manual moves");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "active");
+        assert_eq!(status, TaskStatus::Active);
         assert!(reason.is_none());
         assert!(pub_.events.lock().await.is_empty());
     }
@@ -1338,7 +1338,7 @@ mod tests {
         )
         .await;
         let (status_before, _) = chore_status(&db, &chore);
-        assert_eq!(status_before, "blocked", "sanity: closed_checker must cause blocked");
+        assert_eq!(status_before, TaskStatus::Blocked, "sanity: closed_checker must cause blocked");
         // Human moves the blocked row to `active`.
         db.update_work_item(
             &chore,
@@ -1495,7 +1495,7 @@ mod tests {
 
         // Parent stays in_review — it was never blocked in new-model detection.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
@@ -1565,7 +1565,7 @@ mod tests {
         )
         .await;
         let (s, _) = chore_status(&db, &chore);
-        assert_eq!(s, "blocked");
+        assert_eq!(s, TaskStatus::Blocked);
 
         let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-42");
         let cube = Arc::new(RecordingCubeClient::default());
@@ -1579,7 +1579,7 @@ mod tests {
         .await;
         assert!(resolved);
         let (status, _) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert_eq!(
             cube.releases.lock().await.as_slice(),
             ["lease-42"],
@@ -1696,7 +1696,7 @@ mod tests {
         db.set_conflict_resolution_revision_task_id(&attempt.id, "task_fake_revision")
             .unwrap();
         let (s, _) = chore_status(&db, &chore);
-        assert_eq!(s, "blocked", "sanity: parent must be blocked before probe");
+        assert_eq!(s, TaskStatus::Blocked, "sanity: parent must be blocked before probe");
 
         // Now fire on_conflict_detected for the same PR (still CONFLICTING).
         // The re-arm path should find the active revision and reconcile.
@@ -1711,7 +1711,7 @@ mod tests {
 
         assert!(reconciled, "reconciliation must return true (state changed)");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review", "parent must be back in_review after reconcile");
+        assert_eq!(status, TaskStatus::InReview, "parent must be back in_review after reconcile");
         assert!(reason.is_none());
 
         // Event emitted is "conflict_revision_in_flight".
@@ -1829,7 +1829,7 @@ mod tests {
         let attempt_row = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
         assert_eq!(attempt_row.status, "succeeded");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
     }
 
@@ -1976,7 +1976,7 @@ mod tests {
         .await;
         assert!(!r, "rebase-active path must defer");
         let (status, _) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review", "row stays where it was");
+        assert_eq!(status, TaskStatus::InReview, "row stays where it was");
         assert!(pub_.events.lock().await.is_empty());
     }
 
@@ -2015,7 +2015,7 @@ mod tests {
         .await;
         assert!(!r, "opted-out product must not flip to blocked");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
         assert!(pub_.events.lock().await.is_empty());
     }
@@ -2045,7 +2045,7 @@ mod tests {
         .await;
         assert!(!r, "labelled PR must not flip to blocked");
         let (status, _) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(pub_.events.lock().await.is_empty());
     }
 
@@ -2100,7 +2100,7 @@ mod tests {
         .await;
         // New-model: parent stays in_review after detection (revision in flight).
         let (status_before, _) = chore_status(&db, &chore);
-        assert_eq!(status_before, "in_review");
+        assert_eq!(status_before, TaskStatus::InReview);
         let before = pub_.events.lock().await.len();
         set_product_auto_pr_maintenance(&db_path, &product, false);
 
@@ -2114,7 +2114,7 @@ mod tests {
         .await;
         assert!(!r, "opted-out product must not retire automatically");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review");
+        assert_eq!(status, TaskStatus::InReview);
         assert!(reason.is_none());
         assert_eq!(pub_.events.lock().await.len(), before);
     }
@@ -2200,7 +2200,7 @@ mod tests {
                     Some(a3.id.as_str()),
                     "blocked_attempt_id must not retarget at the pre-abandoned row",
                 );
-                assert_eq!(t.status, "blocked");
+                assert_eq!(t.status, TaskStatus::Blocked);
                 assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -2269,7 +2269,7 @@ mod tests {
 
         // Parent stays in_review — the revision card is the Doing card.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "in_review", "parent must stay in Review while revision is in flight");
+        assert_eq!(status, TaskStatus::InReview, "parent must stay in Review while revision is in flight");
         assert!(reason.is_none());
 
         let attempt = db
@@ -2403,7 +2403,7 @@ mod tests {
         );
         // Churn cap = no fix vehicle → parent must be blocked (human-attention terminal).
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "blocked", "churn cap exhausted: parent must be blocked");
+        assert_eq!(status, TaskStatus::Blocked, "churn cap exhausted: parent must be blocked");
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
     }
 
@@ -2432,7 +2432,7 @@ mod tests {
         // The parent flip precedes the gate, so the chore is still blocked;
         // the poller's merged/closed handling reconciles it on a later sweep.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, "blocked");
+        assert_eq!(status, TaskStatus::Blocked);
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
 
         let attempts = db

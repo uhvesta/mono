@@ -448,7 +448,7 @@ fn interactive_ask(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::TaskKind;
+    use boss_protocol::{TaskKind, TaskStatus};
 
     fn s(value: &str) -> String {
         value.to_owned()
@@ -461,7 +461,7 @@ mod tests {
             .kind(TaskKind::Chore)
             .name("x")
             .description("")
-            .status("todo")
+            .status(TaskStatus::Todo)
             .created_at(updated_at)
             .updated_at(updated_at)
             .created_via("cli")

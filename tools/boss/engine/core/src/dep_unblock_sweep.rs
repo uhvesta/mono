@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::Registry;
-use crate::work::WorkDb;
+use crate::work::{TaskStatus, WorkDb};
 
 /// Interval between sweep passes.
 pub const DEP_UNBLOCK_SWEEP_INTERVAL_SECS: u64 = 30;
@@ -263,7 +263,7 @@ mod tests {
         // Verify auto-block.
         let dep_before = db.get_work_item(&dep_id).unwrap();
         let boss_protocol::WorkItem::Chore(before) = dep_before else { panic!() };
-        assert_eq!(before.status, "blocked");
+        assert_eq!(before.status, TaskStatus::Blocked);
         assert_eq!(before.blocked_reason.as_deref(), Some("dependency"));
 
         // Mark prereq done without triggering the cascade.
@@ -272,7 +272,7 @@ mod tests {
         // Dependent still blocked — cascade didn't fire.
         let dep_still = db.get_work_item(&dep_id).unwrap();
         let boss_protocol::WorkItem::Chore(still) = dep_still else { panic!() };
-        assert_eq!(still.status, "blocked", "must still be blocked before sweep");
+        assert_eq!(still.status, TaskStatus::Blocked, "must still be blocked before sweep");
 
         // Sweep must recover it.
         let db = Arc::new(db);
@@ -283,7 +283,7 @@ mod tests {
 
         let dep_after = db.get_work_item(&dep_id).unwrap();
         let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
-        assert_eq!(after.status, "todo");
+        assert_eq!(after.status, TaskStatus::Todo);
         assert!(after.blocked_reason.is_none(), "blocked_reason must be cleared");
     }
 
@@ -318,7 +318,7 @@ mod tests {
 
         let dep_after = db.get_work_item(&dep_id).unwrap();
         let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
-        assert_eq!(after.status, "todo");
+        assert_eq!(after.status, TaskStatus::Todo);
         assert!(after.blocked_reason.is_none());
     }
 
@@ -356,7 +356,8 @@ mod tests {
         let dep_after = db.get_work_item(&dep_id).unwrap();
         let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
         assert_eq!(
-            after.status, "todo",
+            after.status,
+            TaskStatus::Todo,
             "cascade must unblock when blocked_reason='dependency', even if actor='human'",
         );
         assert!(after.blocked_reason.is_none());
@@ -386,7 +387,7 @@ mod tests {
 
         let dep_after = db.get_work_item(&dep_id).unwrap();
         let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
-        assert_eq!(after.status, "blocked");
+        assert_eq!(after.status, TaskStatus::Blocked);
     }
 
     /// A manually-blocked item (blocked_reason IS NULL, last_status_actor = 'human')

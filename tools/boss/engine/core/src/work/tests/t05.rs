@@ -2137,11 +2137,11 @@ fn real_status_change_sets_last_status_actor_human_for_task() {
         .unwrap();
     }
 
-    // Genuine status change: todo → doing.
+    // Genuine status change: todo → active.
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
-            status: Some("doing".into()),
+            status: Some("active".into()),
             ..WorkItemPatch::default()
         },
     )
@@ -2501,7 +2501,7 @@ fn mark_ci_remediation_retriggered_records_flaky_signal_without_blocking() {
         WorkItem::Chore(t) => t,
         other => panic!("expected chore, got {other:?}"),
     };
-    assert_eq!(task.status, "in_review");
+    assert_eq!(task.status, TaskStatus::InReview);
     assert!(task.blocked_reason.is_none());
 
     // The attempt is now terminal, so `active_ci_remediation_for_work_item`

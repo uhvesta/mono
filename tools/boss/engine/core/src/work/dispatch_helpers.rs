@@ -554,7 +554,7 @@ pub(crate) fn reconcile_revision_execution(
     // Cached dispatch-time gate: if the chain root is `done`, the PR has
     // merged or been closed.  Auto-block the revision so it doesn't get
     // dispatched into an already-merged branch.
-    if chain_root_task.status == "done" || chain_root_task.status == "archived" {
+    if chain_root_task.status == TaskStatus::Done || chain_root_task.status == TaskStatus::Archived {
         let now = now_string();
         let rows_changed = conn.execute(
             "UPDATE tasks

@@ -434,8 +434,8 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
         // there's no point validating a code path we won't run.
         let intends_active_transition = patch.status.as_deref() == Some("active")
             && previous_task_status
-                .as_deref()
-                .is_some_and(|prev| prev != "active");
+                .as_ref()
+                .is_some_and(|prev| *prev != TaskStatus::Active);
         if intends_active_transition && work_item_needs_dispatch(&work_db, &id)
             && let Err(err) = work_db.precheck_dispatch_repo(&id) {
                 let work_item_id_for_event = id.clone();

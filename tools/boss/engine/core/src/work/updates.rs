@@ -133,7 +133,11 @@ impl WorkDb {
 
         apply_text_patch(&mut task.name, patch.name);
         apply_text_patch(&mut task.description, patch.description);
-        apply_text_patch(&mut task.status, patch.status);
+        if let Some(status_str) = patch.status {
+            task.status = status_str
+                .parse::<TaskStatus>()
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
         apply_optional_patch(&mut task.pr_url, patch.pr_url);
         // Reject non-empty repo override when the product has its own repo.
         if let Some(ref repo_patch) = patch.repo_remote_url
@@ -186,13 +190,18 @@ impl WorkDb {
         // Invariant: blocked_reason and blocked_attempt_id must be NULL for any
         // non-blocked status. Enforce this here so every write path honours it,
         // not just the engine's targeted CI/conflict-resolution helpers.
-        if task.status != "blocked" {
+        if task.status != TaskStatus::Blocked {
             task.blocked_reason = None;
             task.blocked_attempt_id = None;
         }
 
         if status_changed {
-            refuse_manual_move_off_blocked_while_gated(&tx, id, &previous_status, &task.status)?;
+            refuse_manual_move_off_blocked_while_gated(
+                &tx,
+                id,
+                previous_status.as_str(),
+                task.status.as_str(),
+            )?;
         }
         let actor_stamp = if status_changed && previous_status != task.status {
             actor
@@ -214,7 +223,7 @@ impl WorkDb {
                 task.id,
                 task.name,
                 task.description,
-                task.status,
+                task.status.as_str(),
                 task.ordinal,
                 task.pr_url,
                 task.updated_at,
@@ -230,7 +239,12 @@ impl WorkDb {
         )?;
 
         if status_changed && previous_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, id, &task.status, &task.updated_at)?;
+            cascade_dependents_after_prereq_status_change(
+                &tx,
+                id,
+                task.status.as_str(),
+                &task.updated_at,
+            )?;
         }
 
         // Manual-override suppression for `blocked: ci_failure` /
@@ -246,8 +260,8 @@ impl WorkDb {
         //      new head) starts with a fresh budget — mirrors the
         //      `boss engine ci retry` reset rule.
         if status_changed
-            && previous_status == "blocked"
-            && task.status != "blocked"
+            && previous_status == TaskStatus::Blocked
+            && task.status != TaskStatus::Blocked
             && matches!(
                 previous_blocked_reason.as_deref(),
                 Some("ci_failure") | Some("ci_failure_exhausted")

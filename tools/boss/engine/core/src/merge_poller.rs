@@ -53,7 +53,7 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
-use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
+use crate::work::{LatePrCandidate, PendingMergeCheck, TaskStatus, WorkDb};
 use boss_protocol::{self, TaskKind};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
@@ -3061,7 +3061,7 @@ mod tests {
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "done");
+                assert_eq!(t.status, TaskStatus::Done);
                 assert_eq!(t.pr_url.as_deref(), Some(pr));
             }
             other => panic!("expected chore, got {other:?}"),
@@ -3093,7 +3093,7 @@ mod tests {
         // signal hits nothing on the resolve side either.
         assert_eq!(outcome.conflict_cleared, 0);
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected chore, got {other:?}"),
         }
         // Only poll-state housekeeping events are allowed; no lifecycle flip.
@@ -3118,11 +3118,11 @@ mod tests {
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore_a).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected chore, got {other:?}"),
         }
         match db.get_work_item(&chore_b).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "done"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
             other => panic!("expected chore, got {other:?}"),
         }
     }
@@ -3158,13 +3158,13 @@ mod tests {
         match db.get_work_item(&project_task_id).unwrap() {
             WorkItem::Task(t) => {
                 assert_eq!(t.kind, TaskKind::ProjectTask);
-                assert_eq!(t.status, "done");
+                assert_eq!(t.status, TaskStatus::Done);
                 assert_eq!(t.pr_url.as_deref(), Some(pr_proj));
             }
             other => panic!("expected project_task, got {other:?}"),
         }
         match db.get_work_item(&chore_id).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "done"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
             other => panic!("expected chore, got {other:?}"),
         }
         let work_events = publisher.work_events.lock().await.clone();
@@ -3193,7 +3193,7 @@ mod tests {
         let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.total_transitions(), 0);
         match db.get_work_item(&project_task_id).unwrap() {
-            WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected project_task, got {other:?}"),
         }
         assert!(publisher.lifecycle_reasons().await.is_empty());
@@ -3235,7 +3235,7 @@ mod tests {
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
                 // New-model: parent stays in_review while revision is in flight.
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -3254,7 +3254,7 @@ mod tests {
         assert_eq!(outcome3.conflict_flagged, 0);
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
                 assert!(t.blocked_attempt_id.is_none());
             }
@@ -3402,7 +3402,7 @@ mod tests {
         // Parent in_review with blocked columns cleared.
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
                 assert!(t.blocked_attempt_id.is_none());
             }
@@ -3612,7 +3612,7 @@ mod tests {
             // Precondition: stranded + invisible to the scalar-reason lists.
             match db.get_work_item(&chore).unwrap() {
                 WorkItem::Chore(t) => {
-                    assert_eq!(t.status, "blocked", "{reason}: precondition status");
+                    assert_eq!(t.status, TaskStatus::Blocked, "{reason}: precondition status");
                     assert!(t.blocked_reason.is_none(), "{reason}: precondition NULL reason");
                 }
                 other => panic!("{reason}: expected chore, got {other:?}"),
@@ -3685,7 +3685,7 @@ mod tests {
             assert_ne!(new_rev, prior_rev_id, "{reason}: new revision is distinct");
             match db.get_work_item(&prior_rev_id).unwrap() {
                 WorkItem::Task(t) => {
-                    assert_eq!(t.status, "in_review", "{reason}: prior revision stays in review");
+                    assert_eq!(t.status, TaskStatus::InReview, "{reason}: prior revision stays in review");
                     assert_eq!(t.kind, TaskKind::Revision);
                 }
                 other => panic!("{reason}: expected prior revision task, got {other:?}"),
@@ -3693,7 +3693,7 @@ mod tests {
             match db.get_work_item(&new_rev).unwrap() {
                 WorkItem::Task(t) => {
                     assert_eq!(t.kind, TaskKind::Revision, "{reason}: new fix vehicle is a revision");
-                    assert_ne!(t.status, "done", "{reason}: new revision is not auto-advanced");
+                    assert_ne!(t.status, TaskStatus::Done, "{reason}: new revision is not auto-advanced");
                 }
                 other => panic!("{reason}: expected new revision task, got {other:?}"),
             }
@@ -3771,7 +3771,7 @@ mod tests {
         );
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "blocked");
+                assert_eq!(t.status, TaskStatus::Blocked);
                 assert!(t.blocked_reason.is_none(), "left untouched at blocked: NULL");
             }
             other => panic!("expected chore, got {other:?}"),
@@ -3856,7 +3856,7 @@ mod tests {
             .recanonicalize_blocked_merge_conflict(&chore, pr)
             .unwrap()
             .expect("claims the null-reason blocked row");
-        assert_eq!(updated.status, "blocked");
+        assert_eq!(updated.status, TaskStatus::Blocked);
         assert_eq!(updated.blocked_reason.as_deref(), Some("merge_conflict"));
         assert!(
             db.active_blocked_signals(&chore)
@@ -3904,7 +3904,7 @@ mod tests {
         // `ci_failure` blocked-signal row keeps the retire path armed.
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -3935,7 +3935,7 @@ mod tests {
         assert_eq!(outcome3.ci_cleared, 1, "next clean probe must retire");
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -4011,7 +4011,7 @@ mod tests {
         );
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review", "parent stays in_review while CI runs");
+                assert_eq!(t.status, TaskStatus::InReview, "parent stays in_review while CI runs");
                 assert!(t.blocked_reason.is_none());
                 assert_eq!(
                     t.ci_required_state.as_deref(),
@@ -4083,7 +4083,7 @@ mod tests {
         assert_eq!(out3.ci_cleared, 1, "a clean probe must retire the remediation");
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
                 assert_eq!(
                     t.ci_required_state.as_deref(),
@@ -4167,7 +4167,7 @@ mod tests {
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
         run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected chore, got {other:?}"),
         }
 
@@ -4177,7 +4177,7 @@ mod tests {
         assert_eq!(outcome.merged, 1);
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "done");
+                assert_eq!(t.status, TaskStatus::Done);
                 assert_eq!(t.pr_url.as_deref(), Some(pr));
                 assert!(
                     t.blocked_reason.is_none(),
@@ -5278,7 +5278,7 @@ mod tests {
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
                 // New-model: parent stays in_review while revision is in flight.
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -5308,7 +5308,7 @@ mod tests {
         );
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -5336,7 +5336,7 @@ mod tests {
         assert_eq!(outcome.conflict_flagged, 0);
         assert_eq!(outcome.total_transitions(), 0);
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected chore, got {other:?}"),
         }
         assert!(publisher.lifecycle_reasons().await.is_empty());
@@ -5385,7 +5385,7 @@ mod tests {
             crate::work::WorkItem::Chore(t) => t,
             other => panic!("expected Chore, got {other:?}"),
         };
-        assert_eq!(task.status, "blocked");
+        assert_eq!(task.status, TaskStatus::Blocked);
         assert_eq!(task.blocked_reason.as_deref(), Some("merge_conflict"));
 
         // Probe now reports CONFLICTING against the *new* main SHA "sha-new".
@@ -5460,7 +5460,7 @@ mod tests {
             crate::work::WorkItem::Chore(t) => t,
             other => panic!("expected Chore, got {other:?}"),
         };
-        assert_eq!(task_after.status, "in_review",
+        assert_eq!(task_after.status, TaskStatus::InReview,
             "stale-base re-arm must reconcile parent to in_review (revision in flight)");
         assert!(task_after.blocked_reason.is_none());
     }
@@ -5558,7 +5558,7 @@ mod tests {
             crate::work::WorkItem::Chore(t) => t,
             _ => panic!(),
         };
-        assert_eq!(task_after.status, "in_review");
+        assert_eq!(task_after.status, TaskStatus::InReview);
         assert!(task_after.blocked_reason.is_none());
 
         // work_item_changed event must have fired.
@@ -5658,7 +5658,7 @@ mod tests {
         assert!(active.is_empty(), "merge_conflict signal cleared; got {active:?}");
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -5709,7 +5709,7 @@ mod tests {
         assert!(active.is_empty(), "ci_failure signal cleared; got {active:?}");
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert_eq!(
                     t.ci_attempts_used, 0,
                     "Phase 10 #32: full cycle resets budget to 0",
@@ -5817,7 +5817,7 @@ mod tests {
         );
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
             }
             other => panic!("expected chore, got {other:?}"),
         }
@@ -5931,7 +5931,7 @@ mod tests {
         assert!(db.active_blocked_signals(&chore).unwrap().is_empty());
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6045,7 +6045,7 @@ mod tests {
         // Parent in_review.
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
-                assert_eq!(t.status, "in_review");
+                assert_eq!(t.status, TaskStatus::InReview);
                 assert!(t.blocked_reason.is_none());
             }
             other => panic!("expected chore, got {other:?}"),
@@ -6206,7 +6206,7 @@ mod tests {
             WorkItem::Chore(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(task.status, "in_review");
+        assert_eq!(task.status, TaskStatus::InReview);
         assert_eq!(
             task.pr_url.as_deref(),
             Some("https://github.com/foo/bar/pull/77")
@@ -6328,7 +6328,7 @@ mod tests {
 
         // Task stays in Review — NOT demoted back to todo.
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected chore, got {other:?}"),
         }
         // The worker execution is now terminal and no longer live.
@@ -6540,7 +6540,7 @@ mod tests {
             WorkItem::Chore(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(t.status, "in_review", "task must be back in_review after CI recovery");
+        assert_eq!(t.status, TaskStatus::InReview, "task must be back in_review after CI recovery");
         assert!(t.blocked_reason.is_none(), "blocked_reason must be cleared");
         assert_eq!(
             t.ci_required_state.as_deref(),
@@ -6697,7 +6697,7 @@ mod tests {
         // revision in flight; the pending ci_remediations row still exists and
         // is what drives the badge this test guards.
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "in_review"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected chore, got {other:?}"),
         }
 
@@ -6729,7 +6729,7 @@ mod tests {
 
         // Task must be done.
         match db.get_work_item(&chore).unwrap() {
-            WorkItem::Chore(t) => assert_eq!(t.status, "done"),
+            WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
             other => panic!("expected chore, got {other:?}"),
         }
 

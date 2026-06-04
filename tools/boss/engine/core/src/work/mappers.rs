@@ -151,6 +151,8 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     };
     let kind_raw: String = row.get(3)?;
     let kind = parse_text_column::<TaskKind>(3, &kind_raw)?;
+    let status_raw: String = row.get(6)?;
+    let status = parse_text_column::<TaskStatus>(6, &status_raw)?;
     Ok(Task {
         id: row.get(0)?,
         product_id: row.get(1)?,
@@ -158,7 +160,7 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         kind,
         name: row.get(4)?,
         description: row.get(5)?,
-        status: row.get(6)?,
+        status,
         ordinal: row.get(7)?,
         pr_url: row.get(8)?,
         deleted_at: row.get(9)?,

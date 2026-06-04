@@ -1671,7 +1671,7 @@ fn manual_move_unrelated_to_ci_does_not_write_suppression() {
     db.update_work_item(
         &chore.id,
         WorkItemPatch {
-            status: Some("to_do".into()),
+            status: Some("todo".into()),
             ..WorkItemPatch::default()
         },
     )

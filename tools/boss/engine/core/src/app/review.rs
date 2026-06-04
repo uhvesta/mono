@@ -48,7 +48,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 return;
             }
         };
-        if task_status != "in_review" {
+        if task_status != TaskStatus::InReview {
             send_response(
                 &sink,
                 &request_id,

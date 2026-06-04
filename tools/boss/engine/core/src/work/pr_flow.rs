@@ -54,10 +54,14 @@ impl WorkDb {
         // keep the existing status. `PendingReview` holds the task in
         // its current status so the reviewer pass runs before human Review.
         let new_status = match target {
-            _ if task.status == "done" || task.status == "archived" => task.status.clone(),
-            WorkerPrCompletionTarget::InReview if task.status == "in_review" => task.status.clone(),
-            WorkerPrCompletionTarget::InReview => "in_review".to_owned(),
-            WorkerPrCompletionTarget::Done => "done".to_owned(),
+            _ if task.status == TaskStatus::Done || task.status == TaskStatus::Archived => {
+                task.status.clone()
+            }
+            WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => {
+                task.status.clone()
+            }
+            WorkerPrCompletionTarget::InReview => TaskStatus::InReview,
+            WorkerPrCompletionTarget::Done => TaskStatus::Done,
             // P992: hold in current status while the reviewer runs.
             WorkerPrCompletionTarget::PendingReview => task.status.clone(),
         };
@@ -78,11 +82,16 @@ impl WorkDb {
                  blocked_reason     = NULL,
                  blocked_attempt_id = NULL
              WHERE id = ?1",
-            params![task.id, new_status, pr_url_for_task, now],
+            params![task.id, new_status.as_str(), pr_url_for_task, now],
         )?;
 
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, &task.id, &new_status, &now)?;
+            cascade_dependents_after_prereq_status_change(
+                &tx,
+                &task.id,
+                new_status.as_str(),
+                &now,
+            )?;
         }
 
         tx.execute(
@@ -382,7 +391,7 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             return Ok(None);
         }
-        if task.status == "done" || task.status == "archived" {
+        if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
             return Ok(None);
         }
         let now = now_string();

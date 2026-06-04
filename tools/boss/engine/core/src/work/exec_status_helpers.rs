@@ -67,8 +67,8 @@ pub(crate) fn task_accepts_execution(task: &Task) -> bool {
     // execution — they only get `waiting_dependency` rows until all
     // prerequisites are complete.
     if matches!(
-        task.status.as_str(),
-        "done" | "archived" | "cancelled" | "in_review"
+        task.status,
+        TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled | TaskStatus::InReview
     ) {
         return false;
     }
@@ -78,7 +78,7 @@ pub(crate) fn task_accepts_execution(task: &Task) -> bool {
     // creates a ready execution. Once `start_execution_run` flips the
     // task to `active` it also clears `autostart` to 0 (single-shot
     // semantics), so `active` tasks always pass this check.
-    if !task.autostart && task.status == "todo" {
+    if !task.autostart && task.status == TaskStatus::Todo {
         return false;
     }
     true
@@ -296,7 +296,7 @@ mod tests {
     /// Build a minimal `Task` for the `task_accepts_execution` cases.
     /// Only `status`, `autostart`, and `deleted_at` drive the function;
     /// every other field carries a fixed placeholder.
-    fn task(status: &str, autostart: bool, deleted_at: Option<&str>) -> Task {
+    fn task(status: TaskStatus, autostart: bool, deleted_at: Option<&str>) -> Task {
         Task::builder()
             .id("task_test")
             .product_id("prod_test")
@@ -356,7 +356,7 @@ mod tests {
     fn task_accepts_execution_rejects_soft_deleted() {
         // A deleted task is rejected even when its status would otherwise pass.
         assert!(!task_accepts_execution(&task(
-            "active",
+            TaskStatus::Active,
             true,
             Some("2026-01-01T00:00:00Z")
         )));
@@ -364,9 +364,14 @@ mod tests {
 
     #[test]
     fn task_accepts_execution_rejects_non_dispatchable_statuses() {
-        for status in ["done", "archived", "cancelled", "in_review"] {
+        for status in [
+            TaskStatus::Done,
+            TaskStatus::Archived,
+            TaskStatus::Cancelled,
+            TaskStatus::InReview,
+        ] {
             assert!(
-                !task_accepts_execution(&task(status, true, None)),
+                !task_accepts_execution(&task(status.clone(), true, None)),
                 "{status} should not accept execution"
             );
         }
@@ -375,18 +380,18 @@ mod tests {
     #[test]
     fn task_accepts_execution_honours_autostart_optout_only_in_todo() {
         // autostart=false parks the task only while it sits in `todo`.
-        assert!(!task_accepts_execution(&task("todo", false, None)));
+        assert!(!task_accepts_execution(&task(TaskStatus::Todo, false, None)));
         // Once active, autostart no longer gates (it is cleared at start).
-        assert!(task_accepts_execution(&task("active", false, None)));
+        assert!(task_accepts_execution(&task(TaskStatus::Active, false, None)));
     }
 
     #[test]
     fn task_accepts_execution_allows_active_and_autostart_todo() {
-        assert!(task_accepts_execution(&task("active", true, None)));
-        assert!(task_accepts_execution(&task("todo", true, None)));
+        assert!(task_accepts_execution(&task(TaskStatus::Active, true, None)));
+        assert!(task_accepts_execution(&task(TaskStatus::Todo, true, None)));
         // `blocked` is intentionally allowed through so the reconciler can
         // create `waiting_dependency` rows for dependency-gated tasks.
-        assert!(task_accepts_execution(&task("blocked", true, None)));
+        assert!(task_accepts_execution(&task(TaskStatus::Blocked, true, None)));
     }
 
     // ── default_slug ────────────────────────────────────────────────────────

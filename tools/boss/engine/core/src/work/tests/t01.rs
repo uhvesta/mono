@@ -1642,7 +1642,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     // Doing column.
     let advanced_chore = db.get_work_item(&chore.id).unwrap();
     match advanced_chore {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
         other => panic!("expected chore/task, got {other:?}"),
     }
 
@@ -1806,7 +1806,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     )
     .unwrap();
     match db.get_work_item(&chore.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "active"),
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
         other => panic!("expected chore/task, got {other:?}"),
     }
 
@@ -1816,7 +1816,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
 
     // Active → todo so the kanban card returns to the To-Do lane.
     match db.get_work_item(&chore.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "todo"),
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Todo),
         other => panic!("expected chore/task, got {other:?}"),
     }
 
@@ -1874,7 +1874,7 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     // `in_review` survives — the PR still exists; cancel only
     // tears down the worker session, not the PR.
     match db.get_work_item(&chore.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "in_review"),
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
         other => panic!("expected chore/task, got {other:?}"),
     }
 
@@ -1957,7 +1957,7 @@ fn start_execution_does_not_downgrade_done_chores() {
     // overwrite that with `active`. Manual transitions win.
     let unchanged = db.get_work_item(&chore.id).unwrap();
     match unchanged {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, "done"),
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Done),
         other => panic!("expected chore/task, got {other:?}"),
     }
 

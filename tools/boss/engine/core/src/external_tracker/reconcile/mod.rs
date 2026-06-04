@@ -25,7 +25,7 @@ use super::{
 };
 use super::credentials::{TrackerCredentialError, TrackerCredentialResolver};
 use crate::metrics::Registry;
-use crate::work::{content_checksum, WorkDb};
+use crate::work::{TaskStatus, content_checksum, WorkDb};
 
 // ── Work-invalidation publisher ───────────────────────────────────────────────
 
@@ -915,7 +915,7 @@ async fn reconcile_existing(
     match &upstream.status {
         UpstreamStatus::Closed { .. } => {
             // Behavior 2: close-mirror — upstream is done, boss must follow.
-            if task.status != "done" && task.status != "archived" {
+            if task.status != TaskStatus::Done && task.status != TaskStatus::Archived {
                 match work_db.reconciler_close_work_item(work_item_id) {
                     Ok(true) => {
                         CLOSED.inc(metrics);
@@ -938,7 +938,7 @@ async fn reconcile_existing(
         UpstreamStatus::Open => {
             // Behavior 5: close-on-merge.
             let has_merged_pr = upstream.pr_associations.iter().any(|p| p.merged);
-            let boss_is_done = task.status == "done" || task.status == "archived";
+            let boss_is_done = task.status == TaskStatus::Done || task.status == TaskStatus::Archived;
             let boss_has_pr = !task.pr_url.as_deref().unwrap_or("").is_empty();
 
             if has_merged_pr && !boss_is_done {
@@ -993,7 +993,7 @@ async fn reconcile_existing(
             // project status is not already the target column; this prevents
             // a regression if the user has manually advanced the item to a
             // later column while the task is still in progress.
-            if task.status == "active" {
+            if task.status == TaskStatus::Active {
                 let already_at_target =
                     upstream.project_status.as_deref() == Some(in_progress_column);
                 if !already_at_target {
@@ -1636,7 +1636,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#1")
             .expect("query ok")
             .expect("chore should exist");
-        assert_eq!(task.status, "todo");
+        assert_eq!(task.status, TaskStatus::Todo);
         assert!(task.name.contains("My issue"), "name should come from title");
         assert_eq!(task.product_id, product.id);
         let ext = task.external_ref.expect("external_ref should be set");
@@ -1733,7 +1733,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#52")
             .expect("query ok")
             .expect("chore should exist despite label failure");
-        assert_eq!(chore.status, "todo");
+        assert_eq!(chore.status, TaskStatus::Todo);
     }
 
     #[tokio::test]
@@ -1896,7 +1896,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#3")
             .expect("query ok")
             .expect("chore should still exist");
-        assert_eq!(updated.status, "done", "boss row should be done");
+        assert_eq!(updated.status, TaskStatus::Done, "boss row should be done");
     }
 
     // ── Test: pr-attach (Behavior 4) ─────────────────────────────────────────
@@ -1990,7 +1990,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#5")
             .expect("query ok")
             .expect("chore exists");
-        assert_eq!(updated.status, "done");
+        assert_eq!(updated.status, TaskStatus::Done);
 
         let calls = tracker.close_calls();
         assert_eq!(calls, vec!["spy#5"], "close_issue should have been called for spy#5");
@@ -2083,7 +2083,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#7")
             .expect("query ok")
             .expect("chore exists");
-        assert_eq!(after_tick1.status, "done", "boss row done after tick 1");
+        assert_eq!(after_tick1.status, TaskStatus::Done, "boss row done after tick 1");
 
         // Tick 2: upstream is still Open (close didn't land); close_issue succeeds.
         tracker.push_ok();
@@ -2126,7 +2126,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#8")
             .expect("query ok")
             .expect("chore exists");
-        assert_eq!(task.status, "todo");
+        assert_eq!(task.status, TaskStatus::Todo);
         assert!(task.pr_url.is_none());
         assert_eq!(task.product_id, product.id);
     }
@@ -2226,7 +2226,7 @@ mod tests {
         let product = setup_product_with_reverse_close(&db);
 
         let chore = seed_done_chore(&db, &product.id, "spy#10", 10);
-        assert_eq!(chore.status, "done");
+        assert_eq!(chore.status, TaskStatus::Done);
 
         // Upstream still Open, no PR associations.
         let tracker = SpyTracker::new(vec![open_item(10, "Issue 10")]);
@@ -2253,7 +2253,7 @@ mod tests {
 
         // Boss row bound and done, upstream shows a merged PR.
         let chore = seed_done_chore(&db, &product.id, "spy#11", 11);
-        assert_eq!(chore.status, "done");
+        assert_eq!(chore.status, TaskStatus::Done);
 
         let tracker = SpyTracker::new(vec![item_with_merged_pr(
             11,
@@ -2285,7 +2285,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         let chore = seed_done_chore(&db, &product.id, "spy#12", 12);
-        assert_eq!(chore.status, "done");
+        assert_eq!(chore.status, TaskStatus::Done);
 
         // Upstream still Open, no PR associations.
         let tracker = SpyTracker::new(vec![open_item(12, "Issue 12")]);
@@ -2332,7 +2332,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#30")
             .expect("query ok")
             .expect("imported chore must be findable by external_ref");
-        assert_eq!(chore.status, "todo");
+        assert_eq!(chore.status, TaskStatus::Todo);
 
         // Simulate the chore being completed (e.g. PR merged → boss dragged to done).
         db.reconciler_close_work_item(&chore.id).expect("close work item");
@@ -2340,7 +2340,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#30")
             .expect("query ok")
             .expect("chore still exists");
-        assert_eq!(closed.status, "done");
+        assert_eq!(closed.status, TaskStatus::Done);
 
         // Pass 2: upstream still Open, boss is done, no merged PR
         //         → reverse_close must fire.
@@ -2421,7 +2421,7 @@ mod tests {
             .find_by_external_ref("spy", "spy#10")
             .expect("query ok")
             .expect("chore should exist after spawn_loop tick");
-        assert_eq!(task.status, "todo");
+        assert_eq!(task.status, TaskStatus::Todo);
 
         let imported = metrics.counter_value("external_tracker.imported").unwrap_or(0);
         assert!(imported >= 1, "IMPORTED counter should be ≥ 1, got {imported}");
@@ -2753,7 +2753,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         let chore = seed_active_chore(&db, &product.id, "spy#30", 30);
-        assert_eq!(chore.status, "active");
+        assert_eq!(chore.status, TaskStatus::Active);
 
         // Upstream is Open with project_status = "Todo" (not yet In progress).
         let item = open_item_with_project_status(30, "Issue 30", "Todo");
@@ -2780,7 +2780,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         let chore = seed_active_chore(&db, &product.id, "spy#31", 31);
-        assert_eq!(chore.status, "active");
+        assert_eq!(chore.status, TaskStatus::Active);
 
         // Upstream already at "In Progress".
         let item = open_item_with_project_status(31, "Issue 31", "In Progress");
@@ -2843,7 +2843,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         let chore = seed_active_chore(&db, &product.id, "spy#33", 33);
-        assert_eq!(chore.status, "active");
+        assert_eq!(chore.status, TaskStatus::Active);
 
         // Upstream is Closed → Behavior 2 fires; Behavior 6 should not.
         let item = UpstreamItem {
@@ -2873,7 +2873,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         let chore = seed_active_chore(&db, &product.id, "spy#34", 34);
-        assert_eq!(chore.status, "active");
+        assert_eq!(chore.status, TaskStatus::Active);
 
         // project_status remains "Todo" both ticks (mutation didn't land yet).
         let item = open_item_with_project_status(34, "Issue 34", "Todo");
@@ -2905,7 +2905,7 @@ mod tests {
         let product = setup_product_with_tracker(&db);
 
         let chore = seed_active_chore(&db, &product.id, "spy#35", 35);
-        assert_eq!(chore.status, "active");
+        assert_eq!(chore.status, TaskStatus::Active);
 
         // project_status is None (Status field not set on the GitHub Project item).
         let item = open_item(35, "Issue 35");

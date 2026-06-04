@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use super::*;
 use crate::merge_poller::{CiProvider, OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
-use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItem, WorkItemPatch};
+use crate::work::{CreateChoreInput, CreateProductInput, TaskStatus, WorkDb, WorkItem, WorkItemPatch};
 
 #[derive(Default)]
 struct RecordingPublisher {
@@ -124,7 +124,7 @@ fn one_failure() -> Vec<RequiredCheckFailure> {
     }]
 }
 
-fn chore_state(db: &WorkDb, id: &str) -> (String, Option<String>) {
+fn chore_state(db: &WorkDb, id: &str) -> (TaskStatus, Option<String>) {
     match db.get_work_item(id).unwrap() {
         WorkItem::Chore(t) => (t.status, t.blocked_reason),
         other => panic!("expected chore, got {other:?}"),
@@ -162,7 +162,7 @@ async fn detection_flips_in_review_to_blocked_ci_failure() {
     // In the in_review model a spawned revision immediately unblocks the
     // parent back to `in_review`; `blocked: ci_failure` is transient.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 
     let events = pub_.events.lock().await.clone();
@@ -253,7 +253,7 @@ async fn detection_defers_when_active_conflict_resolution_exists() {
     .await;
     assert!(!flipped, "active conflict-resolution must pre-empt CI flow");
     let (status, _) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review", "row stays where it was");
+    assert_eq!(status, TaskStatus::InReview, "row stays where it was");
 }
 
 #[tokio::test]
@@ -323,7 +323,7 @@ async fn detection_lands_exhausted_when_budget_is_zero() {
     .await;
     assert!(flipped);
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure_exhausted"));
 
     let typed = pub_.typed_events.lock().await.clone();
@@ -381,7 +381,7 @@ async fn detection_requires_head_ref_oid() {
     .await;
     assert!(!flipped);
     let (status, _) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
 }
 
 #[tokio::test]
@@ -407,7 +407,7 @@ async fn full_cycle_detect_then_retire() {
     assert!(detected);
     // In the in_review model the parent stays in_review while the revision runs.
     let (status, _) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
 
     // 2. Retire — CI is back to clean.
     let resolved = on_ci_resolved(
@@ -419,7 +419,7 @@ async fn full_cycle_detect_then_retire() {
     .await;
     assert!(resolved);
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 
     // Attempt row terminal.
@@ -489,7 +489,7 @@ async fn retire_skipped_when_product_opt_out_flag_disabled() {
     // In the in_review model the parent was never blocked; the retire
     // no-op leaves it in_review.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 }
 
@@ -542,7 +542,7 @@ async fn retire_without_active_attempt_emits_ci_failure_cleared() {
     assert!(resolved, "retire must succeed even without active attempt");
 
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 
     // Engine must emit CiFailureCleared (not CiRemediationSucceeded)
@@ -611,7 +611,7 @@ async fn in_flight_supersedes_stale_ci_failure() {
     assert!(cleared, "stale ci_failure must be superseded by InFlight");
 
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 
     let typed = pub_.typed_events.lock().await.clone();
@@ -675,7 +675,7 @@ async fn in_flight_supersede_skips_when_active_remediation() {
 
     // In the in_review model the parent stays in_review while the revision runs.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
 }
 
@@ -700,7 +700,7 @@ async fn in_flight_supersede_noop_when_in_review() {
     assert!(!cleared, "an in_review chore has no stale failure to clear");
 
     let (status, _) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
     assert!(pub_.typed_events.lock().await.is_empty());
     assert!(pub_.events.lock().await.is_empty());
 }
@@ -727,7 +727,7 @@ async fn in_flight_supersede_skipped_when_pr_has_opt_out_label() {
     assert!(!cleared, "opt-out label must suppress the supersede");
 
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 }
 
@@ -1390,7 +1390,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
     assert!(flipped, "rebounce detection must flip chore to ci_failure");
 
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 
     // Phase 5 cutover: no bespoke ci_remediation execution — the fix
@@ -1481,7 +1481,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
 
     // Chore must still be blocked after the clean probe.
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 }
 
@@ -1523,7 +1523,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
     assert!(!second, "second probe for same SHA must be a no-op");
 
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 
     // Phase 5 cutover: exactly one revision, no ci_remediation executions.
@@ -1593,7 +1593,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
     assert!(cleared, "after worker succeeds, on_ci_resolved must clear the block");
 
     let (status, _) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
 }
 
 // ----- Back-to-back dequeue regression (T628 / PR #718 06:51Z miss) -----
@@ -1639,7 +1639,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     .await;
     assert!(first, "first rebounce must flip chore to ci_failure");
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
     {
         // Phase 5 cutover: no bespoke ci_remediation execution; a revision is
@@ -1685,7 +1685,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     .await;
     assert!(cleared, "on_ci_resolved must clear the block after SHA_1 is terminal");
     let (status, _) = chore_state(&db, &chore);
-    assert_eq!(status, "in_review");
+    assert_eq!(status, TaskStatus::InReview);
 
     // Step 4a: next sweep replays SHA_1 — INSERT is ignored (key exists, row
     // terminal). attempt=None → task flips (WHERE guard matches) but NO new
@@ -1702,7 +1702,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     .await;
     assert!(sha1_replay, "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)");
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
     // Still just the original revision from step 1.
     {
@@ -1769,7 +1769,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         assert_eq!(r, 2, "sha2 must have its own revision; total revisions must be 2");
     }
     let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, "blocked");
+    assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 
     // Sanity: no stranded ci_remediation attempts — sha2 has revision_task_id.

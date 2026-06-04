@@ -17,7 +17,7 @@ use crate::worker_setup::WorkerKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{EditorialRules, ExecutionKind, ExecutionStatus, TemplatePolicy, WorkItemBinding};
 #[cfg(test)]
-use boss_protocol::TaskKind;
+use boss_protocol::{TaskKind, TaskStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunAttention {
@@ -2497,7 +2497,7 @@ mod compose_prompt_tests {
                 .kind(TaskKind::Chore)
                 .name("Fix the thing")
                 .description("Description here.")
-                .status("todo")
+                .status(TaskStatus::Todo)
                 .created_at("2026-05-15T00:00:00Z")
                 .updated_at("2026-05-15T00:00:00Z")
                 .autostart(false)
@@ -3215,7 +3215,7 @@ mod compose_prompt_tests {
             .kind(TaskKind::Revision)
             .name("Revision task")
             .description("Fix the merge conflict.")
-            .status("doing")
+            .status(TaskStatus::Active)
             .created_at("2026-05-15T00:00:00Z")
             .updated_at("2026-05-15T00:00:00Z")
             .autostart(false)
@@ -3719,7 +3719,7 @@ mod compose_worker_spawn_tests {
                 .kind(TaskKind::Chore)
                 .name("Add a new feature")
                 .description("Feature description.")
-                .status("todo")
+                .status(TaskStatus::Todo)
                 .created_at("2026-05-15T00:00:00Z")
                 .updated_at("2026-05-15T00:00:00Z")
                 .autostart(false)
@@ -4013,7 +4013,7 @@ mod pane_spawn_tests {
                 .kind(TaskKind::Chore)
                 .name("Improve top header (agent card) styling")
                 .description("The gray header at the top is too cramped.")
-                .status("todo")
+                .status(TaskStatus::Todo)
                 .created_at("2026-05-06T20:00:00Z")
                 .updated_at("2026-05-06T20:00:00Z")
                 .build(),
