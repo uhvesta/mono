@@ -11,11 +11,15 @@ impl ChangelogRenderer for GithubMarkdownRenderer {
     fn render(&self, range: &ChangelogRange) -> String {
         let mut out = String::new();
         out.push_str("## What's Changed\n");
-        for entry in &range.entries {
-            out.push_str(&format!(
-                "* {} by @{} in {}\n",
-                entry.title, entry.author_login, entry.pr_url,
-            ));
+        if range.entries.is_empty() {
+            out.push_str("Nothing significant!\n");
+        } else {
+            for entry in &range.entries {
+                out.push_str(&format!(
+                    "* {} by @{} in {}\n",
+                    entry.title, entry.author_login, entry.pr_url,
+                ));
+            }
         }
         // Two blank lines before the Full Changelog line.
         out.push_str("\n\n");
@@ -62,6 +66,29 @@ mod tests {
 ## What's Changed
 * Add cool feature by @alice in https://github.com/example/repo/pull/42
 * Fix nasty bug by @bob in https://github.com/example/repo/pull/41
+
+
+**Full Changelog**: https://github.com/example/repo/compare/v1.0.0...v1.1.0";
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn render_empty_entries_shows_placeholder() {
+        let range = ChangelogRange {
+            from_tag: "v1.0.0".to_string(),
+            to_tag: "v1.1.0".to_string(),
+            compare_url:
+                "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
+            entries: vec![],
+        };
+
+        let renderer = GithubMarkdownRenderer;
+        let output = renderer.render(&range);
+
+        let expected = "\
+## What's Changed
+Nothing significant!
 
 
 **Full Changelog**: https://github.com/example/repo/compare/v1.0.0...v1.1.0";
