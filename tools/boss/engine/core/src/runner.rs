@@ -409,6 +409,30 @@ impl ExecutionRunner for PaneSpawnRunner {
         }
         std::fs::write(&prompt_path, &prompt_text)
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
+
+        // Structured-output artifact (review findings / task followups): create
+        // the engine-owned scratch dir and clear any stale file from a prior
+        // run of this exact execution id, then hand the worker its absolute
+        // path via `BOSS_STRUCTURED_OUTPUT`. The same path is embedded in the
+        // worker prompt (see `compose_worker_spawn`); the completion handler
+        // reads + validates it. Best-effort: a prepare failure is non-fatal
+        // (the worker falls back to the transcript-scrape contract).
+        let structured_output_dir = crate::structured_output::default_dir();
+        let structured_output_path =
+            match crate::structured_output::prepare(&structured_output_dir, &execution.id) {
+                Ok(path) => Some(path.display().to_string()),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        dir = %structured_output_dir.display(),
+                        ?err,
+                        "spawn: could not prepare structured-output dir; worker will rely on \
+                         the transcript-scrape fallback",
+                    );
+                    None
+                }
+            };
+
         // Scrub ANTHROPIC_API_KEY from the worker shell's environment before
         // invoking claude. The engine needs the var in its own process for
         // pane-summary LLM calls; workers must authenticate via OAuth
@@ -480,7 +504,14 @@ impl ExecutionRunner for PaneSpawnRunner {
                 events_socket_path: self.events_socket_path(),
                 boss_event_path: self.boss_event_binary(),
                 initial_input,
-                extra_env: vec![],
+                extra_env: structured_output_path
+                    .map(|p| {
+                        vec![(
+                            crate::structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
+                            p,
+                        )]
+                    })
+                    .unwrap_or_default(),
                 title_summary,
                 task_title: Some(work_item_name(work_item).to_owned()),
                 work_item_binding,
@@ -983,6 +1014,7 @@ pub(crate) async fn compose_worker_spawn(
                 task_name,
                 task_description,
                 pr_url,
+                &crate::structured_output::default_path_string(&execution.id),
                 scope,
                 pr_review_context.as_ref(),
             )
@@ -1310,7 +1342,9 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
             | ExecutionKind::InvestigationImplementation
             | ExecutionKind::RevisionImplementation
     ) {
-        prompt.push_str(&followups_emission_block());
+        prompt.push_str(&followups_emission_block(
+            &crate::structured_output::default_path_string(&execution.id),
+        ));
     }
     prompt.push_str("\nRespond with concise markdown using exactly these sections:\n");
     prompt.push_str("## Summary\n## Validation\n## Open Questions\n");
@@ -1622,26 +1656,31 @@ fn design_questions_manifest_block() -> String {
 /// Followups emission instruction (design:
 /// `tools/boss/docs/designs/attentions.md`, "Creation pipeline"). Appended to
 /// the implementation-worker directive: a worker that notices concrete,
-/// out-of-scope follow-on work near task completion surfaces it as a
-/// `FOLLOWUPS:` sentinel + fenced JSON array. The engine parses the
-/// transcript tail and upserts a followup group keyed to this task; the
-/// human turns accepted entries into tasks with one gesture.
-fn followups_emission_block() -> String {
+/// out-of-scope follow-on work near task completion **writes** it as a JSON
+/// array to the engine-owned artifact at `output_path` (see
+/// [`crate::structured_output`]). The engine reads + schema-validates that
+/// file at completion and upserts a followup group keyed to this task; the
+/// human turns accepted entries into tasks with one gesture. A `FOLLOWUPS:`
+/// fenced-JSON sentinel in the final message is kept as a transitional
+/// fallback (and to keep remote workers working until the artifact is fetched
+/// cross-host).
+fn followups_emission_block(output_path: &str) -> String {
     let mut out = String::new();
-    out.push_str("\n## Optional: surface follow-on work as FOLLOWUPS\n\n");
+    out.push_str("\n## Optional: surface follow-on work as followups\n\n");
     out.push_str(
         "If, while completing this task, you noticed concrete follow-on work worth filing — a separate bug, a needed refactor, a missing test, a docs gap — that is OUT OF SCOPE for this PR, you may surface it for the human. This is OPTIONAL: only include genuine, actionable proposals, never invent work to fill it, and never list the change you just made.\n\n",
     );
-    out.push_str(
-        "If (and only if) you have followups, append — after your `## Open Questions` section — a line containing exactly `FOLLOWUPS:` immediately followed by a fenced ```json code block holding a JSON array. Each element is an object:\n",
-    );
+    out.push_str(&format!(
+        "If (and only if) you have followups, **write** a JSON array of them with the `Write` tool to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`):\n\n`{output_path}`\n\nThis path is outside the repo/workspace, so the manifest never pollutes your PR. Each array element is an object:\n",
+    ));
     out.push_str("- `proposed_name` (required): a short task title.\n");
     out.push_str("- `proposed_description` (required): one paragraph of scope.\n");
     out.push_str("- `proposed_effort` (optional): one of `trivial` | `small` | `medium` | `large` | `max`.\n");
     out.push_str("- `proposed_work_kind` (optional): one of `task` | `chore` | `project` (defaults to `task`).\n");
     out.push_str("- `rationale` (optional): why it is worth doing.\n\n");
-    out.push_str("Example:\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Add retry/backoff to the X client\", \"proposed_description\": \"The X client fails hard on transient 5xx; add bounded retry with jitter.\", \"proposed_effort\": \"small\", \"proposed_work_kind\": \"task\", \"rationale\": \"Observed flakes during this task.\"}]\n```\n\n");
-    out.push_str("Omit the block entirely if you have no followups. Emitting it does not block this PR — it just files proposals for the human to review.\n");
+    out.push_str("File contents example:\n\n```json\n[{\"proposed_name\": \"Add retry/backoff to the X client\", \"proposed_description\": \"The X client fails hard on transient 5xx; add bounded retry with jitter.\", \"proposed_effort\": \"small\", \"proposed_work_kind\": \"task\", \"rationale\": \"Observed flakes during this task.\"}]\n```\n\n");
+    out.push_str("Do NOT write the file at all if you have no followups — an absent file means \"no followups\", which is the normal case. Writing it does not block this PR — it just files proposals for the human to review.\n\n");
+    out.push_str("As a fallback only (e.g. if the file write is unavailable), you may instead append — after your `## Open Questions` section — a line containing exactly `FOLLOWUPS:` immediately followed by a fenced ```json code block holding the same JSON array.\n");
     out
 }
 

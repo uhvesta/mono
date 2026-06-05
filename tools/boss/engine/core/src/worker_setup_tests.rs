@@ -351,7 +351,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    for rule in reviewer_deny_rules() {
+    for rule in reviewer_deny_rules(&std_input.workspace_path) {
         assert!(
             !std_deny.contains(&rule.as_str()),
             "standard worker must NOT carry reviewer deny rule: {rule}",
@@ -369,17 +369,39 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         .iter()
         .filter_map(|v| v.as_str())
         .collect();
-    for rule in reviewer_deny_rules() {
+    for rule in reviewer_deny_rules(&rev_input.workspace_path) {
         assert!(
             rev_deny.contains(&rule.as_str()),
             "reviewer worker must carry deny rule: {rule} (got {rev_deny:?})",
         );
     }
-    // Spot-check the most critical rules.
-    for critical in ["Edit(**)", "Write(**)", "Bash(jj git push:*)", "Bash(gh pr create:*)", "Bash(gh pr comment:*)", "Bash(cube pr:*)"] {
+    // Spot-check the most critical publish rules.
+    for critical in ["Bash(jj git push:*)", "Bash(gh pr create:*)", "Bash(gh pr comment:*)", "Bash(cube pr:*)"] {
         assert!(
             rev_deny.contains(&critical),
             "reviewer must deny {critical} (got {rev_deny:?})",
+        );
+    }
+    // The reviewer's file-write deny is scoped to the worker-workspaces root
+    // (NOT a blanket `**`) so it can still write its one out-of-tree
+    // structured-output artifact, while sibling workspaces stay protected.
+    let fence = rev_input
+        .workspace_path
+        .parent()
+        .unwrap_or(&rev_input.workspace_path)
+        .display();
+    for critical in [format!("Edit({fence}/**)"), format!("Write({fence}/**)")] {
+        assert!(
+            rev_deny.contains(&critical.as_str()),
+            "reviewer must deny workspaces-root-scoped {critical} (got {rev_deny:?})",
+        );
+    }
+    // And it must NOT carry the blanket file-write denies — that would block
+    // the artifact write outside the checkout.
+    for blanket in ["Edit(**)", "Write(**)"] {
+        assert!(
+            !rev_deny.contains(&blanket),
+            "reviewer must NOT carry blanket {blanket} (got {rev_deny:?})",
         );
     }
 }

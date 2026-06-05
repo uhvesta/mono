@@ -648,7 +648,7 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
     // implementation workers get nothing extra (they must be able to edit,
     // push, and open PRs).
     match input.worker_kind {
-        WorkerKind::Reviewer => rules.extend(reviewer_deny_rules()),
+        WorkerKind::Reviewer => rules.extend(reviewer_deny_rules(&input.workspace_path)),
         WorkerKind::Triage => rules.extend(triage_deny_rules()),
         WorkerKind::Standard => {}
     }
@@ -668,19 +668,43 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 /// files but must not write, push, or post to any external surface.
 ///
 /// Rules cover:
-/// - File-write tools (`Edit`, `Write`) — all paths via `**`
+/// - File-write tools (`Edit`, `Write`) — **scoped to `workspace_path`**, not
+///   a blanket `**` (see below)
 /// - VCS push — `jj git push` and `git push` in all their CLI forms
 /// - PR mutation via `gh` — create, merge, close, edit, comment, review
 /// - Issue write via `gh` — create, comment, close, edit
 /// - `cube pr ensure` — Boss's PR-opening helper
+///
+/// # Why the file-write deny is scoped, not blanket
+///
+/// The reviewer's mandate is to never change *the PR or its branch*. It must
+/// still write exactly one engine-owned artifact: its `ReviewResult` JSON
+/// (see [`crate::structured_output`]), which lives **outside** the checkout in
+/// an engine scratch dir (the system temp dir). A blanket `Write(**)`/
+/// `Edit(**)` would block that (deny rules take precedence over allow rules in
+/// claude-code, so the path cannot be carved back out with an allow).
+///
+/// Instead the file-write deny is scoped to the **worker-workspaces root** —
+/// the parent of `workspace_path`, under which every per-worker checkout lives
+/// (`~/Documents/dev/workspaces/<repo>-agent-NNN`). That keeps the reviewer
+/// unable to write to its own PR/repo *or* any sibling worker's workspace
+/// (preserving the cross-worker isolation boundary the blanket deny gave),
+/// while permitting the out-of-tree artifact write in `$TMPDIR`. Writing
+/// engine scratch does not change the PR, so this does not weaken the
+/// read-only mandate. The Boss support dir stays denied via the separate
+/// data-dir globs in [`deny_rules`]. If `workspace_path` has no parent
+/// (degenerate), the deny falls back to the workspace itself.
 ///
 /// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
 /// operations are intentionally not denied. They touch only the local
 /// repo state and can never publish commits or PR changes to GitHub, so
 /// they are safe for a read-only reviewer to run (e.g. to navigate the
 /// history for context).
-pub fn reviewer_deny_rules() -> Vec<String> {
-    no_publish_deny_rules()
+pub fn reviewer_deny_rules(workspace_path: &Path) -> Vec<String> {
+    let fence = workspace_path.parent().unwrap_or(workspace_path).display();
+    let mut rules = vec![format!("Edit({fence}/**)"), format!("Write({fence}/**)")];
+    rules.extend(publish_deny_rules());
+    rules
 }
 
 /// Tool deny rules for triage workers (Maint task 6, [`WorkerKind::Triage`]).
@@ -696,15 +720,26 @@ pub fn reviewer_deny_rules() -> Vec<String> {
 /// creating exactly one task is the triage worker's sole write action, and it
 /// goes through the engine IPC (with its own transactional open-task cap),
 /// not through any of the rules above.
+///
+/// Unlike the reviewer (which writes one out-of-tree artifact and so gets a
+/// workspace-scoped file-write deny), a triage worker writes no file at all,
+/// so its file-write deny stays the blanket `Write(**)`/`Edit(**)`.
 pub fn triage_deny_rules() -> Vec<String> {
-    no_publish_deny_rules()
+    let mut rules = vec![
+        // File-write tools — deny all edits and writes regardless of path.
+        "Edit(**)".to_owned(),
+        "Write(**)".to_owned(),
+    ];
+    rules.extend(publish_deny_rules());
+    rules
 }
 
-/// Shared read-only / no-publish deny set used by both reviewer and triage
-/// workers. Neither kind may edit files, push commits, or write to GitHub.
+/// Shared no-publish deny set used by both reviewer and triage workers:
+/// neither kind may push commits or write to GitHub. The file-write deny is
+/// kind-specific and lives in [`reviewer_deny_rules`] / [`triage_deny_rules`]
+/// (workspace-scoped vs. blanket), so it is NOT part of this set.
 ///
 /// Rules cover:
-/// - File-write tools (`Edit`, `Write`) — all paths via `**`
 /// - VCS push — `jj git push` and `git push` in all their CLI forms
 /// - PR mutation via `gh` — create, merge, close, edit, comment, review
 /// - Issue write via `gh` — create, comment, close, edit
@@ -713,11 +748,8 @@ pub fn triage_deny_rules() -> Vec<String> {
 /// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
 /// operations are intentionally not denied. They touch only the local
 /// repo state and can never publish commits or PR changes to GitHub.
-fn no_publish_deny_rules() -> Vec<String> {
+fn publish_deny_rules() -> Vec<String> {
     vec![
-        // File-write tools — deny all edits and writes regardless of path.
-        "Edit(**)".to_owned(),
-        "Write(**)".to_owned(),
         // VCS push — both the bare command and the trailing-args form.
         "Bash(jj git push)".to_owned(),
         "Bash(jj git push:*)".to_owned(),

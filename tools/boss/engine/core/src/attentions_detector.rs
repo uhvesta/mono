@@ -9,10 +9,14 @@
 //!   design PR is detected (or merged), [`reconcile_design_doc_questions`]
 //!   fetches the manifest from the PR branch, parses it, and upserts a
 //!   `question|{project_id}|doc:{path}` group plus its members.
-//! - **Followups** — an implementation worker emits a `FOLLOWUPS:` sentinel
-//!   followed by a fenced JSON array near the end of its final response.
-//!   At completion, [`reconcile_task_followups`] reads the transcript tail,
-//!   parses the block, and upserts a `followup|{task_id}` group.
+//! - **Followups** — an implementation worker **writes** a JSON array of
+//!   followups to the engine-owned structured-output artifact (see
+//!   [`crate::structured_output`]). At completion, [`reconcile_task_followups`]
+//!   reads + schema-validates that file and upserts a `followup|{task_id}`
+//!   group. A `FOLLOWUPS:` sentinel + fenced JSON array in the transcript tail
+//!   is kept as a **transitional fallback** (covering remote workers, whose
+//!   artifact is written on the remote host, and any artifact-write failure)
+//!   and can be removed once the artifact path is proven.
 //!
 //! Both paths are content-idempotent: re-detecting the same PR or
 //! re-emitting the same block never appends duplicate members (the dedup
@@ -21,6 +25,7 @@
 //! concern — [`extract_doc_questions_backstop`] and
 //! [`extract_followups_backstop`] — disabled by default.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -358,33 +363,46 @@ async fn fetch_pr_file(
 // ── Followups: transcript-tail sentinel ─────────────────────────────────────
 
 /// Fired from `completion::finalize_pr_transition` for any completing work
-/// item. Reads the run transcript, extracts the worker's assistant text, and
-/// upserts a `followup|{work_item_id}` group from any `FOLLOWUPS:` block.
-/// Returns the group + newly-inserted members, or `None` when there is no
-/// transcript / no block / no new followups. Failures are logged and
-/// swallowed.
+/// item. Reads followups from the engine-owned structured-output artifact
+/// (PRIMARY) — schema-validated as a `FollowupEntry` JSON array — and upserts
+/// a `followup|{work_item_id}` group. Falls back to scraping a `FOLLOWUPS:`
+/// block from the transcript tail (TRANSITIONAL) when the artifact is absent
+/// or malformed. Returns the group + newly-inserted members, or `None` when
+/// there is no artifact/transcript, no block, or no new followups.
+///
+/// Followups are **optional**: an absent artifact means "no followups" (the
+/// normal case), and a *malformed* artifact is logged and treated as a
+/// fall-through to the transcript — never a re-prompt. This reconcile must
+/// never mask the surrounding PR transition, and the producing worker's
+/// terminal act is opening its PR, so re-prompting here is structurally
+/// wrong. All failures are logged and swallowed.
 pub async fn reconcile_task_followups(
     work_db: &WorkDb,
     work_item_id: &str,
     execution_id: &str,
+    structured_output_dir: Option<&Path>,
     transcript_path: Option<&str>,
 ) -> Option<(AttentionGroup, Vec<Attention>)> {
-    let path = transcript_path?;
-    let jsonl = match tokio::fs::read_to_string(path).await {
-        Ok(jsonl) => jsonl,
-        Err(err) => {
-            tracing::debug!(
-                execution_id,
-                path,
-                ?err,
-                "attentions detector: could not read transcript for followups"
-            );
-            return None;
+    let entries = match read_followups_artifact(structured_output_dir, execution_id) {
+        Some(entries) => entries,
+        None => {
+            let path = transcript_path?;
+            let jsonl = match tokio::fs::read_to_string(path).await {
+                Ok(jsonl) => jsonl,
+                Err(err) => {
+                    tracing::debug!(
+                        execution_id,
+                        path,
+                        ?err,
+                        "attentions detector: could not read transcript for followups"
+                    );
+                    return None;
+                }
+            };
+            let assistant_text = extract_assistant_text(&jsonl);
+            parse_followups_block(&assistant_text)
         }
     };
-
-    let assistant_text = extract_assistant_text(&jsonl);
-    let entries = parse_followups_block(&assistant_text);
     if entries.is_empty() {
         return None;
     }
@@ -475,6 +493,37 @@ fn build_followup_input(
             .confidence_source("structured")
             .build(),
     )
+}
+
+/// Read + validate the followups artifact (a `FollowupEntry` JSON array) from
+/// the engine-owned structured-output dir. Returns:
+/// - `None` when no dir is provided, the artifact is absent/empty (the normal
+///   "no followups" case), or it is present-but-malformed.
+///
+/// A *malformed* artifact is logged at WARN and yields `None` so the caller
+/// falls back to the transcript sentinel — followups are optional and best
+/// effort, so a bad manifest must never block the PR transition or trigger a
+/// re-prompt. An explicit empty array (`[]`) parses to `Some(vec![])`, which
+/// the caller treats as "no followups" (and does NOT fall back to the
+/// transcript — the worker deliberately recorded none).
+fn read_followups_artifact(
+    structured_output_dir: Option<&Path>,
+    execution_id: &str,
+) -> Option<Vec<FollowupEntry>> {
+    let dir = structured_output_dir?;
+    let raw = crate::structured_output::read(dir, execution_id)?;
+    match serde_json::from_str::<Vec<FollowupEntry>>(&raw) {
+        Ok(entries) => Some(entries),
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "attentions detector: followups artifact present but is not a valid \
+                 FollowupEntry JSON array; falling back to transcript sentinel"
+            );
+            None
+        }
+    }
 }
 
 /// Concatenate the worker's assistant-authored text from a JSONL transcript.
@@ -1065,6 +1114,43 @@ mod tests {
         // A `]` inside a string literal must not terminate the array.
         let s = r#"prefix [{"k": "a]b"}] suffix"#;
         assert_eq!(extract_balanced_array(s).as_deref(), Some(r#"[{"k": "a]b"}]"#));
+    }
+
+    #[test]
+    fn read_followups_artifact_parses_valid_array_and_skips_malformed() {
+        let dir = std::env::temp_dir().join(format!("boss-fu-art-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent artifact → None (the normal "no followups" case).
+        assert!(read_followups_artifact(Some(&dir), "missing").is_none());
+
+        // Valid FollowupEntry array → Some.
+        std::fs::write(
+            crate::structured_output::path_in(&dir, "e1"),
+            r#"[{"proposed_name":"Wire retries","proposed_description":"add backoff"}]"#,
+        )
+        .unwrap();
+        let entries = read_followups_artifact(Some(&dir), "e1").expect("valid array parses");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].proposed_name, "Wire retries");
+
+        // Explicit empty array → Some(empty) (deliberately "no followups",
+        // distinct from absent — the caller must not fall back to transcript).
+        std::fs::write(crate::structured_output::path_in(&dir, "e3"), "[]").unwrap();
+        assert_eq!(
+            read_followups_artifact(Some(&dir), "e3").map(|v| v.len()),
+            Some(0)
+        );
+
+        // Malformed → None (caller falls back to the transcript sentinel).
+        std::fs::write(crate::structured_output::path_in(&dir, "e2"), "{not json}").unwrap();
+        assert!(read_followups_artifact(Some(&dir), "e2").is_none());
+
+        // No dir provided → None.
+        assert!(read_followups_artifact(None, "e1").is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

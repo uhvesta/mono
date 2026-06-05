@@ -939,6 +939,13 @@ pub struct WorkerCompletionHandler {
     /// out to `gh pr view`); tests inject `FakePrStateChecker::always(Open)`
     /// via [`Self::with_pr_state_checker`] to avoid live network calls.
     pr_state_checker: Arc<dyn crate::work::PrStateChecker>,
+    /// Engine-owned base directory for worker structured-output artifacts
+    /// (review findings / task followups). Mirrors the dir the spawn path
+    /// resolves via [`crate::structured_output::default_dir`]; both are the
+    /// same in production. Tests point it at a tempdir via
+    /// [`Self::with_structured_output_dir`] so they can seed/inspect the
+    /// artifact without touching the shared system temp dir.
+    structured_output_dir: std::path::PathBuf,
 }
 
 impl WorkerCompletionHandler {
@@ -974,7 +981,16 @@ impl WorkerCompletionHandler {
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
             pr_state_checker: Arc::new(crate::work::GhPrStateChecker),
+            structured_output_dir: crate::structured_output::default_dir(),
         }
+    }
+
+    /// Point structured-output reads at `dir` instead of the process-wide
+    /// [`crate::structured_output::default_dir`]. Tests use this to seed the
+    /// per-execution artifact in a tempdir; production leaves the default.
+    pub fn with_structured_output_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.structured_output_dir = dir;
+        self
     }
 
     /// Wire an externally-owned [`NudgeBreaker`] into this handler.
@@ -2184,30 +2200,97 @@ must not be asked to open one",
             }
         };
 
-        // P992 task 8: parse ReviewResult from the reviewer's transcript and
-        // apply the severity gate. Falls back gracefully (no revision) when the
-        // reviewer produced no parseable JSON block.
-        //
-        // The extractor tries three strategies: ```json fence, plain ``` fence,
-        // and bare JSON scan. Failure here means the transcript was truly
-        // unparseable (malformed JSON, wrong schema, or reviewer crash) — log at
-        // ERROR so it surfaces in monitoring rather than passing silently.
-        let review_result = self.read_final_triage_message(&execution.id).await
-            .into_message()
-            .and_then(|text| {
-                let result = crate::pr_review::extract_review_result(&text);
-                if result.is_none() {
+        // Read the reviewer's ReviewResult. PRIMARY channel: the engine-owned
+        // structured-output artifact the reviewer wrote, schema-validated here
+        // via `ReviewResult::from_json`. TRANSITIONAL FALLBACK: scrape the
+        // transcript's final message (fenced / bare JSON) — this covers remote
+        // workers, whose artifact is written on the remote host and not
+        // readable here, and any local artifact-write failure. The legacy
+        // scraper (`extract_review_result` + the balanced-brace hack) is kept
+        // only as this fallback and can be deleted once the artifact path is
+        // proven in production.
+        let from_artifact = crate::structured_output::read(
+            &self.structured_output_dir,
+            &execution.id,
+        )
+        .and_then(
+            |raw| match crate::pr_review::ReviewResult::from_json(&raw) {
+                Ok(result) => Some(result),
+                Err(err) => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        ?err,
+                        "pr_review finalize: structured-output artifact present but did not \
+                         validate as ReviewResult; trying the transcript fallback",
+                    );
+                    None
+                }
+            },
+        );
+        let review_result = match from_artifact {
+            Some(result) => Some(result),
+            None => self
+                .read_final_triage_message(&execution.id)
+                .await
+                .into_message()
+                .and_then(|text| crate::pr_review::extract_review_result(&text)),
+        };
+
+        // Neither the artifact nor the transcript yielded a valid ReviewResult.
+        // Do NOT silently advance the PR unreviewed (the old failure mode that
+        // dropped every finding). Probe the still-live reviewer to (re-)write
+        // its artifact and re-run the finalizer on the next Stop — bounded by
+        // the shared auto-nudge breaker so a reviewer that never produces a
+        // valid result cannot loop forever.
+        if review_result.is_none() {
+            match self.nudge_breaker.record(
+                &execution.id,
+                "pr_review:awaiting_result",
+                self.max_unproductive_nudges,
+            ) {
+                NudgeDecision::Proceed { count } => {
+                    let output_path = crate::structured_output::path_in(
+                        &self.structured_output_dir,
+                        &execution.id,
+                    );
+                    let probe = format!(
+                        "Your review did not produce a valid ReviewResult. Write the \
+                         ReviewResult JSON (matching the schema in your task prompt) to \
+                         this file with the Write tool, then stop — do NOT change the PR:\n\n{}",
+                        output_path.display(),
+                    );
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        nudge_count = count,
+                        max = self.max_unproductive_nudges,
+                        "pr_review finalize: no readable ReviewResult (artifact + transcript \
+                         both empty/invalid); re-prompting reviewer to write the artifact",
+                    );
+                    self.probe_queuer.queue_probe(&execution.id, &probe);
+                    return StopOutcome::ReviewPassAwaitingResult;
+                }
+                NudgeDecision::Trip { count } => {
                     tracing::error!(
                         execution_id = %execution.id,
                         producing_task_id,
-                        "pr_review finalize: reviewer transcript contained no parseable \
-                         ReviewResult (tried fenced-json, plain-fence, and bare-JSON scan); \
-                         advancing to in_review without revision — check reviewer output for \
-                         malformed JSON or schema mismatch",
+                        nudge_count = count,
+                        "pr_review finalize: reviewer failed to produce a valid ReviewResult \
+                         after re-prompting; advancing to in_review WITHOUT a revision and \
+                         filing an attention",
                     );
+                    self.file_review_result_giveup_attention(&execution, count)
+                        .await;
+                    // Fall through with review_result = None → advance to
+                    // in_review unimpeded (no revision).
                 }
-                result
-            });
+            }
+        }
+
+        // We are going to finalise now (we have a result, or we gave up after
+        // re-prompting). Reap the engine-owned artifact either way.
+        crate::structured_output::clear(&self.structured_output_dir, &execution.id);
 
         // P992 task 9: extract head_sha before review_result is (potentially)
         // consumed by the revision path below. Used to update last_reviewed_sha.
@@ -2832,11 +2915,12 @@ must not be asked to open one",
                     }
                 }
 
-        // Followups: any completing implementation worker may emit a
-        // `FOLLOWUPS:` block near the end of its run. Parse the transcript
-        // tail and upsert a followup group keyed to the originating work
-        // item. A no-op (no transcript / no block) when absent; idempotent
-        // across re-runs via the store's content dedup.
+        // Followups: any completing implementation worker may surface
+        // out-of-scope follow-on work. PRIMARY: the engine-owned
+        // structured-output artifact (a `FollowupEntry` JSON array). FALLBACK:
+        // a `FOLLOWUPS:` block scraped from the transcript tail. A no-op (no
+        // artifact / no transcript / no block) when absent; idempotent across
+        // re-runs via the store's content dedup.
         let transcript_path = self
             .work_db
             .transcript_path_for_execution(execution_id)
@@ -2846,6 +2930,7 @@ must not be asked to open one",
             &self.work_db,
             &work_item_id,
             execution_id,
+            Some(&self.structured_output_dir),
             transcript_path.as_deref(),
         )
         .await;
@@ -2868,6 +2953,10 @@ must not be asked to open one",
                 self.publish_attentions_created(&group, &created).await;
             }
         }
+        // Reap the engine-owned followups artifact regardless of outcome (it
+        // lives in the system temp dir, but delete eagerly rather than waiting
+        // on OS reaping).
+        crate::structured_output::clear(&self.structured_output_dir, execution_id);
 
         if merged {
             tracing::info!(
@@ -3047,7 +3136,8 @@ must not be asked to open one",
             // remediation finalisation. Covered for exhaustiveness.
             StopOutcome::ReviewerEnqueued { .. }
             | StopOutcome::ReviewPassCompleted { .. }
-            | StopOutcome::ReviewPassRevisionCreated { .. } => false,
+            | StopOutcome::ReviewPassRevisionCreated { .. }
+            | StopOutcome::ReviewPassAwaitingResult => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -3457,6 +3547,57 @@ must not be asked to open one",
             "auto-nudge circuit breaker tripped — parked execution, no further nudges"
         );
         StopOutcome::NudgeBreakerParked { reason }
+    }
+
+    /// File a human-visible attention item recording that a reviewer worker
+    /// exhausted its re-prompts without ever producing a readable
+    /// `ReviewResult`, so its PR is advancing to Review **unreviewed**. Unlike
+    /// [`Self::park_for_unproductive_nudges`], this does NOT change the
+    /// execution's terminal handling — the caller still finalises the reviewer
+    /// pass and advances the producing task — it only surfaces the give-up to
+    /// the human. Best-effort: a filing failure is logged and swallowed.
+    async fn file_review_result_giveup_attention(
+        &self,
+        execution: &crate::work::WorkExecution,
+        nudge_count: u32,
+    ) {
+        let body = format!(
+            "The automated reviewer for this PR stopped {nudge_count} time(s) without writing a \
+             valid ReviewResult — neither the structured-output artifact nor the transcript \
+             fallback validated. The producing task is advancing to Review WITHOUT an automated \
+             revision; review the PR by hand."
+        );
+        // Scope to the execution (not the work item): the store rejects
+        // setting both, and execution-scoped mirrors the nudge-breaker
+        // attention so `list_attention_items(&execution.id)` surfaces it.
+        match self.work_db.create_attention_item(CreateAttentionItemInput {
+            execution_id: Some(execution.id.clone()),
+            work_item_id: None,
+            kind: REVIEW_RESULT_GIVEUP_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Reviewer produced no valid ReviewResult".to_owned(),
+            body_markdown: body,
+            resolved_at: None,
+        }) {
+            Ok(item) => {
+                if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
+                    let product_id = work_item_product_id(&work_item);
+                    self.publisher
+                        .publish_frontend_event_on_product(
+                            &product_id,
+                            FrontendEvent::AttentionItemCreated { item },
+                        )
+                        .await;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "pr_review finalize: failed to file review-result give-up attention item",
+                );
+            }
+        }
     }
 
     /// Hook invoked once when an execution transitions to `running`
@@ -4238,6 +4379,14 @@ enum ShaDeltaGateOutcome {
 /// flows, and so repeated Stops dedupe against an already-open item.
 pub const NUDGE_BREAKER_ATTENTION_KIND: &str = "nudge_breaker_tripped";
 
+/// Attention-item kind filed when a reviewer worker exhausts its re-prompts
+/// without ever producing a readable `ReviewResult` (neither the
+/// structured-output artifact nor the transcript fallback validated). The
+/// producing task is advanced to `in_review` without a revision, so this item
+/// is the human-visible record that the PR proceeded *unreviewed* — replacing
+/// the old silent drop.
+pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
+
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an
@@ -4433,6 +4582,15 @@ pub enum StopOutcome {
     /// P992 task 7: a `pr_review` reviewer execution finished and the
     /// producing task has been advanced to `in_review`.
     ReviewPassCompleted { pr_url: String },
+    /// A `pr_review` reviewer execution stopped without a readable
+    /// `ReviewResult` — neither the structured-output artifact nor the
+    /// transcript fallback yielded a valid object. The engine queued a probe
+    /// asking the reviewer to (re-)write the artifact and left the execution
+    /// live (non-terminal); the next Stop re-runs the finalizer. This replaces
+    /// the old silent "advance to in_review with no revision" drop. Bounded by
+    /// the auto-nudge breaker — once it trips, the finalizer advances to
+    /// `in_review` without a revision and files an attention.
+    ReviewPassAwaitingResult,
     /// P992 task 8: a `pr_review` reviewer execution found qualifying findings
     /// (at least one `critical`/`high` severity or `regression` category) and
     /// created a revision task on the producing task. The producing task is
@@ -11042,15 +11200,73 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
     }
 
-    /// When no transcript is recorded (reviewer crashed or hook missed) the
-    /// completion handler must fall back gracefully to advancing the producing
-    /// task to `in_review` without creating a revision.
+    /// When no ReviewResult is readable (no artifact AND no parseable
+    /// transcript), the finalizer must NOT silently advance the PR unreviewed.
+    /// It re-prompts the still-live reviewer (queues a probe naming the
+    /// artifact path) and returns the non-terminal `ReviewPassAwaitingResult`,
+    /// leaving the producing task untouched so the next Stop can re-read.
     #[tokio::test]
-    async fn pr_review_pass_missing_transcript_advances_gracefully_without_revision() {
+    async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
         let workspace = tempdir().unwrap();
-        // No review result JSON → no transcript written.
+        // No review result JSON → no transcript written, no artifact written.
         let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
             pr_review_exec_fixture(workspace.path(), None);
+        let out_dir = tempdir().unwrap();
+        let probe_queuer = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            probe_queuer.clone(),
+        )
+        .with_pr_state_checker(open_pr_checker())
+        .with_structured_output_dir(out_dir.path().to_path_buf())
+        .with_max_unproductive_nudges(2);
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassAwaitingResult),
+            "no readable result must re-prompt (not advance); got {outcome:?}",
+        );
+
+        // Task must NOT have advanced — it stays put pending the re-emit.
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_ne!(
+            task.status,
+            TaskStatus::InReview,
+            "task must not advance to in_review while re-prompting the reviewer",
+        );
+
+        // A probe naming the artifact path must have been queued.
+        let probes = probe_queuer.snapshot();
+        assert_eq!(probes.len(), 1, "exactly one probe must be queued");
+        assert_eq!(probes[0].0, pr_review_exec_id, "probe keyed to the reviewer exec");
+        let expected_path =
+            crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id);
+        assert!(
+            probes[0].1.contains(&expected_path.display().to_string()),
+            "probe must name the artifact path; got: {}",
+            probes[0].1,
+        );
+    }
+
+    /// After the auto-nudge breaker trips (the reviewer kept failing to write a
+    /// valid result across re-prompts), the finalizer gives up: it advances the
+    /// producing task to `in_review` WITHOUT a revision and files a
+    /// human-visible attention item — replacing the old silent drop.
+    #[tokio::test]
+    async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() {
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
+        let out_dir = tempdir().unwrap();
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -11060,23 +11276,92 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             Arc::new(RecordingPaneReleaser::default()),
             Arc::new(RecordingProbeQueuer::default()),
         )
-        .with_pr_state_checker(open_pr_checker());
+        .with_pr_state_checker(open_pr_checker())
+        .with_structured_output_dir(out_dir.path().to_path_buf())
+        // max=1: first Stop re-prompts (Proceed), second Stop trips.
+        .with_max_unproductive_nudges(1);
 
-        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        // First Stop: re-prompt.
+        let first = handler.on_stop(&pr_review_exec_id).await;
         assert!(
-            matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
-            "missing transcript must fall back to ReviewPassCompleted; got {outcome:?}",
+            matches!(first, StopOutcome::ReviewPassAwaitingResult),
+            "first no-result Stop must re-prompt; got {first:?}",
         );
 
-        // Task still advances — a reviewer crash must not strand the task.
+        // Second Stop: breaker trips → advance without revision.
+        let second = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(second, StopOutcome::ReviewPassCompleted { .. }),
+            "breaker trip must advance to in_review (no revision); got {second:?}",
+        );
+
         let item = db.get_work_item(&chore_id).unwrap();
         let task = match item {
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            task.status, TaskStatus::InReview,
-            "producing task must advance to in_review even when reviewer produced no transcript",
+            task.status,
+            TaskStatus::InReview,
+            "producing task must advance after the breaker gives up",
+        );
+
+        // An attention item must record that the PR advanced unreviewed.
+        let attentions = db.list_attention_items(&pr_review_exec_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .any(|i| i.kind == REVIEW_RESULT_GIVEUP_ATTENTION_KIND),
+            "a review-result-missing attention must be filed; got {attentions:?}",
+        );
+    }
+
+    /// The PRIMARY channel: a `ReviewResult` written to the engine-owned
+    /// structured-output artifact (no transcript at all) must drive the
+    /// severity gate and create a revision.
+    #[tokio::test]
+    async fn pr_review_pass_reads_result_from_artifact_file() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json = high_finding_review_result_json(pr_url);
+        // No transcript — the artifact is the only source.
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), None);
+        let out_dir = tempdir().unwrap();
+        std::fs::write(
+            crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
+            &json,
+        )
+        .unwrap();
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker())
+        .with_structured_output_dir(out_dir.path().to_path_buf());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
+            "artifact with a high finding must create a revision; got {outcome:?}",
+        );
+
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(task.status, TaskStatus::InReview);
+
+        // The artifact must be reaped after a successful read.
+        assert!(
+            !crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id).exists(),
+            "structured-output artifact must be deleted after the finalizer reads it",
         );
     }
 

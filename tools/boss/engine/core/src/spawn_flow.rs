@@ -52,6 +52,9 @@ const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/
 /// because we never set it explicitly here.
 const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     "BOSS_TASK_ID",
+    // Absolute path of the engine-owned structured-output artifact the worker
+    // writes (review findings / task followups). See `crate::structured_output`.
+    "BOSS_STRUCTURED_OUTPUT",
     "CUBE_LEASE_ID",
     "CUBE_REPO",
 ];

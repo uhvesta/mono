@@ -20,10 +20,15 @@
 //!
 //! # Output contract
 //!
-//! The reviewer emits exactly one `ReviewResult` JSON object in a fenced
-//! ` ```json ` block in its final message. The completion handler (task 8)
-//! extracts and parses this block. The `ReviewResult` is the sole
-//! deliverable; the reviewer must not emit any other action.
+//! The reviewer **writes** exactly one `ReviewResult` JSON object to the
+//! engine-owned artifact path it is handed (see [`crate::structured_output`]),
+//! using the `Write` tool. The completion handler reads + schema-validates
+//! that file at the Stop boundary. As a **transitional fallback** (and to keep
+//! remote/SSH reviewers working until the artifact is fetched cross-host), the
+//! reviewer also ends its final message with the same JSON in a fenced
+//! ` ```json ` block, which the legacy [`extract_review_result`] scraper reads
+//! when the file is absent. The `ReviewResult` is the sole deliverable; the
+//! reviewer must not emit any other action.
 
 use serde::{Deserialize, Serialize};
 
@@ -473,12 +478,20 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
          \n\
          Forbidden actions (tool calls for these are denied):\n\
          \n\
-         - Writing or editing any file (`Edit`, `Write`).\n\
+         - Editing any file, or writing any file inside this workspace or any\n\
+           sibling worker workspace (`Edit`, `Write` under the workspaces root).\n\
          - Committing or pushing (`jj git push`, `git push`).\n\
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`).\n\
          - Interacting with GitHub issues in any write capacity.\n\
          - Running `cube pr ensure` or any Boss PR helper.\n\
+         \n\
+         **The one permitted write** is your `ReviewResult` JSON, which you\n\
+         write with the `Write` tool to the engine-owned artifact path given in\n\
+         your task prompt (also exported as `$BOSS_STRUCTURED_OUTPUT`). That\n\
+         path is OUTSIDE every worker workspace, so it is not part of the PR or\n\
+         repo — writing it does not violate the read-only mandate. Do not write\n\
+         anywhere else.\n\
          \n\
          Anything you would \"fix\", describe as a finding in the\n\
          `ReviewResult` JSON instead. Your feedback stays inside Boss —\n\
@@ -550,10 +563,16 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
 /// When the engine cannot pre-classify the PR (no file list available),
 /// pass [`ReviewScope::Code`]; the self-detection fallback in the code rubric
 /// section covers that case.
+///
+/// `output_path` is the absolute, engine-owned artifact path the reviewer must
+/// write its `ReviewResult` JSON to (see [`crate::structured_output`]). It is
+/// the primary output channel; the prompt also asks for a fenced-JSON copy in
+/// the final message as a transitional fallback.
 pub fn render_reviewer_initial_prompt(
     task_name: &str,
     task_description: &str,
     pr_url: &str,
+    output_path: &str,
     scope: ReviewScope,
     ctx: Option<&PrReviewContext>,
 ) -> String {
@@ -627,10 +646,12 @@ pub fn render_reviewer_initial_prompt(
         "# PR review\n\
          \n\
          You are an independent PR reviewer. Your ONLY job is to review the \
-         PR and return a single structured `ReviewResult` JSON. You MUST NOT \
+         PR and produce a single structured `ReviewResult` JSON. You MUST NOT \
          change the PR in any way: no commits, no pushes, no `gh` writes, no \
-         edits to any file or branch, no comments on GitHub. You operate \
-         **read-only**. Anything you would \"fix\" you instead describe as a \
+         edits to repo files or branches, no comments on GitHub. You operate \
+         **read-only** on the PR. The ONE write you make is your `ReviewResult` \
+         JSON, to the engine-owned artifact path below (outside the repo). \
+         Anything you would \"fix\" you instead describe as a \
          finding. Posting to GitHub is prohibited — your feedback stays inside \
          Boss as an internal revision.\n\
          \n\
@@ -650,12 +671,11 @@ pub fn render_reviewer_initial_prompt(
          {diff_step}\
          3. Get the PR description: `gh pr view {pr_ref}`\n\
          4. Read changed files and surrounding context using `Read`, `cat`, \
-            `grep`, `jj show`, etc. — no writes.\n\
-         5. Produce the `ReviewResult` JSON (schema below) in a fenced \
-            ` ```json ` block as the **very last thing in your final message**. \
-            No prose, commentary, or text of any kind may follow the closing ` ``` `. \
-            Prefer the ` ```json ` fence — the engine also accepts plain ` ``` ` fences \
-            and bare inline JSON, but the fenced form is the canonical shape.\n\
+            `grep`, `jj show`, etc. — no writes to repo files.\n\
+         5. Produce the `ReviewResult` JSON (schema below) and deliver it as \
+            described in **Required output** — write it to the artifact file \
+            with the `Write` tool, and also include it as a fenced \
+            ` ```json ` block at the end of your final message.\n\
          \n\
          {embedded_diff_section}\
          {rubric}\n\
@@ -671,13 +691,23 @@ pub fn render_reviewer_initial_prompt(
          \n\
          ## Required output — CRITICAL\n\
          \n\
-         Your final message MUST end with exactly one `ReviewResult` JSON \
-         in a fenced ` ```json ` block. This is the LAST content in your \
-         message — nothing follows the closing ` ``` `. Do NOT emit bare \
-         JSON, inline JSON, or JSON in any other fence type. The engine \
-         extracts this block by looking for the ` ```json ` fence; if the \
-         block is absent or malformed, all your findings will be silently \
-         discarded. No other terminal action is permitted.\n\
+         **Primary (required):** write your single `ReviewResult` JSON object \
+         to this exact file using the `Write` tool — nothing else, just the \
+         JSON:\n\
+         \n\
+         `{output_path}`\n\
+         \n\
+         This path is also exported as `$BOSS_STRUCTURED_OUTPUT`. It lives \
+         outside every repo/workspace, so writing it is the one write you are \
+         permitted (it does not touch the PR). The engine reads and \
+         schema-validates this file; if it is missing or invalid the engine \
+         will ask you to write it again.\n\
+         \n\
+         **Also (fallback):** end your final message with the same \
+         `ReviewResult` JSON in a fenced ` ```json ` block as the LAST content \
+         in your message — nothing follows the closing ` ``` `. This is a \
+         backstop the engine uses only if the file is unreadable. No other \
+         terminal action is permitted.\n\
          \n\
          Schema:\n\
          \n\
@@ -724,6 +754,7 @@ pub fn render_reviewer_initial_prompt(
         task_name = task_name,
         task_description = task_description,
         pr_url = pr_url,
+        output_path = output_path,
         pr_metadata_block = pr_metadata_block,
         pr_ref = pr_ref,
         diff_step = diff_step,
@@ -867,6 +898,7 @@ mod tests {
             "Fix the auth bug",
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
         );
@@ -887,6 +919,7 @@ mod tests {
             "Fix the auth bug",
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
         );
@@ -917,6 +950,7 @@ mod tests {
             "Fix the auth bug",
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             Some(&ctx),
         );
@@ -954,6 +988,7 @@ mod tests {
             "Add a feature",
             "Implement the new feature.",
             "https://github.com/org/repo/pull/42",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             Some(&ctx),
         );
@@ -988,6 +1023,7 @@ mod tests {
             "Add a feature",
             "Implement the new feature.",
             "https://github.com/org/repo/pull/42",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             Some(&ctx),
         );
@@ -1007,6 +1043,7 @@ mod tests {
             "Fix the auth bug",
             "Auth middleware drops sessions on timeout.",
             "https://github.com/org/repo/pull/99",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
         );
@@ -1026,6 +1063,7 @@ mod tests {
             "Add design doc",
             "Write a design doc for feature X.",
             "https://github.com/org/repo/pull/100",
+            "/tmp/bwo/exec.json",
             ReviewScope::DocsOnly,
             None,
         );
@@ -1044,11 +1082,42 @@ mod tests {
             "T",
             "D",
             "https://github.com/pr/1",
+            "/tmp/bwo/exec.json",
             ReviewScope::Code,
             None,
         );
         assert!(prompt.contains("fast, high-signal"));
         assert!(prompt.contains("scrutiny budget"));
+    }
+
+    #[test]
+    fn reviewer_initial_prompt_directs_write_to_artifact_path() {
+        let prompt = render_reviewer_initial_prompt(
+            "T",
+            "D",
+            "https://github.com/pr/1",
+            "/var/tmp/boss-worker-output/exec_abc_1.json",
+            ReviewScope::Code,
+            None,
+        );
+        // The artifact path is embedded verbatim as the primary output target.
+        assert!(
+            prompt.contains("/var/tmp/boss-worker-output/exec_abc_1.json"),
+            "prompt must embed the literal artifact path"
+        );
+        assert!(
+            prompt.contains("$BOSS_STRUCTURED_OUTPUT"),
+            "prompt must reference the env var fallback"
+        );
+        assert!(
+            prompt.contains("`Write` tool"),
+            "prompt must instruct using the Write tool"
+        );
+        // Fenced JSON is kept as a transitional fallback, not the primary.
+        assert!(
+            prompt.contains("fallback"),
+            "prompt must describe the fenced-JSON fallback"
+        );
     }
 
     // --- classify_changed_files ---
