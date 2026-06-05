@@ -1590,6 +1590,10 @@ struct WorkItemDependency: Hashable {
 /// Used by the transcript viewer's execution list.
 struct ExecutionVM: Identifiable, Hashable {
     let id: String
+    /// The task id that owns this execution. When a transcript viewer
+    /// loads the full revision chain, executions from revision tasks
+    /// carry those tasks' ids here rather than the chain root's id.
+    let workItemId: String
     let kind: String
     let status: String
     let model: String?

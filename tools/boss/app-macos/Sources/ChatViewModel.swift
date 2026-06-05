@@ -2405,44 +2405,51 @@ final class ChatViewModel: ObservableObject {
         task(withID: id)
     }
 
-    /// All `kind == "revision"` tasks whose `parentTaskId` matches the
-    /// supplied id AND whose status is `"in_review"`. Used by the Review-
-    /// lane parent card to render per-revision rollup lines.
+    /// `kind == "revision"` tasks for parentID with status `"in_review"`.
     func inReviewRevisions(forParentTaskID parentID: String) -> [WorkTask] {
-        let matches: (WorkTask) -> Bool = {
-            $0.kind == "revision"
-                && $0.parentTaskId == parentID
-                && $0.status == "in_review"
-        }
-        var result: [WorkTask] = []
-        // Project-task-parented revisions live under their project; chore-
-        // parented ones live in the product-level bucket. Search both so the
-        // parent's Review card rolls up every in-review revision regardless of
-        // whether the chain root is a project_task or a chore (issue #789).
-        for tasks in tasksByProjectID.values {
-            result.append(contentsOf: tasks.filter(matches))
-        }
-        for revisions in productLevelRevisionsByProductID.values {
-            result.append(contentsOf: revisions.filter(matches))
-        }
-        return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+        revisions(forParentTaskID: parentID, status: "in_review", includeChoresAndProductTasks: false)
     }
 
-    /// All `kind == "revision"` tasks whose `parentTaskId` matches the
-    /// supplied id AND whose status is `"done"`. Used by the Done-lane
-    /// parent card to render per-revision rollup lines.
+    /// `kind == "revision"` tasks for parentID with status `"done"`.
     func doneRevisions(forParentTaskID parentID: String) -> [WorkTask] {
-        let matches: (WorkTask) -> Bool = {
-            $0.kind == "revision"
-                && $0.parentTaskId == parentID
-                && $0.status == "done"
+        revisions(forParentTaskID: parentID, status: "done", includeChoresAndProductTasks: false)
+    }
+
+    /// `kind == "revision"` tasks for parentID regardless of status.
+    func allRevisions(forParentTaskID parentID: String) -> [WorkTask] {
+        revisions(forParentTaskID: parentID, status: nil, includeChoresAndProductTasks: true)
+    }
+
+    // Shared impl: project-task-parented revisions live under their project; chore-
+    // parented ones live in the product-level bucket (issue #789). Pass
+    // includeChoresAndProductTasks=true to also search choresByProductID and
+    // productLevelTasksByProductID (needed for allRevisions).
+    private func revisions(
+        forParentTaskID parentID: String,
+        status: String?,
+        includeChoresAndProductTasks: Bool
+    ) -> [WorkTask] {
+        let matches: (WorkTask) -> Bool = { task in
+            task.kind == "revision"
+                && task.parentTaskId == parentID
+                && (status == nil || task.status == status)
         }
         var result: [WorkTask] = []
         for tasks in tasksByProjectID.values {
             result.append(contentsOf: tasks.filter(matches))
         }
+        if includeChoresAndProductTasks {
+            for chores in choresByProductID.values {
+                result.append(contentsOf: chores.filter(matches))
+            }
+        }
         for revisions in productLevelRevisionsByProductID.values {
             result.append(contentsOf: revisions.filter(matches))
+        }
+        if includeChoresAndProductTasks {
+            for tasks in productLevelTasksByProductID.values {
+                result.append(contentsOf: tasks.filter(matches))
+            }
         }
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
     }

@@ -815,6 +815,11 @@ pub enum FrontendRequest {
 
     ListExecutions {
         work_item_id: Option<String>,
+        /// When `true` and `work_item_id` names a chain root, the
+        /// response includes executions from every revision task in
+        /// the chain as well as the root's own executions.
+        #[serde(default)]
+        include_revision_chain: bool,
     },
 
     /// Snapshot of every registered engine feature flag and its current

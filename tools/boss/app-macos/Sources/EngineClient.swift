@@ -764,6 +764,7 @@ final class EngineClient: @unchecked Sendable {
         sendLine([
             "type": "list_executions",
             "work_item_id": taskId,
+            "include_revision_chain": true,
         ])
     }
 
@@ -2254,6 +2255,8 @@ final class EngineClient: @unchecked Sendable {
     private func parseExecutionVM(_ payload: [String: Any]) -> ExecutionVM? {
         guard let id = payload["id"] as? String,
               !id.isEmpty,
+              let workItemId = payload["work_item_id"] as? String,
+              !workItemId.isEmpty,
               let kind = payload["kind"] as? String,
               let status = payload["status"] as? String
         else {
@@ -2261,6 +2264,7 @@ final class EngineClient: @unchecked Sendable {
         }
         return ExecutionVM(
             id: id,
+            workItemId: workItemId,
             kind: kind,
             status: status,
             model: payload["model"] as? String,

@@ -161,11 +161,23 @@ pub(super) async fn handle_list_executions(ctx: Dispatch, req: FrontendRequest) 
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ListExecutions { work_item_id } = req else {
+    let FrontendRequest::ListExecutions {
+        work_item_id,
+        include_revision_chain,
+    } = req
+    else {
         unreachable!()
     };
     {
-        match work_db.list_executions(work_item_id.as_deref()) {
+        let result = if include_revision_chain {
+            match work_item_id.as_deref() {
+                Some(id) => work_db.list_executions_for_chain(id),
+                None => work_db.list_executions(None),
+            }
+        } else {
+            work_db.list_executions(work_item_id.as_deref())
+        };
+        match result {
             Ok(executions) => {
                 send_response(
                     &sink,

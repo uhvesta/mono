@@ -7319,6 +7319,7 @@ async fn list_executions_for_item(
     match client
         .send_request(&FrontendRequest::ListExecutions {
             work_item_id: Some(work_item_id.to_owned()),
+            include_revision_chain: false,
         })
         .await
         .map_err(CliError::internal)?

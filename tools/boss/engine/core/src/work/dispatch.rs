@@ -492,6 +492,39 @@ impl WorkDb {
         collect_rows(rows)
     }
 
+    /// List all executions for `chain_root_id` plus every revision task in
+    /// its chain. Results are ordered chronologically (created_at ASC, id
+    /// ASC) across all tasks so the caller sees a unified history.
+    pub fn list_executions_for_chain(
+        &self,
+        chain_root_id: &str,
+    ) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let revision_ids = collect_chain_revision_ids(&conn, chain_root_id)?;
+        let mut all_ids = vec![chain_root_id.to_owned()];
+        all_ids.extend(revision_ids);
+
+        let mut all_executions = Vec::new();
+        for task_id in &all_ids {
+            let mut stmt = conn.prepare(
+                "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                        cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                        created_at, started_at, finished_at,
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                 FROM work_executions
+                 WHERE work_item_id = ?1",
+            )?;
+            let rows = stmt.query_map([task_id], map_execution)?;
+            all_executions.extend(collect_rows(rows)?);
+        }
+        all_executions.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(all_executions)
+    }
+
     pub fn get_execution(&self, id: &str) -> Result<WorkExecution> {
         let conn = self.connect()?;
         query_execution(&conn, id).require("execution", id)

@@ -81,6 +81,19 @@ struct ExecutionRow: View {
     }
 }
 
+// MARK: - ExecutionGroup
+
+/// One task's worth of executions, labelled for the revision-chain picker.
+struct ExecutionGroup: Identifiable {
+    let taskId: String
+    /// Human-readable label: "Original" for the chain root, "R1", "R2", …
+    /// for revision tasks in sequence order.
+    let label: String
+    let executions: [ExecutionVM]
+
+    var id: String { taskId }
+}
+
 // MARK: - TranscriptViewerView
 
 /// Master/detail transcript viewer: execution list on the left, transcript
@@ -98,6 +111,47 @@ struct TranscriptViewerView: View {
 
     private var isLoading: Bool {
         chatModel.executionsByTaskID[ref.taskId] == nil
+    }
+
+    /// Executions grouped by task. Returns a single unnamed group when the
+    /// list is entirely from the chain root (the common pre-revision case),
+    /// and multiple labelled groups when revisions contributed executions.
+    private var executionGroups: [ExecutionGroup] {
+        let all = executions
+        guard !all.isEmpty else { return [] }
+
+        // Partition by workItemId while preserving the chronological order
+        // within each bucket. The chain root's executions always go first;
+        // revision buckets follow in revisionSeq order.
+        var byTask: [String: [ExecutionVM]] = [:]
+        for exec in all {
+            byTask[exec.workItemId, default: []].append(exec)
+        }
+
+        // Build the ordered task list: root first, then revisions by seq.
+        let revisions = chatModel.allRevisions(forParentTaskID: ref.taskId)
+        var orderedTaskIds: [String] = [ref.taskId]
+        orderedTaskIds.append(contentsOf: revisions.map { $0.id })
+        // Append any task ids not covered above (defensive, shouldn't happen).
+        for taskId in byTask.keys where !orderedTaskIds.contains(taskId) {
+            orderedTaskIds.append(taskId)
+        }
+
+        let hasRevisionExecutions = orderedTaskIds.dropFirst().contains {
+            byTask[$0] != nil
+        }
+
+        return orderedTaskIds.compactMap { taskId -> ExecutionGroup? in
+            guard let execs = byTask[taskId], !execs.isEmpty else { return nil }
+            let label: String
+            if taskId == ref.taskId {
+                label = hasRevisionExecutions ? "Original" : ""
+            } else {
+                let seq = revisions.first(where: { $0.id == taskId })?.revisionSeq
+                label = seq.map { "R\($0)" } ?? "Revision"
+            }
+            return ExecutionGroup(taskId: taskId, label: label, executions: execs)
+        }
     }
 
     var body: some View {
@@ -140,9 +194,21 @@ struct TranscriptViewerView: View {
                     description: Text("This task has not been run yet.")
                 )
             } else {
-                List(executions, selection: $selectedExecutionId) { exec in
-                    ExecutionRow(exec: exec)
-                        .tag(exec.id)
+                let groups = executionGroups
+                List(selection: $selectedExecutionId) {
+                    ForEach(groups) { group in
+                        if group.label.isEmpty {
+                            ForEach(group.executions) { exec in
+                                ExecutionRow(exec: exec).tag(exec.id)
+                            }
+                        } else {
+                            Section(group.label) {
+                                ForEach(group.executions) { exec in
+                                    ExecutionRow(exec: exec).tag(exec.id)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
