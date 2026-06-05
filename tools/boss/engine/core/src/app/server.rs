@@ -811,6 +811,13 @@ pub async fn serve(
     // catches it on the first sweep after the wedge.
     let stage_thresholds = crate::dispatch_reader::StageThresholds::new(Duration::from_secs(120))
         .with_override("worker_claimed", Duration::from_secs(30))
+        // host_selected is a pure in-process step; flag it fast so a hang
+        // before even reaching cube is caught on the first sweep.
+        .with_override("host_selected", Duration::from_secs(30))
+        // cube_repo_ensure_attempted wraps a cube subprocess bounded by
+        // CUBE_REPO_ENSURE_TIMEOUT (60s). Match that bound so the watchdog
+        // fires as soon as the subprocess timeout would have elapsed.
+        .with_override("cube_repo_ensure_attempted", Duration::from_secs(60))
         .with_override("cube_repo_ensured", Duration::from_secs(60))
         .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
     let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
