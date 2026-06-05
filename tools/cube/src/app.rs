@@ -20,6 +20,7 @@ use crate::config;
 use crate::lock::RepoLock;
 use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::paths;
+use crate::pr_bookmark;
 use crate::setup::{self, SetupReport, StepStatus, run_setup_engine};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 
@@ -2118,6 +2119,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         Some(b) => b,
         None => detect_jj_bookmark(runner, &cwd)?,
     };
+
+    // Refuse to push a `pr/<n>` bookmark — those are local-only cube
+    // bookkeeping and must never reach a remote.
+    pr_bookmark::assert_not_pr_bookmark(&branch)
+        .map_err(CubeError::InvalidArgument)?;
 
     // Push the branch to the GitHub remote by name (--allow-new is
     // idempotent: fine when the remote bookmark already exists).
@@ -11614,6 +11620,32 @@ github\tssh://org-1@github.com/spinyfin/mono.git
         assert!(
             msg.contains("push verification failed") && msg.contains("4ce6198") && msg.contains("2f8dd09"),
             "error should name the mismatch loudly: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_pr_guard_rejects_pr_bookmark_branch_arg() {
+        // Passing --branch pr/42 to `cube pr ensure` must be refused before any
+        // push is attempted — the `pr/<n>` namespace is reserved as local-only.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            // No further commands: the guard fires before jj git push.
+        ]);
+
+        let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "pr/42"]);
+        let err = run_with_dependencies(cli, None, &runner)
+            .expect_err("ensure_pr should refuse a pr/* branch");
+        runner.assert_exhausted();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pr/42") && msg.contains("reserved"),
+            "error should mention the bookmark and reserved: {msg}"
         );
     }
 

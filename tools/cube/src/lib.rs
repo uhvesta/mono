@@ -6,6 +6,7 @@ pub mod config;
 pub mod lock;
 pub mod metadata;
 pub mod paths;
+pub mod pr_bookmark;
 pub mod setup;
 pub mod store;
 
