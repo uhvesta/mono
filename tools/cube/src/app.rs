@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::cli::{
-    ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, PrEnsureArgs, RepoCommand,
-    StackCommand, WorkspaceCommand,
+    ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, PrEnsureArgs, PrPushArgs,
+    RepoCommand, StackCommand, WorkspaceCommand,
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::config;
@@ -1885,6 +1885,7 @@ fn run_stack(command: StackCommand) -> Result<RunResult> {
 fn run_pr(command: PrCommand, runner: &dyn CommandRunner) -> Result<RunResult> {
     match command {
         PrCommand::Ensure(args) => ensure_pr(args, runner),
+        PrCommand::Push(args) => pr_push(args, runner),
         _ => Err(CubeError::NotImplemented(format!(
             "pr command `{}` is not implemented yet",
             pr_command_name(&command)
@@ -2262,6 +2263,422 @@ fn detect_jj_bookmark(runner: &dyn CommandRunner, cwd: &Path) -> Result<String> 
             )
         })
         .map(str::to_string)
+}
+
+/// Advance an existing PR by pushing the current commit (`@`) to its head branch.
+///
+/// Implements the `cube pr push` subcommand. Advances both the remote head
+/// branch and the local `pr/<n>` bookmark to `@` (fast-forward only by
+/// default) and verifies the push reached GitHub.
+fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
+    let cwd = std::env::current_dir().map_err(CubeError::Io)?;
+
+    // Resolve owner/repo and the github remote name.
+    let remote_output = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["git", "remote", "list"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to list jj remotes (is this a jj workspace?): {e}"
+            ))
+        })?;
+    let (github_remote, owner_repo) = parse_github_remote(&remote_output).ok_or_else(|| {
+        CubeError::InvalidArgument(format!(
+            "could not detect a github.com remote from `jj git remote list` output:\n{remote_output}"
+        ))
+    })?;
+
+    // Resolve (pr_number, head_branch) from args or by inference.
+    let (pr_number, head_branch) =
+        resolve_pr_push_target(&args, runner, &cwd, &github_remote, &owner_repo)?;
+
+    // Guard: the head branch must not be a reserved pr/* bookmark.
+    pr_bookmark::assert_not_pr_bookmark(&head_branch)
+        .map_err(CubeError::InvalidArgument)?;
+
+    let pr_bm = pr_bookmark::pr_bookmark_name(pr_number);
+
+    // Check that the PR is still open — refuse to push onto a merged/closed PR.
+    check_pr_open(runner, &cwd, &owner_repo, pr_number)?;
+
+    // Trigger jj's working-copy snapshot and check if @ is empty.
+    let empty_out = runner
+        .run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["log", "-r", "@", "--no-graph", "-T", "empty"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!("failed to inspect working copy: {e}"))
+        })?;
+    let at_is_empty = empty_out.trim() == "true";
+
+    if at_is_empty {
+        // @ is empty: this is either a no-op (already pushed) or a "nothing to land" error.
+        // Check whether the pr/<n> bookmark and GitHub are already in sync.
+        let github_sha = fetch_github_sha(runner, &cwd, &owner_repo, &head_branch)?;
+        let pr_bm_sha_result = runner.run(&RealCommandRunner::invocation(
+            &cwd,
+            "jj",
+            &["log", "-r", &pr_bm, "--no-graph", "-T", "commit_id"],
+        ));
+        match pr_bm_sha_result {
+            Ok(sha) if sha.trim() == github_sha.trim() => {
+                // Bookmarks and GitHub are already in sync — idempotent no-op.
+                let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+                return RunResult::new(
+                    pr_url.clone(),
+                    json!({"action": "noop", "url": pr_url, "number": pr_number}),
+                );
+            }
+            _ => {
+                return Err(CubeError::InvalidArgument(
+                    "@ is empty — nothing to land; create a commit before running `cube pr push`"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+
+    // For force-with-lease: skip the descendant check (lease verification is the safety instead).
+    // For normal push: @ must be a descendant of pr/<n> (fast-forward enforcement).
+    if args.force_with_lease {
+        // Lease verification: jj's last-fetched remote state must match GitHub.
+        let remote_ref = format!("{head_branch}@{github_remote}");
+        let fetched_sha = runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["log", "-r", &remote_ref, "--no-graph", "-T", "commit_id"],
+            ))
+            .map_err(|e| {
+                CubeError::InvalidArgument(format!(
+                    "failed to read last-fetched state of `{remote_ref}`: {e}; \
+                     run `jj git fetch` before `cube pr push --force-with-lease`"
+                ))
+            })?;
+        let fetched_sha = fetched_sha.trim();
+        let github_sha = fetch_github_sha(runner, &cwd, &owner_repo, &head_branch)?;
+        let github_sha = github_sha.trim();
+        if fetched_sha != github_sha {
+            return Err(CubeError::InvalidArgument(format!(
+                "force-with-lease refused: `{head_branch}` on GitHub ({github_sha}) has advanced \
+                 beyond the last-fetched state ({fetched_sha}). Another workspace pushed \
+                 concurrently. Run `jj git fetch` and decide whether to rebase before \
+                 force-pushing."
+            )));
+        }
+
+        // Advance both bookmarks to @.
+        advance_pr_bookmarks(runner, &cwd, &head_branch, &pr_bm)?;
+
+        // Force push via git (jj git push has no --force-with-lease flag).
+        runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "git",
+                &["push", "--force-with-lease", &github_remote, &head_branch],
+            ))
+            .map_err(|e| {
+                CubeError::InvalidArgument(format!(
+                    "force-with-lease push of `{head_branch}` failed: {e}"
+                ))
+            })?;
+    } else {
+        // Normal fast-forward push: @ must be a descendant of pr/<n>.
+        let ancestor_rev = format!("{pr_bm} & ancestors(@)");
+        let ancestor_out = runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &["log", "-r", &ancestor_rev, "--no-graph", "-T", "commit_id"],
+            ))
+            .map_err(|e| {
+                CubeError::InvalidArgument(format!(
+                    "failed to check ancestry of `{pr_bm}`: {e}"
+                ))
+            })?;
+        if ancestor_out.trim().is_empty() {
+            return Err(CubeError::InvalidArgument(format!(
+                "@ is not a descendant of `{pr_bm}` — refusing to push (this would not be a \
+                 fast-forward). Use `--force-with-lease` for rewrite scenarios, or run \
+                 `cube workspace lease --resume_pr {pr_number}` to rebuild on the current head."
+            )));
+        }
+
+        // Advance both bookmarks to @.
+        advance_pr_bookmarks(runner, &cwd, &head_branch, &pr_bm)?;
+
+        // Push the head branch (no --allow-new: the branch already exists remotely).
+        runner
+            .run(&RealCommandRunner::invocation(
+                &cwd,
+                "jj",
+                &[
+                    "git",
+                    "push",
+                    "-b",
+                    &head_branch,
+                    "--remote",
+                    &github_remote,
+                ],
+            ))
+            .map_err(|e| {
+                CubeError::InvalidArgument(format!("failed to push `{head_branch}`: {e}"))
+            })?;
+    }
+
+    // Verify the push reached GitHub.
+    verify_push_reached_github(runner, &cwd, &owner_repo, &head_branch)?;
+
+    let pr_url = format!("https://github.com/{owner_repo}/pull/{pr_number}");
+    RunResult::new(
+        pr_url.clone(),
+        json!({"action": "pushed", "url": pr_url, "number": pr_number}),
+    )
+}
+
+/// Resolve (pr_number, head_branch) for `cube pr push` from args and/or jj ancestry.
+fn resolve_pr_push_target(
+    args: &PrPushArgs,
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    _github_remote: &str,
+    owner_repo: &str,
+) -> Result<(u64, String)> {
+    match (args.pr, args.branch.as_deref()) {
+        (Some(n), Some(b)) => Ok((n, b.to_string())),
+
+        (Some(n), None) => {
+            // Have PR number; find head branch from the pr/<n> bookmark's co-located bookmarks.
+            let pr_bm = pr_bookmark::pr_bookmark_name(n);
+            let bm_out = runner
+                .run(&RealCommandRunner::invocation(
+                    cwd,
+                    "jj",
+                    &[
+                        "log",
+                        "-r",
+                        &pr_bm,
+                        "--no-graph",
+                        "-T",
+                        r#"bookmarks.map(|b| b.name()).join("\n")"#,
+                    ],
+                ))
+                .map_err(|e| {
+                    CubeError::InvalidArgument(format!(
+                        "could not find `{pr_bm}` bookmark locally: {e}; \
+                         run `cube workspace lease --resume_pr {n}` first or pass --branch"
+                    ))
+                })?;
+            let head_branch = bm_out
+                .lines()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
+                .next()
+                .ok_or_else(|| {
+                    CubeError::InvalidArgument(format!(
+                        "no head branch found co-located with `{pr_bm}`; pass --branch explicitly"
+                    ))
+                })?
+                .to_string();
+            Ok((n, head_branch))
+        }
+
+        (None, Some(b)) => {
+            // Have branch; find PR number from GitHub.
+            let list_json = runner
+                .run(&RealCommandRunner::invocation(
+                    cwd,
+                    "gh",
+                    &[
+                        "pr",
+                        "list",
+                        "-R",
+                        owner_repo,
+                        "--head",
+                        b,
+                        "--state",
+                        "open",
+                        "--json",
+                        "number",
+                    ],
+                ))
+                .map_err(|e| {
+                    CubeError::InvalidArgument(format!(
+                        "failed to look up open PR for branch `{b}`: {e}"
+                    ))
+                })?;
+            let prs: Vec<serde_json::Value> =
+                serde_json::from_str(&list_json).map_err(|e| {
+                    CubeError::InvalidArgument(format!(
+                        "unexpected response from `gh pr list` for branch `{b}`: {e}"
+                    ))
+                })?;
+            let number = prs
+                .first()
+                .and_then(|pr| pr["number"].as_u64())
+                .ok_or_else(|| {
+                    CubeError::InvalidArgument(format!(
+                        "no open PR found for branch `{b}`; create a PR with `cube pr ensure` first"
+                    ))
+                })?;
+            Ok((number, b.to_string()))
+        }
+
+        (None, None) => {
+            // Infer from @'s ancestry: find nearest commit with a pr/* bookmark.
+            let infer_out = runner
+                .run(&RealCommandRunner::invocation(
+                    cwd,
+                    "jj",
+                    &[
+                        "log",
+                        "-r",
+                        r#"latest(ancestors(@) & bookmarks(glob:"pr/*"))"#,
+                        "--no-graph",
+                        "-T",
+                        r#"bookmarks.map(|b| b.name()).join("\n")"#,
+                    ],
+                ))
+                .map_err(|e| {
+                    CubeError::InvalidArgument(format!("failed to infer PR from ancestry: {e}"))
+                })?;
+
+            if infer_out.trim().is_empty() {
+                return Err(CubeError::InvalidArgument(
+                    "could not infer PR from `@`'s ancestry — no `pr/<n>` bookmark found. \
+                     Pass `--pr <n>` or `--branch <name>` explicitly, or run \
+                     `cube workspace lease --resume_pr <n>` to position the workspace first."
+                        .to_string(),
+                ));
+            }
+
+            let mut pr_number: Option<u64> = None;
+            let mut head_branch: Option<String> = None;
+            for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                if pr_bookmark::is_pr_bookmark(name) {
+                    if let Some(n_str) = name.strip_prefix("pr/") {
+                        if let Ok(n) = n_str.parse::<u64>() {
+                            pr_number = Some(n);
+                        }
+                    }
+                } else {
+                    head_branch = Some(name.to_string());
+                }
+            }
+
+            match (pr_number, head_branch) {
+                (Some(n), Some(b)) => Ok((n, b)),
+                (Some(n), None) => Err(CubeError::InvalidArgument(format!(
+                    "found `pr/{n}` in ancestry but no co-located head branch; \
+                     pass --branch explicitly"
+                ))),
+                _ => Err(CubeError::InvalidArgument(
+                    "failed to infer PR and branch from ancestry; \
+                     pass --pr and --branch explicitly"
+                        .to_string(),
+                )),
+            }
+        }
+    }
+}
+
+/// Verify the PR identified by `pr_number` is open on GitHub; error if merged/closed.
+fn check_pr_open(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    owner_repo: &str,
+    pr_number: u64,
+) -> Result<()> {
+    let state_json = runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "gh",
+            &[
+                "pr",
+                "view",
+                &pr_number.to_string(),
+                "-R",
+                owner_repo,
+                "--json",
+                "state",
+            ],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to check state of PR #{pr_number}: {e}"
+            ))
+        })?;
+    let state: serde_json::Value = serde_json::from_str(&state_json).map_err(|e| {
+        CubeError::InvalidArgument(format!(
+            "unexpected response from `gh pr view {pr_number}`: {e}"
+        ))
+    })?;
+    let state_str = state["state"].as_str().unwrap_or("UNKNOWN");
+    if state_str != "OPEN" {
+        return Err(CubeError::InvalidArgument(format!(
+            "PR #{pr_number} is {state_str} — refusing to push onto a non-open PR. \
+             Only OPEN pull requests can be advanced with `cube pr push`."
+        )));
+    }
+    Ok(())
+}
+
+/// Fetch the current head SHA of `branch` from GitHub (authoritative source).
+fn fetch_github_sha(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    owner_repo: &str,
+    branch: &str,
+) -> Result<String> {
+    let api_path = format!("repos/{owner_repo}/branches/{branch}");
+    runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "gh",
+            &["api", &api_path, "--jq", ".commit.sha"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to fetch GitHub head sha for `{branch}`: {e}"
+            ))
+        })
+}
+
+/// Advance `head_branch` and `pr_bm` bookmarks to `@`.
+fn advance_pr_bookmarks(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    head_branch: &str,
+    pr_bm: &str,
+) -> Result<()> {
+    runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["bookmark", "set", head_branch, "-r", "@"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to advance `{head_branch}` bookmark to @: {e}"
+            ))
+        })?;
+    runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["bookmark", "set", pr_bm, "-r", "@"],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to advance `{pr_bm}` bookmark to @: {e}"
+            ))
+        })?;
+    Ok(())
 }
 
 fn run_graph(_args: GraphArgs) -> Result<RunResult> {
@@ -4135,6 +4552,7 @@ fn stack_command_name(command: &StackCommand) -> &'static str {
 fn pr_command_name(command: &PrCommand) -> &'static str {
     match command {
         PrCommand::Ensure(_) => "ensure",
+        PrCommand::Push(_) => "push",
         PrCommand::Sync { .. } => "sync",
         PrCommand::Merge { .. } => "merge",
     }
@@ -12286,6 +12704,437 @@ steps:
         assert!(
             msg.contains("2") && msg.contains("my-feature"),
             "error should mention count and branch: {msg}"
+        );
+    }
+
+    // --- pr_push tests ---
+
+    /// Build the standard remote-list response for a github-remote workspace.
+    fn remote_list_github() -> &'static str {
+        "origin\t/Users/bduff/dev/agents/repos/mono\ngithub\tgit@github.com:spinyfin/mono.git\n"
+    }
+
+    #[test]
+    fn pr_push_happy_path_advance() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            // remote list → github remote
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            // check PR is open
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            // @ is not empty
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            // ancestor check: pr/42 is an ancestor of @
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
+                "aabbcc\n",
+            ),
+            // advance head-branch bookmark
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
+            // advance pr/42 bookmark
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+            // push (no --allow-new)
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["git", "push", "-b", "boss/exec_abc", "--remote", "github"],
+                "",
+            ),
+            // verify: local sha
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
+                "deadbeef\n",
+            ),
+            // verify: github sha
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "deadbeef\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("pr_push happy path");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["action"], "pushed");
+        assert_eq!(result.payload["number"], 42);
+        assert!(result.payload["url"].as_str().unwrap().contains("/pull/42"));
+    }
+
+    #[test]
+    fn pr_push_noop_idempotency() {
+        // @ is empty AND pr/42 sha matches GitHub head → no-op success.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            // @ is empty
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "true"),
+            // fetch github sha for head-branch
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "abc123\n",
+            ),
+            // fetch pr/42 sha — matches github
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "pr/42", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("pr_push noop");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["action"], "noop");
+        assert_eq!(result.payload["number"], 42);
+    }
+
+    #[test]
+    fn pr_push_empty_at_nothing_to_land() {
+        // @ is empty AND pr/42 sha does NOT match GitHub head → error.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "true"),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "github_sha\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "pr/42", "--no-graph", "-T", "commit_id"],
+                "local_sha\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should fail — nothing to land");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("empty") && err.to_string().contains("nothing to land"),
+            "error should mention empty and nothing to land: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_push_detached_refusal() {
+        // @ is not a descendant of pr/42 → refuse.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            // ancestor check returns empty → not a descendant
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
+                "",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse detached @");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("not a descendant") || err.to_string().contains("descendant"),
+            "error should mention descendant: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_push_stale_push_error() {
+        // @ is non-empty, is a descendant, but jj git push fails (stale remote head).
+        let cwd = std::env::current_dir().expect("cwd");
+        let push_err = CubeError::CommandFailed {
+            program: "jj".to_string(),
+            args: vec!["git".to_string(), "push".to_string(), "-b".to_string(),
+                       "boss/exec_abc".to_string(), "--remote".to_string(), "github".to_string()],
+            status: Some(1),
+            stderr: "Error: Remote bookmark boss/exec_abc@github is ahead of local bookmark"
+                .to_string(),
+        };
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
+                "aabbcc\n",
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+            // push fails
+            ExpectedCommand {
+                cwd: cwd.clone(),
+                program: "jj".to_string(),
+                args: ["git", "push", "-b", "boss/exec_abc", "--remote", "github"]
+                    .iter().map(|s| s.to_string()).collect(),
+                result: Err(push_err),
+                creates_dir: None,
+            },
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should surface push error");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("push") || err.to_string().contains("boss/exec_abc"),
+            "error should mention push failure: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_push_merged_pr_hard_error() {
+        // PR is MERGED → hard error, no push attempted.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"MERGED"}"#,
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should hard-error on merged PR");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("MERGED") || err.to_string().contains("merged"),
+            "error should mention MERGED: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_push_closed_pr_hard_error() {
+        // PR is CLOSED → hard error.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"CLOSED"}"#,
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should hard-error on closed PR");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("CLOSED") || err.to_string().contains("non-open"),
+            "error should mention closed/non-open: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_push_force_with_lease_happy_path() {
+        // --force-with-lease: lease valid (fetched sha == github sha) → force push succeeds.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            // @ is not empty
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            // lease check: jj's view of remote tracking bookmark
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "boss/exec_abc@github", "--no-graph", "-T", "commit_id"],
+                "remote_sha\n",
+            ),
+            // lease check: GitHub's actual head — matches jj's view
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "remote_sha\n",
+            ),
+            // advance bookmarks
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+            // force push via git
+            ExpectedCommand::ok(
+                cwd.clone(), "git",
+                &["push", "--force-with-lease", "github", "boss/exec_abc"],
+                "",
+            ),
+            // verify
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
+                "new_sha\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "new_sha\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc", "--force-with-lease",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("force-with-lease happy path");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["action"], "pushed");
+        assert_eq!(result.payload["number"], 42);
+    }
+
+    #[test]
+    fn pr_push_force_with_lease_concurrent_advance_refusal() {
+        // --force-with-lease: GitHub has advanced beyond last fetch → refuse.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            // lease check: jj's view of remote
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "boss/exec_abc@github", "--no-graph", "-T", "commit_id"],
+                "old_sha\n",
+            ),
+            // lease check: GitHub advanced concurrently
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "new_sha_from_concurrent_push\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc", "--force-with-lease",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse concurrent advance");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("force-with-lease refused")
+                || err.to_string().contains("advanced"),
+            "error should mention lease refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn pr_push_infers_from_ancestry() {
+        // No --pr / --branch: infer from jj ancestry.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+            // Inference query
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &[
+                    "log", "-r", r#"latest(ancestors(@) & bookmarks(glob:"pr/*"))"#,
+                    "--no-graph", "-T", r#"bookmarks.map(|b| b.name()).join("\n")"#,
+                ],
+                "boss/exec_abc\npr/42\n",
+            ),
+            // check PR is open
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
+                r#"{"state":"OPEN"}"#,
+            ),
+            // @ is not empty
+            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            // ancestor check
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
+                "aabbcc\n",
+            ),
+            // advance bookmarks
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "boss/exec_abc", "-r", "@"], ""),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
+            // push
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["git", "push", "-b", "boss/exec_abc", "--remote", "github"],
+                "",
+            ),
+            // verify
+            ExpectedCommand::ok(
+                cwd.clone(), "jj",
+                &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
+                "deadbeef\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(), "gh",
+                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                "deadbeef\n",
+            ),
+        ]);
+
+        let cli = Cli::parse_from(["cube", "pr", "push"]);
+        let result = run_with_dependencies(cli, None, &runner).expect("pr_push inferred from ancestry");
+        runner.assert_exhausted();
+        assert_eq!(result.payload["action"], "pushed");
+        assert_eq!(result.payload["number"], 42);
+    }
+
+    #[test]
+    fn pr_push_guard_rejects_pr_bookmark_head_branch() {
+        // If the resolved head-branch is a pr/* name (explicit --branch pr/42), refuse.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "pr/42",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse pr/* branch");
+        runner.assert_exhausted();
+        assert!(
+            err.to_string().contains("reserved") || err.to_string().contains("pr/42"),
+            "error should mention reserved namespace: {err}"
         );
     }
 

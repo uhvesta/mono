@@ -315,10 +315,35 @@ pub enum PrCommand {
     /// re-run: if the PR already exists its URL is returned unchanged.
     /// Uses `-R <owner/repo>` with `gh` so no `GIT_DIR` guess is needed.
     Ensure(PrEnsureArgs),
+    /// Advance an existing PR by pushing the current commit to its head branch.
+    ///
+    /// Advances both the remote head branch and the local `pr/<n>` bookmark to
+    /// `@` (fast-forward only by default) and pushes to GitHub. Idempotent: a
+    /// re-run with nothing new to land is a no-op. Refuses non-descendants,
+    /// merged/closed PRs, and empty commits (unless already pushed).
+    Push(PrPushArgs),
     /// Sync local change state to GitHub pull requests.
     Sync(PrSyncArgs),
     /// Merge one PR or a ready sub-stack.
     Merge(PrMergeArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PrPushArgs {
+    /// PR number to advance. If omitted, inferred from the nearest `pr/<n>`
+    /// bookmark in `@`'s ancestry.
+    #[arg(long)]
+    pub pr: Option<u64>,
+    /// Head branch name to push. If omitted, inferred from the co-located
+    /// non-`pr/*` bookmark on the same commit as the `pr/<n>` ancestor.
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// Force-push with lease semantics: verifies that GitHub's head has not
+    /// advanced beyond the last-fetched state before force-pushing. Required
+    /// for rewrite scenarios (amend, rebase). The default push is
+    /// fast-forward only.
+    #[arg(long)]
+    pub force_with_lease: bool,
 }
 
 #[derive(Debug, Args)]
@@ -381,7 +406,7 @@ pub struct DoctorArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{ChangeCommand, Cli, Command, PrCommand, PrEnsureArgs, RepoCommand, WorkspaceCommand};
+    use super::{ChangeCommand, Cli, Command, PrCommand, PrEnsureArgs, PrPushArgs, RepoCommand, WorkspaceCommand};
 
     #[test]
     fn repo_ensure_matches_phase_a_shape() {
@@ -1078,6 +1103,55 @@ mod tests {
                 assert!(!draft);
             }
             _ => panic!("expected pr ensure command"),
+        }
+    }
+
+    #[test]
+    fn pr_push_parses_explicit_pr_and_branch() {
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc123_01",
+        ]);
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Push(PrPushArgs { pr, branch, force_with_lease }),
+            } => {
+                assert_eq!(pr, Some(42));
+                assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
+                assert!(!force_with_lease);
+            }
+            _ => panic!("expected pr push command"),
+        }
+    }
+
+    #[test]
+    fn pr_push_accepts_force_with_lease() {
+        let cli = Cli::parse_from([
+            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc", "--force-with-lease",
+        ]);
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Push(PrPushArgs { pr, branch, force_with_lease }),
+            } => {
+                assert_eq!(pr, Some(42));
+                assert_eq!(branch.as_deref(), Some("boss/exec_abc"));
+                assert!(force_with_lease);
+            }
+            _ => panic!("expected pr push command"),
+        }
+    }
+
+    #[test]
+    fn pr_push_all_args_optional() {
+        let cli = Cli::parse_from(["cube", "pr", "push"]);
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Push(PrPushArgs { pr, branch, force_with_lease }),
+            } => {
+                assert!(pr.is_none());
+                assert!(branch.is_none());
+                assert!(!force_with_lease);
+            }
+            _ => panic!("expected pr push command"),
         }
     }
 }
