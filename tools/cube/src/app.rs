@@ -2011,7 +2011,8 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     // assert it matches the local commit, failing loudly on mismatch.
     verify_push_reached_github(runner, &cwd, &owner_repo, &branch)?;
 
-    // Check for an existing open PR.
+    // Check for existing open PRs. Using --state open is explicit: gh pr list
+    // defaults to open-only, but being explicit guards against any default drift.
     let list_json = runner
         .run(&RealCommandRunner::invocation(
             &cwd,
@@ -2023,6 +2024,8 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
                 &owner_repo,
                 "--head",
                 &branch,
+                "--state",
+                "open",
                 "--json",
                 "url",
             ],
@@ -2031,19 +2034,29 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
             CubeError::InvalidArgument(format!("failed to check for existing PR: {e}"))
         })?;
 
-    if let Ok(prs) = serde_json::from_str::<Vec<serde_json::Value>>(&list_json)
-        && let Some(url) = prs
-            .first()
-            .and_then(|pr| pr.get("url"))
-            .and_then(|v| v.as_str())
-        {
-            let url = url.to_string();
-            let number = pr_number_from_url(&url);
-            return RunResult::new(
-                url.clone(),
-                json!({"action": "exists", "url": url, "number": number}),
-            );
-        }
+    let prs = serde_json::from_str::<Vec<serde_json::Value>>(&list_json).unwrap_or_default();
+
+    if prs.len() > 1 {
+        return Err(CubeError::InvalidArgument(format!(
+            "found {} open PRs for branch `{branch}` — expected at most 1. \
+             Close duplicate PRs before retrying.",
+            prs.len()
+        )));
+    }
+
+    if let Some(url) = prs
+        .first()
+        .and_then(|pr| pr.get("url"))
+        .and_then(|v| v.as_str())
+    {
+        let url = url.to_string();
+        let number = pr_number_from_url(&url);
+        let pr_bookmark_name = set_pr_bookmark(runner, &cwd, number, &branch)?;
+        return RunResult::new(
+            url.clone(),
+            json!({"action": "exists", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
+        );
+    }
 
     // No existing PR — create one.
     let mut create_args: Vec<&str> = vec![
@@ -2095,10 +2108,39 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         ));
     }
     let number = pr_number_from_url(&url);
+    let pr_bookmark_name = set_pr_bookmark(runner, &cwd, number, &branch)?;
     RunResult::new(
         url.clone(),
-        json!({"action": "created", "url": url, "number": number}),
+        json!({"action": "created", "url": url, "number": number, "pr_bookmark": pr_bookmark_name}),
     )
+}
+
+/// Sets the local `pr/<n>` bookmark on the given branch.
+///
+/// Returns the bookmark name if the number was resolved, or `None` if the PR
+/// URL didn't contain a parseable number (so callers can include it in JSON).
+fn set_pr_bookmark(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    number: Option<u64>,
+    branch: &str,
+) -> Result<Option<String>> {
+    let Some(n) = number else {
+        return Ok(None);
+    };
+    let bookmark_name = pr_bookmark::pr_bookmark_name(n);
+    runner
+        .run(&RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["bookmark", "set", &bookmark_name, "-r", branch],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to set local bookmark `{bookmark_name}`: {e}"
+            ))
+        })?;
+    Ok(Some(bookmark_name))
 }
 
 /// Verify that a just-pushed branch actually reached GitHub.
@@ -10869,7 +10911,8 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
                 ],
                 "[]",
             ),
@@ -10892,6 +10935,12 @@ steps:
                     &body_path,
                 ],
                 "https://github.com/spinyfin/mono/pull/99",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", "pr/99", "-r", "my-feature"],
+                "",
             ),
         ]);
 
@@ -10957,7 +11006,8 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
                 ],
                 "[]",
             ),
@@ -10969,6 +11019,12 @@ steps:
                     "main", "--title", "New PR",
                 ],
                 "https://github.com/spinyfin/mono/pull/42",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", "pr/42", "-r", "my-feature"],
+                "",
             ),
         ]);
 
@@ -10982,6 +11038,7 @@ steps:
         assert_eq!(result.payload["action"], "created");
         assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/42");
         assert_eq!(result.payload["number"], 42);
+        assert_eq!(result.payload["pr_bookmark"], "pr/42");
     }
 
     #[test]
@@ -11023,9 +11080,16 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
                 ],
                 r#"[{"url":"https://github.com/spinyfin/mono/pull/7"}]"#,
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", "pr/7", "-r", "my-feature"],
+                "",
             ),
         ]);
 
@@ -11039,6 +11103,7 @@ steps:
         assert_eq!(result.payload["action"], "exists");
         assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/7");
         assert_eq!(result.payload["number"], 7);
+        assert_eq!(result.payload["pr_bookmark"], "pr/7");
     }
 
     #[test]
@@ -11086,7 +11151,8 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--json", "url",
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
                 ],
                 "[]",
             ),
@@ -11098,6 +11164,12 @@ steps:
                     "main", "--title", "New PR",
                 ],
                 "https://github.com/spinyfin/mono/pull/77",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", "pr/77", "-r", "my-feature"],
+                "",
             ),
         ]);
 
@@ -11186,6 +11258,207 @@ steps:
         assert!(
             msg.contains("pr/42") && msg.contains("reserved"),
             "error should mention the bookmark and reserved: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_pr_sets_pr_bookmark_on_create() {
+        // After a new PR is created, `jj bookmark set pr/<n> -r <branch>` must
+        // be called so the workspace has a local pointer from number to head.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
+                ],
+                "[]",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "create", "-R", "spinyfin/mono", "--head", "my-feature", "--base",
+                    "main", "--title", "My Feature",
+                ],
+                "https://github.com/spinyfin/mono/pull/55",
+            ),
+            // Must call `jj bookmark set pr/55 -r my-feature` after creation.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", "pr/55", "-r", "my-feature"],
+                "",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "My Feature",
+        ]);
+        let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr create+bookmark");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["pr_bookmark"], "pr/55");
+    }
+
+    #[test]
+    fn ensure_pr_sets_pr_bookmark_on_existing_pr() {
+        // When a PR already exists (backfill path), `jj bookmark set pr/<n> -r
+        // <branch>` must still be called so the local bookmark is up to date.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
+                ],
+                r#"[{"url":"https://github.com/spinyfin/mono/pull/33"}]"#,
+            ),
+            // Bookmark set must happen even on the reuse/backfill path.
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["bookmark", "set", "pr/33", "-r", "my-feature"],
+                "",
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "My Feature",
+        ]);
+        let result =
+            run_with_dependencies(cli, None, &runner).expect("ensure_pr exists+bookmark");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["action"], "exists");
+        assert_eq!(result.payload["pr_bookmark"], "pr/33");
+    }
+
+    #[test]
+    fn ensure_pr_errors_on_multiple_open_prs() {
+        // If `gh pr list` returns more than one open PR for the branch, cube
+        // must error rather than silently picking one. This is an unexpected
+        // state that requires human intervention.
+        let cwd = std::env::current_dir().expect("cwd");
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &[
+                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
+                ],
+                "",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "my-feature", "--no-graph", "-T", "commit_id"],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/my-feature",
+                    "--jq",
+                    ".commit.sha",
+                ],
+                "abc123\n",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
+                    "open", "--json", "url",
+                ],
+                r#"[{"url":"https://github.com/spinyfin/mono/pull/10"},{"url":"https://github.com/spinyfin/mono/pull/11"}]"#,
+            ),
+        ]);
+
+        let cli = Cli::parse_from([
+            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "My Feature",
+        ]);
+        let err = run_with_dependencies(cli, None, &runner)
+            .expect_err("ensure_pr should fail on >1 open PRs");
+        runner.assert_exhausted();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("2") && msg.contains("my-feature"),
+            "error should mention count and branch: {msg}"
         );
     }
 
