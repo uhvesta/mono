@@ -516,9 +516,10 @@ impl std::str::FromStr for ExecutionStatus {
 /// that every callsite handles new variants explicitly — adding a new status
 /// here produces a compile error at every status-keyed branch that must
 /// reason about it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    #[default]
     Todo,
     Active,
     Blocked,
@@ -568,12 +569,6 @@ impl TaskStatus {
             Self::Archived => "archived",
             Self::Cancelled => "cancelled",
         }
-    }
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Todo
     }
 }
 

@@ -6744,7 +6744,7 @@ enum BindPrAction<'a> {
 fn classify_bind_pr<'a>(prior: Option<&'a str>, new: &str) -> BindPrAction<'a> {
     match prior {
         Some(p) if p == new => BindPrAction::Idempotent,
-        Some(p) if p.is_empty() => BindPrAction::FirstTime,
+        Some("") => BindPrAction::FirstTime,
         Some(p) => BindPrAction::Overwrite { previous: p },
         None => BindPrAction::FirstTime,
     }
@@ -8469,8 +8469,8 @@ enum LintSeverity {
 }
 
 /// One row in the `lint-design-docs` report. Carries enough state for
-/// the human to act on the finding without re-resolving: project id
-/// + slug for identification, product slug for the grouping context,
+/// the human to act on the finding without re-resolving: project id +
+/// slug for identification, product slug for the grouping context,
 /// the current pointer fields (so the user can see what's set), the
 /// reason the finding fired, and a copy-pasteable `suggested_fix`
 /// CLI invocation.

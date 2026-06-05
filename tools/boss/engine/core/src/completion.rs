@@ -2280,7 +2280,7 @@ must not be asked to open one",
                          after re-prompting; advancing to in_review WITHOUT a revision and \
                          filing an attention",
                     );
-                    self.file_review_result_giveup_attention(&execution, count)
+                    self.file_review_result_giveup_attention(execution, count)
                         .await;
                     // Fall through with review_result = None → advance to
                     // in_review unimpeded (no revision).

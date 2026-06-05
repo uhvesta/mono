@@ -1182,12 +1182,12 @@ async fn resolve_agent_ref_or_work_item(
     states: &[LiveWorkerState],
 ) -> Result<String> {
     match resolve_agent_ref(reference, states) {
-        Ok(state) => return Ok(state.run_id.clone()),
+        Ok(state) => Ok(state.run_id.clone()),
         Err(agent_err) => {
             if let Some(state) = resolve_tnnn_to_live_worker(client, reference, states).await? {
                 return Ok(state.run_id.clone());
             }
-            return Err(agent_err);
+            Err(agent_err)
         }
     }
 }
@@ -2047,7 +2047,7 @@ fn metrics_list(json: bool, state_root: Option<PathBuf>, prefix: Option<&str>) -
     } else {
         let name_width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
         for row in &rows {
-            print_metric_row_short(row, now as u128, name_width);
+            print_metric_row_short(row, now, name_width);
         }
     }
     Ok(())
@@ -2069,7 +2069,7 @@ fn metrics_show(json: bool, state_root: Option<PathBuf>, name: &str) -> Result<(
             }
         }
         Some(r) => {
-            let age = format_age_ms(r.timestamp_ms, now as u128);
+            let age = format_age_ms(r.timestamp_ms, now);
             if json {
                 println!(
                     "{}",
@@ -2120,7 +2120,7 @@ async fn metrics_show_live(
 }
 
 fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntry>) {
-    let now = now_epoch_ms() as u128;
+    let now = now_epoch_ms();
     match entry {
         None => {
             if json {
@@ -2404,7 +2404,7 @@ async fn hosts_add(
         let mut obj = host_to_json(&host, &caps);
         if let Some(outcome) = push_outcome.as_ref() {
             obj["wrapper_push"] = serde_json::to_value(outcome)
-                .unwrap_or_else(|_| serde_json::Value::Null);
+                .unwrap_or(serde_json::Value::Null);
         }
         println!("{}", obj);
     } else {

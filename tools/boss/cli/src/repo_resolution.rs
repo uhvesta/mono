@@ -308,6 +308,7 @@ const MIN_ALIAS_LEN: usize = 2;
 ///   - the `owner/repo` path segment,
 ///   - the short name (basename minus `.git`),
 ///   - the short name with dashes stripped.
+///
 /// Duplicates pruned; aliases below [`MIN_ALIAS_LEN`] dropped at
 /// match time.
 fn aliases_for(url: &str) -> Vec<String> {
@@ -340,8 +341,8 @@ fn owner_repo_for(url: &str) -> Option<String> {
     // common shape after the first prefix-strip is `…/owner/repo`,
     // so take the last two non-empty path components.
     let after_scheme = trimmed
-        .splitn(2, "://")
-        .nth(1)
+        .split_once("://")
+        .map(|x| x.1)
         .unwrap_or(trimmed)
         .trim_start_matches('/');
     let body = after_scheme

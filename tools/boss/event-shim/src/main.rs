@@ -229,9 +229,8 @@ fn connect_once(path: &str) -> Result<UnixStream> {
 /// per [`retry_delays`]. Returns the last error if every attempt fails.
 fn connect_with_retry(path: &str) -> Result<UnixStream> {
     let delays = retry_delays();
-    match connect_once(path) {
-        Ok(stream) => return Ok(stream),
-        Err(_) => {}
+    if let Ok(stream) = connect_once(path) {
+        return Ok(stream);
     }
     let mut last_err: Option<anyhow::Error> = None;
     for delay in delays {

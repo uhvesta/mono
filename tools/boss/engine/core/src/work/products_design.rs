@@ -95,7 +95,7 @@ impl WorkDb {
         let _ = query_product(&tx, product_id).require("product", product_id)?;
         let now = now_string();
         let rules_json = rules
-            .map(|r| serde_json::to_string(r))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(|e| anyhow::anyhow!("failed to serialize editorial_rules: {e}"))?;
         tx.execute(
