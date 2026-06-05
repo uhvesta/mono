@@ -97,6 +97,28 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         category: "editorial",
         default_enabled: false,
     },
+    FeatureFlagSpec {
+        name: "attentions_questions_backstop",
+        description:
+            "Extraction backstop for the attentions questions pipeline (design: attentions.md). \
+             When a design-doc PR ships no `<slug>.attentions.json` manifest, scan the doc's \
+             'Risks / open questions' section and synthesise `prompt`-type attentions flagged \
+             `confidence_source = extracted`. DEFAULT OFF — lower-trust path, enable once the \
+             primary manifest path is proven stable.",
+        category: "attentions",
+        default_enabled: false,
+    },
+    FeatureFlagSpec {
+        name: "attentions_followups_backstop",
+        description:
+            "Extraction backstop for the attentions followups pipeline (design: attentions.md). \
+             When a completing worker emits no structured `FOLLOWUPS:` block, run a lightweight \
+             supervisor LLM pass over the transcript tail to extract candidate followups flagged \
+             `confidence_source = extracted`. DEFAULT OFF — requires an Anthropic API key and \
+             carries model-call cost; enable once the primary sentinel path is proven stable.",
+        category: "attentions",
+        default_enabled: false,
+    },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.
@@ -416,5 +438,51 @@ mod tests {
         assert!(on_disk.contains("false"));
         // Temp file must have been cleaned up by the rename.
         assert!(!tmp.path().join("feature-flags.toml.tmp").exists());
+    }
+
+    #[test]
+    fn attentions_backstops_default_off() {
+        // Both backstop flags default to false — lower-trust extraction paths
+        // that the operator opts in to, not on by default.
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("attentions_questions_backstop"),
+            "attentions_questions_backstop must default disabled"
+        );
+        assert!(
+            !store.is_enabled("attentions_followups_backstop"),
+            "attentions_followups_backstop must default disabled"
+        );
+        let snap = store.snapshot_all();
+        let qs = snap
+            .iter()
+            .find(|s| s.name == "attentions_questions_backstop")
+            .expect("attentions_questions_backstop must be in registry");
+        assert!(!qs.default_enabled);
+        assert_eq!(qs.category, "attentions");
+        let fu = snap
+            .iter()
+            .find(|s| s.name == "attentions_followups_backstop")
+            .expect("attentions_followups_backstop must be in registry");
+        assert!(!fu.default_enabled);
+        assert_eq!(fu.category, "attentions");
+    }
+
+    #[test]
+    fn attentions_backstops_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        store.set("attentions_questions_backstop", true).unwrap();
+        store.set("attentions_followups_backstop", true).unwrap();
+        assert!(store.is_enabled("attentions_questions_backstop"));
+        assert!(store.is_enabled("attentions_followups_backstop"));
+        // Persists across a fresh store backed by the same file.
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("attentions_questions_backstop"));
+        assert!(store2.is_enabled("attentions_followups_backstop"));
     }
 }

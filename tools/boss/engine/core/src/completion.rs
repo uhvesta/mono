@@ -2799,7 +2799,7 @@ must not be asked to open one",
                     // A design worker may ship a sibling `<slug>.attentions.json`
                     // question manifest; parse it off the PR branch and upsert
                     // the question group. Idempotent across re-detections.
-                    if let Some((group, created)) =
+                    let questions_result =
                         attentions_detector::reconcile_design_doc_questions(
                             &self.work_db,
                             &task.id,
@@ -2807,9 +2807,28 @@ must not be asked to open one",
                             &pr_url,
                             merged,
                         )
-                        .await
+                        .await;
+                    if let Some((ref group, ref created)) = questions_result {
+                        self.publish_attentions_created(group, created).await;
+                    } else if self
+                        .feature_flags
+                        .is_enabled("attentions_questions_backstop")
                     {
-                        self.publish_attentions_created(&group, &created).await;
+                        // Primary found no manifest; fall back to the extraction
+                        // backstop which reads the doc's "Risks / open questions"
+                        // section (flagged `confidence_source = extracted`).
+                        if let Some((group, created)) =
+                            attentions_detector::extract_doc_questions_backstop(
+                                &self.work_db,
+                                &task.id,
+                                project_id,
+                                &pr_url,
+                                merged,
+                            )
+                            .await
+                        {
+                            self.publish_attentions_created(&group, &created).await;
+                        }
                     }
                 }
 
@@ -2823,15 +2842,31 @@ must not be asked to open one",
             .transcript_path_for_execution(execution_id)
             .ok()
             .flatten();
-        if let Some((group, created)) = attentions_detector::reconcile_task_followups(
+        let followups_result = attentions_detector::reconcile_task_followups(
             &self.work_db,
             &work_item_id,
             execution_id,
             transcript_path.as_deref(),
         )
-        .await
+        .await;
+        if let Some((ref group, ref created)) = followups_result {
+            self.publish_attentions_created(group, created).await;
+        } else if self
+            .feature_flags
+            .is_enabled("attentions_followups_backstop")
         {
-            self.publish_attentions_created(&group, &created).await;
+            // Primary found no FOLLOWUPS: block; fall back to the supervisor
+            // extraction backstop (flagged `confidence_source = extracted`).
+            if let Some((group, created)) = attentions_detector::extract_followups_backstop(
+                &self.work_db,
+                &work_item_id,
+                execution_id,
+                transcript_path.as_deref(),
+            )
+            .await
+            {
+                self.publish_attentions_created(&group, &created).await;
+            }
         }
 
         if merged {
