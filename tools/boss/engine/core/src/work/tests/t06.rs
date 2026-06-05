@@ -2103,6 +2103,220 @@ fn merge_conflict_revision_still_redispatches_while_attempt_active() {
     );
 }
 
+// ── CI-fix revision: stop re-dispatch once the attempt retires ──
+//
+// Symmetric sibling of the merge-conflict arm above. `reconcile_revision_execution`
+// (via `retired_spawning_attempt_status`) keys on the task's `created_via` prefix:
+// `merge-conflict:<crz_id>` → `conflict_resolutions`, `ci-fix:<id>` → `ci_remediations`.
+// The merge-conflict arm is exercised by the two tests above; these mirror them for
+// the `ci-fix` arm so a regression in *that* branch (a CI-fix revision minting a fresh
+// `revision_implementation` execution on every reconcile tick after its
+// `ci_remediations` attempt retired) can't slip through silently.
+
+/// Insert a `kind=revision` task linked to a CI-fix attempt.
+/// Mirrors what `ci_watch` produces for a CI remediation: `created_via =
+/// "ci-fix:<ci_remediations.id>"`, parent = the chore, and (as in the
+/// steady-state loop) the row already flipped to `active`.
+fn insert_ci_fix_revision_row(
+    db: &WorkDb,
+    product_id: &str,
+    parent_task_id: &str,
+    rem_id: &str,
+) -> String {
+    let conn = db.connect().unwrap();
+    let id = next_id("task");
+    let now = now_string();
+    let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}{rem_id}");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Fix failing CI on PR', '', 'active', ?3, ?3, 0, ?4, ?5)",
+        rusqlite::params![id, product_id, now, created_via, parent_task_id],
+    )
+    .unwrap();
+    id
+}
+
+/// Insert a `pending` CI remediation attempt linked to `chore_id`, and a
+/// `ci-fix:<id>` revision task parented to it. Returns `(rem_id, revision_id)`.
+fn setup_ci_fix_revision(
+    db: &WorkDb,
+    product_id: &str,
+    chore_id: &str,
+    pr_url: &str,
+    pr_number: i64,
+) -> (String, String) {
+    let rem = db
+        .insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product_id.to_owned(),
+            work_item_id: chore_id.to_owned(),
+            pr_url: pr_url.to_owned(),
+            pr_number,
+            head_branch: "feature".into(),
+            head_sha_at_trigger: "head-1".into(),
+            attempt_kind: "fix".into(),
+            consumes_budget: 1,
+            failed_checks: "[]".into(),
+            failure_kind: "pr_branch_ci".into(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .unwrap();
+    let revision_id = insert_ci_fix_revision_row(db, product_id, chore_id, &rem.id);
+    db.set_ci_remediation_revision_task_id(&rem.id, &revision_id)
+        .unwrap();
+    (rem.id, revision_id)
+}
+
+/// Regression sibling of `merge_conflict_revision_stops_dispatch_after_attempt_succeeds`
+/// for the `ci-fix` arm: a CI-fix revision must stop being re-dispatched once its
+/// `ci_remediations` attempt has retired (`succeeded`), even though the chore PR is
+/// still open + `in_review`. After the fix: a retired attempt drops the queued
+/// execution and settles the revision to `in_review`; no new execution is created.
+#[test]
+fn ci_fix_revision_stops_dispatch_after_attempt_succeeds() {
+    let db = WorkDb::open(temp_db_path("ci-fix-revision-stop-succeeds")).unwrap();
+    let product_id = make_revision_product(&db, "ci-fix-stop-ok");
+    let pr_url = "https://github.com/spinyfin/mono/pull/980";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 980);
+
+    // First reconcile: attempt is still `pending`, so the revision dispatches
+    // normally — the behaviour the fix must preserve.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_first = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_first.len(),
+        1,
+        "a pending attempt must still dispatch the revision once: {after_first:?}",
+    );
+    assert_eq!(after_first[0].1, "ready");
+
+    // CI fix lands and the attempt retires. The `ready` execution from above is
+    // still queued (the exact race that makes a manual move-to-Review pointless).
+    db.mark_ci_remediation_succeeded(&rem_id, None).unwrap();
+
+    // Second reconcile: must NOT mint another execution.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_second = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_second.len(),
+        1,
+        "no new execution may be created once the attempt has retired: {after_second:?}",
+    );
+    assert_eq!(
+        after_second[0].1, "abandoned",
+        "the leftover queued execution must be abandoned so start_execution_run \
+         can't flip the revision back to active",
+    );
+    assert_eq!(
+        task_status(&db, &revision_id),
+        "in_review",
+        "the revision must be settled to in_review once its fix vehicle is spent",
+    );
+
+    // Third reconcile: idempotent — the in_review revision is no longer dispatchable.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_third = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_third.len(),
+        1,
+        "reconcile must remain a no-op for a settled revision: {after_third:?}",
+    );
+    assert_eq!(task_status(&db, &revision_id), "in_review");
+}
+
+/// Second retired-status case for the `ci-fix` arm: a `failed` attempt is just
+/// as terminal as `succeeded`, so it must also stop re-dispatch and settle the
+/// revision to `in_review`. (A CI fix that exhausts/aborts must not keep minting
+/// executions either.)
+#[test]
+fn ci_fix_revision_stops_dispatch_after_attempt_fails() {
+    let db = WorkDb::open(temp_db_path("ci-fix-revision-stop-fails")).unwrap();
+    let product_id = make_revision_product(&db, "ci-fix-stop-fail");
+    let pr_url = "https://github.com/spinyfin/mono/pull/981";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let (rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 981);
+
+    // First reconcile: pending attempt → dispatch once.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_first = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_first.len(),
+        1,
+        "a pending attempt must still dispatch the revision once: {after_first:?}",
+    );
+    assert_eq!(after_first[0].1, "ready");
+
+    // The CI fix attempt fails (retires terminally).
+    db.mark_ci_remediation_failed(&rem_id, "ran out of attempts")
+        .unwrap();
+
+    // Second reconcile: no new execution; queued row abandoned; revision settled.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let after_second = executions_for(&db, &revision_id);
+    assert_eq!(
+        after_second.len(),
+        1,
+        "no new execution may be created once the attempt has retired: {after_second:?}",
+    );
+    assert_eq!(
+        after_second[0].1, "abandoned",
+        "the leftover queued execution must be abandoned once the failed attempt retires",
+    );
+    assert_eq!(
+        task_status(&db, &revision_id),
+        "in_review",
+        "the revision must be settled to in_review once its (failed) fix vehicle is spent",
+    );
+}
+
+/// Guard against over-blocking on the `ci-fix` arm (sibling of
+/// `merge_conflict_revision_still_redispatches_while_attempt_active`): while the
+/// `ci_remediations` attempt is still active (`pending`/`running`), a revision
+/// whose previous execution died must still be re-dispatched. The fix only
+/// short-circuits *retired* attempts.
+#[test]
+fn ci_fix_revision_still_redispatches_while_attempt_active() {
+    let db = WorkDb::open(temp_db_path("ci-fix-revision-active-redispatch")).unwrap();
+    let product_id = make_revision_product(&db, "ci-fix-active");
+    let pr_url = "https://github.com/spinyfin/mono/pull/982";
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let (_rem_id, revision_id) = setup_ci_fix_revision(&db, &product_id, &chore_id, pr_url, 982);
+
+    // First dispatch, then simulate a dead worker (execution orphaned).
+    db.reconcile_product_executions(&product_id).unwrap();
+    let first = executions_for(&db, &revision_id);
+    assert_eq!(first.len(), 1);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_executions SET status = 'orphaned' WHERE id = ?1",
+            rusqlite::params![first[0].0],
+        )
+        .unwrap();
+
+    // Attempt is still pending → reconcile must re-dispatch a fresh execution.
+    db.reconcile_product_executions(&product_id).unwrap();
+    let second = executions_for(&db, &revision_id);
+    assert_eq!(
+        second.len(),
+        2,
+        "an active attempt must still re-dispatch after a worker dies: {second:?}",
+    );
+    assert!(
+        second.iter().any(|(_, status)| status == "ready"),
+        "a fresh ready execution must exist while the attempt is active: {second:?}",
+    );
+    assert_eq!(
+        task_status(&db, &revision_id),
+        "active",
+        "the revision must stay dispatchable while its attempt is active",
+    );
+}
+
 // ── Revision completion must leave the base row in Review, never Doing ──
 //
 // Contract: a base task/chore that has a revision underway must REMAIN in
