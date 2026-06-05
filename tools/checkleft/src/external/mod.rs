@@ -8,15 +8,16 @@ use serde::Deserialize;
 
 use crate::path::validate_relative_path;
 
+/// Runtime tag for the `wasm` tier (sandboxed pure computation). The `wasm`
+/// manifest mode selects this runtime.
 pub const EXTERNAL_CHECK_RUNTIME_V1: &str = "sandbox-v1";
-pub const EXTERNAL_CHECK_EXEC_RUNTIME_V1: &str = "exec-v1";
-/// Runtime tag for the declarative tier (config-only, framework-owned invocation).
+/// Runtime tag for the `declarative` tier (config-only, framework-owned
+/// invocation + declarative transforms). Subsumes the former `exec-v1` tier.
 pub const EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1: &str = "declarative-v1";
 pub const EXTERNAL_CHECK_API_V1: &str = "v1";
 pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
 
 pub mod declarative;
-pub mod exec_protocol;
 
 pub use declarative::{ExternalCheckDeclarativePackage, run_declarative_check};
 
@@ -70,8 +71,11 @@ pub struct ExternalCheckPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCheckPackageImplementation {
+    /// The `wasm` tier: a sandboxed wasm artifact (pure computation).
     Artifact(ExternalCheckArtifactPackage),
-    Exec(ExternalCheckExecPackage),
+    /// The `declarative` tier: framework-owned invocations + declarative
+    /// transforms. Subsumes the former `exec` tier (via the `passthrough`
+    /// transform).
     Declarative(ExternalCheckDeclarativePackage),
 }
 
@@ -79,13 +83,6 @@ pub enum ExternalCheckPackageImplementation {
 pub struct ExternalCheckArtifactPackage {
     pub artifact_path: String,
     pub artifact_sha256: String,
-    pub provenance: Option<ExternalCheckArtifactProvenance>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalCheckExecPackage {
-    pub executable_path: String,
-    pub args: Vec<String>,
     pub provenance: Option<ExternalCheckArtifactProvenance>,
 }
 
@@ -208,8 +205,7 @@ impl RawDeclarativeCheckManifest {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RawExternalCheckMode {
-    Artifact,
-    Exec,
+    Wasm,
     Declarative,
 }
 
@@ -281,19 +277,9 @@ impl RawExternalCheckPackage {
 
         let capabilities = validate_capabilities(mode, capabilities)?;
         let implementation = match mode {
-            RawExternalCheckMode::Artifact => {
+            RawExternalCheckMode::Wasm => {
                 reject_declarative_fields(&declarative)?;
                 ExternalCheckPackageImplementation::Artifact(validate_artifact_implementation(
-                    artifact_path,
-                    artifact_sha256,
-                    executable_path,
-                    args,
-                    provenance,
-                )?)
-            }
-            RawExternalCheckMode::Exec => {
-                reject_declarative_fields(&declarative)?;
-                ExternalCheckPackageImplementation::Exec(validate_exec_implementation(
                     artifact_path,
                     artifact_sha256,
                     executable_path,
@@ -340,28 +326,6 @@ fn validate_artifact_implementation(
     })
 }
 
-fn validate_exec_implementation(
-    artifact_path: Option<String>,
-    artifact_sha256: Option<String>,
-    executable_path: Option<String>,
-    args: Vec<String>,
-    provenance: Option<ExternalCheckArtifactProvenance>,
-) -> Result<ExternalCheckExecPackage> {
-    reject_if_present("artifact_path", artifact_path.as_ref())?;
-    reject_if_present("artifact_sha256", artifact_sha256.as_ref())?;
-
-    let args = args
-        .into_iter()
-        .map(|arg| required_non_empty("args[]", arg))
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(ExternalCheckExecPackage {
-        executable_path: required_some_relative_path_string("executable_path", executable_path)?,
-        args,
-        provenance,
-    })
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawExternalCheckCapabilities {
@@ -396,8 +360,7 @@ impl RawExternalCheckCapabilities {
 
 fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Result<()> {
     let expected = match mode {
-        RawExternalCheckMode::Artifact => EXTERNAL_CHECK_RUNTIME_V1,
-        RawExternalCheckMode::Exec => EXTERNAL_CHECK_EXEC_RUNTIME_V1,
+        RawExternalCheckMode::Wasm => EXTERNAL_CHECK_RUNTIME_V1,
         RawExternalCheckMode::Declarative => EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
     };
     if runtime != expected {
@@ -411,11 +374,11 @@ fn validate_capabilities(
     capabilities: Option<RawExternalCheckCapabilities>,
 ) -> Result<ExternalCheckCapabilities> {
     match (mode, capabilities) {
-        // Capabilities are a wasm-guest command-grant concept; the exec and
-        // declarative tiers run binaries directly (framework-owned), so a
-        // `capabilities` block is meaningless there.
-        (RawExternalCheckMode::Exec | RawExternalCheckMode::Declarative, Some(_)) => {
-            bail!("field `capabilities` is not allowed in `exec` or `declarative` mode");
+        // Capabilities are a wasm-guest command-grant concept; the declarative
+        // tier runs binaries directly (framework-owned), so a `capabilities`
+        // block is meaningless there.
+        (RawExternalCheckMode::Declarative, Some(_)) => {
+            bail!("field `capabilities` is not allowed in `declarative` mode");
         }
         (_, Some(raw)) => raw.validate(),
         (_, None) => Ok(ExternalCheckCapabilities::default()),
@@ -435,8 +398,7 @@ fn reject_declarative_fields(declarative: &declarative::RawDeclarativeFields) ->
 impl fmt::Display for RawExternalCheckMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Artifact => write!(f, "artifact"),
-            Self::Exec => write!(f, "exec"),
+            Self::Wasm => write!(f, "wasm"),
             Self::Declarative => write!(f, "declarative"),
         }
     }

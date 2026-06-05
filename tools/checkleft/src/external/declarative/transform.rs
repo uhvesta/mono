@@ -1,8 +1,17 @@
 //! Declarative transforms: the projection DSL that turns an invocation's
 //! `(stdout, exit_code, file-it-ran-on)` into `Vec<Finding>`.
 //!
-//! Only the `json` strategy is implemented (enough for buildifier). The
-//! [`Transform`] enum is the strategy slot: `regex` (parse stdout lines) and
+//! Two strategies are implemented:
+//!
+//! - `json` — a [`Selector`] locates issue rows and a [`FindingTemplate`] projects
+//!   each into a [`Finding`] (enough for buildifier).
+//! - `passthrough` — the invoked binary already emits checkleft findings JSON
+//!   (`{"findings":[…]}`) on stdout, so the transform is the identity: parse and
+//!   return them. This is how the old `exec-v1` tier folds into the declarative
+//!   runtime — a custom binary "ships its own transform" by emitting findings
+//!   directly, modelled as `{ invoke: <binary>, transform: passthrough }`.
+//!
+//! The [`Transform`] enum is the strategy slot: `regex` (parse stdout lines) and
 //! `sarif` (map SARIF results) would each add a variant here and reuse the same
 //! `apply(stdout, exit_code, input_file) → Vec<Finding>` signature. Computed
 //! transforms that need real logic are where the wasm pure-function tier begins.
@@ -10,6 +19,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::output::{Finding, Location, Severity};
@@ -21,6 +31,8 @@ use super::template::{RenderContext, Template};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Transform {
     Json(JsonTransform),
+    /// Identity: the binary already emitted checkleft findings JSON on stdout.
+    Passthrough,
     // Future: Regex(RegexTransform), Sarif(SarifTransform).
 }
 
@@ -35,8 +47,31 @@ impl Transform {
     ) -> Result<Vec<Finding>> {
         match self {
             Transform::Json(json) => json.apply(stdout, exit_code, input_file),
+            Transform::Passthrough => passthrough(stdout),
         }
     }
+}
+
+/// The `passthrough` strategy: the binary emits a checkleft findings document
+/// (`{"findings":[…]}`) on stdout; return those findings unchanged. `exit_code`
+/// and `input_file` are unused — exit semantics already gated whether we got here.
+fn passthrough(stdout: &[u8]) -> Result<Vec<Finding>> {
+    let document: PassthroughDocument = serde_json::from_slice(stdout).with_context(|| {
+        format!(
+            "declarative passthrough transform could not parse tool stdout as a checkleft \
+             findings document (`{{\"findings\":[…]}}`); raw stdout: {:?}",
+            String::from_utf8_lossy(stdout)
+        )
+    })?;
+    Ok(document.findings)
+}
+
+/// The shape a passthrough binary writes to stdout. Mirrors the runtime's findings
+/// output: a single object with a `findings` array.
+#[derive(Debug, Deserialize)]
+struct PassthroughDocument {
+    #[serde(default)]
+    findings: Vec<Finding>,
 }
 
 /// The `json` strategy: a [`Selector`] locates the issue rows; a [`FindingTemplate`]

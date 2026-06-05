@@ -1,5 +1,12 @@
 # Checkleft: Bazel-Backed Repo-Local Checks
 
+> **Superseded (runtime unification).** The `exec-v1` runtime / `mode = "exec"`
+> this design introduced has been folded into the **declarative** runtime. The
+> `local_check` bazel rule now generates a declarative manifest whose single
+> invocation uses the `passthrough` transform (the binary still emits a checkleft
+> findings document on stdout). The mechanics below describe the original
+> `exec-v1` shape; substitute "declarative passthrough" for "exec-v1".
+
 ## Overview
 
 This design adds a low-friction execution mode for repository-owned custom

@@ -1,3 +1,31 @@
+/// Build a resolved `declarative` external package (the runtime the former
+/// `exec` tier folded into) for routing/policy tests. The mock executor returns
+/// canned results, so the invocation body is never actually run.
+fn declarative_package(check_id: &str) -> ExternalCheckPackage {
+    let manifest = r#"
+id = "CHECK_ID"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.md"]
+
+[needs.tool.default]
+path = "bazel-bin/checks/domain_typo/domain_typo"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{files}}"]
+exit = { "0" = "findings", default = "error" }
+
+[invocations.transform]
+kind = "passthrough"
+"#
+    .replace("CHECK_ID", check_id);
+    parse_external_check_package_manifest(&manifest).expect("valid declarative manifest")
+}
+
 #[tokio::test]
 async fn runner_reports_missing_external_package() {
     let temp = tempdir().expect("create temp dir");
@@ -180,7 +208,7 @@ allow_bypass = true
 }
 
 #[tokio::test]
-async fn runner_allows_exec_runtime_for_local_config() {
+async fn runner_allows_declarative_runtime_for_local_config() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
     fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
@@ -196,19 +224,7 @@ implementation = "generated:domain-typo-check"
     .expect("write config");
 
     let provider = StaticExternalProvider {
-        package: Some(ExternalCheckPackage {
-            id: "domain-typo-check".to_owned(),
-            runtime: "exec-v1".to_owned(),
-            api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Exec(
-                crate::external::ExternalCheckExecPackage {
-                    executable_path: "bazel-bin/checks/domain_typo/domain_typo".to_owned(),
-                    args: Vec::new(),
-                    provenance: None,
-                },
-            ),
-        }),
+        package: Some(declarative_package("domain-typo-check")),
     };
     let seen_packages = Arc::new(Mutex::new(Vec::new()));
     let executor = StaticExternalExecutor {
@@ -216,7 +232,7 @@ implementation = "generated:domain-typo-check"
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
                 severity: Severity::Warning,
-                message: "local exec ran".to_owned(),
+                message: "local declarative ran".to_owned(),
                 location: None,
                 remediations: vec![],
                 suggested_fix: None,
@@ -244,7 +260,7 @@ implementation = "generated:domain-typo-check"
         .expect("run checks");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].findings[0].message, "local exec ran");
+    assert_eq!(results[0].findings[0].message, "local declarative ran");
     assert_eq!(
         seen_packages.lock().expect("lock seen packages").as_slice(),
         ["domain-typo-check"]
@@ -506,7 +522,7 @@ implementation = "generated:domain-typo-check"
 }
 
 #[tokio::test]
-async fn runner_rejects_exec_runtime_from_external_checks_url() {
+async fn runner_rejects_declarative_runtime_from_external_checks_url() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
     fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
@@ -526,19 +542,7 @@ checks:
         .await;
 
     let provider = StaticExternalProvider {
-        package: Some(ExternalCheckPackage {
-            id: "domain-typo-check".to_owned(),
-            runtime: "exec-v1".to_owned(),
-            api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Exec(
-                crate::external::ExternalCheckExecPackage {
-                    executable_path: "bazel-bin/checks/domain_typo/domain_typo".to_owned(),
-                    args: Vec::new(),
-                    provenance: None,
-                },
-            ),
-        }),
+        package: Some(declarative_package("domain-typo-check")),
     };
     let seen_packages = Arc::new(Mutex::new(Vec::new()));
     let executor = StaticExternalExecutor {
@@ -581,7 +585,7 @@ checks:
     assert!(
         results[0].findings[0]
             .message
-            .contains("cannot use runtime `exec-v1`")
+            .contains("cannot use runtime `declarative-v1`")
     );
     assert!(
         seen_packages
@@ -592,7 +596,7 @@ checks:
 }
 
 #[tokio::test]
-async fn runner_allows_exec_runtime_from_external_checks_file() {
+async fn runner_allows_declarative_runtime_from_external_checks_file() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
     fs::write(temp.path().join("docs/file.md"), "value\n").expect("write file");
@@ -611,19 +615,7 @@ checks:
     .expect("write external config");
 
     let provider = StaticExternalProvider {
-        package: Some(ExternalCheckPackage {
-            id: "domain-typo-check".to_owned(),
-            runtime: "exec-v1".to_owned(),
-            api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Exec(
-                crate::external::ExternalCheckExecPackage {
-                    executable_path: "bazel-bin/checks/domain_typo/domain_typo".to_owned(),
-                    args: Vec::new(),
-                    provenance: None,
-                },
-            ),
-        }),
+        package: Some(declarative_package("domain-typo-check")),
     };
     let seen_packages = Arc::new(Mutex::new(Vec::new()));
     let executor = StaticExternalExecutor {
@@ -631,7 +623,7 @@ checks:
             check_id: "domain-typo-check".to_owned(),
             findings: vec![Finding {
                 severity: Severity::Warning,
-                message: "external file exec ran".to_owned(),
+                message: "external file declarative ran".to_owned(),
                 location: None,
                 remediations: vec![],
                 suggested_fix: None,
@@ -669,7 +661,10 @@ checks:
         .expect("run checks");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].findings[0].message, "external file exec ran");
+    assert_eq!(
+        results[0].findings[0].message,
+        "external file declarative ran"
+    );
     assert_eq!(
         seen_packages.lock().expect("lock seen packages").as_slice(),
         ["domain-typo-check"]

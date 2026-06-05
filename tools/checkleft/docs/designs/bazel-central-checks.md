@@ -1,5 +1,13 @@
 # Checkleft: Central Dev-Infra Checks for Bazel Repos
 
+> **Superseded (runtime unification).** References to the `exec-v1` runtime below
+> predate the runtime unification: `exec-v1` has been folded into the
+> **declarative** runtime (a custom binary is now a declarative invocation with
+> the `passthrough` transform). The trust boundary this design relies on — that
+> framework-invoked binaries are rejected from `external_checks_url` and allowed
+> only from checked-in / file config — is unchanged; it now applies to the
+> `declarative` runtime in place of `exec-v1`.
+
 ## Overview
 
 This design adds a Bazel-first integration model for centrally owned Checkleft

@@ -1,4 +1,5 @@
-//! The **declarative** external-check tier (spike).
+//! The **declarative** external-check runtime — one of the two external-check
+//! runtimes (the other is `wasm`, for sandboxed pure computation).
 //!
 //! A declarative check ships *zero check-authored code*. The package manifest
 //! fully describes how to run a wrapped tool, and the checkleft framework — not a
@@ -6,17 +7,20 @@
 //! decomposes into: select files → resolve declared binaries → run declared
 //! invocations → apply declared transforms → emit [`Finding`]s.
 //!
-//! This is the third external-check tier, sibling to `artifact` (wasm pure
-//! computation) and `exec` (ship a binary). buildifier is the forcing example:
-//! it needs file selection, binary resolution, ordered invocations with explicit
-//! exit-code semantics, and a JSON→Finding projection — but no real computation,
-//! so it collapses to pure declaration.
+//! This runtime is the single "framework runs declared invocations + transforms"
+//! path. It **subsumes the former `exec-v1` tier**: an `exec` check (a custom
+//! binary that emits checkleft findings JSON directly) is just an invocation with
+//! the `passthrough` transform. buildifier is the other forcing example: file
+//! selection, binary resolution, ordered invocations with explicit exit-code
+//! semantics, and a JSON→Finding projection — but no real computation, so it
+//! collapses to pure declaration.
 //!
-//! # Scope (spike)
+//! # Transform strategies
 //!
-//! Only the `json` transform strategy is implemented (enough for buildifier).
-//! `regex` and `sarif` are reserved as a future strategy slot (see [`transform`]).
-//! Invocation sandboxing is explicitly out of scope (deferred by design).
+//! `json` (selector + finding map) and `passthrough` (the binary already emits a
+//! findings document) are implemented. `regex` and `sarif` are reserved as a
+//! future strategy slot (see [`transform`]). Invocation sandboxing is explicitly
+//! out of scope (deferred by design).
 //!
 //! [`Finding`]: crate::output::Finding
 
@@ -334,13 +338,25 @@ fn validate_transform(id: &str, raw: RawTransform) -> Result<transform::Transfor
             let finding = validate_finding(id, finding)?;
             Ok(transform::Transform::Json(transform::JsonTransform { selector, finding }))
         }
-        // Future strategy slot — intentionally unbuilt in this spike. A `regex`
-        // strategy would parse stdout lines; a `sarif` strategy would map SARIF
-        // results. Both fit the same `(stdout, exit_code, context) → Vec<Finding>`
-        // seam; richer/computed transforms are where the wasm pure-function tier
-        // takes over.
+        // The identity transform: the binary already emits checkleft findings JSON
+        // directly. This is how an old `exec-v1` check expresses itself in the
+        // unified declarative runtime — it ships no selector/finding map because
+        // its stdout *is* the finding document.
+        "passthrough" => {
+            if raw.select.is_some() {
+                bail!("passthrough transform for invocation `{id}` must not set `select`");
+            }
+            if raw.finding.is_some() {
+                bail!("passthrough transform for invocation `{id}` must not set `finding`");
+            }
+            Ok(transform::Transform::Passthrough)
+        }
+        // Future strategy slot — intentionally unbuilt. A `regex` strategy would
+        // parse stdout lines; a `sarif` strategy would map SARIF results. Both fit
+        // the same `(stdout, exit_code, context) → Vec<Finding>` seam;
+        // richer/computed transforms are where the wasm pure-function tier takes over.
         "regex" | "sarif" => bail!(
-            "transform kind `{}` is reserved for a future spike; only `json` is implemented",
+            "transform kind `{}` is reserved for a future spike; only `json` and `passthrough` are implemented",
             raw.kind
         ),
         other => bail!("invocation `{id}` has unknown transform kind `{other}`"),

@@ -46,8 +46,7 @@ pub fn resolve_all(
 
 fn resolve_one(repo_root: &Path, name: &str, binding: &BinaryBinding) -> Result<PathBuf> {
     match binding {
-        // Used as-is: may be a PATH name (resolved by the OS at spawn) or a path.
-        BinaryBinding::Path(path) => Ok(PathBuf::from(path)),
+        BinaryBinding::Path(path) => Ok(resolve_path_binding(repo_root, path)),
         BinaryBinding::Bazel(target) => {
             resolve_bazel_target_executable(repo_root, target).with_context(|| {
                 format!(
@@ -56,6 +55,27 @@ fn resolve_one(repo_root: &Path, name: &str, binding: &BinaryBinding) -> Result<
                 )
             })
         }
+    }
+}
+
+/// Resolve a `path` binding to a concrete program path.
+///
+/// - A **bare name** (no path separator, e.g. `buildifier`) is left as-is so the
+///   OS resolves it via `PATH` at spawn time.
+/// - An **absolute path** is used as-is.
+/// - A **relative path with a separator** (e.g. a `bazel-bin/…/launcher` produced
+///   by the `local_check` bazel rule, which is how the folded `exec` tier ships a
+///   binary) is joined to `repo_root`. `Command` program resolution combined with
+///   `current_dir` is platform-specific for relative program paths, so we anchor
+///   it to the repo root to make the spawn unambiguous — matching the old exec
+///   runtime, which resolved repo-relative executables against the root.
+fn resolve_path_binding(repo_root: &Path, path: &str) -> PathBuf {
+    let candidate = Path::new(path);
+    let has_separator = path.contains('/') || path.contains('\\');
+    if candidate.is_absolute() || !has_separator {
+        PathBuf::from(path)
+    } else {
+        repo_root.join(candidate)
     }
 }
 

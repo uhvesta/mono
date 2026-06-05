@@ -13,6 +13,7 @@ use crate::config::ConfigResolver;
 use crate::external::{
     ExternalCheckArtifactPackage, ExternalCheckExecutor, ExternalCheckImplementationRef,
     ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};

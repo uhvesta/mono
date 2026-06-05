@@ -1,14 +1,13 @@
 """Bazel rules and providers for local checkleft checks."""
 
 CheckInfo = provider(
-    doc = "Metadata for one repo-local checkleft exec-v1 package.",
+    doc = "Metadata for one repo-local checkleft declarative (passthrough) package.",
     fields = {
-        "args": "Static argv entries for the wrapped executable.",
+        "args": "Static argv entries prepended before the matched files.",
         "check_id": "External package id stored in the generated manifest.",
         "launcher": "Executable File produced by local_check for checkleft to invoke.",
         "implementation_name": "Generated implementation id used in check indexes.",
         "manifest": "Manifest file written by local_check.",
-        "provenance_target": "Target label recorded in manifest provenance.",
     },
 )
 
@@ -32,25 +31,33 @@ def _toml_string(value):
         value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"),
     )
 
-def _render_exec_manifest(check_id, executable_path, args, provenance_target):
+def _render_declarative_passthrough_manifest(check_id, executable_path, args):
+    # A repo-local check binary is modelled as a single declarative invocation with
+    # the `passthrough` transform: the binary emits a checkleft findings document
+    # (`{"findings":[…]}`) on stdout, which the framework returns unchanged. This is
+    # the unified replacement for the former `exec-v1` runtime.
+    arg_entries = [_toml_string(arg) for arg in args] + [_toml_string("{{files}}")]
     lines = [
         "id = {}".format(_toml_string(check_id)),
-        "runtime = \"exec-v1\"",
+        "runtime = \"declarative-v1\"",
         "api_version = \"v1\"",
-        "mode = \"exec\"",
-        "executable_path = {}".format(_toml_string(executable_path)),
+        "mode = \"declarative\"",
+        "applies_to = [\"**\"]",
+        "",
+        "[needs.tool.default]",
+        "path = {}".format(_toml_string(executable_path)),
+        "",
+        "[[invocations]]",
+        "id = \"run\"",
+        "run = \"tool\"",
+        "mode = \"batch\"",
+        "args = [{}]".format(", ".join(arg_entries)),
+        "exit = { \"0\" = \"findings\", default = \"error\" }",
+        "",
+        "[invocations.transform]",
+        "kind = \"passthrough\"",
+        "",
     ]
-    if args:
-        lines.append(
-            "args = [{}]".format(", ".join([_toml_string(arg) for arg in args])),
-        )
-    lines.extend([
-        "",
-        "[provenance]",
-        "generator = \"bazel\"",
-        "target = {}".format(_toml_string(provenance_target)),
-        "",
-    ])
     return "\n".join(lines)
 
 def _workspace_bin_path(file):
@@ -139,11 +146,10 @@ exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
     manifest = ctx.actions.declare_file("{}.check.toml".format(ctx.label.name))
     ctx.actions.write(
         output = manifest,
-        content = _render_exec_manifest(
+        content = _render_declarative_passthrough_manifest(
             check_id = check_id,
             executable_path = _workspace_bin_path(launcher),
             args = ctx.attr.exec_args,
-            provenance_target = str(ctx.attr.binary.label),
         ),
     )
 
@@ -163,7 +169,6 @@ exec "$runfiles/{workspace_name}/{binary_short_path}" "$@"
             launcher = launcher,
             implementation_name = implementation_name,
             manifest = manifest,
-            provenance_target = str(ctx.attr.binary.label),
         ),
     ]
 
@@ -236,11 +241,10 @@ def _check_index_impl(ctx):
         )
         ctx.actions.write(
             output = manifest,
-            content = _render_exec_manifest(
+            content = _render_declarative_passthrough_manifest(
                 check_id = info.check_id,
                 executable_path = _workspace_bin_path(info.launcher),
                 args = info.args,
-                provenance_target = info.provenance_target,
             ),
         )
         generated_manifests.append(manifest)

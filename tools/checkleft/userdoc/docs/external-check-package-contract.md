@@ -4,10 +4,18 @@ This page freezes the initial external-check contracts for the sandboxed work.
 
 Scope for this phase:
 
-1. Manifest schema (`artifact` and `exec` modes).
+1. Manifest schema (`wasm` and `declarative` modes).
 2. Implementation reference syntax (`generated:` and file path refs).
 3. Capability policy contract shape.
 4. Host API operation names and semantics.
+
+> **Runtime unification.** There are two external-check runtimes: `wasm`
+> (sandboxed pure computation, runtime tag `sandbox-v1`) and `declarative`
+> (framework-owned invocation of declared binaries + declarative transforms,
+> runtime tag `declarative-v1`). The former `exec` mode / `exec-v1` runtime has
+> been **folded into the declarative runtime**: a custom binary that emits a
+> checkleft findings document is now expressed as a declarative invocation with
+> the `passthrough` transform.
 
 Non-goals for this phase:
 
@@ -67,12 +75,12 @@ Required common fields:
 1. `id`
 2. `runtime`
 3. `api_version` (currently must be `v1`)
-4. `mode` (`artifact` or `exec`)
-5. Optional `[capabilities]` table for sandboxed modes only
+4. `mode` (`wasm` or `declarative`)
+5. Optional `[capabilities]` table for the `wasm` mode only
 
-### `artifact` mode fields
+### `wasm` mode fields
 
-Required:
+`runtime = "sandbox-v1"`. Required:
 
 1. `artifact_path` (safe relative path)
 2. `artifact_sha256`
@@ -83,36 +91,37 @@ Optional:
    - `generator`
    - `target`
 
-Not allowed in `artifact` mode:
+Not allowed in `wasm` mode:
 
-1. `language`
-2. `entry`
-3. `build_adapter`
-4. `sources`
+1. `executable_path`, `args`
+2. `applies_to`, `needs`, `invocations` (declarative-only)
 
-### `exec` mode fields
+### `declarative` mode fields
 
-Required:
+`runtime = "declarative-v1"`. The framework selects files, resolves declared
+binaries, runs declared invocations, and applies declared transforms. Required:
 
-1. `runtime = "exec-v1"`
-2. `executable_path` (safe relative path)
+1. `applies_to` — non-empty list of file globs the check applies to.
+2. `needs` — at least one declared binary, each with a `default` binding
+   (`{ bazel = "<label>" }` or `{ path = "<path-or-name>" }`).
+3. `invocations` — at least one invocation, each with `id`, `run` (a declared
+   binary), `mode` (`batch` | `per_file`), templated `args`, an `exit` map
+   (codes → `ok` | `findings` | `error`, plus a required `default`), and a
+   `transform`.
 
-Optional:
+Transform strategies:
 
-1. `args`
-2. `[provenance]`
-   - `generator`
-   - `target`
+- `json` — a `select` (jq subset) locates issue rows and a `finding` map projects
+  each into a finding.
+- `passthrough` — the binary already emits a checkleft findings document
+  (`{"findings":[…]}`) on stdout; it is returned unchanged. This is how the former
+  `exec` tier is expressed. `passthrough` must not set `select` or `finding`.
 
-Not allowed in `exec` mode:
+Not allowed in `declarative` mode:
 
 1. `[capabilities]`
-2. `language`
-3. `entry`
-4. `build_adapter`
-5. `sources`
-6. `artifact_path`
-7. `artifact_sha256`
+2. `artifact_path`, `artifact_sha256`
+3. `executable_path`, `args` (top-level), `[provenance]`
 
 ## Capability Contract
 
@@ -136,8 +145,9 @@ Runtime policy (enforced later in execution wiring):
 1. Effective allowed commands = global checkleft command ceiling ∩ manifest `commands`.
 2. Shell entrypoints remain hard-blocked.
 
-`exec-v1` packages do not support capabilities. They run as trusted repo-local
-executables and must omit the `[capabilities]` table entirely.
+`declarative` packages do not support capabilities. The framework owns binary
+invocation directly (the runtime, not the check, runs the binary), so the
+`[capabilities]` table — a `wasm`-guest command-grant concept — must be omitted.
 
 ## Host API Contract Surface (Names Frozen)
 

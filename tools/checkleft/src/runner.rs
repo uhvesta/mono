@@ -644,13 +644,13 @@ impl Runner {
         if check.origin == CheckConfigOrigin::ExternalUrl
             && matches!(
                 &package.implementation,
-                ExternalCheckPackageImplementation::Exec(_)
-                    | ExternalCheckPackageImplementation::Declarative(_)
+                ExternalCheckPackageImplementation::Declarative(_)
             )
         {
-            // Both exec and declarative run real binaries the framework selects;
-            // letting a remote-fetched config drive that is the same trust level as
-            // shipping a binary, so it is rejected from `external_checks_url`.
+            // The declarative runtime runs real binaries the framework selects
+            // (this is the path the former `exec` tier folded into); letting a
+            // remote-fetched config drive that is the same trust level as shipping
+            // a binary, so it is rejected from `external_checks_url`.
             return ScheduledExecution::Invalid {
                 message: format!(
                     "external check `{}` from `settings.external_checks_url` cannot use runtime `{}`",

@@ -6,10 +6,9 @@ use tempfile::tempdir;
 
 use super::{
     CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    EXTERNAL_CHECK_EXEC_RUNTIME_V1, ExternalCheckImplementationRef, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
-    parse_external_check_package_manifest,
+    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
+    GeneratedExternalCheckPackageProvider, parse_external_check_package_manifest,
 };
 
 struct StaticProvider {
@@ -26,10 +25,10 @@ impl ExternalCheckPackageProvider for StaticProvider {
 }
 
 #[test]
-fn parses_artifact_mode_manifest() {
+fn parses_wasm_mode_manifest() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 artifact_path = "bazel-bin/checks/workflow_shell_strict/check.wasm"
@@ -48,39 +47,10 @@ target = "//checks/workflow_shell_strict:check_wasm"
 }
 
 #[test]
-fn parses_exec_mode_manifest() {
-    let manifest = r#"
-id = "frontend-no-legacy-api"
-mode = "exec"
-runtime = "exec-v1"
-api_version = "v1"
-executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
-args = ["--format=json"]
-
-[provenance]
-generator = "bazel"
-target = "//checks/frontend_no_legacy_api:frontend_no_legacy_api_bin"
-"#;
-
-    let package = parse_external_check_package_manifest(manifest).expect("valid manifest");
-    assert_eq!(package.runtime, EXTERNAL_CHECK_EXEC_RUNTIME_V1);
-    match package.implementation {
-        ExternalCheckPackageImplementation::Exec(exec) => {
-            assert_eq!(
-                exec.executable_path,
-                "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
-            );
-            assert_eq!(exec.args, vec!["--format=json"]);
-        }
-        other => panic!("expected exec package, got {other:?}"),
-    }
-}
-
-#[test]
-fn artifact_mode_requires_required_fields() {
+fn wasm_mode_requires_required_fields() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 "#;
@@ -90,23 +60,30 @@ api_version = "v1"
 }
 
 #[test]
-fn exec_mode_requires_executable_path() {
+fn rejects_unknown_mode() {
     let manifest = r#"
 id = "frontend-no-legacy-api"
 mode = "exec"
 runtime = "exec-v1"
 api_version = "v1"
+executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
 "#;
 
+    // `exec` was folded into the declarative runtime; only `wasm` and
+    // `declarative` modes remain.
     let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-    assert!(error.to_string().contains("executable_path"));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("unknown variant `exec`") || message.contains("mode"),
+        "unexpected error: {message}"
+    );
 }
 
 #[test]
 fn rejects_invalid_runtime() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v2"
 api_version = "v1"
 artifact_path = "check.wasm"
@@ -121,7 +98,7 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 fn rejects_duplicate_commands() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 artifact_path = "check.wasm"
@@ -136,13 +113,26 @@ commands = ["grep", "grep"]
 }
 
 #[test]
-fn exec_mode_rejects_capabilities() {
+fn declarative_mode_rejects_capabilities() {
     let manifest = r#"
-id = "frontend-no-legacy-api"
-mode = "exec"
-runtime = "exec-v1"
+id = "buildifier-declarative"
+mode = "declarative"
+runtime = "declarative-v1"
 api_version = "v1"
-executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
+applies_to = ["**/*.bzl"]
+
+[needs.buildifier.default]
+path = "buildifier"
+
+[[invocations]]
+id = "run"
+run = "buildifier"
+mode = "batch"
+args = ["{{files}}"]
+exit = { "0" = "findings", default = "error" }
+
+[invocations.transform]
+kind = "passthrough"
 
 [capabilities]
 commands = ["grep"]
@@ -153,24 +143,10 @@ commands = ["grep"]
 }
 
 #[test]
-fn exec_mode_rejects_sandbox_runtime() {
-    let manifest = r#"
-id = "frontend-no-legacy-api"
-mode = "exec"
-runtime = "sandbox-v1"
-api_version = "v1"
-executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
-"#;
-
-    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
-    assert!(error.to_string().contains("expected `exec-v1`"));
-}
-
-#[test]
 fn rejects_unknown_manifest_fields() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 api_vesion = "v1"
@@ -188,7 +164,7 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 fn rejects_non_canonical_artifact_sha256() {
     let manifest = r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 artifact_path = "bazel-bin/checks/workflow_shell_strict/check.wasm"
@@ -242,7 +218,7 @@ fn file_provider_resolves_manifest_path() {
         temp.path().join("checks/workflow/check.toml"),
         r#"
 id = "workflow-shell-strict-v2"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 artifact_path = "checks/workflow/check.wasm"
@@ -271,7 +247,7 @@ fn generated_provider_resolves_from_index() {
         temp.path().join("generated/domain_typo.check.toml"),
         r#"
 id = "domain-typo-check"
-mode = "artifact"
+mode = "wasm"
 runtime = "sandbox-v1"
 api_version = "v1"
 artifact_path = "checks/domain_typo.wasm"
