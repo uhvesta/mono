@@ -133,18 +133,45 @@ pub(super) async fn handle_set_product_default_model(ctx: Dispatch, req: Fronten
 
 pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
-        sink, request_id, ..
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
     } = ctx;
-    let FrontendRequest::SetProductEditorialRules { .. } = req else {
+    let FrontendRequest::SetProductEditorialRules { input } = req else {
         unreachable!()
     };
     {
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkError {
-                message: "set-editorial-rules is not yet implemented".into(),
-            },
-        );
+        match work_db.set_product_editorial_rules(&input.product_id, input.rules.as_ref()) {
+            Ok(product) => {
+                let item = WorkItem::Product(product);
+                let pid = work_item_product_id(&item);
+                let revision = publish_work_invalidation(
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    vec![work_product_topic(&pid)],
+                    "product_editorial_rules_set",
+                    Some(pid),
+                    vec![work_item_id(&item)],
+                )
+                .await;
+                send_response_with_revision(
+                    &sink,
+                    &request_id,
+                    revision,
+                    FrontendEvent::WorkItemUpdated { item },
+                );
+            }
+            Err(err) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            ),
+        }
     }
 }

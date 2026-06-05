@@ -31,6 +31,7 @@ rust_binary(
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/client",
+        "//tools/boss/engine/editorial",
         "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -47,6 +48,7 @@ rust_test(
     deps = [
         "//lib/rust/git_utils",
         "//tools/boss/client",
+        "//tools/boss/engine/editorial",
         "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(
@@ -228,6 +230,31 @@ rust_test(
     size = "small",
     timeout = "moderate",
     srcs = ["tests/external_tracker.rs"],
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+# End-to-end coverage for `boss product set-editorial-rules`,
+# `boss product show` (editorial-rules block), and `boss editorial test`.
+# Verifies the set → show → unset round-trip and that editorial::evaluate
+# produces the correct decision without touching GitHub.
+rust_test(
+    name = "editorial_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = ["tests/editorial.rs"],
     data = [":boss"],
     edition = "2024",
     proc_macro_deps = all_crate_deps(

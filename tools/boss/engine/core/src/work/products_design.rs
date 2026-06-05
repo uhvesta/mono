@@ -81,6 +81,32 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Set (or clear) a product's `editorial_rules` JSON blob.
+    ///
+    /// `rules = Some(r)` serialises the blob and stores it. `rules = None`
+    /// clears the column to NULL so all-defaults behaviour resumes.
+    pub fn set_product_editorial_rules(
+        &self,
+        product_id: &str,
+        rules: Option<&boss_protocol::EditorialRules>,
+    ) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let now = now_string();
+        let rules_json = rules
+            .map(|r| serde_json::to_string(r))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("failed to serialize editorial_rules: {e}"))?;
+        tx.execute(
+            "UPDATE products SET editorial_rules = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, rules_json, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Write the project's design-doc pointer columns.
     ///
     /// Three input shapes (matching `SetProjectDesignDocInput`):

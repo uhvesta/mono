@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 boss-client = { path = "../client" }
+boss-editorial = { path = "../engine/editorial" }
 boss-github = { path = "../github" }
 boss-protocol = { path = "../protocol" }
 clap = { workspace = true, features = ["derive"] }

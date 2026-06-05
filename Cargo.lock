@@ -227,6 +227,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boss-client",
+ "boss-editorial",
  "boss-engine",
  "boss-github",
  "boss-protocol",

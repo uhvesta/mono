@@ -86,7 +86,7 @@ pub(crate) fn resolve_execution_branch_naming(
 
 pub(crate) fn query_product(conn: &Connection, id: &str) -> Result<Option<Product>> {
     conn.query_row(
-        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix
+        "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix, editorial_rules
          FROM products
          WHERE id = ?1",
         [id],

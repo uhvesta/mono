@@ -13,12 +13,12 @@ use boss_protocol::{
     CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateInvestigationInput,
     CreateManyChoresInput, CreateManyTasksInput, CreateRevisionInput,
     CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
-    DependencyFilter, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
-    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    OrgAuthState, PrWorkItemMatch, Product, Project,
+    DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel,
+    EngineAttemptListEntry, FrontendEvent, FrontendRequest, GitHubAuthStateDto,
+    LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PrWorkItemMatch, Product, Project,
     ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
+    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -195,6 +195,15 @@ enum Commands {
         #[command(subcommand)]
         command: GithubCommand,
     },
+    /// Inspect and test editorial rules that control what agents write
+    /// into PR bodies, comments, and other GitHub-visible text.
+    ///
+    /// See `boss product set-editorial-rules` to configure rules on a
+    /// product and `boss product show` to inspect the current settings.
+    Editorial {
+        #[command(subcommand)]
+        command: EditorialCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -224,6 +233,22 @@ enum ProductCommand {
     /// higher level in the §Q4 rules).
     #[command(name = "audit-effort")]
     AuditEffort(ProductAuditEffortArgs),
+    /// Set (or clear) editorial rules for this product.
+    ///
+    /// Editorial rules constrain what agents write into PR bodies,
+    /// comments, and other GitHub-visible text. Useful when running
+    /// Boss in a work environment where leaking internal taxonomy or
+    /// ignoring PR-template conventions is unacceptable.
+    ///
+    /// `--from-file PATH` reads a JSON file containing an `EditorialRules`
+    /// object and stores it on the product. `--unset` clears any existing
+    /// rules (all-defaults behaviour resumes).
+    ///
+    /// Use `boss editorial test` to validate rules against a sample body
+    /// before applying them. Use `boss editorial show` to inspect the
+    /// audit trail of hook decisions.
+    #[command(name = "set-editorial-rules")]
+    SetEditorialRules(ProductSetEditorialRulesArgs),
     /// Bind (or unbind) an external issue tracker on a product.
     ///
     /// Use `--kind github --org ORG --repo REPO --project N` to bind the
@@ -989,6 +1014,55 @@ enum GithubAuthCommand {
     Logout,
 }
 
+#[derive(Debug, Subcommand)]
+enum EditorialCommand {
+    /// List recent editorial hook decisions for a product.
+    ///
+    /// Prints the audit trail of allow / rewrite / deny decisions the
+    /// editorial hook recorded for every `gh pr|issue` invocation by a
+    /// worker on this product. Ordered freshest first.
+    ///
+    /// Use `--pr N` to narrow to a specific pull request number.
+    /// Use `--limit N` to cap how many rows are returned (default 50).
+    Show(EditorialShowArgs),
+    /// Locally test editorial rules against a PR body file.
+    ///
+    /// Reads the product's configured `editorial_rules`, runs
+    /// `editorial::evaluate` against the body in `--body-file`, and prints
+    /// the decision (allow / rewrite / deny) with a description of any
+    /// findings. Does NOT touch GitHub — safe to run as many times as you
+    /// like while authoring rules.
+    Test(EditorialTestArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct EditorialShowArgs {
+    /// Product id or slug.
+    selector: String,
+
+    /// Filter to editorial actions recorded for this PR number.
+    #[arg(long, value_name = "N")]
+    pr: Option<u64>,
+
+    /// Maximum number of actions to return (default 50).
+    #[arg(long, value_name = "N")]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct EditorialTestArgs {
+    /// Product id or slug.
+    selector: String,
+
+    /// Path to the PR body file to evaluate.
+    #[arg(long, value_name = "PATH")]
+    body_file: PathBuf,
+
+    /// PR title to include in the evaluation (optional).
+    #[arg(long, value_name = "TITLE", default_value = "")]
+    title: String,
+}
+
 #[derive(Debug, Clone, Args)]
 struct EngineCiListArgs {
     /// Filter to a single product (id or slug). Omit for all products.
@@ -1238,6 +1312,22 @@ struct ProductAuditEffortArgs {
     /// the last N days. Default: all recorded events.
     #[arg(long, value_name = "DAYS")]
     window_days: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ProductSetEditorialRulesArgs {
+    /// Product id or slug.
+    selector: String,
+
+    /// Path to a JSON file containing an `EditorialRules` object.
+    /// Mutually exclusive with `--unset`.
+    #[arg(long, value_name = "PATH", conflicts_with = "unset")]
+    from_file: Option<PathBuf>,
+
+    /// Clear the product's editorial rules (restores all-defaults behaviour).
+    /// Mutually exclusive with `--from-file`.
+    #[arg(long)]
+    unset: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2486,6 +2576,10 @@ async fn run_cli(cli: Cli) -> Result<(), CliError> {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_github_command(command, &ctx).await
         }
+        Commands::Editorial { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            run_editorial_command(command, &ctx).await
+        }
     }
 }
 
@@ -2769,6 +2863,60 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     Err(CliError::application(message))
                 }
                 other => Err(unexpected_event("product audit-effort", &other)),
+            }
+        }
+        ProductCommand::SetEditorialRules(args) => {
+            if !args.unset && args.from_file.is_none() {
+                return Err(CliError::usage(
+                    "provide either --from-file <path> or --unset",
+                ));
+            }
+            let selector = args.selector.clone();
+            let product = resolve_product(&mut client, Some(selector), ctx).await?;
+            let rules: Option<EditorialRules> = if args.unset {
+                None
+            } else {
+                let path = args.from_file.as_ref().unwrap();
+                let contents = std::fs::read_to_string(path).map_err(|e| {
+                    CliError::usage(format!("could not read {}: {e}", path.display()))
+                })?;
+                let parsed: EditorialRules =
+                    serde_json::from_str(&contents).map_err(|e| {
+                        CliError::usage(format!(
+                            "invalid EditorialRules JSON in {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                Some(parsed)
+            };
+            let input = SetProductEditorialRulesInput {
+                product_id: product.id.clone(),
+                rules,
+            };
+            let response = client
+                .send_request(&FrontendRequest::SetProductEditorialRules { input })
+                .await
+                .map_err(CliError::internal)?;
+            match response {
+                FrontendEvent::WorkItemUpdated { item } => {
+                    let updated = expect_product(item)?;
+                    print_entity(ctx, &serde_json::json!({ "product": updated }), || {
+                        if args.unset {
+                            if !ctx.quiet {
+                                println!(
+                                    "Editorial rules cleared from product {}.",
+                                    updated.slug
+                                );
+                            }
+                        } else {
+                            print_product_details("Updated product", &updated);
+                        }
+                    })
+                }
+                FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+                    Err(CliError::application(message))
+                }
+                other => Err(unexpected_event("product set-editorial-rules", &other)),
             }
         }
         ProductCommand::SetExternalTracker(args) => {
@@ -4231,6 +4379,134 @@ fn print_automation_runs_table(runs: &[AutomationRun]) {
         ]);
     }
     println!("{table}");
+}
+
+// ---------------------------------------------------------------------------
+// Editorial command handler
+// ---------------------------------------------------------------------------
+
+async fn run_editorial_command(
+    command: EditorialCommand,
+    ctx: &RunContext,
+) -> Result<(), CliError> {
+    match command {
+        EditorialCommand::Show(args) => run_editorial_show(args, ctx).await,
+        EditorialCommand::Test(args) => run_editorial_test(args, ctx).await,
+    }
+}
+
+async fn run_editorial_show(args: EditorialShowArgs, ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+    let response = client
+        .send_request(&FrontendRequest::ListEditorialActions {
+            product_id: product.id.clone(),
+            limit: args.limit,
+        })
+        .await
+        .map_err(CliError::internal)?;
+    match response {
+        FrontendEvent::EditorialActionsList { actions, .. } => {
+            let filtered: Vec<&EditorialAction> = if let Some(pr_num) = args.pr {
+                let suffix = format!("/{pr_num}");
+                actions
+                    .iter()
+                    .filter(|a| {
+                        a.pr_url
+                            .as_deref()
+                            .map(|u| u.ends_with(&suffix))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            } else {
+                actions.iter().collect()
+            };
+            print_entity(
+                ctx,
+                &serde_json::json!({ "product_id": product.id, "actions": filtered }),
+                || {
+                    if filtered.is_empty() {
+                        if !ctx.quiet {
+                            println!("No editorial actions recorded for product {}.", product.slug);
+                        }
+                    } else {
+                        println!(
+                            "Editorial actions for product {} ({}):",
+                            product.name, product.slug
+                        );
+                        for action in &filtered {
+                            let pr = action.pr_url.as_deref().unwrap_or("(no PR)");
+                            let first_reason_line =
+                                action.reason.lines().next().unwrap_or("");
+                            println!(
+                                "  [{}] {} — {}",
+                                action.action, pr, first_reason_line
+                            );
+                            println!("    at {}", action.created_at);
+                        }
+                    }
+                },
+            )
+        }
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("editorial show", &other)),
+    }
+}
+
+async fn run_editorial_test(args: EditorialTestArgs, ctx: &RunContext) -> Result<(), CliError> {
+    let mut client = connect_for_work(ctx).await?;
+    let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+    let body = std::fs::read_to_string(&args.body_file).map_err(|e| {
+        CliError::usage(format!(
+            "could not read {}: {e}",
+            args.body_file.display()
+        ))
+    })?;
+    let rules = product.editorial_rules.clone().unwrap_or_default();
+    let compiled = boss_editorial::CompiledRules::compile(rules).map_err(|e| {
+        CliError::application(format!("invalid redaction regex in editorial_rules: {e}"))
+    })?;
+    let decision = boss_editorial::evaluate(&body, &args.title, &compiled, None);
+    let (decision_str, findings): (&str, Vec<String>) = match &decision {
+        boss_editorial::EditorialDecision::Allow => ("allow", vec![]),
+        boss_editorial::EditorialDecision::Rewrite { findings, .. } => (
+            "rewrite",
+            findings.iter().map(|f| f.description.clone()).collect(),
+        ),
+        boss_editorial::EditorialDecision::Block { findings } => (
+            "deny",
+            findings.iter().map(|f| f.description.clone()).collect(),
+        ),
+    };
+    let rewritten_body: Option<&str> = match &decision {
+        boss_editorial::EditorialDecision::Rewrite { body, .. } => Some(body.as_str()),
+        _ => None,
+    };
+    print_entity(
+        ctx,
+        &serde_json::json!({
+            "product_id": product.id,
+            "decision": decision_str,
+            "findings": findings,
+        }),
+        || {
+            println!("Decision: {decision_str}");
+            if findings.is_empty() {
+                println!("No findings.");
+            } else {
+                println!("Findings:");
+                for f in &findings {
+                    println!("  - {f}");
+                }
+            }
+            if let Some(new_body) = rewritten_body {
+                println!("\nRewritten body:");
+                println!("{new_body}");
+            }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -8060,6 +8336,37 @@ fn print_product_details(title: &str, product: &Product) {
     }
     if let Some(preamble) = product.dispatch_preamble.as_deref() {
         println!("Dispatch preamble: {preamble}");
+    }
+    if let Some(rules) = product.editorial_rules.as_ref() {
+        println!("Editorial rules:");
+        let branch_str = match &rules.branch_naming {
+            boss_protocol::BranchNaming::BossExecPrefix => "boss-exec-prefix (default)".to_owned(),
+            boss_protocol::BranchNaming::OpaqueHash => "opaque-hash".to_owned(),
+            boss_protocol::BranchNaming::CustomPrefix { prefix } => {
+                format!("custom-prefix ({prefix})")
+            }
+        };
+        println!("  Branch naming: {branch_str}");
+        let template_str = match rules.template_policy {
+            boss_protocol::TemplatePolicy::Off => "off (default)",
+            boss_protocol::TemplatePolicy::Advise => "advise",
+            boss_protocol::TemplatePolicy::Enforce => "enforce",
+        };
+        println!("  Template policy: {template_str}");
+        let trailer_str = match rules.commit_trailer_policy {
+            boss_protocol::TrailerPolicy::Default => "default",
+            boss_protocol::TrailerPolicy::NoAiTrailer => "no-ai-trailer",
+        };
+        println!("  Commit trailer: {trailer_str}");
+        if !rules.redactions.is_empty() {
+            println!("  Redactions: {} rule(s)", rules.redactions.len());
+        }
+        if let Some(instructions) = rules.instructions.as_deref() {
+            println!("  Instructions: {instructions}");
+        }
+        if product.dispatch_preamble.is_some() && rules.instructions.is_some() {
+            println!("  [note] Both dispatch_preamble and editorial_rules.instructions are set — consider consolidating into editorial_rules.instructions (R11).");
+        }
     }
     if let Some(kind) = product.external_tracker_kind.as_deref() {
         println!("External tracker:");
