@@ -5,10 +5,16 @@
 //! `json` transform with the spike manifest's `select` + `finding` map, produces
 //! exactly the same `Vec<Finding>` as the built-in `BuildifierCheck` parsers.
 //!
-//! The `e2e_*` tests are gated behind `CHECKLEFT_SPIKE_E2E=1` because they shell
-//! out to a real (bazel-resolved) buildifier, which is not present in the hermetic
-//! test sandbox. They are not skipping a failing assertion — they require an
-//! external tool — and are run manually for the spike's end-to-end evidence.
+//! The `e2e_*` tests here are gated behind `CHECKLEFT_SPIKE_E2E=1` because they
+//! resolve buildifier via `bazel build` / `bazel cquery`, which cannot run inside
+//! the hermetic test sandbox. They are not skipping a failing assertion — they
+//! require an external tool — and exercise the production *bazel resolver* path
+//! manually.
+//!
+//! Full **hermetic end-to-end** parity (the real buildifier binary driven through
+//! the entire pipeline and compared to the built-in `BuildifierCheck`, under a
+//! plain `bazel test`) lives in the sibling [`super::parity_e2e`] module, which
+//! gets buildifier from the test's runfiles instead of shelling out to bazel.
 
 use std::path::Path;
 

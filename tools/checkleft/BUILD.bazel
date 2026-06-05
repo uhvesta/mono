@@ -55,8 +55,21 @@ musl_binary(
 rust_test(
     name = "checkleft_lib_test",
     size = "small",
-    compile_data = ["checks/buildifier/check.yaml"],
+    # check.yaml is the canonical buildifier definition; the fixtures back the
+    # hermetic parity test in src/external/declarative/parity_e2e.rs. All are
+    # embedded via include_str! so the test and the shipped definition cannot drift.
+    compile_data = [
+        "checks/buildifier/check.yaml",
+        "tests/fixtures/buildifier/malformed.bzl.fixture",
+        "tests/fixtures/buildifier/unformatted.bzl.fixture",
+    ],
     crate = ":checkleft_lib",
+    # The real buildifier binary, staged into the test's runfiles so the
+    # declarative pipeline can run hermetically (no nested bazel) and be compared
+    # against the built-in BuildifierCheck. parity_e2e.rs resolves it from the
+    # CHECKLEFT_E2E_BUILDIFIER runfiles path via @rules_rust//rust/runfiles.
+    data = ["@buildifier_prebuilt//:buildifier"],
+    env = {"CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
@@ -64,7 +77,7 @@ rust_test(
     deps = all_crate_deps(
         normal = True,
         normal_dev = True,
-    ),
+    ) + ["@rules_rust//rust/runfiles"],
 )
 
 rust_test(

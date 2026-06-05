@@ -1,0 +1,14 @@
+"""A deliberately mis-formatted but lint-clean Starlark file.
+
+buildifier --mode=check flags this file as needing formatting (the
+`x+y` on the last line is reformatted to `x + y`), but it is otherwise
+lint-clean: it has a module docstring, the function has a docstring, and
+there are no unused variables or no-effect expressions. It exercises the
+declarative check's *format* invocation end-to-end (one format finding,
+zero lint findings), complementing malformed.bzl.fixture which is
+format-clean but carries three lint warnings.
+"""
+
+def add(x, y):
+    """Returns the sum of x and y."""
+    return x+y

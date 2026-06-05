@@ -40,6 +40,10 @@ pub mod transform;
 #[cfg(test)]
 mod tests;
 
+/// Hermetic end-to-end parity test against a real (runfiles-staged) buildifier.
+#[cfg(test)]
+mod parity_e2e;
+
 pub use executor::run_declarative_check;
 
 use selector::Selector;
