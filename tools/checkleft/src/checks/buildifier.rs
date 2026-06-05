@@ -259,7 +259,10 @@ fn resolve_invocation(invocation: &BuildifierInvocation) -> Result<PathBuf> {
 
 /// Builds `target` and resolves its executable path via `bazel cquery --output=starlark`.
 /// Returns an absolute path to the built binary.
-fn resolve_bazel_target_executable(repo_root: &Path, target: &str) -> Result<PathBuf> {
+///
+/// `pub(crate)` so the framework-owned declarative external-check resolver can reuse
+/// the exact same Bazel resolution the built-in buildifier check uses.
+pub(crate) fn resolve_bazel_target_executable(repo_root: &Path, target: &str) -> Result<PathBuf> {
     // Build the target first.
     let build_output = Command::new("bazel")
         .arg("build")

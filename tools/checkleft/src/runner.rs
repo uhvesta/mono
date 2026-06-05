@@ -11,9 +11,8 @@ use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
 use crate::exclusion::ExclusionStatus;
 use crate::external::{
-    EXTERNAL_CHECK_EXEC_RUNTIME_V1, ExternalCheckExecutor, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCheckPackageProvider, NoopExternalCheckExecutor,
-    NoopExternalCheckPackageProvider,
+    ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -646,12 +645,16 @@ impl Runner {
             && matches!(
                 &package.implementation,
                 ExternalCheckPackageImplementation::Exec(_)
+                    | ExternalCheckPackageImplementation::Declarative(_)
             )
         {
+            // Both exec and declarative run real binaries the framework selects;
+            // letting a remote-fetched config drive that is the same trust level as
+            // shipping a binary, so it is rejected from `external_checks_url`.
             return ScheduledExecution::Invalid {
                 message: format!(
                     "external check `{}` from `settings.external_checks_url` cannot use runtime `{}`",
-                    check.id, EXTERNAL_CHECK_EXEC_RUNTIME_V1
+                    check.id, package.runtime
                 ),
                 remediation: Some(
                     "Move this check definition into the repository's checked-in CHECKS file or use a sandboxed runtime."

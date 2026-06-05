@@ -1,6 +1,8 @@
 mod api_breaking_surface;
 mod bazel;
-mod buildifier;
+// `pub(crate)` so the declarative external-check tier can reuse the bazel binary
+// resolver, and so spike parity tests can call the built-in JSON parsers directly.
+pub(crate) mod buildifier;
 mod code_patterns;
 mod docs_link_integrity;
 mod file_size;

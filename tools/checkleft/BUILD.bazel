@@ -55,6 +55,7 @@ musl_binary(
 rust_test(
     name = "checkleft_lib_test",
     size = "small",
+    compile_data = ["checks/buildifier/check.yaml"],
     crate = ":checkleft_lib",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,

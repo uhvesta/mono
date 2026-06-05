@@ -1,3 +1,18 @@
 checks:
   - id: no-usfa-typo
     enabled: false
+
+# ── declarative buildifier spike (not enabled — enabling would duplicate the
+#    built-in `buildifier` check and break dogfooding CI) ──────────────────────
+#
+# To enable the declarative check in a repo that has adopted it:
+#
+#   checks:
+#     - id: buildifier
+#       check: buildifier-declarative
+#       implementation: tools/checkleft/checks/buildifier/check.yaml
+#       # Optional: override the default Bazel resolver with a direct path.
+#       # config:
+#       #   needs:
+#       #     buildifier:
+#       #       path: /usr/local/bin/buildifier

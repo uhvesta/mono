@@ -1,0 +1,61 @@
+id: buildifier-declarative
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/BUILD"
+  - "**/BUILD.bazel"
+  - "**/*.bzl"
+  - "**/*.star"
+  - "**/WORKSPACE"
+  - "**/WORKSPACE.bazel"
+  - "**/MODULE.bazel"
+
+needs:
+  buildifier:
+    default:
+      bazel: "@buildifier_prebuilt//:buildifier"
+
+invocations:
+  - id: format
+    run: buildifier
+    mode: batch
+    args:
+      - "--mode=check"
+      - "--format=json"
+      - "{{files}}"
+    exit:
+      "0": findings
+      default: error
+    transform:
+      kind: json
+      select: ".files[] | select(.formatted == false)"
+      finding:
+        path: "{{item.filename}}"
+        message: "file needs buildifier formatting"
+        severity: warning
+        remediations:
+          - "Run `buildifier {{item.filename}}` to auto-format."
+
+  - id: lint
+    run: buildifier
+    mode: per_file
+    args:
+      - "--mode=check"
+      - "--lint=warn"
+      - "--format=json"
+      - "{{file}}"
+    exit:
+      "0": findings
+      default: error
+    transform:
+      kind: json
+      select: ".files[].warnings[]"
+      finding:
+        path: "{{input.file}}"
+        line: "{{item.start.line}}"
+        column: "{{item.start.column}}"
+        message: "{{item.category}}: {{item.message}}"
+        severity: warning
+        remediations:
+          - "Run `buildifier --lint=fix {{input.file}}` to auto-fix, or resolve manually."

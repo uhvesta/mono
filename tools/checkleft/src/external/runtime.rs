@@ -14,9 +14,10 @@ use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding};
 
 use super::{
-    EXTERNAL_CHECK_EXEC_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage,
-    ExternalCheckExecPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCommandCapabilities, exec_protocol,
+    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, EXTERNAL_CHECK_EXEC_RUNTIME_V1,
+    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckExecPackage,
+    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCommandCapabilities,
+    exec_protocol, run_declarative_check,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -375,6 +376,18 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
     ) -> Result<CheckResult> {
         match &package.implementation {
+            ExternalCheckPackageImplementation::Declarative(declarative) => {
+                if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
+                    bail!(
+                        "unsupported external runtime `{}` for declarative package `{}`",
+                        package.runtime,
+                        package.id
+                    );
+                }
+                // Framework-owned invocation: resolve declared binaries and run
+                // them at the repo root. Sandboxing is deferred by design.
+                run_declarative_check(&self.root, &package.id, declarative, changeset, config)
+            }
             ExternalCheckPackageImplementation::Exec(exec) => {
                 if package.runtime != EXTERNAL_CHECK_EXEC_RUNTIME_V1 {
                     bail!(

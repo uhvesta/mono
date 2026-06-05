@@ -10,10 +10,15 @@ use crate::path::validate_relative_path;
 
 pub const EXTERNAL_CHECK_RUNTIME_V1: &str = "sandbox-v1";
 pub const EXTERNAL_CHECK_EXEC_RUNTIME_V1: &str = "exec-v1";
+/// Runtime tag for the declarative tier (config-only, framework-owned invocation).
+pub const EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1: &str = "declarative-v1";
 pub const EXTERNAL_CHECK_API_V1: &str = "v1";
 pub const GENERATED_IMPLEMENTATION_PREFIX: &str = "generated:";
 
+pub mod declarative;
 pub mod exec_protocol;
+
+pub use declarative::{ExternalCheckDeclarativePackage, run_declarative_check};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCheckImplementationRef {
@@ -67,6 +72,7 @@ pub struct ExternalCheckPackage {
 pub enum ExternalCheckPackageImplementation {
     Artifact(ExternalCheckArtifactPackage),
     Exec(ExternalCheckExecPackage),
+    Declarative(ExternalCheckDeclarativePackage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,8 +122,17 @@ pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExter
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("failed to read external check manifest {}", path.display()))?;
-    parse_external_check_package_manifest(&contents)
-        .with_context(|| format!("invalid external check manifest {}", path.display()))
+    let is_yaml = matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("yaml" | "yml")
+    );
+    if is_yaml {
+        parse_declarative_check_manifest(&contents)
+            .with_context(|| format!("invalid declarative external check manifest {}", path.display()))
+    } else {
+        parse_external_check_package_manifest(&contents)
+            .with_context(|| format!("invalid external check manifest {}", path.display()))
+    }
 }
 
 pub fn parse_external_check_package_manifest(contents: &str) -> Result<ExternalCheckPackage> {
@@ -126,11 +141,76 @@ pub fn parse_external_check_package_manifest(contents: &str) -> Result<ExternalC
     raw.validate()
 }
 
+/// Parse a declarative check package manifest from YAML. Declarative manifests
+/// are YAML (as opposed to the TOML used by `artifact`/`exec` packages) — they
+/// have a richer schema (invocations/transforms) that reads naturally as YAML.
+pub fn parse_declarative_check_manifest(contents: &str) -> Result<ExternalCheckPackage> {
+    let raw: RawDeclarativeCheckManifest =
+        serde_yaml::from_str(contents).context("failed to parse declarative check manifest YAML")?;
+    raw.validate()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeclarativeCheckManifest {
+    id: String,
+    mode: String,
+    runtime: String,
+    api_version: String,
+    applies_to: Vec<String>,
+    #[serde(default)]
+    needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
+    #[serde(default)]
+    invocations: Vec<declarative::RawInvocation>,
+}
+
+impl RawDeclarativeCheckManifest {
+    fn validate(self) -> Result<ExternalCheckPackage> {
+        let id = required_non_empty("id", self.id)?;
+        let runtime = required_non_empty("runtime", self.runtime)?;
+        let api_version = required_non_empty("api_version", self.api_version)?;
+
+        if self.mode != "declarative" {
+            bail!(
+                "declarative manifest `mode` must be `declarative`, got `{}`",
+                self.mode
+            );
+        }
+        if runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
+            bail!(
+                "unsupported runtime `{runtime}` (expected `{EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1}`)"
+            );
+        }
+        if api_version != EXTERNAL_CHECK_API_V1 {
+            bail!(
+                "unsupported api_version `{api_version}` (expected `{EXTERNAL_CHECK_API_V1}`)"
+            );
+        }
+
+        let declarative_fields = declarative::RawDeclarativeFields {
+            applies_to: self.applies_to,
+            needs: self.needs,
+            invocations: self.invocations,
+        };
+
+        Ok(ExternalCheckPackage {
+            id,
+            runtime,
+            api_version,
+            capabilities: ExternalCheckCapabilities::default(),
+            implementation: ExternalCheckPackageImplementation::Declarative(
+                declarative::validate_declarative_implementation(declarative_fields)?,
+            ),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RawExternalCheckMode {
     Artifact,
     Exec,
+    Declarative,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +232,16 @@ struct RawExternalCheckPackage {
     args: Vec<String>,
     #[serde(default)]
     provenance: Option<ExternalCheckArtifactProvenance>,
+    // Declarative-mode fields. Declared explicitly (not flattened — `flatten` is
+    // incompatible with `deny_unknown_fields`) so the existing single-parse +
+    // unknown-field rejection still holds. They are rejected in artifact/exec
+    // modes and required in declarative mode.
+    #[serde(default)]
+    applies_to: Vec<String>,
+    #[serde(default)]
+    needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
+    #[serde(default)]
+    invocations: Vec<declarative::RawInvocation>,
 }
 
 impl RawExternalCheckPackage {
@@ -167,7 +257,15 @@ impl RawExternalCheckPackage {
             executable_path,
             args,
             provenance,
+            applies_to,
+            needs,
+            invocations,
         } = self;
+        let declarative = declarative::RawDeclarativeFields {
+            applies_to,
+            needs,
+            invocations,
+        };
 
         let id = required_non_empty("id", id)?;
         let runtime = required_non_empty("runtime", runtime)?;
@@ -184,6 +282,7 @@ impl RawExternalCheckPackage {
         let capabilities = validate_capabilities(mode, capabilities)?;
         let implementation = match mode {
             RawExternalCheckMode::Artifact => {
+                reject_declarative_fields(&declarative)?;
                 ExternalCheckPackageImplementation::Artifact(validate_artifact_implementation(
                     artifact_path,
                     artifact_sha256,
@@ -193,6 +292,7 @@ impl RawExternalCheckPackage {
                 )?)
             }
             RawExternalCheckMode::Exec => {
+                reject_declarative_fields(&declarative)?;
                 ExternalCheckPackageImplementation::Exec(validate_exec_implementation(
                     artifact_path,
                     artifact_sha256,
@@ -200,6 +300,16 @@ impl RawExternalCheckPackage {
                     args,
                     provenance,
                 )?)
+            }
+            RawExternalCheckMode::Declarative => {
+                reject_if_present("artifact_path", artifact_path.as_ref())?;
+                reject_if_present("artifact_sha256", artifact_sha256.as_ref())?;
+                reject_if_present("executable_path", executable_path.as_ref())?;
+                reject_if_present_list("args", &args)?;
+                reject_if_present("provenance", provenance.as_ref())?;
+                ExternalCheckPackageImplementation::Declarative(
+                    declarative::validate_declarative_implementation(declarative)?,
+                )
             }
         };
 
@@ -288,6 +398,7 @@ fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Resul
     let expected = match mode {
         RawExternalCheckMode::Artifact => EXTERNAL_CHECK_RUNTIME_V1,
         RawExternalCheckMode::Exec => EXTERNAL_CHECK_EXEC_RUNTIME_V1,
+        RawExternalCheckMode::Declarative => EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
     };
     if runtime != expected {
         bail!("unsupported runtime `{runtime}` for `{mode}` mode (expected `{expected}`)");
@@ -300,12 +411,25 @@ fn validate_capabilities(
     capabilities: Option<RawExternalCheckCapabilities>,
 ) -> Result<ExternalCheckCapabilities> {
     match (mode, capabilities) {
-        (RawExternalCheckMode::Exec, Some(_)) => {
-            bail!("field `capabilities` is not allowed in `exec` mode");
+        // Capabilities are a wasm-guest command-grant concept; the exec and
+        // declarative tiers run binaries directly (framework-owned), so a
+        // `capabilities` block is meaningless there.
+        (RawExternalCheckMode::Exec | RawExternalCheckMode::Declarative, Some(_)) => {
+            bail!("field `capabilities` is not allowed in `exec` or `declarative` mode");
         }
         (_, Some(raw)) => raw.validate(),
         (_, None) => Ok(ExternalCheckCapabilities::default()),
     }
+}
+
+/// Reject declarative-only fields in artifact/exec modes.
+fn reject_declarative_fields(declarative: &declarative::RawDeclarativeFields) -> Result<()> {
+    if !declarative.is_empty() {
+        bail!(
+            "fields `applies_to`/`needs`/`invocations` are only allowed in `declarative` mode"
+        );
+    }
+    Ok(())
 }
 
 impl fmt::Display for RawExternalCheckMode {
@@ -313,6 +437,7 @@ impl fmt::Display for RawExternalCheckMode {
         match self {
             Self::Artifact => write!(f, "artifact"),
             Self::Exec => write!(f, "exec"),
+            Self::Declarative => write!(f, "declarative"),
         }
     }
 }
