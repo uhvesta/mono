@@ -849,6 +849,7 @@ fn run_workspace(
             task,
             prefer,
             allow_dirty,
+            resume_pr,
         } => {
             let repo_record = store
                 .get_repo(&repo)?
@@ -1276,16 +1277,32 @@ fn run_workspace(
             } else {
                 expired_by_workspace_id.get(workspace.workspace_id.as_str()).copied()
             };
-            if let Err(error) = reset_workspace_guarded(
-                runner,
-                database_path,
-                &workspace.workspace_path,
-                &repo_record.main_branch,
-                prior_expired,
-            ) {
-                let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                return Err(error);
-            }
+            let resume_info = if let Some(pr_number) = resume_pr {
+                match resume_workspace_on_pr(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    pr_number,
+                ) {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                        return Err(e);
+                    }
+                }
+            } else {
+                if let Err(error) = reset_workspace_guarded(
+                    runner,
+                    database_path,
+                    &workspace.workspace_path,
+                    &repo_record.main_branch,
+                    prior_expired,
+                ) {
+                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                    return Err(error);
+                }
+                None
+            };
 
             let head_commit =
                 current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
@@ -1301,6 +1318,8 @@ fn run_workspace(
                 holder = holder,
                 task = task,
                 head_commit = workspace.head_commit,
+                resume_pr_number = resume_info.as_ref().map(|i| i.pr_number),
+                resume_head_branch = resume_info.as_ref().map(|i| i.head_branch.as_str()),
             );
 
             // Defense-in-depth (issue #1174): keep Boss/host infra files —
@@ -1333,14 +1352,18 @@ fn run_workspace(
             }
 
             let message = format_lease_message(&lease_message, &setup_report);
-            RunResult::new(
-                message,
-                json!({
-                    "workspace": workspace,
-                    "setup": setup_report,
-                    "health_check": health_checks,
-                }),
-            )
+            let mut payload = json!({
+                "workspace": workspace,
+                "setup": setup_report,
+                "health_check": health_checks,
+            });
+            if let Some(ref info) = resume_info {
+                payload["resume_pr"] = json!({
+                    "pr_number": info.pr_number,
+                    "head_branch": info.head_branch,
+                });
+            }
+            RunResult::new(message, payload)
         }
         WorkspaceCommand::Release {
             workspace,
@@ -2894,6 +2917,153 @@ fn reset_workspace(
     main_branch: &str,
 ) -> Result<()> {
     reset_workspace_guarded(runner, database_path, workspace_path, main_branch, None)
+}
+
+/// Resolve the GitHub remote name and `owner/repo` slug from `jj git remote
+/// list` run inside the given workspace path.
+fn resolve_github_remote_for_workspace(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+) -> Result<(String, String)> {
+    let remote_output = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &["git", "remote", "list"]),
+    )?;
+    parse_github_remote(&remote_output).ok_or_else(|| {
+        CubeError::InvalidArgument(format!(
+            "could not detect a github.com remote from `jj git remote list` in {}:\n{remote_output}",
+            workspace_path.display()
+        ))
+    })
+}
+
+/// Info returned from a successful `--resume_pr` positioning pass.
+struct PrResumeInfo {
+    pr_number: u64,
+    head_branch: String,
+}
+
+/// Replace the normal `jj new <main>` reset with the PR-resume positioning
+/// sequence: resolve github remote → fetch → resolve PR N's head via `gh` →
+/// reconcile `pr/<n>` and head-branch bookmarks → `jj new pr/<n>`.
+///
+/// After this returns, `@` is a fresh empty commit ready to edit on top of
+/// PR N's current head.
+fn resume_workspace_on_pr(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    pr_number: u64,
+) -> Result<PrResumeInfo> {
+    let (github_remote, owner_repo) =
+        resolve_github_remote_for_workspace(runner, database_path, workspace_path)?;
+
+    // Fetch from the GitHub remote — load-bearing for the cold path where the
+    // PR branch has never been fetched into this workspace.
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &["git", "fetch", "--remote", &github_remote],
+        ),
+    )?;
+
+    // Resolve PR N's current head from GitHub: state, head branch, and OID.
+    let pr_n_str = pr_number.to_string();
+    let pr_json = runner
+        .run(&RealCommandRunner::invocation(
+            workspace_path,
+            "gh",
+            &[
+                "pr",
+                "view",
+                &pr_n_str,
+                "-R",
+                &owner_repo,
+                "--json",
+                "headRefName,headRefOid,state",
+            ],
+        ))
+        .map_err(|e| {
+            CubeError::InvalidArgument(format!(
+                "failed to resolve PR {pr_number} in {owner_repo}: {e}"
+            ))
+        })?;
+
+    let pr_info: serde_json::Value = serde_json::from_str(&pr_json)?;
+
+    let state = pr_info
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+    if state == "MERGED" || state == "CLOSED" {
+        return Err(CubeError::InvalidArgument(format!(
+            "PR {pr_number} ({owner_repo}) is {state} — cannot resume on a non-open PR. \
+             Use `cube workspace lease` without `--resume-pr` for a fresh task, or check \
+             the PR number."
+        )));
+    }
+
+    let head_branch = pr_info
+        .get("headRefName")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            CubeError::InvalidArgument(format!(
+                "PR {pr_number} ({owner_repo}) returned no headRefName from GitHub"
+            ))
+        })?
+        .to_string();
+
+    let pr_bm = pr_bookmark::pr_bookmark_name(pr_number);
+    let remote_ref = format!("{head_branch}@{github_remote}");
+
+    // Set pr/<n> to the fetched GitHub head (create-or-move, idempotent).
+    // Works for both the warm path (reconciling an existing local bookmark) and
+    // the cold path (creating it for the first time in this workspace).
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &["bookmark", "set", &pr_bm, "-r", &remote_ref],
+        ),
+    )?;
+
+    // Re-establish the local head-branch bookmark pointing at the fetched ref
+    // so a later `cube pr push` has the branch name available.
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &[
+                "bookmark",
+                "set",
+                &head_branch,
+                "-r",
+                &remote_ref,
+                "--allow-backwards",
+            ],
+        ),
+    )?;
+
+    // Land editable: fresh empty child commit on top of the PR head.
+    run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(workspace_path, "jj", &["new", &pr_bm]),
+    )?;
+
+    Ok(PrResumeInfo {
+        pr_number,
+        head_branch,
+    })
 }
 
 /// Variant of [`reset_workspace`] that refuses to run the destructive
@@ -6272,6 +6442,324 @@ mod tests {
         .expect_err("expected lease to fail for leased preferred workspace");
         runner.assert_exhausted();
         assert!(matches!(err, CubeError::InvalidArgument(_)));
+    }
+
+    // ── --resume_pr tests ──────────────────────────────────────────────────────
+
+    /// Helper: build the expected command sequence for a `--resume_pr` lease.
+    ///
+    /// The sequence is the same for both the warm path (local `pr/<n>` bookmark
+    /// already present) and the cold path (bookmark absent — both call `gh pr
+    /// view` and then `jj bookmark set`).
+    fn resume_pr_runner_for(
+        workspace_path: &std::path::Path,
+        pr_number: u64,
+        head_branch: &str,
+        head_commit: &str,
+    ) -> FakeRunner {
+        let github_remote = "github";
+        let remote_list = format!("origin\t/local/mirror\n{github_remote}\tgit@github.com:spinyfin/mono.git\n");
+        let pr_json = format!(
+            r#"{{"headRefName":"{head_branch}","headRefOid":"deadbeef1234567890","state":"OPEN"}}"#
+        );
+        let remote_ref = format!("{head_branch}@{github_remote}");
+        let pr_bm = format!("pr/{pr_number}");
+        FakeRunner::new(vec![
+            // Health check
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            // Resolve github remote
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], &remote_list),
+            // Fetch from GitHub remote (--remote <github_remote>)
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch", "--remote", github_remote], ""),
+            // Resolve PR head from gh
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "gh", &[
+                "pr", "view", &pr_number.to_string(),
+                "-R", "spinyfin/mono",
+                "--json", "headRefName,headRefOid,state",
+            ], &pr_json),
+            // Set pr/<n> bookmark
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref], ""),
+            // Set head-branch bookmark
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", head_branch, "-r", &remote_ref, "--allow-backwards"], ""),
+            // Land on PR head
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", &pr_bm], ""),
+            // Record head_commit
+            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"], head_commit),
+        ])
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_warm_path_positions_on_pr_head() {
+        // "Warm path": the workspace was previously used for PR 1364, so the
+        // local `pr/1364` bookmark is already present. The resume sequence runs
+        // the same commands regardless (gh always consulted for reconciliation).
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let runner = resume_pr_runner_for(&ws_path, 1364, "boss/exec_18b6_a1", "cafe1234");
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "resume PR 1364",
+                "--resume-pr", "1364",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("resume_pr lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        assert_eq!(result.payload["workspace"]["head_commit"], "cafe1234");
+        assert_eq!(result.payload["resume_pr"]["pr_number"], 1364);
+        assert_eq!(result.payload["resume_pr"]["head_branch"], "boss/exec_18b6_a1");
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_cold_path_fallback_via_gh() {
+        // "Cold path": the workspace has never seen PR 42 before; the local
+        // `pr/42` bookmark is absent. The resume sequence still calls `gh pr
+        // view` and creates the bookmark on the fetched ref.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let runner = resume_pr_runner_for(&ws_path, 42, "boss/exec_cold_b2", "deadc0de");
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "resume cold PR 42",
+                "--resume-pr", "42",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("cold resume_pr lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["resume_pr"]["pr_number"], 42);
+        assert_eq!(result.payload["resume_pr"]["head_branch"], "boss/exec_cold_b2");
+        assert_eq!(result.payload["workspace"]["head_commit"], "deadc0de");
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_with_prefer_uses_preferred_workspace() {
+        // --prefer + --resume_pr: the preferred workspace is free and gets
+        // leased, then positioned on the PR head.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("ws-004 dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj"))
+            .expect("ws-007 dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // --prefer mono-agent-007 → that workspace must be health-checked first
+        // and then positioned on the PR head.
+        let preferred_path = workspace_root.join("mono-agent-007");
+        let runner = resume_pr_runner_for(&preferred_path, 99, "boss/exec_pref_c3", "feedface");
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "resume PR 99 on preferred workspace",
+                "--prefer", "mono-agent-007",
+                "--resume-pr", "99",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("prefer + resume_pr lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-007");
+        assert_eq!(result.payload["resume_pr"]["pr_number"], 99);
+        assert_eq!(result.payload["resume_pr"]["head_branch"], "boss/exec_pref_c3");
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_fallback_when_prefer_absent() {
+        // --prefer names a workspace that doesn't exist → cube silently falls
+        // back to another free workspace and still positions on the PR head.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        // Only mono-agent-004 exists; the preferred mono-agent-999 does not.
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let runner = resume_pr_runner_for(&ws_path, 77, "boss/exec_fallback_d4", "b0b0b0b0");
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "resume with fallback",
+                "--prefer", "mono-agent-999",
+                "--resume-pr", "77",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("fallback resume_pr lease");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        assert_eq!(result.payload["resume_pr"]["pr_number"], 77);
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_hard_errors_on_merged_pr() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let pr_json = r#"{"headRefName":"boss/exec_merged","headRefOid":"deadbeef","state":"MERGED"}"#;
+        let remote_list = "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], remote_list),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
+            ExpectedCommand::ok(ws_path.clone(), "gh", &[
+                "pr", "view", "5",
+                "-R", "spinyfin/mono",
+                "--json", "headRefName,headRefOid,state",
+            ], pr_json),
+        ]);
+
+        let err = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "attempt to resume merged PR",
+                "--resume-pr", "5",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("expected hard error for merged PR");
+        runner.assert_exhausted();
+
+        let msg = err.to_string();
+        assert!(msg.contains("MERGED"), "error should mention MERGED: {msg}");
+        assert!(msg.contains("5"), "error should mention PR number: {msg}");
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_hard_errors_on_closed_pr() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let pr_json = r#"{"headRefName":"boss/exec_closed","headRefOid":"cafebabe","state":"CLOSED"}"#;
+        let remote_list = "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n";
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], remote_list),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
+            ExpectedCommand::ok(ws_path.clone(), "gh", &[
+                "pr", "view", "10",
+                "-R", "spinyfin/mono",
+                "--json", "headRefName,headRefOid,state",
+            ], pr_json),
+        ]);
+
+        let err = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "attempt to resume closed PR",
+                "--resume-pr", "10",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect_err("expected hard error for closed PR");
+        runner.assert_exhausted();
+
+        let msg = err.to_string();
+        assert!(msg.contains("CLOSED"), "error should mention CLOSED: {msg}");
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_json_omits_resume_pr_when_not_used() {
+        // Normal lease without --resume_pr must not include "resume_pr" in JSON.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
+            .expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let runner = lease_runner_for(&ws_path, "abc1234");
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "normal task"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("normal lease");
+        runner.assert_exhausted();
+
+        assert!(
+            result.payload.get("resume_pr").is_none(),
+            "normal lease must not include resume_pr in JSON: {:?}",
+            result.payload
+        );
     }
 
     #[test]
