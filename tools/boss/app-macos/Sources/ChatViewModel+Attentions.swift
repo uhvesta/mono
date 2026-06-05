@@ -137,6 +137,27 @@ extension ChatViewModel {
         revealWorkCard(ref.taskID, productID: task.productID)
     }
 
+    /// Open question groups whose `source_doc_path` matches the given absolute
+    /// file path. Checked across all known products so the design-renderer
+    /// window (which may display a doc from any product) still finds its
+    /// groups regardless of which product is currently selected. The match
+    /// is suffix-based: the group's repo-relative `source_doc_path` must
+    /// appear as the trailing component of `absolutePath`.
+    func openQuestionGroupsForDocPath(_ absolutePath: String) -> [AttentionGroup] {
+        attentionGroupsByProductID.values
+            .flatMap { $0 }
+            .filter { group in
+                guard group.kind == "question",
+                      group.isOpen,
+                      let sourceDocPath = group.sourceDocPath,
+                      !sourceDocPath.isEmpty
+                else { return false }
+                return absolutePath == sourceDocPath
+                    || absolutePath.hasSuffix("/\(sourceDocPath)")
+            }
+            .sorted { $0.createdAt > $1.createdAt }
+    }
+
     /// Open the design doc a question group is about, reusing the project
     /// design-doc viewer when the group's association project resolves.
     func openAttentionDesignDoc(_ group: AttentionGroup) {

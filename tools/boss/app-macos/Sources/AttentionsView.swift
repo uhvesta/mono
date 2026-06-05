@@ -109,7 +109,7 @@ struct AttentionsView: View {
 }
 
 /// One open / partially-answered group, expandable to its member controls.
-private struct AttentionGroupCard: View {
+struct AttentionGroupCard: View {
     @EnvironmentObject private var model: ChatViewModel
     let group: AttentionGroup
     @State private var isExpanded = true
@@ -290,7 +290,7 @@ private struct AttentionGroupCard: View {
 }
 
 /// One member row: the kind-appropriate inline control plus a skip affordance.
-private struct AttentionMemberRow: View {
+struct AttentionMemberRow: View {
     @EnvironmentObject private var model: ChatViewModel
     let group: AttentionGroup
     let member: Attention
@@ -298,13 +298,21 @@ private struct AttentionMemberRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .center, spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
                 if group.kind != "followup" {
                     stateGlyph
+                        .padding(.top, member.sourceAnchor != nil ? 14 : 0)
                 }
-                Text(title)
-                    .font(.subheadline.weight(.medium))
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    if let anchor = member.sourceAnchor {
+                        Text("§ \(anchor)")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
+                    Text(title)
+                        .font(.subheadline.weight(.medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             control
             // yes_no / multiple_choice need a discrete skip; prompt has its
@@ -485,7 +493,7 @@ private struct AttentionMemberRow: View {
 
 /// A group that has been actioned this session — shows the produced artifact
 /// with a jump link, no controls.
-private struct AttentionResolvedCard: View {
+struct AttentionResolvedCard: View {
     @EnvironmentObject private var model: ChatViewModel
     let group: AttentionGroup
 
@@ -534,7 +542,7 @@ private struct AttentionResolvedCard: View {
 }
 
 /// Small capsule chip used for kind / extracted / effort labels.
-private struct AttentionChip: View {
+struct AttentionChip: View {
     let text: String
     var system: String?
     var tint: Color = .accentColor

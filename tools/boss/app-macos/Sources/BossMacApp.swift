@@ -91,6 +91,7 @@ struct BossMacApp: App {
                     .navigationTitle(content.title)
             }
         }
+        .environmentObject(chatModel)
         .defaultSize(width: 880, height: 700)
 
         // Review-terminal window: opened from a Review-column card's

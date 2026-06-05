@@ -109,25 +109,38 @@ struct DesignRendererContent: Codable, Hashable {
 struct DesignRendererView: View {
     let content: DesignRendererContent
 
+    @EnvironmentObject private var model: ChatViewModel
     @State private var source: String = ""
     @State private var loadError: String?
 
+    private var questionGroups: [AttentionGroup] {
+        model.openQuestionGroupsForDocPath(content.filePath)
+    }
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                header
-                Divider()
-                body(of: content)
+        HStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    header
+                    Divider()
+                    body(of: content)
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 20)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 20)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+            .task(id: content.filePath) {
+                await load()
+            }
+            .withComments()
+
+            if !questionGroups.isEmpty {
+                Divider()
+                DesignQuestionsPanel(groups: questionGroups)
+                    .frame(width: 320)
+            }
         }
-        .textSelection(.enabled)
-        .task(id: content.filePath) {
-            await load()
-        }
-        .withComments()
     }
 
     @ViewBuilder
