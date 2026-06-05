@@ -1,0 +1,18 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Canonical name for the per-work-item selection column? This doc proposes `driver`; P284 already wrote `backend` into its (not-yet-implemented) design.",
+    "choices": ["driver (rename P284 to match)", "backend (adopt P284's existing name)"],
+    "anchor": "mix-and-match--rollout"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "For products with editorial rules (P576), must a driver that lacks pre-execution tool interception be REFUSED (vs. degraded to post-hoc redaction, which leaves a window where un-redacted text is briefly live on GitHub)?",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Include the UtilityModel decoupling (the four direct-Anthropic call sites: live-status, pane-summary, magic-wand, attentions backstop) in v1 scope, rather than deferring it as future work?",
+    "anchor": "risks--open-questions"
+  }
+]
