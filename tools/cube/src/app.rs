@@ -1283,6 +1283,8 @@ fn run_workspace(
                     database_path,
                     &workspace.workspace_path,
                     pr_number,
+                    prior_expired,
+                    &repo_record.main_branch,
                 ) {
                     Ok(info) => Some(info),
                     Err(e) => {
@@ -3463,6 +3465,8 @@ fn resume_workspace_on_pr(
     database_path: Option<&Path>,
     workspace_path: &Path,
     pr_number: u64,
+    prior_expired: Option<&crate::store::ExpiredLease>,
+    main_branch: &str,
 ) -> Result<PrResumeInfo> {
     let (github_remote, owner_repo) =
         resolve_github_remote_for_workspace(runner, database_path, workspace_path)?;
@@ -3478,6 +3482,37 @@ fn resume_workspace_on_pr(
             &["git", "fetch", "--remote", &github_remote],
         ),
     )?;
+
+    // Guard: if this workspace was reclaimed from an expired lease, refuse to
+    // reposition `@` when the prior holder left uncommitted work. Without this
+    // check, `jj new pr/<n>` would snapshot those files into the new commit,
+    // silently mixing them with the PR's content. Matches the guard in
+    // `reset_workspace_guarded`.
+    if let Some(prior) = prior_expired {
+        let head_status = read_head_status(runner, database_path, workspace_path, main_branch)?;
+        if !head_status.is_clean_on_main {
+            audit!(
+                database_path,
+                "workspace.reset_refused_dirty",
+                workspace_path = workspace_path.display().to_string(),
+                main_branch = main_branch,
+                head_change_id = head_status.head_change_id,
+                head_is_empty = head_status.head_is_empty,
+                head_parent_bookmarks = head_status.head_parent_bookmarks,
+                prior_lease_id = prior.lease_id,
+                prior_holder = prior.holder.as_deref(),
+                prior_task = prior.task.as_deref(),
+            );
+            return Err(CubeError::LeaseExpiredWorkspaceDirty {
+                workspace_path: workspace_path.to_path_buf(),
+                prior_lease_id: prior.lease_id.clone(),
+                prior_holder: prior
+                    .holder
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+            });
+        }
+    }
 
     // Resolve PR N's current head from GitHub: state, head branch, and OID.
     let pr_n_str = pr_number.to_string();
@@ -11723,6 +11758,97 @@ steps:
         )
         .expect("second lease must succeed when the workspace is clean on main");
         second_runner.assert_exhausted();
+    }
+
+    /// When `--resume-pr` is combined with a workspace reclaimed from an expired
+    /// lease, the dirty guard must fire and surface `LeaseExpiredWorkspaceDirty`
+    /// instead of snapshotting the prior holder's uncommitted files into the new
+    /// commit on top of the PR head.
+    #[test]
+    fn resume_pr_on_expired_lease_refuses_dirty_workspace() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+        run_with_dependencies(
+            add_repo_cli(&workspace_root),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo");
+
+        // First lease — normal happy path.
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let first = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "wip"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("first lease");
+        let prior_lease_id = first.payload["workspace"]["lease_id"]
+            .as_str()
+            .expect("lease id")
+            .to_string();
+        lease_runner.assert_exhausted();
+
+        // Force the first lease to appear expired so the next lease call reclaims it.
+        force_lease_expiry(&database_path, &prior_lease_id, 1);
+
+        // The second lease uses --resume-pr. After the health check, it resolves
+        // the github remote, fetches, then runs the head-status probe. The probe
+        // returns a non-empty @ whose parent isn't main — exactly the WIP shape
+        // left by a still-active prior worker. The guard must stop here and NOT
+        // proceed to `gh pr view` or `jj new pr/<n>`.
+        let github_remote = "github";
+        let remote_list = format!("origin\t/local/mirror\n{github_remote}\tgit@github.com:spinyfin/mono.git\n");
+        let probe_output = "abcd1234\tfalse\tfeature-bookmark";
+        let head_status_template = "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")";
+        let second_runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], &remote_list),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch", "--remote", github_remote], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", head_status_template],
+                probe_output,
+            ),
+        ]);
+
+        let err = run_with_dependencies(
+            Cli::parse_from([
+                "cube", "workspace", "lease", "mono",
+                "--task", "resume dirty PR",
+                "--resume-pr", "42",
+            ]),
+            Some(&database_path),
+            &second_runner,
+        )
+        .expect_err("resume-pr on dirty expired workspace must refuse");
+
+        match &err {
+            CubeError::LeaseExpiredWorkspaceDirty {
+                workspace_path: refused_path,
+                prior_lease_id: refused_lease,
+                ..
+            } => {
+                assert_eq!(refused_path, &workspace_path);
+                assert_eq!(refused_lease, &prior_lease_id);
+            }
+            other => panic!("expected LeaseExpiredWorkspaceDirty, got {other:?}"),
+        }
+        second_runner.assert_exhausted();
+
+        // The workspace is back to `free` — the new lease was rolled back.
+        use crate::store::{Store, WorkspaceListFilter};
+        let store = Store::open_at(&database_path).unwrap();
+        let rows = store
+            .list_workspaces_filtered(&WorkspaceListFilter::default())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Free);
+        assert_eq!(rows[0].last_release_reason.as_deref(), Some("lease_setup_failed"));
     }
 
     #[test]
