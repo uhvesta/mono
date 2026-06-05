@@ -956,7 +956,27 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
     var shortIDLabel: String? = nil
     @ViewBuilder let content: () -> Content
 
-    @State private var userToggled: Bool = false
+    @State private var userToggled: Bool
+
+    init(
+        sectionID: String,
+        title: String,
+        count: Int,
+        defaultExpanded: Bool,
+        shortIDLabel: String? = nil,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.sectionID = sectionID
+        self.title = title
+        self.count = count
+        self.defaultExpanded = defaultExpanded
+        self.shortIDLabel = shortIDLabel
+        self.content = content
+        let stored = UserDefaults.standard.object(
+            forKey: "boss.kanban.section.\(sectionID).userToggled"
+        ) as? Bool
+        self._userToggled = State(initialValue: stored ?? false)
+    }
 
     private var isExpanded: Bool {
         userToggled ? !defaultExpanded : defaultExpanded
@@ -965,7 +985,11 @@ private struct CollapsibleWorkBoardSection<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Button {
-                userToggled.toggle()
+                let next = !userToggled
+                userToggled = next
+                UserDefaults.standard.set(
+                    next, forKey: "boss.kanban.section.\(sectionID).userToggled"
+                )
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
