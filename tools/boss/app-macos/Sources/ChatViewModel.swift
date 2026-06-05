@@ -100,6 +100,13 @@ final class ChatViewModel: ObservableObject {
     @Published var automationRunsByID: [String: [AppAutomationRun]] = [:]
     /// The automation currently selected in the Automations tab detail pane.
     @Published var selectedAutomationID: String?
+    /// Editorial-action audit rows keyed by product id. Populated on demand
+    /// when the Editorial Controls sheet is opened for a product.
+    @Published var editorialActionsByProductID: [String: [EditorialAction]] = [:]
+    /// Fetch state for the editorial-actions list keyed by product id.
+    @Published var editorialActionsFetchStateByProductID: [String: AutomationsFetchState] = [:]
+    /// When non-nil, the Editorial Controls sheet is presented for this product id.
+    @Published var editorialControlsProductID: String?
     @Published var selectedWorkProductID: String? {
         didSet { invalidateWorkCache() }
     }
@@ -1316,40 +1323,6 @@ final class ChatViewModel: ObservableObject {
         engine.sendUnsetProductExternalTracker(productId: productId)
     }
 
-    // MARK: GitHub OAuth device-flow bridges (OAuth device-flow design §4)
-    //
-    // Thin pass-throughs to the engine RPCs. The engine owns the flow and
-    // the token; these just kick state transitions. The resulting
-    // `gitHubAuthState` updates arrive via `git_hub_auth_state` events.
-
-    /// Begin the device flow (the "Connect" / "Start over" action).
-    func gitHubAuthConnect() {
-        engine.sendGitHubAuthStart()
-    }
-
-    /// Abort an in-progress device flow (the "Cancel" action).
-    func gitHubAuthCancel() {
-        engine.sendGitHubAuthCancel()
-    }
-
-    /// Delete the stored token and return to disconnected.
-    func gitHubAuthDisconnect() {
-        engine.sendGitHubAuthDisconnect()
-    }
-
-    /// Re-run the device flow, overwriting the stored token. Identical to
-    /// `gitHubAuthConnect` at the wire level (the engine restarts the flow
-    /// from `Authorized`); named separately so the call site reads clearly.
-    func gitHubAuthReauthorize() {
-        engine.sendGitHubAuthStart()
-    }
-
-    /// Re-request the current state, which re-runs the engine's org/SSO
-    /// probe when connected (the "Re-check" affordance, design §7).
-    func gitHubAuthRecheck() {
-        engine.sendGitHubAuthStatus()
-    }
-
     func deleteSelectedWorkItem() {
         guard let task = selectedTask else { return }
         engine.sendDeleteWorkItem(id: task.id)
@@ -2269,6 +2242,10 @@ final class ChatViewModel: ObservableObject {
             openTaskCountByAutomationID[automationID] = count
         case .automationRunsList(let automationID, let runs):
             automationRunsByID[automationID] = runs
+        // MARK: Editorial controls events
+        case .editorialActionsList(let productID, let actions):
+            editorialActionsByProductID[productID] = actions
+            editorialActionsFetchStateByProductID[productID] = .loaded
         }
     }
 

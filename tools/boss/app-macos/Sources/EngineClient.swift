@@ -266,6 +266,10 @@ enum EngineEvent {
     case automationOpenTaskCount(automationID: String, count: Int)
     /// Response to `list_automation_runs` — the run history for one automation.
     case automationRunsList(automationID: String, runs: [AppAutomationRun])
+    // MARK: Editorial controls events
+    /// Response to `list_editorial_actions` — audit rows for a product,
+    /// ordered freshest-first.
+    case editorialActionsList(productID: String, actions: [EditorialAction])
     // MARK: Attention events (attentions.md — Notifications toolbar + window)
     /// Reply to `list_attention_groups` — the groups for a product plus
     /// every group's member rows (flattened; bucketed client-side by
@@ -835,6 +839,39 @@ final class EngineClient: @unchecked Sendable {
     /// with `automation_runs_list`.
     func sendListAutomationRuns(automationId: String) {
         sendLine(["type": "list_automation_runs", "automation_id": automationId])
+    }
+
+    // MARK: Editorial controls
+
+    /// Set a product's editorial rules. Engine replies with `work_item_updated`
+    /// carrying the updated product row. Pass `nil` for `rules` to clear.
+    func sendSetProductEditorialRules(productId: String, rules: EditorialRules?) {
+        if let rules = rules,
+           let data = try? JSONEncoder().encode(rules),
+           let rulesObj = try? JSONSerialization.jsonObject(with: data) {
+            sendLine([
+                "type": "set_product_editorial_rules",
+                "product_id": productId,
+                "rules": rulesObj,
+            ])
+        } else {
+            sendLine([
+                "type": "set_product_editorial_rules",
+                "product_id": productId,
+                "rules": NSNull(),
+            ])
+        }
+    }
+
+    /// List recent editorial hook decisions for a product, freshest first.
+    /// Engine replies with `editorial_actions_list`.
+    func sendListEditorialActions(productId: String, limit: Int? = nil) {
+        var msg: [String: Any] = [
+            "type": "list_editorial_actions",
+            "product_id": productId,
+        ]
+        if let limit { msg["limit"] = limit }
+        sendLine(msg)
     }
 
     /// Resolve a project's design-doc pointer. Engine replies with
@@ -1623,6 +1660,14 @@ final class EngineClient: @unchecked Sendable {
                 if !automationID.isEmpty {
                     emit(.automationRunsList(automationID: automationID, runs: runs))
                 }
+            // MARK: Editorial controls responses
+            case "editorial_actions_list":
+                let productID = payload["product_id"] as? String ?? ""
+                let rawActions = payload["actions"] as? [[String: Any]] ?? []
+                let actions = rawActions.compactMap(parseEditorialAction)
+                if !productID.isEmpty {
+                    emit(.editorialActionsList(productID: productID, actions: actions))
+                }
             default:
                 break
             }
@@ -1725,6 +1770,31 @@ final class EngineClient: @unchecked Sendable {
             outcome: outcome,
             producedTaskID: payload["produced_task_id"] as? String,
             detail: payload["detail"] as? String
+        )
+    }
+
+    // MARK: - Editorial parsers
+
+    private func parseEditorialAction(_ payload: [String: Any]) -> EditorialAction? {
+        guard let id = payload["id"] as? String,
+              let productID = payload["product_id"] as? String,
+              let executionID = payload["execution_id"] as? String,
+              let toolCommand = payload["tool_command"] as? String,
+              let action = payload["action"] as? String,
+              let reason = payload["reason"] as? String,
+              let createdAt = payload["created_at"] as? String
+        else {
+            return nil
+        }
+        return EditorialAction(
+            id: id,
+            productID: productID,
+            executionID: executionID,
+            prURL: payload["pr_url"] as? String,
+            toolCommand: toolCommand,
+            action: action,
+            reason: reason,
+            createdAt: createdAt
         )
     }
 

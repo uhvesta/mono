@@ -253,4 +253,24 @@ extension ChatViewModel {
         }
         engine.sendDeleteAutomation(id: id)
     }
+
+    // MARK: - Editorial controls actions
+
+    /// Open the editorial controls sheet for the given product.
+    func openEditorialControls(productID: String) {
+        editorialControlsProductID = productID
+        loadEditorialActions(productID: productID)
+    }
+
+    /// Reload the editorial-action audit rows for a product.
+    func loadEditorialActions(productID: String) {
+        guard isConnected else { return }
+        editorialActionsFetchStateByProductID[productID] = .loading
+        engine.sendListEditorialActions(productId: productID, limit: 50)
+    }
+
+    /// Persist new editorial rules for a product. Pass `nil` to clear all rules.
+    func setProductEditorialRules(productID: String, rules: EditorialRules?) {
+        engine.sendSetProductEditorialRules(productId: productID, rules: rules)
+    }
 }

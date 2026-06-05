@@ -307,6 +307,18 @@ struct ContentView: View {
                 }
             )
         }
+        .sheet(isPresented: Binding(
+            get: { model.editorialControlsProductID != nil },
+            set: { if !$0 { model.editorialControlsProductID = nil } }
+        )) {
+            if let productID = model.editorialControlsProductID {
+                EditorialControlsSheet(
+                    model: model,
+                    productID: productID,
+                    onDismiss: { model.editorialControlsProductID = nil }
+                )
+            }
+        }
         .sheet(item: $model.pendingWorkEditRequest) { request in
             WorkEditSheet(
                 request: request,
@@ -451,18 +463,32 @@ struct ContentView: View {
                             products: model.activeProducts
                         )
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.trailing, 28)
+                        .padding(.trailing, 56)
 
-                        Button {
-                            model.presentEditSelectedProduct()
-                        } label: {
-                            Image(systemName: "square.and.pencil")
-                                .frame(width: 16, height: 16)
+                        HStack(spacing: 4) {
+                            Button {
+                                if let productID = model.selectedProduct?.id {
+                                    model.openEditorialControls(productID: productID)
+                                }
+                            } label: {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                    .frame(width: 16, height: 16)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Editorial Rules")
+                            .disabled(model.selectedProduct == nil || !model.isConnected)
+
+                            Button {
+                                model.presentEditSelectedProduct()
+                            } label: {
+                                Image(systemName: "square.and.pencil")
+                                    .frame(width: 16, height: 16)
+                            }
+                            .buttonStyle(.borderless)
+                            .padding(.trailing, -2)
+                            .help("Edit Product")
+                            .disabled(model.selectedProduct == nil || !model.isConnected)
                         }
-                        .buttonStyle(.borderless)
-                        .padding(.trailing, -2)
-                        .help("Edit Product")
-                        .disabled(model.selectedProduct == nil || !model.isConnected)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .listRowInsets(EdgeInsets(top: 3, leading: -8, bottom: 3, trailing: 0))
