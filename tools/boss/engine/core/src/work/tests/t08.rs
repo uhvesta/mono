@@ -619,20 +619,38 @@ fn action_with_skip_unanswered_clears_open_members_then_actions() {
 }
 
 #[test]
-fn action_all_skipped_question_group_has_nothing_to_produce() {
+fn action_all_skipped_question_group_auto_dismisses() {
+    // "Skip all + Submit" on a question group should dismiss the card rather
+    // than error, matching the followup auto-dismiss path for all-rejected groups.
     let (db, _product, project_id, _task) = fixture();
     let (a, _g) = db
         .create_attention(question(&project_id, "docs/x.md", "Q"))
         .unwrap();
     let g = db.answer_attention(&a.id, None, true, false).unwrap();
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let err = db
-        .action_attention_group(&g.id, false, &checker)
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("no answered questions"),
-        "unexpected error: {err}"
-    );
+    let result = db.action_attention_group(&g.id, false, &checker).unwrap();
+    assert_eq!(result.group.state, "dismissed");
+    assert!(result.group.dismissed_at.is_some());
+    assert!(result.produced_work_item_ids.is_empty());
+}
+
+#[test]
+fn action_all_skipped_via_skip_unanswered_question_group_auto_dismisses() {
+    // skip_unanswered=true on a question group where nobody answered should
+    // also dismiss — this is the exact "Submit answers" button path.
+    let (db, _product, project_id, _task) = fixture();
+    let (a1, _g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q1"))
+        .unwrap();
+    let (_a2, _g) = db
+        .create_attention(question(&project_id, "docs/x.md", "Q2"))
+        .unwrap();
+    // Skip a1 explicitly; a2 is still open — skip_unanswered covers it.
+    let g = db.answer_attention(&a1.id, None, true, false).unwrap();
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let result = db.action_attention_group(&g.id, true, &checker).unwrap();
+    assert_eq!(result.group.state, "dismissed");
+    assert!(result.produced_work_item_ids.is_empty());
 }
 
 #[test]

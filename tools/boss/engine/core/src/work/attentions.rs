@@ -1066,6 +1066,27 @@ impl WorkDb {
             );
         }
 
+        // A question group where every member was skipped (none answered) has
+        // no content to produce a revision or design task from. Treat this as
+        // "I don't want to act on any of these" and dismiss the group so the
+        // card disappears — matching the existing auto-dismiss path for
+        // followup groups where all members are rejected.
+        if group.kind == "question" && members.iter().all(|m| m.answer_state != "answered") {
+            let now = now_string();
+            tx.execute(
+                "UPDATE attention_groups SET state = 'dismissed', dismissed_at = ?2 WHERE id = ?1",
+                params![group.id, now],
+            )?;
+            let group = query_attention_group(&tx, &group.id)?.with_context(|| {
+                format!("missing attention group after auto-dismiss: {}", group.id)
+            })?;
+            tx.commit()?;
+            return Ok(ActionedAttentionGroup {
+                group,
+                produced_work_item_ids: vec![],
+            });
+        }
+
         let (produced_kind, produced_ref, produced_work_item_ids) = match group.kind.as_str() {
             "question" => action_question_group(&tx, &group, &members, pr_checker)?,
             "followup" => action_followup_group(&tx, &group, &members)?,
