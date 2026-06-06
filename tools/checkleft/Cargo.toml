@@ -60,10 +60,10 @@ tracing-subscriber = { version = "0.3.19", default-features = false, features = 
 tree-sitter = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-starlark = { workspace = true }
+tempfile = { workspace = true }
 walkdir = { workspace = true }
 wasmtime = { version = "42.0.1", default-features = false, features = ["anyhow", "component-model", "cranelift", "runtime", "std"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 wat = { workspace = true }
 wiremock = { workspace = true }

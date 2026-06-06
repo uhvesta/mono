@@ -153,6 +153,8 @@ pub use command_policy::ExternalCommandCapabilities;
 mod component_bindings;
 mod runtime;
 pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
+pub mod sandbox;
+pub use sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
 
 pub fn load_external_check_package_manifest(path: &Path) -> Result<ExternalCheckPackage> {
     let contents = fs::read_to_string(path)
