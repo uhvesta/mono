@@ -1737,7 +1737,7 @@ fn compose_revision_directive(
         _ => String::new(),
     };
     let parent_pr_url = execution.pr_url.as_deref().unwrap_or("(unknown)");
-    let pr_number = crate::completion::pr_number_from_url(parent_pr_url)
+    let pr_number = boss_github::pr_url::pr_number_from_url(parent_pr_url)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".into());
     let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)

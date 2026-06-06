@@ -15,6 +15,8 @@ use std::process::Stdio;
 use anyhow::{Result, anyhow};
 use tokio::process::Command;
 
+use boss_github::pr_url::parse_pr_url_parts;
+
 /// Outcome of a successful [`gh_merge_when_ready`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeAction {
@@ -133,20 +135,6 @@ async fn probe_is_merged(pr_url: &str) -> bool {
     String::from_utf8_lossy(&out.stdout).trim() == "MERGED"
 }
 
-/// Parse `(owner, repo, number)` from a canonical GitHub PR URL of the
-/// form `https://github.com/<owner>/<repo>/pull/<N>`.
-pub(crate) fn parse_pr_url_parts(pr_url: &str) -> Option<(&str, &str, u64)> {
-    let path = pr_url.strip_prefix("https://github.com/")?;
-    let mut parts = path.splitn(4, '/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    let repo = parts.next().filter(|s| !s.is_empty())?;
-    if parts.next()? != "pull" {
-        return None;
-    }
-    let number: u64 = parts.next()?.parse().ok()?;
-    Some((owner, repo, number))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,42 +154,6 @@ mod tests {
     #[test]
     fn merge_action_merged_as_str() {
         assert_eq!(MergeAction::Merged.as_str(), "merged");
-    }
-
-    // --- parse_pr_url_parts ---
-
-    #[test]
-    fn parse_pr_url_parts_valid() {
-        let (owner, repo, number) =
-            parse_pr_url_parts("https://github.com/spinyfin/boss/pull/123").unwrap();
-        assert_eq!(owner, "spinyfin");
-        assert_eq!(repo, "boss");
-        assert_eq!(number, 123);
-    }
-
-    #[test]
-    fn parse_pr_url_parts_rejects_non_github_host() {
-        assert!(parse_pr_url_parts("https://gitlab.com/foo/bar/merge_requests/1").is_none());
-    }
-
-    #[test]
-    fn parse_pr_url_parts_rejects_issues_path() {
-        assert!(parse_pr_url_parts("https://github.com/foo/bar/issues/1").is_none());
-    }
-
-    #[test]
-    fn parse_pr_url_parts_rejects_non_numeric_pr_number() {
-        assert!(parse_pr_url_parts("https://github.com/foo/bar/pull/abc").is_none());
-    }
-
-    #[test]
-    fn parse_pr_url_parts_rejects_empty_owner() {
-        assert!(parse_pr_url_parts("https://github.com//repo/pull/1").is_none());
-    }
-
-    #[test]
-    fn parse_pr_url_parts_rejects_bare_domain() {
-        assert!(parse_pr_url_parts("https://github.com/").is_none());
     }
 
     // --- derive_action (mirrors the if/else in gh_merge_when_ready) ---

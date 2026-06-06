@@ -287,7 +287,7 @@ async fn checkout_pr_head_local(
     pr_url: &str,
     repo_slug: &str,
 ) -> Result<String> {
-    let pr_number = crate::completion::pr_number_from_url(pr_url)
+    let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
 
     // 1. Fetch the current head SHA from GitHub via the shared gh-cli helper.
@@ -677,7 +677,7 @@ impl HostAdapter for SshHostAdapter {
         pr_url: &str,
         repo_slug: &str,
     ) -> Result<String> {
-        let pr_number = crate::completion::pr_number_from_url(pr_url)
+        let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
             .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
         let host = &self.transport.host_id;
 

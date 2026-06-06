@@ -64,6 +64,7 @@ use crate::merge_poller::{
 };
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
+use boss_github::pr_url::pr_number_from_url;
 use crate::work::{
     CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
     WorkerPrCompletionTarget,
@@ -582,12 +583,6 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
 }
 
 
-/// Parse the PR number from a canonical GitHub PR URL
-/// (`https://github.com/<owner>/<repo>/pull/<N>`).
-pub(crate) fn pr_number_from_url(pr_url: &str) -> Option<u64> {
-    pr_url.split('/').next_back()?.parse().ok()
-}
-
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
 #[derive(Debug, Clone)]
 struct ApiPr {
@@ -798,10 +793,7 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
 /// `gh` auth issue, etc.). Callers must propagate this as a detector
 /// failure rather than treating it as confirmation of an empty diff.
 async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
-    let pr_number = pr_url
-        .split('/')
-        .next_back()
-        .and_then(|s| s.parse::<u64>().ok())
+    let pr_number = pr_number_from_url(pr_url)
         .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
     let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
     let stdout = run_gh(

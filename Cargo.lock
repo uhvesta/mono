@@ -285,6 +285,7 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-editorial",
  "boss-feature-flags",
+ "boss-github",
  "boss-log-files",
  "boss-pr-template",
  "boss-protocol",

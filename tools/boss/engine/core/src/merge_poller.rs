@@ -53,6 +53,7 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
+use boss_github::pr_url::{pr_number_from_url, repo_from_pr_url};
 use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
 #[cfg(test)]
 use crate::work::TaskStatus;
@@ -506,35 +507,6 @@ impl MergeProbe for CommandMergeProbe {
         probe.in_merge_queue = fetch_merge_queue_status(pr_url).await;
         Ok(probe)
     }
-}
-
-/// Extract `"owner/repo"` from a GitHub PR URL of the form
-/// `https://github.com/owner/repo/pull/NNN`.
-fn repo_from_pr_url(pr_url: &str) -> Option<&str> {
-    let path = pr_url.strip_prefix("https://github.com/")?;
-    let mut segments = path.splitn(3, '/');
-    let owner = segments.next()?;
-    let repo = segments.next()?;
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    let end = owner.len() + 1 + repo.len();
-    Some(&path[..end])
-}
-
-/// Extract the PR number from a GitHub PR URL of the form
-/// `https://github.com/owner/repo/pull/NNN`.
-fn pr_number_from_url(pr_url: &str) -> Option<u64> {
-    let path = pr_url.strip_prefix("https://github.com/")?;
-    // path is now "owner/repo/pull/NNN" or similar
-    let mut segments = path.splitn(4, '/');
-    segments.next()?; // owner
-    segments.next()?; // repo
-    let pull = segments.next()?;
-    if pull != "pull" {
-        return None;
-    }
-    segments.next()?.parse().ok()
 }
 
 /// Query GitHub's GraphQL API to determine whether `pr_url` is currently
@@ -5211,34 +5183,6 @@ mod tests {
             Some("spinyfin"),
         );
         assert_eq!(super::owner_from_pr_url("not-a-url"), None);
-    }
-
-    #[test]
-    fn repo_from_pr_url_extracts_owner_repo() {
-        assert_eq!(
-            super::repo_from_pr_url("https://github.com/spinyfin/mono/pull/568"),
-            Some("spinyfin/mono"),
-        );
-        assert_eq!(
-            super::repo_from_pr_url("https://github.com/owner/my-repo/pull/1"),
-            Some("owner/my-repo"),
-        );
-        assert_eq!(super::repo_from_pr_url("https://example.com/owner/repo/pull/1"), None);
-        assert_eq!(super::repo_from_pr_url("not-a-url"), None);
-    }
-
-    #[test]
-    fn pr_number_from_url_extracts_number() {
-        assert_eq!(
-            super::pr_number_from_url("https://github.com/spinyfin/mono/pull/568"),
-            Some(568),
-        );
-        assert_eq!(
-            super::pr_number_from_url("https://github.com/owner/my-repo/pull/1"),
-            Some(1),
-        );
-        assert_eq!(super::pr_number_from_url("https://example.com/owner/repo/pull/1"), None);
-        assert_eq!(super::pr_number_from_url("not-a-url"), None);
     }
 
     #[test]

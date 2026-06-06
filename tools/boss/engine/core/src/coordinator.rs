@@ -2387,7 +2387,7 @@ impl ExecutionCoordinator {
             && execution
                 .pr_url
                 .as_deref()
-                .and_then(crate::completion::pr_number_from_url)
+                .and_then(boss_github::pr_url::pr_number_from_url)
                 .is_some();
 
         let change: Option<CubeChangeHandle> = if let Some(pr_url) = pr_review_pr_url {
@@ -2962,7 +2962,7 @@ impl ExecutionCoordinator {
                 execution
                     .pr_url
                     .as_deref()
-                    .and_then(crate::completion::pr_number_from_url)
+                    .and_then(boss_github::pr_url::pr_number_from_url)
             } else {
                 None
             };

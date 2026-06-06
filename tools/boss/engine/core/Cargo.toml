@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
+boss-github = { path = "../../github" }
 boss-transcript-markdown = { path = "../transcript-markdown" }
 async-trait = { workspace = true }
 bon = { workspace = true }
