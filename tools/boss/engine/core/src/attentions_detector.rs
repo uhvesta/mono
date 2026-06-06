@@ -26,14 +26,12 @@
 //! [`extract_followups_backstop`] — disabled by default.
 
 use std::path::Path;
-use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use boss_protocol::{Attention, AttentionGroup, CreateAttentionInput};
 use boss_transcript_markdown::{TranscriptEventKind, parse_transcript};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
 use crate::design_detector;
 use crate::work::WorkDb;
@@ -175,7 +173,7 @@ pub async fn reconcile_design_doc_questions(
 
     let mut found: Option<(String, String)> = None;
     for branch in &branches {
-        match fetch_pr_file(&owner, &repo, &manifest_path, branch).await {
+        match boss_github::contents::fetch_repo_file(&owner, &repo, &manifest_path, branch).await {
             Ok(Some(content)) => {
                 found = Some((content, branch.clone()));
                 break;
@@ -316,48 +314,6 @@ fn sibling_manifest_path(doc_path: &str) -> Option<String> {
 fn parse_owner_repo_from_pr_url(pr_url: &str) -> Option<(String, String)> {
     let (owner, repo) = git_utils::repo_slug::parse_github_owner_repo(pr_url).ok()?;
     Some((owner.to_owned(), repo.to_owned()))
-}
-
-/// Fetch one file's raw contents from `owner/repo@branch` via the GitHub
-/// Contents API. Returns `Ok(None)` when the file does not exist (a 404 —
-/// the common "no manifest" case), `Err` only on a real tool/transport
-/// failure. `--method GET` is required so `-f ref=` lands in the query
-/// string (gh otherwise switches to POST once a field is added), which also
-/// makes gh URL-encode slashed branch names like `boss/exec_*` correctly.
-async fn fetch_pr_file(
-    owner: &str,
-    repo: &str,
-    path: &str,
-    branch: &str,
-) -> anyhow::Result<Option<String>> {
-    let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &endpoint,
-            "--method",
-            "GET",
-            "-f",
-            &format!("ref={branch}"),
-            "-H",
-            "Accept: application/vnd.github.raw",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output()
-        .await?;
-
-    if output.status.success() {
-        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("Not Found") || stderr.contains("404") {
-        return Ok(None);
-    }
-    anyhow::bail!("`gh api {endpoint}` failed: {}", stderr.trim());
 }
 
 // ── Followups: transcript-tail sentinel ─────────────────────────────────────
@@ -643,7 +599,7 @@ pub async fn extract_doc_questions_backstop(
 
     let mut found: Option<(String, String)> = None;
     for branch in &branches {
-        match fetch_pr_file(&owner, &repo, &doc_path, branch).await {
+        match boss_github::contents::fetch_repo_file(&owner, &repo, &doc_path, branch).await {
             Ok(Some(content)) => {
                 found = Some((content, branch.clone()));
                 break;

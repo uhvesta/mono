@@ -57,6 +57,7 @@ rust_library(
         "src/design_detector.rs",
         "src/dispatch_events.rs",
         "src/dispatch_reader.rs",
+        "src/doc_fetcher.rs",
         "src/editorial_hook.rs",
         "src/effort.rs",
         "src/engine_control.rs",

@@ -9,6 +9,7 @@
 //! `BOSS_SHAKE_PRIVATE_KEY_PEM`. See `tools/boss/cli/README.md` for
 //! the one-time developer setup instructions.
 
+pub mod contents;
 pub mod pr_url;
 
 use std::sync::OnceLock;
