@@ -1881,6 +1881,127 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     let _ = std::fs::remove_file(path);
 }
 
+/// The "AI reviewing" badge (`ai_reviewing`) must be honest: it may only show
+/// when a reviewer agent is actually in flight (`pr_review` execution
+/// `running`), never while the review is merely enqueued or stuck in the
+/// pre-start retry loop (`ready`). Regression for the jj-immutable-head
+/// dispatch bug, where a `pr_review` exec bounced ready→fail→ready and the card
+/// lied "AI reviewing" the whole time even though nothing was reviewing.
+#[test]
+fn ai_reviewing_badge_only_shows_while_reviewer_running() {
+    let path = temp_db_path("ai-reviewing-running-only");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Has PR under review".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+
+    // Simulate the P992 `PendingReview` hold: the implementation finished and
+    // opened a PR, but the card is held in Doing (`active`) with the PR stamped
+    // while the reviewer pass runs. This is the only state the badge keys on.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore.id, "https://github.com/spinyfin/mono/pull/4242"],
+        )
+        .unwrap();
+    }
+
+    // Reviewer enqueued but not yet dispatched (`ready`). Nothing is reviewing,
+    // so the badge must stay off.
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore.id)
+        .expect("chore present in work tree");
+    assert!(
+        !card.ai_reviewing,
+        "a `ready` (queued / retrying) reviewer must NOT show the AI-reviewing badge"
+    );
+
+    // Reviewer agent actually starts → exec `running`. Now the badge is honest.
+    let (_, run) = db
+        .start_execution_run(
+            &review.id,
+            "worker-rev",
+            "mono",
+            "lease-rev",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore.id)
+        .expect("chore present in work tree");
+    assert!(
+        card.ai_reviewing,
+        "a `running` reviewer must show the AI-reviewing badge"
+    );
+
+    // Reviewer finishes (terminal) → badge off again.
+    db.finish_execution_run(
+        &review.id,
+        &run.id,
+        ExecutionStatus::Completed,
+        "completed",
+        None,
+        None,
+        true,
+        None,
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore.id)
+        .expect("chore present in work tree");
+    assert!(
+        !card.ai_reviewing,
+        "a finished (terminal) reviewer must NOT show the AI-reviewing badge"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn cancel_execution_errors_on_unknown_id() {
     let path = temp_db_path("cancel-unknown");

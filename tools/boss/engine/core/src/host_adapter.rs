@@ -20,14 +20,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use serde::Deserialize;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
@@ -96,17 +94,6 @@ pub trait HostAdapter: Send + Sync {
         workspace_path: &Path,
         title: &str,
     ) -> Result<CubeChangeHandle>;
-
-    /// For `pr_review` executions: check out the PR head commit in the leased
-    /// workspace instead of creating a fresh change. Returns the head SHA on
-    /// success. Called only when the task's `pr_url` is non-empty; the normal
-    /// `create_change` path is used otherwise.
-    async fn checkout_pr_head_for_review(
-        &self,
-        workspace_path: &Path,
-        pr_url: &str,
-        repo_slug: &str,
-    ) -> Result<String>;
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
 
@@ -239,15 +226,6 @@ impl HostAdapter for LocalHostAdapter {
         self.cube_client.create_change(workspace_path, title).await
     }
 
-    async fn checkout_pr_head_for_review(
-        &self,
-        workspace_path: &Path,
-        pr_url: &str,
-        repo_slug: &str,
-    ) -> Result<String> {
-        checkout_pr_head_local(workspace_path, pr_url, repo_slug).await
-    }
-
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
         self.cube_client.workspace_status(workspace_path).await
     }
@@ -276,64 +254,6 @@ impl HostAdapter for LocalHostAdapter {
             .run_execution(worker_id, execution, work_item, workspace_path, cube_change_id)
             .await
     }
-}
-
-/// Run `gh pr view` + `jj git fetch` + `jj edit` locally in `workspace_path`
-/// to position the working copy at the PR head. Called by
-/// [`LocalHostAdapter::checkout_pr_head_for_review`]; extracted as a free
-/// function so the logic is readable without the `self` boilerplate.
-async fn checkout_pr_head_local(
-    workspace_path: &Path,
-    pr_url: &str,
-    repo_slug: &str,
-) -> Result<String> {
-    let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
-        .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-
-    // 1. Fetch the current head SHA from GitHub via the shared gh-cli helper.
-    let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
-
-    // 2. Fetch remote refs so jj knows about the head commit.
-    {
-        let output = Command::new("jj")
-            .args(["git", "fetch"])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .context("failed to spawn `jj git fetch`")?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`jj git fetch` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-
-    // 3. Move the workspace's working copy to the PR head.
-    {
-        let output = Command::new("jj")
-            .args(["edit", &head_sha])
-            .current_dir(workspace_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .with_context(|| format!("failed to spawn `jj edit {head_sha}`"))?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "`jj edit {head_sha}` failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-
-    Ok(head_sha)
 }
 
 // ── SshHostAdapter ────────────────────────────────────────────────────────────
@@ -669,56 +589,6 @@ impl HostAdapter for SshHostAdapter {
         Ok(CubeChangeHandle {
             change_id: payload.change.change_id,
         })
-    }
-
-    async fn checkout_pr_head_for_review(
-        &self,
-        workspace_path: &Path,
-        pr_url: &str,
-        repo_slug: &str,
-    ) -> Result<String> {
-        let pr_number = boss_github::pr_url::pr_number_from_url(pr_url)
-            .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
-        let host = &self.transport.host_id;
-
-        // 1. Fetch the head SHA from GitHub via the shared gh-cli helper.
-        //    gh queries the GitHub API; the result is identical whether run
-        //    locally or on the remote host, so we run it locally to avoid the
-        //    SSH round-trip.
-        let head_sha = git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await?;
-
-        // 2. Fetch remote refs on the remote host.
-        let workspace = workspace_path.display().to_string();
-        let fetch_cmd = format!("cd '{}' && jj git fetch", workspace);
-        let output = self
-            .transport
-            .run(&["sh", "-c", &fetch_cmd])
-            .await
-            .with_context(|| format!("failed to run `jj git fetch` on remote host {host}"))?;
-        if !output.success() {
-            return Err(anyhow!(
-                "`jj git fetch` failed on {host}: {}",
-                output.stderr.trim()
-            ));
-        }
-
-        // 3. Move the working copy to the PR head on the remote host.
-        let edit_cmd = format!("cd '{}' && jj edit '{head_sha}'", workspace);
-        let output = self
-            .transport
-            .run(&["sh", "-c", &edit_cmd])
-            .await
-            .with_context(|| {
-                format!("failed to run `jj edit {head_sha}` on remote host {host}")
-            })?;
-        if !output.success() {
-            return Err(anyhow!(
-                "`jj edit {head_sha}` failed on {host}: {}",
-                output.stderr.trim()
-            ));
-        }
-
-        Ok(head_sha)
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {

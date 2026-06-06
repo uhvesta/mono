@@ -335,9 +335,14 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
 /// execution. Called from `get_work_tree` to surface the "Reviewing (AI)"
 /// badge on kanban cards while the reviewer pass is in flight.
 ///
-/// The flag is derived — not a stored DB column — so it's always accurate: a
-/// task that never had a reviewer, or whose reviewer has already finalised,
-/// arrives with `ai_reviewing = false` (the default).
+/// "In flight" means the `pr_review` execution is `running` — a reviewer agent
+/// is actually reviewing. A `ready` execution (queued for a review-pool slot,
+/// or stuck in the pre-start retry loop after a dispatch failure) is NOT
+/// counted: nothing is reviewing yet, so claiming "AI reviewing" would be a
+/// lie. The flag is derived — not a stored DB column — so it's always
+/// accurate: a task that never had a reviewer, whose reviewer is still queued,
+/// or whose reviewer has already finalised (or failed to dispatch) arrives
+/// with `ai_reviewing = false` (the default).
 pub(crate) fn attach_ai_reviewing_flag(
     conn: &Connection,
     tasks: &mut [Task],
@@ -355,9 +360,15 @@ pub(crate) fn attach_ai_reviewing_flag(
         return Ok(());
     }
 
-    // Find which of those candidates have a non-terminal `pr_review` execution.
-    // Non-terminal = not in (completed, abandoned, failed, cancelled, orphaned).
-    // We use a single query with an IN clause built from the candidate IDs.
+    // Find which of those candidates have a `pr_review` execution that is
+    // actually `running` — i.e. a reviewer agent is in flight. We deliberately
+    // do NOT count a merely-`ready` execution: a `pr_review` exec sits in
+    // `ready` while queued for a review-pool slot AND while bouncing through the
+    // pre-start retry loop after a dispatch failure (e.g. the jj-immutable-head
+    // bug this badge was lying about). In neither case is anything reviewing,
+    // so showing "AI reviewing" would be dishonest. Terminal states
+    // (completed/failed/…) are likewise not in flight. Only `running` means an
+    // agent is reviewing right now.
     let placeholders = candidate_ids
         .iter()
         .enumerate()
@@ -369,7 +380,7 @@ pub(crate) fn attach_ai_reviewing_flag(
          FROM work_executions we
          WHERE we.work_item_id IN ({})
            AND we.kind = 'pr_review'
-           AND we.status NOT IN ('completed', 'abandoned', 'failed', 'cancelled', 'orphaned')",
+           AND we.status = 'running'",
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;

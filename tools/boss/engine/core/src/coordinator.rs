@@ -1181,7 +1181,10 @@ pub struct ExecutionCoordinator {
 /// Steps:
 /// 1. Fetch the current head OID from GitHub via `gh pr view`.
 /// 2. `jj git fetch` — pull the remote refs into the local jj store.
-/// 3. `jj edit <sha>` — move the workspace's working copy to the PR head.
+/// 3. `jj new <sha>` — position the working copy on a fresh empty child of the
+///    PR head. (`jj new`, not `jj edit`: a pushed PR head is immutable, so
+///    `jj edit` fails deterministically; the empty child's tree equals the
+///    head's, so the read-only reviewer still sees the PR-head files.)
 ///
 /// Returns the head SHA on success. Any subprocess failure is returned as an
 /// `Err` so the dispatcher can record a start failure and retry.
@@ -2315,8 +2318,29 @@ impl ExecutionCoordinator {
             )
             .await;
 
+        // For pr_review and revision_implementation executions with a PR URL,
+        // pass --resume_pr to cube during the lease so it handles workspace
+        // positioning (fetch + pr/<n> bookmark + `jj new`). The fallback
+        // workspace also receives resume_pr — cube's cold path recovers the
+        // head from GitHub via `gh pr view` when pr/<n> is absent.
+        let resume_pr: Option<u64> = match execution.kind {
+            ExecutionKind::RevisionImplementation => execution
+                .pr_url
+                .as_deref()
+                .and_then(boss_github::pr_url::pr_number_from_url),
+            ExecutionKind::PrReview => match &work_item {
+                WorkItem::Task(task) | WorkItem::Chore(task) => task
+                    .pr_url
+                    .as_deref()
+                    .filter(|u| !u.is_empty())
+                    .and_then(boss_github::pr_url::pr_number_from_url),
+                _ => None,
+            },
+            _ => None,
+        };
+
         let lease = match self
-            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, &adapter)
+            .lease_workspace_with_fallback(execution, worker_id, &repo, &task, resume_pr, &adapter)
             .await
         {
             Ok(lease) => lease,
@@ -2363,114 +2387,23 @@ impl ExecutionCoordinator {
         }
         let change_title = execution_change_title(execution, &work_item);
 
-        // For pr_review executions that have a resolvable PR URL, check out the
-        // PR head in the leased workspace rather than creating a fresh jj change.
-        // The reviewer reads real source at the PR head; writes remain blocked by
-        // the tool denylist (design §9). When there is no PR URL (rare edge case),
-        // fall through to the normal create_change path.
-        let pr_review_pr_url: Option<&str> = if execution.kind == ExecutionKind::PrReview {
-            match &work_item {
-                WorkItem::Task(task) | WorkItem::Chore(task) => {
-                    task.pr_url.as_deref().filter(|u| !u.is_empty())
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        // pr_review and revision_implementation executions whose lease received
+        // --resume_pr are already positioned: cube ran `jj git fetch` + `jj new
+        // pr/<n>` so the workspace is on a fresh editable child of the PR head.
+        // For reviews the reviewer reads files there; for revisions the worker
+        // edits there. No separate action needed; emit an event for the timeline.
+        let positioned_by_lease = resume_pr.is_some()
+            && matches!(
+                execution.kind,
+                ExecutionKind::PrReview | ExecutionKind::RevisionImplementation
+            );
 
-        // Revision_implementation executions with a parseable PR URL had their
-        // workspace positioned by cube's --resume_pr flag during the lease step
-        // above. Skip create_change for these; cube's `jj new pr/<n>` already
-        // created the editable child commit the worker needs.
-        let revision_positioned_by_lease = execution.kind == ExecutionKind::RevisionImplementation
-            && execution
-                .pr_url
-                .as_deref()
-                .and_then(boss_github::pr_url::pr_number_from_url)
-                .is_some();
-
-        let change: Option<CubeChangeHandle> = if let Some(pr_url) = pr_review_pr_url {
-            let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
-                .unwrap_or_default();
-            match adapter
-                .checkout_pr_head_for_review(&lease.workspace_path, pr_url, &repo_slug)
-                .await
-            {
-                Ok(head_sha) => {
-                    tracing::info!(
-                        execution_id = %execution.id,
-                        pr_url,
-                        %head_sha,
-                        workspace_path = %lease.workspace_path.display(),
-                        "reviewer workspace checked out to PR head",
-                    );
-                    self.dispatch_events
-                        .emit(
-                            DispatchEvent::new(
-                                Stage::CubeChangeCreated,
-                                DispatchOutcome::Ok,
-                                &execution.id,
-                            )
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_cube_repo(&repo.repo_id)
-                            .with_cube_lease(&lease.lease_id)
-                            .with_cube_workspace(&lease.workspace_id)
-                            .with_details(serde_json::json!({
-                                "reviewer_pr_checkout": true,
-                                "head_sha": head_sha,
-                            })),
-                        )
-                        .await;
-                    None
-                }
-                Err(err) => {
-                    if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
-                        tracing::error!(
-                            ?release_err,
-                            lease_id = %lease.lease_id,
-                            "failed to release workspace after reviewer PR checkout failure",
-                        );
-                    }
-                    self.dispatch_events
-                        .emit(
-                            DispatchEvent::new(
-                                Stage::CubeChangeCreated,
-                                DispatchOutcome::Error,
-                                &execution.id,
-                            )
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_cube_repo(&repo.repo_id)
-                            .with_cube_lease(&lease.lease_id)
-                            .with_cube_workspace(&lease.workspace_id)
-                            .with_error(&err),
-                        )
-                        .await;
-                    self.record_start_failure(
-                        Arc::clone(self),
-                        execution,
-                        worker_id,
-                        Some(repo.repo_id.as_str()),
-                        "reviewer_pr_checkout_failed",
-                        "Reviewer workspace checkout to PR head failed",
-                        &err,
-                    )?;
-                    return Err(err);
-                }
-            }
-        } else if revision_positioned_by_lease {
-            // Revision pre-positioning was handled by cube's --resume_pr flag
-            // during the lease step (see `lease_workspace_with_fallback`). Cube
-            // ran `jj git fetch` + `jj new pr/<n>` so the workspace is already
-            // on a fresh editable commit above the PR head. No separate action
-            // needed here; emit an event so the timeline is complete.
+        let change: Option<CubeChangeHandle> = if positioned_by_lease {
             tracing::info!(
                 execution_id = %execution.id,
-                pr_url = execution.pr_url.as_deref().unwrap_or(""),
+                kind = execution.kind.as_str(),
                 workspace_path = %lease.workspace_path.display(),
-                "revision workspace positioned by cube --resume_pr during lease",
+                "workspace positioned by cube --resume_pr during lease",
             );
             self.dispatch_events
                 .emit(
@@ -2485,7 +2418,8 @@ impl ExecutionCoordinator {
                     .with_cube_lease(&lease.lease_id)
                     .with_cube_workspace(&lease.workspace_id)
                     .with_details(serde_json::json!({
-                        "revision_pr_positioned_by_lease": true,
+                        "pr_positioned_by_lease": true,
+                        "kind": execution.kind.as_str(),
                     })),
                 )
                 .await;
@@ -2934,6 +2868,7 @@ impl ExecutionCoordinator {
         worker_id: &str,
         repo: &CubeRepoHandle,
         task: &str,
+        resume_pr: Option<u64>,
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<CubeWorkspaceLease> {
         let prefer = execution.preferred_workspace_id.as_deref();
@@ -2951,21 +2886,6 @@ impl ExecutionCoordinator {
         } else {
             "none"
         };
-
-        // For revision_implementation executions with a PR URL, pass --resume_pr
-        // to cube so it handles workspace positioning (fetch + pr/<n> bookmark +
-        // `jj new`). This replaces the post-lease `position_revision_workspace`
-        // call. The fallback workspace also receives resume_pr — cube's cold path
-        // recovers the head from GitHub via `gh pr view` when pr/<n> is absent.
-        let resume_pr: Option<u64> =
-            if execution.kind == ExecutionKind::RevisionImplementation {
-                execution
-                    .pr_url
-                    .as_deref()
-                    .and_then(boss_github::pr_url::pr_number_from_url)
-            } else {
-                None
-            };
 
         // Stale-lease reclaim (issue #962 — UI-crash resume).
         //
@@ -6814,6 +6734,7 @@ mod tests {
                 "worker-resume",
                 &repo,
                 "task",
+                None,
                 &coordinator.host_adapter,
             )
             .await;
@@ -6901,6 +6822,7 @@ mod tests {
                 "worker-resume",
                 &repo,
                 "task",
+                None,
                 &coordinator.host_adapter,
             )
             .await;
@@ -9544,141 +9466,13 @@ mod tests {
         );
     }
 
-    // ── Reviewer workspace checkout tests ─────────────────────────────────────
+    // ── Reviewer workspace positioning tests ──────────────────────────────────
 
-    use crate::host_adapter::LocalHostAdapter;
     use crate::work::WorkItemPatch;
-
-    /// A host adapter that delegates all workspace-lifecycle and spawn methods
-    /// to an inner `LocalHostAdapter` but intercepts
-    /// `checkout_pr_head_for_review` so tests can control its outcome and verify
-    /// it was called.
-    struct CheckoutControllingHostAdapter {
-        inner: Arc<dyn HostAdapter>,
-        /// `Some(sha)` → reviewer checkout succeeds and returns that SHA.
-        /// `None` → reviewer checkout fails with a canned error.
-        checkout_sha: Option<String>,
-        checkout_calls: Mutex<Vec<(PathBuf, String, String)>>,
-    }
-
-    #[async_trait]
-    impl HostAdapter for CheckoutControllingHostAdapter {
-        fn host_id(&self) -> &str {
-            self.inner.host_id()
-        }
-
-        async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
-            self.inner.ensure_repo(origin).await
-        }
-
-        async fn lease_workspace(
-            &self,
-            repo_id: &str,
-            task: &str,
-            prefer_workspace_id: Option<&str>,
-            allow_dirty: bool,
-            resume_pr: Option<u64>,
-        ) -> Result<CubeWorkspaceLease> {
-            self.inner
-                .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, resume_pr)
-                .await
-        }
-
-        async fn release_workspace(&self, lease_id: &str) -> Result<()> {
-            self.inner.release_workspace(lease_id).await
-        }
-
-        async fn heartbeat_lease(
-            &self,
-            lease_id: &str,
-            ttl_seconds: Option<u64>,
-        ) -> Result<()> {
-            self.inner.heartbeat_lease(lease_id, ttl_seconds).await
-        }
-
-        async fn force_release_lease(
-            &self,
-            lease_id: &str,
-            reason: Option<&str>,
-        ) -> Result<()> {
-            self.inner.force_release_lease(lease_id, reason).await
-        }
-
-        async fn create_change(
-            &self,
-            workspace_path: &std::path::Path,
-            title: &str,
-        ) -> Result<CubeChangeHandle> {
-            self.inner.create_change(workspace_path, title).await
-        }
-
-        async fn checkout_pr_head_for_review(
-            &self,
-            workspace_path: &std::path::Path,
-            pr_url: &str,
-            repo_slug: &str,
-        ) -> Result<String> {
-            self.checkout_calls.lock().await.push((
-                workspace_path.to_path_buf(),
-                pr_url.to_owned(),
-                repo_slug.to_owned(),
-            ));
-            match &self.checkout_sha {
-                Some(sha) => Ok(sha.clone()),
-                None => Err(anyhow!("simulated reviewer checkout failure")),
-            }
-        }
-
-        async fn workspace_status(
-            &self,
-            workspace_path: &std::path::Path,
-        ) -> Result<CubeWorkspaceStatus> {
-            self.inner.workspace_status(workspace_path).await
-        }
-
-        async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-            self.inner.list_workspaces().await
-        }
-
-        async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-            self.inner.list_repos().await
-        }
-
-        fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
-            self.inner.command_repr(args)
-        }
-
-        async fn spawn_worker(
-            &self,
-            worker_id: &str,
-            execution: &crate::work::WorkExecution,
-            work_item: &crate::work::WorkItem,
-            workspace_path: &std::path::Path,
-            cube_change_id: Option<&str>,
-        ) -> Result<crate::runner::RunOutcome> {
-            self.inner
-                .spawn_worker(worker_id, execution, work_item, workspace_path, cube_change_id)
-                .await
-        }
-    }
-
-    /// A `HostAdapterProvider` that always returns the same adapter regardless
-    /// of which host is requested. Used in checkout tests to inject the
-    /// `CheckoutControllingHostAdapter`.
-    struct StaticHostAdapterProvider {
-        adapter: Arc<dyn HostAdapter>,
-    }
-
-    #[async_trait]
-    impl HostAdapterProvider for StaticHostAdapterProvider {
-        async fn adapter_for(&self, _host: &Host) -> Result<Arc<dyn HostAdapter>> {
-            Ok(Arc::clone(&self.adapter))
-        }
-    }
 
     /// Helper: create a product + chore pair and return their ids. When
     /// `pr_url` is `Some`, the chore's `pr_url` field is also set so that
-    /// `schedule_execution` picks it up for the reviewer checkout path.
+    /// `schedule_execution` picks it up for the reviewer positioning path.
     fn make_pr_review_fixture(
         db: &WorkDb,
         pr_url: Option<&str>,
@@ -9721,10 +9515,11 @@ mod tests {
     }
 
     /// When a `pr_review` execution has a non-empty `pr_url` on its task,
-    /// `schedule_execution` must call `checkout_pr_head_for_review` and must
-    /// NOT call `create_change`.
+    /// `schedule_execution` must lease the workspace with `--resume_pr <n>` and
+    /// must NOT call `create_change`. Cube's `--resume_pr` positioning (during
+    /// the lease) replaces the old post-lease `checkout_pr_head_for_review` call.
     #[tokio::test]
-    async fn pr_review_with_pr_url_calls_checkout_not_create_change() {
+    async fn pr_review_with_pr_url_leases_with_resume_pr_not_create_change() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -9747,15 +9542,6 @@ mod tests {
             ..FakeExecutionRunner::default()
         });
 
-        let checkout_adapter = Arc::new(CheckoutControllingHostAdapter {
-            inner: Arc::new(LocalHostAdapter::new(
-                Arc::clone(&cube) as Arc<dyn CubeClient>,
-                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
-            )),
-            checkout_sha: Some("abc123deadbeef".to_owned()),
-            checkout_calls: Mutex::new(Vec::new()),
-        });
-
         let mut coord = ExecutionCoordinator::new(
             db.clone(),
             WorkerPool::new(1),
@@ -9763,9 +9549,6 @@ mod tests {
             runner.clone(),
         );
         coord.set_review_pool(WorkerPool::new_review(1));
-        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
-            adapter: Arc::clone(&checkout_adapter) as Arc<dyn HostAdapter>,
-        }));
         let coordinator = Arc::new(coord);
 
         let worker_id = coordinator
@@ -9779,26 +9562,29 @@ mod tests {
             .await;
         assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
-        // Checkout was called with the correct pr_url.
-        let calls = checkout_adapter.checkout_calls.lock().await;
-        assert_eq!(calls.len(), 1, "checkout must be called exactly once");
+        // lease_workspace was called with resume_pr = Some(42) for PR #42.
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(calls.len(), 1, "lease_workspace must be called exactly once");
         assert_eq!(
-            calls[0].1, pr_url,
-            "checkout must receive the task's pr_url"
+            calls[0].4,
+            Some(42),
+            "lease_workspace must receive resume_pr = Some(42) for PR #42"
         );
+        drop(calls);
 
-        // create_change must NOT have been called — reviewer path skips it.
+        // create_change must NOT have been called — positioning happened in cube.
         assert!(
             cube.create_calls.lock().await.is_empty(),
-            "create_change must not be called for the reviewer checkout path"
+            "create_change must not be called for the reviewer positioning path"
         );
     }
 
-    /// When `checkout_pr_head_for_review` fails, `schedule_execution` must
-    /// record a `reviewer_pr_checkout_failed` start failure and release the
-    /// workspace.
+    /// When a `pr_review` lease fails (which now includes `--resume_pr`
+    /// positioning), `schedule_execution` must record a
+    /// `cube_workspace_lease_failed` start failure and must not release a
+    /// workspace (none was acquired).
     #[tokio::test]
-    async fn pr_review_checkout_failure_records_start_failure_and_releases_workspace() {
+    async fn pr_review_lease_with_resume_pr_failure_records_start_failure() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
 
@@ -9815,17 +9601,13 @@ mod tests {
             )
             .unwrap();
 
-        let cube = Arc::new(FakeCubeClient::default());
-        let runner = Arc::new(FakeExecutionRunner::default());
-
-        let checkout_adapter = Arc::new(CheckoutControllingHostAdapter {
-            inner: Arc::new(LocalHostAdapter::new(
-                Arc::clone(&cube) as Arc<dyn CubeClient>,
-                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
-            )),
-            checkout_sha: None, // fail
-            checkout_calls: Mutex::new(Vec::new()),
+        // fail_lease simulates cube's --resume_pr positioning failing inside
+        // the `cube workspace lease` call itself (e.g. PR not found, merged PR).
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease: true,
+            ..FakeCubeClient::default()
         });
+        let runner = Arc::new(FakeExecutionRunner::default());
 
         let mut coord = ExecutionCoordinator::new(
             db.clone(),
@@ -9834,9 +9616,6 @@ mod tests {
             runner.clone(),
         );
         coord.set_review_pool(WorkerPool::new_review(1));
-        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
-            adapter: Arc::clone(&checkout_adapter) as Arc<dyn HostAdapter>,
-        }));
         // Disable retries so the pre-start failure is terminal immediately.
         let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
 
@@ -9851,27 +9630,26 @@ mod tests {
             .await;
         assert!(
             result.is_err(),
-            "schedule_execution must fail when checkout fails"
+            "schedule_execution must fail when the lease (including --resume_pr) fails"
         );
 
-        // The workspace lease must have been released.
-        assert_eq!(
-            cube.release_calls.lock().await.len(),
-            1,
-            "workspace must be released after checkout failure"
+        // No workspace was ever leased so there is nothing to release.
+        assert!(
+            cube.release_calls.lock().await.is_empty(),
+            "no release should occur when the lease itself failed"
         );
 
-        // A reviewer_pr_checkout_failed attention item must exist.
+        // A cube_workspace_lease_failed attention item must exist.
         let items = db.list_attention_items(&execution.id).unwrap();
         assert!(
-            items.iter().any(|i| i.kind == "reviewer_pr_checkout_failed"),
-            "expected a reviewer_pr_checkout_failed attention item, got {:?}",
+            items.iter().any(|i| i.kind == "cube_workspace_lease_failed"),
+            "expected a cube_workspace_lease_failed attention item, got {:?}",
             items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
         );
     }
 
     /// When a `pr_review` execution has no `pr_url` on its task, the normal
-    /// `create_change` path must be used and checkout must not be called.
+    /// `create_change` path must be used.
     #[tokio::test]
     async fn pr_review_without_pr_url_uses_create_change_path() {
         let dir = tempdir().unwrap();
@@ -9896,15 +9674,6 @@ mod tests {
             ..FakeExecutionRunner::default()
         });
 
-        let checkout_adapter = Arc::new(CheckoutControllingHostAdapter {
-            inner: Arc::new(LocalHostAdapter::new(
-                Arc::clone(&cube) as Arc<dyn CubeClient>,
-                Arc::clone(&runner) as Arc<dyn ExecutionRunner>,
-            )),
-            checkout_sha: Some("would-not-be-called".to_owned()),
-            checkout_calls: Mutex::new(Vec::new()),
-        });
-
         let mut coord = ExecutionCoordinator::new(
             db.clone(),
             WorkerPool::new(1),
@@ -9912,9 +9681,6 @@ mod tests {
             runner.clone(),
         );
         coord.set_review_pool(WorkerPool::new_review(1));
-        coord.set_host_adapter_provider(Arc::new(StaticHostAdapterProvider {
-            adapter: Arc::clone(&checkout_adapter) as Arc<dyn HostAdapter>,
-        }));
         let coordinator = Arc::new(coord);
 
         let worker_id = coordinator
@@ -9931,11 +9697,16 @@ mod tests {
             "schedule_execution must succeed on the create_change path: {result:?}"
         );
 
-        // checkout must NOT have been called — no pr_url means create_change path.
-        assert!(
-            checkout_adapter.checkout_calls.lock().await.is_empty(),
-            "checkout_pr_head_for_review must not be called when pr_url is absent"
+        // lease_workspace must NOT have received resume_pr — no pr_url means
+        // no PR positioning during the lease.
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(calls.len(), 1, "lease_workspace must be called exactly once");
+        assert_eq!(
+            calls[0].4,
+            None,
+            "lease_workspace must NOT receive resume_pr when pr_url is absent"
         );
+        drop(calls);
 
         // create_change must have been called once.
         assert_eq!(
