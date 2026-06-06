@@ -210,6 +210,14 @@ enum EngineEvent {
     /// persisted the new value. The Settings window uses this as the
     /// "saved" signal.
     case settingSet(key: String, enabled: Bool)
+    /// Response to `list_hosts` — all registered hosts with capabilities.
+    case hostsList(hosts: [EngineHost])
+    /// Response to `add_host` or `get_host` — one host with capabilities.
+    case hostResult(host: EngineHost)
+    /// Response to `set_host_enabled`, `add_host_tag`, or `remove_host_tag`.
+    case hostUpdated(host: EngineHost)
+    /// Response to `remove_host` — the named host was deleted.
+    case hostRemoved(id: String)
     /// Response to `metrics_list_live` — bulk snapshot of every
     /// registered engine counter and gauge, sorted by name. Drives the
     /// Metrics debug pane's initial load and its polling timer.
@@ -420,6 +428,53 @@ final class EngineClient: @unchecked Sendable {
             "key": key,
             "enabled": enabled,
         ])
+    }
+
+    /// Fetch the full host registry (including `local`).
+    func sendListHosts() {
+        sendLine(["type": "list_hosts"])
+    }
+
+    /// Fetch one host by id.
+    func sendGetHost(id: String) {
+        sendLine(["type": "get_host", "id": id])
+    }
+
+    /// Register a new SSH remote host. The engine pushes the wrapper
+    /// script and replies with `host_result` (enabled) or `host_result`
+    /// with `enabled = false` and `last_error_text` set (push failed).
+    func sendAddHost(id: String, sshTarget: String, poolSize: Int = 1, tags: [String] = []) {
+        sendLine([
+            "type": "add_host",
+            "id": id,
+            "ssh_target": sshTarget,
+            "pool_size": poolSize,
+            "tags": tags,
+        ])
+    }
+
+    /// Enable or disable a registered host.
+    func sendSetHostEnabled(id: String, enabled: Bool) {
+        sendLine([
+            "type": "set_host_enabled",
+            "id": id,
+            "enabled": enabled,
+        ])
+    }
+
+    /// Deregister a remote host. Fails for the built-in `local` host.
+    func sendRemoveHost(id: String) {
+        sendLine(["type": "remove_host", "id": id])
+    }
+
+    /// Add a user-defined capability tag to a host.
+    func sendAddHostTag(hostId: String, tag: String) {
+        sendLine(["type": "add_host_tag", "host_id": hostId, "tag": tag])
+    }
+
+    /// Remove a user-defined capability tag from a host.
+    func sendRemoveHostTag(hostId: String, tag: String) {
+        sendLine(["type": "remove_host_tag", "host_id": hostId, "tag": tag])
     }
 
     /// Ask the engine for a live snapshot of every registered metric.
@@ -1521,6 +1576,25 @@ final class EngineClient: @unchecked Sendable {
                 if !key.isEmpty {
                     emit(.settingSet(key: key, enabled: enabled))
                 }
+            case "hosts_list":
+                let raw = payload["hosts"] as? [[String: Any]] ?? []
+                let hosts = raw.compactMap(parseEngineHost)
+                emit(.hostsList(hosts: hosts))
+            case "host_result":
+                if let raw = payload["host"] as? [String: Any],
+                   let host = parseEngineHost(raw) {
+                    emit(.hostResult(host: host))
+                }
+            case "host_updated":
+                if let raw = payload["host"] as? [String: Any],
+                   let host = parseEngineHost(raw) {
+                    emit(.hostUpdated(host: host))
+                }
+            case "host_removed":
+                let hostId = payload["id"] as? String ?? ""
+                if !hostId.isEmpty {
+                    emit(.hostRemoved(id: hostId))
+                }
             case "metrics_list_live_result":
                 let raw = payload["entries"] as? [[String: Any]] ?? []
                 let entries = raw.compactMap(parseEngineMetric)
@@ -2210,6 +2284,36 @@ final class EngineClient: @unchecked Sendable {
             return nil
         }
         return EngineHealthIssue(kind: kind, severity: severity, title: title, body: body)
+    }
+
+    private func parseEngineHost(_ payload: [String: Any]) -> EngineHost? {
+        guard
+            let hostId = payload["id"] as? String,
+            !hostId.isEmpty,
+            let poolSize = (payload["pool_size"] as? NSNumber)?.intValue,
+            let enabled = (payload["enabled"] as? NSNumber)?.boolValue,
+            let createdAt = payload["created_at"] as? String
+        else {
+            return nil
+        }
+        let rawCaps = payload["capabilities"] as? [[String: Any]] ?? []
+        let capabilities = rawCaps.compactMap { cap -> EngineHostCapability? in
+            guard
+                let capability = cap["capability"] as? String,
+                let source = cap["source"] as? String
+            else { return nil }
+            return EngineHostCapability(capability: capability, source: source)
+        }
+        return EngineHost(
+            hostId: hostId,
+            sshTarget: payload["ssh_target"] as? String,
+            poolSize: poolSize,
+            enabled: enabled,
+            lastSeenAt: payload["last_seen_at"] as? String,
+            lastErrorText: payload["last_error_text"] as? String,
+            createdAt: createdAt,
+            capabilities: capabilities
+        )
     }
 
     private func parseEngineSetting(_ payload: [String: Any]) -> EngineSetting? {

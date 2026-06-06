@@ -21,6 +21,10 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Engine", systemImage: "gearshape")
                 }
+            HostRegistryPane()
+                .tabItem {
+                    Label("Hosts", systemImage: "server.rack")
+                }
             FeatureFlagsViewer()
                 .tabItem {
                     Label("Feature Flags", systemImage: "flag")
@@ -40,7 +44,7 @@ struct SettingsView: View {
             // current truth, not a snapshot from minutes ago.
             chatModel.refreshEngineHealth()
         }
-        .frame(minWidth: 560, minHeight: 360)
+        .frame(minWidth: 560, minHeight: 400)
     }
 }
 

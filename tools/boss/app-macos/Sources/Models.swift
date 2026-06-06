@@ -2130,6 +2130,30 @@ struct EngineHealthIssue: Identifiable, Hashable {
     let body: String
 }
 
+/// One registered host, decoded from a `hosts_list` / `host_result` /
+/// `host_updated` response. Mirrors `boss_protocol::HostSnapshot`.
+struct EngineHost: Identifiable, Hashable {
+    var id: String { hostId }
+    let hostId: String
+    let sshTarget: String?
+    let poolSize: Int
+    let enabled: Bool
+    let lastSeenAt: String?
+    let lastErrorText: String?
+    let createdAt: String
+    let capabilities: [EngineHostCapability]
+
+    var isLocal: Bool { hostId == "local" }
+}
+
+/// One capability on a registered host.
+struct EngineHostCapability: Identifiable, Hashable {
+    var id: String { "\(capability):\(source)" }
+    let capability: String
+    /// `"auto"` (engine-discovered) or `"user"` (manually tagged).
+    let source: String
+}
+
 /// Snapshot of one engine feature flag, decoded from a
 /// `feature_flags_list` response. Mirrors the engine's
 /// `boss_protocol::FeatureFlagSnapshot` one-for-one.

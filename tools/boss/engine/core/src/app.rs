@@ -61,6 +61,7 @@ mod engine_meta;
 mod executions;
 mod external_tracker;
 mod github_auth;
+mod hosts;
 mod live_status;
 mod metrics;
 mod panes;
@@ -2363,6 +2364,8 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::AddDependency { .. } => {
                 dependencies::handle_add_dependency(ctx, r).await
             }
+            r @ FrontendRequest::AddHost { .. } => hosts::handle_add_host(ctx, r).await,
+            r @ FrontendRequest::AddHostTag { .. } => hosts::handle_add_host_tag(ctx, r).await,
             r @ FrontendRequest::AnswerAttention { .. } => {
                 attentions::handle_answer_attention(ctx, r).await
             }
@@ -2503,6 +2506,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetExecution { .. } => {
                 executions::handle_get_execution(ctx, r).await
             }
+            r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => {
@@ -2581,6 +2585,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListFeatureFlags => {
                 engine_meta::handle_list_feature_flags(ctx, r).await
             }
+            r @ FrontendRequest::ListHosts => hosts::handle_list_hosts(ctx, r).await,
             r @ FrontendRequest::ListLiveStatusDisabledSlots => {
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }
@@ -2633,6 +2638,10 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RemoveDependency { .. } => {
                 dependencies::handle_remove_dependency(ctx, r).await
             }
+            r @ FrontendRequest::RemoveHost { .. } => hosts::handle_remove_host(ctx, r).await,
+            r @ FrontendRequest::RemoveHostTag { .. } => {
+                hosts::handle_remove_host_tag(ctx, r).await
+            }
             r @ FrontendRequest::ReorderProjectTasks { .. } => {
                 projects::handle_reorder_project_tasks(ctx, r).await
             }
@@ -2668,6 +2677,9 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::SetFeatureFlag { .. } => {
                 engine_meta::handle_set_feature_flag(ctx, r).await
+            }
+            r @ FrontendRequest::SetHostEnabled { .. } => {
+                hosts::handle_set_host_enabled(ctx, r).await
             }
             r @ FrontendRequest::SetLiveStatusEnabled { .. } => {
                 live_status::handle_set_live_status_enabled(ctx, r).await

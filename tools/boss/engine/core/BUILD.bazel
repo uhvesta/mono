@@ -18,6 +18,7 @@ rust_library(
         "src/app/external_tracker.rs",
         "src/app/github_auth.rs",
         "src/app/handler_helpers.rs",
+        "src/app/hosts.rs",
         "src/app/live_status.rs",
         "src/app/metrics.rs",
         "src/app/panes.rs",

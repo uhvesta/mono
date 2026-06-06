@@ -90,7 +90,6 @@ exclude_structs = [
   "protocol/src/live_status_debug.rs::LiveStatusSlotDebug",
   "protocol/src/live_worker_state.rs::LiveWorkerState",
   "protocol/src/wire.rs::WorkspacePoolEntry",
-  "protocol/src/wire.rs::MetricLiveEntry",
 ]
 
 [checks.policy]

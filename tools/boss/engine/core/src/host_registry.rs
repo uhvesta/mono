@@ -299,6 +299,18 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Record a human-readable error description on the host row.
+    /// Called when an eager wrapper push fails at registration time so the
+    /// UI can surface the cause without the user needing to check logs.
+    pub fn set_host_last_error(&self, id: &str, text: Option<&str>) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE hosts SET last_error_text = ?1 WHERE id = ?2",
+            params![text, id],
+        )?;
+        Ok(())
+    }
+
     /// Delete a host. Fails if live executions reference it (by convention;
     /// Phase 1 has no dispatch so the check is always trivially true).
     pub fn remove_host(&self, id: &str) -> Result<()> {

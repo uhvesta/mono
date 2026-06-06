@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
+use crate::health_wire::EngineHealthReport;
+use crate::host_registry_wire::HostSnapshot;
+use crate::metrics_wire::MetricLiveEntry;
 use crate::live_worker_state::LiveWorkerState;
 use crate::types::{
     AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
@@ -67,6 +70,10 @@ pub fn magic_wand_dispatch_topic(dispatch_id: &str) -> String {
 /// PreToolUse hook decision so the UI can badge product cards.
 pub fn editorial_actions_topic(product_id: &str) -> String {
     format!("editorial_actions.{product_id}")
+}
+
+fn default_pool_size() -> i64 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +172,29 @@ pub enum FrontendRequest {
     AddDependency {
         #[serde(flatten)]
         input: AddDependencyInput,
+    },
+
+    /// Register a new remote SSH host. The engine stores the row,
+    /// then eagerly pushes the `boss-remote-run` wrapper and runs
+    /// capability discovery — identical to `bossctl hosts add`. On
+    /// success replies with [`FrontendEvent::HostResult`]. On failure
+    /// replies with [`FrontendEvent::Error`] with a human-readable
+    /// message. The host row is created before the push; if the push
+    /// fails the host is left disabled (same policy as the CLI).
+    AddHost {
+        id: String,
+        ssh_target: String,
+        #[serde(default = "default_pool_size")]
+        pool_size: i64,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+
+    /// Add one user-defined capability tag to a registered host.
+    /// Replies with [`FrontendEvent::HostUpdated`] on success.
+    AddHostTag {
+        host_id: String,
+        tag: String,
     },
 
     /// Record the human's answer for one attention member (`atn_…`).
@@ -588,6 +618,13 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Full details for one registered host, including all capabilities.
+    /// Replies with [`FrontendEvent::HostResult`] or
+    /// [`FrontendEvent::Error`] when the id is unknown.
+    GetHost {
+        id: String,
+    },
+
     GetRun {
         id: String,
     },
@@ -828,6 +865,11 @@ pub enum FrontendRequest {
     /// Read-only; no side effects.
     ListFeatureFlags,
 
+    /// All registered hosts with their enabled state and capabilities.
+    /// Includes the built-in `local` host. Replies with
+    /// [`FrontendEvent::HostsList`].
+    ListHosts,
+
     /// Snapshot of which slots currently have the live-status
     /// summarizer disabled. The UI uses this to render the toggle
     /// state on the Agents-tab worker row.
@@ -1055,6 +1097,22 @@ pub enum FrontendRequest {
         input: RemoveDependencyInput,
     },
 
+    /// Deregister a remote host. Fails for the built-in `local` host
+    /// (matching the `bossctl hosts remove` invariant). Replies with
+    /// [`FrontendEvent::HostRemoved`] on success or
+    /// [`FrontendEvent::Error`] on failure.
+    RemoveHost {
+        id: String,
+    },
+
+    /// Remove one user-defined capability tag from a host. Only user
+    /// tags can be removed; auto-discovered tags are managed by the
+    /// engine heartbeat. Replies with [`FrontendEvent::HostUpdated`].
+    RemoveHostTag {
+        host_id: String,
+        tag: String,
+    },
+
     ReorderProjectTasks {
         project_id: String,
         task_ids: Vec<String>,
@@ -1169,6 +1227,14 @@ pub enum FrontendRequest {
     /// state and is the round-trip "the engine has reloaded" signal
     /// the debug pane uses to render the toggle as committed.
     SetFeatureFlag { name: String, enabled: bool },
+
+    /// Enable or disable a registered host. Disabled hosts receive no
+    /// new work dispatches. Replies with [`FrontendEvent::HostUpdated`]
+    /// on success or [`FrontendEvent::Error`] when the id is unknown.
+    SetHostEnabled {
+        id: String,
+        enabled: bool,
+    },
 
     /// Per-slot toggle for the live-status summarizer. When
     /// `enabled = false`, the engine stops calling the summarizer for
@@ -2002,6 +2068,19 @@ pub enum FrontendEvent {
     /// persisted the new value. The macOS Settings window uses this as
     /// the "saved" signal to commit the toggle state.
     SettingSet { key: String, enabled: bool },
+    /// Response to [`FrontendRequest::ListHosts`]: every registered
+    /// host (including `local`) with its capabilities.
+    HostsList { hosts: Vec<HostSnapshot> },
+    /// Response to [`FrontendRequest::GetHost`] or
+    /// [`FrontendRequest::AddHost`]: one host with all capabilities.
+    HostResult { host: HostSnapshot },
+    /// Response to [`FrontendRequest::SetHostEnabled`],
+    /// [`FrontendRequest::AddHostTag`], or
+    /// [`FrontendRequest::RemoveHostTag`]: the updated host snapshot.
+    HostUpdated { host: HostSnapshot },
+    /// Response to [`FrontendRequest::RemoveHost`]: the host has been
+    /// deleted. `id` is the id that was removed.
+    HostRemoved { id: String },
     /// Response to [`FrontendRequest::MetricsShowLive`]: the
     /// in-memory snapshot for `name`. `entry` is `None` when no
     /// counter or gauge with that name is registered in the current
@@ -2284,59 +2363,6 @@ pub struct FeatureFlagSnapshot {
     pub enabled: bool,
 }
 
-/// Engine-side health snapshot returned by
-/// [`FrontendEvent::EngineHealthResult`]. The chore that introduced
-/// this surface (#699) was triggered by silent summarization failure
-/// when `ANTHROPIC_API_KEY` is missing — the macOS app showed nothing,
-/// the user only noticed because live-status sentences never appeared.
-///
-/// `issues` is the structured list the UI renders. It is intentionally
-/// extensible: the chore notes other required config (engine socket
-/// path, etc.) "likely also applies", so the shape is "report a list
-/// of named problems" rather than a one-off boolean.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EngineHealthReport {
-    /// True iff the engine's agent config had an `ANTHROPIC_API_KEY`
-    /// at startup. Surfaced as a top-level bit (rather than only via
-    /// the `issues` list) so a CLI consumer doing
-    /// `boss engine health --json | jq .anthropic_api_key_present`
-    /// gets a single boolean without having to grep through the issues
-    /// array.
-    pub anthropic_api_key_present: bool,
-    /// True when dispatch is globally paused. A paused engine will not
-    /// dispatch new executions from any source until explicitly resumed via
-    /// `SetDispatchPaused { paused: false }`. Surfaced as a top-level field
-    /// (in addition to the `issues` list entry) so CLI consumers can check
-    /// it with a simple `jq .dispatch_paused`.
-    #[serde(default)]
-    pub dispatch_paused: bool,
-    /// Issues the UI should render, in display order (highest priority
-    /// first). Empty when the engine is healthy.
-    pub issues: Vec<EngineHealthIssue>,
-}
-
-/// One UI-actionable engine-health issue. Carries pre-rendered title
-/// and body strings so the macOS app can show the banner without
-/// translating engine state into prose at the call site. The engine
-/// owns the wording; the UI owns the styling.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EngineHealthIssue {
-    /// Stable lowercase snake_case kind identifier. The UI uses this
-    /// as a styling / icon / dismissal-state key. Initial values:
-    /// - `missing_anthropic_api_key` — engine started without an
-    ///   `ANTHROPIC_API_KEY`; summarizer cannot succeed.
-    pub kind: String,
-    /// `"error"` (a user-visible feature is broken) or `"warning"`
-    /// (a background feature is degraded). The banner styling keys
-    /// off this so an error renders in red and a warning in amber.
-    pub severity: String,
-    /// One-line title rendered inline in the banner.
-    pub title: String,
-    /// Multi-line body with the remediation steps (e.g. which env var
-    /// to set and where to restart). The UI wraps and renders verbatim.
-    pub body: String,
-}
-
 /// Snapshot of one per-installation setting's static metadata + current
 /// value. Wire type for [`FrontendEvent::SettingsList`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2399,27 +2425,6 @@ pub enum TopicEventPayload {
     WorkEditorialAction {
         action: EditorialAction,
     },
-}
-
-/// In-memory snapshot of one metric (counter or gauge), returned by
-/// [`FrontendEvent::MetricsShowLiveResult`]. Values are read directly
-/// from the engine's atomics so they are not subject to the 30s
-/// flush-staleness window.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MetricLiveEntry {
-    pub name: String,
-    pub description: String,
-    /// `"counter"` or `"gauge"`.
-    pub kind: String,
-    /// Counter value cast to `i64` (same bit pattern — values above
-    /// `i64::MAX` are theoretical). Gauge value is a signed `i64`.
-    pub value: i64,
-    /// Milliseconds since Unix epoch of the last increment (counter)
-    /// or set (gauge). 0 means "never updated since registration".
-    pub timestamp_ms: i64,
-    /// True when this entry was rehydrated from `state.db` but no
-    /// handle in the current binary matches its name.
-    pub stale: bool,
 }
 
 #[cfg(test)]
@@ -2667,6 +2672,8 @@ mod editorial_controls_tests {
 #[cfg(test)]
 mod feature_flags_wire_tests {
     use super::*;
+    use crate::health_wire::{EngineHealthIssue, EngineHealthReport};
+    use crate::metrics_wire::MetricLiveEntry;
 
     #[test]
     fn list_feature_flags_request_round_trips() {
