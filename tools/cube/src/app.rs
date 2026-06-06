@@ -339,6 +339,95 @@ fn run_repo(
                 }),
             )
         }
+        RepoCommand::Remove {
+            repo,
+            force,
+            purge_workspaces,
+        } => {
+            // Idempotent: removing a non-existent repo is a clean no-op.
+            let Some(record) = store.get_repo(&repo)? else {
+                return RunResult::new(
+                    format!("Repo `{repo}` is not configured; nothing to remove."),
+                    json!({ "repo": repo, "removed": false }),
+                );
+            };
+
+            let _lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
+
+            // Collect workspace info before deletion (needed for lease check + purge).
+            let workspaces = store.list_workspaces(&repo)?;
+            let leased: Vec<&WorkspaceRecord> = workspaces
+                .iter()
+                .filter(|w| w.state == WorkspaceState::Leased)
+                .collect();
+            if !leased.is_empty() && !force {
+                let ids = leased
+                    .iter()
+                    .map(|w| w.workspace_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(CubeError::InvalidArgument(format!(
+                    "repo `{repo}` has {} leased workspace(s) ({}); release them first or pass --force",
+                    leased.len(),
+                    ids,
+                )));
+            }
+
+            let workspace_paths: Vec<PathBuf> =
+                workspaces.iter().map(|w| w.workspace_path.clone()).collect();
+            let workspace_count = workspaces.len();
+
+            // Delete the repo row; FK cascades remove workspaces, workspace_setup,
+            // and changes rows automatically.
+            store.delete_repo(&repo)?;
+
+            // Optionally remove on-disk workspace directories.
+            let mut purged_dirs: Vec<String> = Vec::new();
+            if purge_workspaces {
+                for path in &workspace_paths {
+                    match fs::remove_dir_all(path) {
+                        Ok(()) => purged_dirs.push(path.display().to_string()),
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            eprintln!(
+                                "warning: failed to remove workspace dir {}: {err}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+            }
+
+            audit!(
+                database_path,
+                "repo.removed",
+                repo = record.repo,
+                workspace_count = workspace_count,
+                forced = force,
+                purged_workspaces = purge_workspaces,
+            );
+
+            let message = if purge_workspaces {
+                format!(
+                    "Removed repo `{repo}` ({workspace_count} workspace(s)) from the registry and deleted on-disk directories."
+                )
+            } else {
+                format!(
+                    "Removed repo `{repo}` ({workspace_count} workspace(s)) from the registry (on-disk directories left intact)."
+                )
+            };
+            RunResult::new(
+                message,
+                json!({
+                    "repo": record,
+                    "workspace_count": workspace_count,
+                    "removed": true,
+                    "forced": force,
+                    "purged_workspaces": purge_workspaces,
+                    "purged_dirs": purged_dirs,
+                }),
+            )
+        }
     }
 }
 
@@ -13537,5 +13626,156 @@ steps:
             Some(original_since),
             "unhealthy_since should not be reset when transitioning between unhealthy states"
         );
+    }
+
+    #[test]
+    fn repo_remove_nonexistent_is_no_op() {
+        let (_tempdir, database_path) = with_database_path();
+
+        let cli = Cli::parse_from(["cube", "repo", "remove", "does-not-exist"]);
+        let result = run_with_dependencies(cli, Some(&database_path), &FakeRunner::default())
+            .expect("remove of non-existent repo should succeed");
+
+        assert_eq!(result.payload["removed"], false);
+        assert_eq!(result.payload["repo"], "does-not-exist");
+    }
+
+    #[test]
+    fn repo_remove_deletes_repo_and_cascades() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        // Register a repo.
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@example.com:org/mono.git",
+                "--workspace-root",
+                workspace_root.to_str().unwrap(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo add");
+
+        // Populate two workspace rows directly via the store.
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[
+                        WorkspaceCandidate {
+                            workspace_id: "mono-agent-001".to_string(),
+                            workspace_path: workspace_root.join("mono-agent-001"),
+                        },
+                        WorkspaceCandidate {
+                            workspace_id: "mono-agent-002".to_string(),
+                            workspace_path: workspace_root.join("mono-agent-002"),
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+
+        // Remove the repo via CLI.
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "repo", "remove", "mono"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo remove should succeed");
+
+        assert_eq!(result.payload["removed"], true);
+        assert_eq!(result.payload["workspace_count"], 2);
+
+        // Verify the repo and workspace rows are gone.
+        {
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).unwrap();
+            assert!(store.get_repo("mono").unwrap().is_none(), "repo row should be deleted");
+            assert!(
+                store.list_workspaces("mono").unwrap().is_empty(),
+                "workspace rows should be cascade-deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_remove_refuses_leased_without_force() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+
+        run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "repo",
+                "add",
+                "mono",
+                "--origin",
+                "git@example.com:org/mono.git",
+                "--workspace-root",
+                workspace_root.to_str().unwrap(),
+                "--workspace-prefix",
+                "mono-agent-",
+            ]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("repo add");
+
+        // Populate and lease one workspace.
+        {
+            use crate::metadata::WorkspaceCandidate;
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-001".to_string(),
+                        workspace_path: workspace_root.join("mono-agent-001"),
+                    }],
+                )
+                .unwrap();
+            store
+                .claim_workspace(
+                    "mono",
+                    "boss/worker-1",
+                    "demo task",
+                    "lease-001",
+                    100,
+                    Some(9999),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Remove without --force should fail.
+        let err = run_with_dependencies(
+            Cli::parse_from(["cube", "repo", "remove", "mono"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect_err("should fail with leased workspaces");
+        assert!(matches!(err, CubeError::InvalidArgument(_)));
+
+        // Remove with --force should succeed.
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "repo", "remove", "mono", "--force"]),
+            Some(&database_path),
+            &FakeRunner::default(),
+        )
+        .expect("--force remove should succeed");
+        assert_eq!(result.payload["removed"], true);
+        assert_eq!(result.payload["forced"], true);
     }
 }

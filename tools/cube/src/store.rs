@@ -710,6 +710,21 @@ impl Store {
             .map_err(CubeError::Storage)
     }
 
+    /// Delete a repo pool row. Returns `true` if the row existed and was deleted,
+    /// `false` if the repo was not registered (idempotent no-op).
+    ///
+    /// The existing `ON DELETE CASCADE` foreign keys cascade the deletion to
+    /// `workspaces`, `workspace_setup`, and `changes` automatically.
+    /// `PRAGMA foreign_keys = ON` is enforced by [`Store::migrate`] on every
+    /// connection, so the cascade always fires.
+    pub fn delete_repo(&self, repo: &str) -> Result<bool, CubeError> {
+        let count = self
+            .connection
+            .execute("DELETE FROM repos WHERE repo = ?1", params![repo])
+            .map_err(CubeError::Storage)?;
+        Ok(count > 0)
+    }
+
     pub fn forget_workspace(&self, repo: &str, workspace_id: &str) -> Result<(), CubeError> {
         self.connection
             .execute(
@@ -1579,5 +1594,67 @@ mod tests {
         assert_eq!(inserted, change);
         let fetched = store.get_change("chg_test").expect("get");
         assert_eq!(fetched, Some(change));
+    }
+
+    #[test]
+    fn delete_repo_cascades_workspaces_and_changes() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@example.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("repo");
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: workspace_root.join("mono-agent-001"),
+                }],
+            )
+            .expect("sync");
+
+        store
+            .insert_change(&ChangeRecord {
+                change_id: "chg_cascade_test".to_string(),
+                repo: "mono".to_string(),
+                workspace_path: workspace_root.join("mono-agent-001"),
+                parent_change_id: None,
+                title: "test".to_string(),
+                jj_change_id: "abc123".to_string(),
+                head_commit: "dead".to_string(),
+                created_at_epoch_s: 1,
+            })
+            .expect("change");
+
+        let removed = store.delete_repo("mono").expect("delete");
+        assert!(removed, "delete_repo should return true when the repo existed");
+
+        assert!(
+            store.get_repo("mono").expect("get").is_none(),
+            "repo row should be gone"
+        );
+        assert!(
+            store.list_workspaces("mono").expect("list").is_empty(),
+            "workspace rows should be cascade-deleted"
+        );
+        assert!(
+            store.get_change("chg_cascade_test").expect("get").is_none(),
+            "change row should be cascade-deleted"
+        );
+    }
+
+    #[test]
+    fn delete_repo_nonexistent_returns_false() {
+        let (_tempdir, store) = open_store();
+        let removed = store.delete_repo("does-not-exist").expect("delete");
+        assert!(!removed, "delete_repo should return false for unknown repo");
     }
 }

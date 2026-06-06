@@ -80,6 +80,21 @@ pub enum RepoCommand {
         /// Stable repo identifier such as `mono`.
         repo: String,
     },
+    /// Remove a repo pool and all its workspaces and changes.
+    ///
+    /// Deletes the repo row and cascades to workspace, workspace_setup, and
+    /// change records. By default the on-disk workspace directories are left
+    /// intact; pass `--purge-workspaces` to delete them too.
+    Remove {
+        /// Stable repo identifier such as `mono`.
+        repo: String,
+        /// Remove even if one or more workspaces in the pool are currently leased.
+        #[arg(long)]
+        force: bool,
+        /// Also delete on-disk workspace directories under the pool's workspace_root.
+        #[arg(long)]
+        purge_workspaces: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
