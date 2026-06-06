@@ -380,3 +380,274 @@ fn lift_finding_with_no_location_or_fix() {
     assert!(finding.suggested_fix.is_none());
     assert!(finding.remediations.is_empty());
 }
+
+// --- T4: access-scope lifting unit tests ---
+
+#[test]
+fn lift_access_scope_none_defaults_to_modified_only() {
+    let scope = super::lift_access_scope(None);
+    assert!(matches!(scope, crate::external::sandbox::AccessScope::ModifiedOnly));
+}
+
+#[test]
+fn lift_access_scope_modified_only_variant() {
+    let scope = super::lift_access_scope(Some(&super::wit_types::AccessScope::ModifiedOnly));
+    assert!(matches!(scope, crate::external::sandbox::AccessScope::ModifiedOnly));
+}
+
+#[test]
+fn lift_access_scope_whole_repo_variant() {
+    let scope = super::lift_access_scope(Some(&super::wit_types::AccessScope::WholeRepo));
+    assert!(matches!(scope, crate::external::sandbox::AccessScope::WholeRepo));
+}
+
+#[test]
+fn lift_access_scope_globs_variant_preserves_patterns() {
+    let patterns = vec!["**/*.rs".to_owned(), "**/Cargo.toml".to_owned()];
+    let scope =
+        super::lift_access_scope(Some(&super::wit_types::AccessScope::Globs(patterns.clone())));
+    match scope {
+        crate::external::sandbox::AccessScope::Globs(got) => assert_eq!(got, patterns),
+        other => panic!("expected Globs, got {other:?}"),
+    }
+}
+
+// --- T4: WASI sandbox integration tests ---
+//
+// These tests verify that the executor correctly creates the FS sandbox from
+// the declared access scope and that files outside the scope are absent from
+// the sandbox directory (structural enforcement — no WASI component binary is
+// needed to observe the preopened directory contents).
+
+#[test]
+fn sandbox_is_populated_only_with_changeset_files_for_modified_only_scope() {
+    use crate::external::sandbox::{AccessScope, HostCeiling, create_sandbox};
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+    use std::path::Path;
+
+    struct MapTree(std::collections::HashMap<PathBuf, Vec<u8>>);
+    impl SourceTree for MapTree {
+        fn read_file(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+            self.0
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not found: {}", path.display()))
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.0.contains_key(path)
+        }
+        fn list_dir(&self, _: &Path) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+        fn glob(&self, _: &str) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+    }
+
+    let tree = MapTree(
+        [
+            ("changed.rs", b"fn changed() {}".as_slice()),
+            ("bystander.rs", b"fn bystander() {}".as_slice()),
+        ]
+        .into_iter()
+        .map(|(p, c)| (PathBuf::from(p), c.to_vec()))
+        .collect(),
+    );
+
+    let cs = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("changed.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let dir = tempdir().expect("temp dir");
+    let ceiling = HostCeiling::new(dir.path());
+    let sandbox = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &ceiling)
+        .expect("create sandbox");
+
+    assert!(
+        sandbox.root.path().join("changed.rs").exists(),
+        "changed.rs must be in sandbox"
+    );
+    assert!(
+        !sandbox.root.path().join("bystander.rs").exists(),
+        "bystander.rs must NOT be in sandbox (outside scope)"
+    );
+}
+
+#[test]
+fn sandbox_grant_includes_glob_matched_files() {
+    use crate::external::sandbox::{AccessScope, HostCeiling, create_sandbox};
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use globset::{Glob, GlobSetBuilder};
+
+    struct GlobTree(HashMap<PathBuf, Vec<u8>>);
+    impl SourceTree for GlobTree {
+        fn read_file(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+            self.0
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not found: {}", path.display()))
+        }
+        fn exists(&self, path: &Path) -> bool {
+            self.0.contains_key(path)
+        }
+        fn list_dir(&self, _: &Path) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+        fn glob(&self, pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
+            let mut builder = GlobSetBuilder::new();
+            builder.add(Glob::new(pattern)?);
+            let set = builder.build()?;
+            let mut hits: Vec<PathBuf> = self
+                .0
+                .keys()
+                .filter(|p| set.is_match(p.as_path()))
+                .cloned()
+                .collect();
+            hits.sort();
+            Ok(hits)
+        }
+    }
+
+    let tree = GlobTree(
+        [
+            ("Cargo.toml", b"[package]".as_slice()),
+            ("lib/Cargo.toml", b"[package]".as_slice()),
+            ("src/main.rs", b"fn main() {}".as_slice()),
+        ]
+        .into_iter()
+        .map(|(p, c)| (PathBuf::from(p), c.to_vec()))
+        .collect(),
+    );
+
+    let cs = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src/main.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let dir = tempdir().expect("temp dir");
+    let ceiling = HostCeiling::new(dir.path());
+    let sandbox = create_sandbox(
+        &cs,
+        AccessScope::Globs(vec!["**/Cargo.toml".to_owned()]),
+        &tree,
+        &ceiling,
+    )
+    .expect("create sandbox");
+
+    // Changeset file + both Cargo.toml matches
+    assert!(sandbox.root.path().join("src/main.rs").exists(), "changeset file must be granted");
+    assert!(sandbox.root.path().join("Cargo.toml").exists(), "root Cargo.toml must be granted");
+    assert!(sandbox.root.path().join("lib/Cargo.toml").exists(), "lib Cargo.toml must be granted");
+}
+
+#[test]
+fn sandbox_deny_rejects_traversal_escape_in_changeset() {
+    use crate::external::sandbox::{AccessScope, HostCeiling, create_sandbox};
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+    use std::path::Path;
+
+    struct EmptyTree;
+    impl SourceTree for EmptyTree {
+        fn read_file(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("not found: {}", path.display())
+        }
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn list_dir(&self, _: &Path) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+        fn glob(&self, _: &str) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+    }
+
+    let cs = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("../../etc/passwd"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let dir = tempdir().expect("temp dir");
+    let ceiling = HostCeiling::new(dir.path());
+    let err = create_sandbox(&cs, AccessScope::ModifiedOnly, &EmptyTree, &ceiling)
+        .expect_err("traversal escape must be rejected");
+
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("traversal") || rendered.contains("invalid path"),
+        "expected traversal error, got: {rendered}"
+    );
+}
+
+#[test]
+fn sandbox_deny_rejects_absolute_path_in_changeset() {
+    use crate::external::sandbox::{AccessScope, HostCeiling, create_sandbox};
+    use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+    use std::path::Path;
+
+    struct EmptyTree;
+    impl SourceTree for EmptyTree {
+        fn read_file(&self, path: &Path) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("not found: {}", path.display())
+        }
+        fn exists(&self, _: &Path) -> bool {
+            false
+        }
+        fn list_dir(&self, _: &Path) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+        fn glob(&self, _: &str) -> anyhow::Result<Vec<PathBuf>> {
+            Ok(vec![])
+        }
+    }
+
+    let cs = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("/etc/passwd"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let dir = tempdir().expect("temp dir");
+    let ceiling = HostCeiling::new(dir.path());
+    let err = create_sandbox(&cs, AccessScope::ModifiedOnly, &EmptyTree, &ceiling)
+        .expect_err("absolute path must be rejected");
+
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("absolute") || rendered.contains("invalid path"),
+        "expected absolute-path error, got: {rendered}"
+    );
+}
+
+#[test]
+fn build_component_v1_linker_succeeds() {
+    use wasmtime::{Config, Engine};
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    let engine = Engine::new(&config).expect("build engine");
+    super::build_component_v1_linker(&engine).expect("build component-v1 linker with WASI");
+}
+
+#[test]
+fn host_state_with_empty_wasi_does_not_panic() {
+    let _ = super::HostState::with_empty_wasi();
+}
+
+#[test]
+fn host_state_with_sandbox_root_preopens_the_directory() {
+    let dir = tempdir().expect("temp dir");
+    fs::write(dir.path().join("probe.txt"), b"hello").expect("write probe file");
+    let state =
+        super::HostState::with_sandbox_root(dir.path()).expect("build HostState with sandbox root");
+    // The HostState was created — the preopened_dir call did not fail.
+    // (Runtime behavior is verified by the full component integration path once a
+    // test component binary is available.)
+    drop(state);
+}
