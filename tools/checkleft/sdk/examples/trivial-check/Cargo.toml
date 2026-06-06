@@ -1,0 +1,16 @@
+[package]
+name = "checkleft-trivial-check-example"
+version = "0.1.0"
+edition.workspace = true
+description = "Trivial example checkleft check component built with checkleft-check-sdk"
+
+# cdylib is required to compile this crate as a wasm component.
+# On the host target this produces a native shared library; on wasm32-wasip2
+# it produces the component .wasm artifact.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+checkleft-check-sdk = { path = "../../" }
+wit-bindgen = "0.51"
+serde = { workspace = true, features = ["derive"] }

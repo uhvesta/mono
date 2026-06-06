@@ -1,0 +1,16 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_proc_macro")
+
+rust_proc_macro(
+    name = "checkleft_check_sdk_macro",
+    srcs = ["src/lib.rs"],
+    # check.wit is embedded via include_str! at proc-macro compile time.
+    compile_data = ["//tools/checkleft/wit:check.wit"],
+    crate_name = "checkleft_check_sdk_macro",
+    edition = "2024",
+    visibility = [
+        "//tools/checkleft/sdk:__pkg__",
+        "//tools/checkleft/sdk/examples/trivial-check:__pkg__",
+    ],
+    deps = all_crate_deps(normal = True),
+)

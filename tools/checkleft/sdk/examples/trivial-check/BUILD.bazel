@@ -1,0 +1,21 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_shared_library")
+
+# On the host target this builds a native shared library (.so / .dylib).
+# On wasm32-wasip2 (via T9's rust_wasm_component rule) it builds the component.
+rust_shared_library(
+    name = "trivial_check",
+    srcs = ["src/lib.rs"],
+    crate_name = "checkleft_trivial_check_example",
+    edition = "2024",
+    proc_macro_deps = [
+        # The #[check] and export_checks! macros are provided by sdk-macro;
+        # they're re-exported from checkleft-check-sdk but Bazel requires the
+        # proc-macro target to be listed explicitly in the user's crate too.
+        "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
+    ] + all_crate_deps(proc_macro = True),
+    visibility = ["//tools/checkleft:__pkg__"],
+    deps = [
+        "//tools/checkleft/sdk:checkleft_check_sdk",
+    ] + all_crate_deps(normal = True),
+)

@@ -1,0 +1,34 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "checkleft_check_sdk",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "checkleft_check_sdk",
+    edition = "2024",
+    proc_macro_deps = [
+        "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
+    ] + all_crate_deps(proc_macro = True),
+    # Guests compile for wasm32-wasip2; the SDK must also build for the host
+    # target so that unit tests (rust_test below) work without a wasm toolchain.
+    visibility = [
+        "//tools/checkleft/sdk/examples:__subpackages__",
+    ],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "checkleft_check_sdk_test",
+    size = "small",
+    crate = ":checkleft_check_sdk",
+    proc_macro_deps = [
+        "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
+    ] + all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

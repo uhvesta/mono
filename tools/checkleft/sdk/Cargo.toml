@@ -1,0 +1,13 @@
+[package]
+name = "checkleft-check-sdk"
+version = "0.1.0"
+edition.workspace = true
+description = "Guest SDK for authoring checkleft checks as WebAssembly Component Model components"
+
+[dependencies]
+checkleft-check-sdk-macro = { path = "../sdk-macro" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }

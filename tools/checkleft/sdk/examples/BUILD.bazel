@@ -1,0 +1,2 @@
+# Placeholder so bazel can find the package boundary.
+# The trivial-check example has its own BUILD.bazel.
