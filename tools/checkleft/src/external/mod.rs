@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,9 +7,13 @@ use serde::Deserialize;
 
 use crate::path::validate_relative_path;
 
-/// Runtime tag for the `wasm` tier (sandboxed pure computation). The `wasm`
-/// manifest mode selects this runtime.
+/// Runtime tag for the legacy `sandbox-v1` wasm tier. Still referenced by
+/// `runtime.rs` execution for existing artifacts; no new manifests may use it
+/// (the `wasm` schema mode that selected it has been removed — see T7).
 pub const EXTERNAL_CHECK_RUNTIME_V1: &str = "sandbox-v1";
+/// Runtime tag for the `component` tier (WebAssembly Component Model). The
+/// `component` manifest mode selects this runtime.
+pub const EXTERNAL_CHECK_COMPONENT_RUNTIME_V1: &str = "component-v1";
 /// Runtime tag for the `declarative` tier (config-only, framework-owned
 /// invocation + declarative transforms). Subsumes the former `exec-v1` tier.
 pub const EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1: &str = "declarative-v1";
@@ -106,12 +109,38 @@ pub struct ExternalCheckPackage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCheckPackageImplementation {
-    /// The `wasm` tier: a sandboxed wasm artifact (pure computation).
+    /// The `component` tier: a WebAssembly Component Model artifact with
+    /// capability-scoped file access and resource limits.
+    Component(ExternalCheckComponentPackage),
+    /// The legacy `sandbox-v1` wasm tier: a sandboxed core wasm artifact.
+    /// Kept for runtime execution compatibility pending T11 cleanup.
     Artifact(ExternalCheckArtifactPackage),
     /// The `declarative` tier: framework-owned invocations + declarative
     /// transforms. Subsumes the former `exec` tier (via the `passthrough`
     /// transform).
     Declarative(ExternalCheckDeclarativePackage),
+}
+
+/// A WebAssembly Component Model check package parsed from a `mode = "component"`
+/// manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCheckComponentPackage {
+    pub artifact_path: String,
+    pub artifact_sha256: String,
+    pub limits: Option<ExternalCheckComponentLimits>,
+    /// Optional allowlist of check IDs exported by this component. When present,
+    /// must agree with what `list-checks` returns (defense-in-depth).
+    pub checks: Option<Vec<String>>,
+    pub provenance: Option<ExternalCheckArtifactProvenance>,
+}
+
+/// Per-manifest resource limits for a component-mode check. Values are clamped
+/// by a host ceiling at execution time so an out-of-tree manifest cannot grant
+/// itself unbounded resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCheckComponentLimits {
+    pub timeout_ms: Option<u64>,
+    pub max_memory_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,7 +278,7 @@ impl RawDeclarativeCheckManifest {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RawExternalCheckMode {
-    Wasm,
+    Component,
     Declarative,
 }
 
@@ -261,27 +290,35 @@ struct RawExternalCheckPackage {
     api_version: String,
     mode: RawExternalCheckMode,
     #[serde(default)]
-    capabilities: Option<RawExternalCheckCapabilities>,
-    #[serde(default)]
     artifact_path: Option<String>,
     #[serde(default)]
     artifact_sha256: Option<String>,
+    // Component-mode fields.
     #[serde(default)]
-    executable_path: Option<String>,
+    limits: Option<RawExternalCheckComponentLimits>,
     #[serde(default)]
-    args: Vec<String>,
+    checks: Vec<String>,
     #[serde(default)]
     provenance: Option<ExternalCheckArtifactProvenance>,
     // Declarative-mode fields. Declared explicitly (not flattened — `flatten` is
     // incompatible with `deny_unknown_fields`) so the existing single-parse +
-    // unknown-field rejection still holds. They are rejected in artifact/exec
-    // modes and required in declarative mode.
+    // unknown-field rejection still holds. They are rejected in component mode
+    // and required in declarative mode.
     #[serde(default)]
     applies_to: Vec<String>,
     #[serde(default)]
     needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
     #[serde(default)]
     invocations: Vec<declarative::RawInvocation>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExternalCheckComponentLimits {
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_memory_mb: Option<u64>,
 }
 
 impl RawExternalCheckPackage {
@@ -291,11 +328,10 @@ impl RawExternalCheckPackage {
             runtime,
             api_version,
             mode,
-            capabilities,
             artifact_path,
             artifact_sha256,
-            executable_path,
-            args,
+            limits,
+            checks,
             provenance,
             applies_to,
             needs,
@@ -319,23 +355,22 @@ impl RawExternalCheckPackage {
             );
         }
 
-        let capabilities = validate_capabilities(mode, capabilities)?;
         let implementation = match mode {
-            RawExternalCheckMode::Wasm => {
+            RawExternalCheckMode::Component => {
                 reject_declarative_fields(&declarative)?;
-                ExternalCheckPackageImplementation::Artifact(validate_artifact_implementation(
+                ExternalCheckPackageImplementation::Component(validate_component_implementation(
                     artifact_path,
                     artifact_sha256,
-                    executable_path,
-                    args,
+                    limits,
+                    checks,
                     provenance,
                 )?)
             }
             RawExternalCheckMode::Declarative => {
                 reject_if_present("artifact_path", artifact_path.as_ref())?;
                 reject_if_present("artifact_sha256", artifact_sha256.as_ref())?;
-                reject_if_present("executable_path", executable_path.as_ref())?;
-                reject_if_present_list("args", &args)?;
+                reject_if_present("limits", limits.as_ref())?;
+                reject_if_present_list("checks", &checks)?;
                 reject_if_present("provenance", provenance.as_ref())?;
                 ExternalCheckPackageImplementation::Declarative(
                     declarative::validate_declarative_implementation(declarative)?,
@@ -347,64 +382,40 @@ impl RawExternalCheckPackage {
             id,
             runtime,
             api_version,
-            capabilities,
+            capabilities: ExternalCheckCapabilities::default(),
             implementation,
         })
     }
 }
 
-fn validate_artifact_implementation(
+fn validate_component_implementation(
     artifact_path: Option<String>,
     artifact_sha256: Option<String>,
-    executable_path: Option<String>,
-    args: Vec<String>,
+    limits: Option<RawExternalCheckComponentLimits>,
+    checks: Vec<String>,
     provenance: Option<ExternalCheckArtifactProvenance>,
-) -> Result<ExternalCheckArtifactPackage> {
-    reject_if_present("executable_path", executable_path.as_ref())?;
-    reject_if_present_list("args", &args)?;
-
-    Ok(ExternalCheckArtifactPackage {
+) -> Result<ExternalCheckComponentPackage> {
+    let validated_limits = limits.as_ref().map(|raw| ExternalCheckComponentLimits {
+        timeout_ms: raw.timeout_ms,
+        max_memory_mb: raw.max_memory_mb,
+    });
+    let checks_allowlist = if checks.is_empty() {
+        None
+    } else {
+        Some(checks)
+    };
+    Ok(ExternalCheckComponentPackage {
         artifact_path: required_some_relative_path_string("artifact_path", artifact_path)?,
         artifact_sha256: required_some_sha256("artifact_sha256", artifact_sha256)?,
+        limits: validated_limits,
+        checks: checks_allowlist,
         provenance,
     })
 }
 
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawExternalCheckCapabilities {
-    #[serde(default)]
-    commands: Vec<String>,
-}
-
-impl RawExternalCheckCapabilities {
-    fn validate(&self) -> Result<ExternalCheckCapabilities> {
-        let mut seen = HashSet::new();
-        let mut commands = Vec::with_capacity(self.commands.len());
-
-        for command in &self.commands {
-            let command = required_non_empty("capabilities.commands[]", command.clone())?;
-            if command.contains('/') || command.contains('\\') {
-                bail!(
-                    "command `{command}` must be a bare command name, not a path in `capabilities.commands`"
-                );
-            }
-            if command.chars().any(char::is_whitespace) {
-                bail!("command `{command}` must not contain whitespace");
-            }
-            if !seen.insert(command.clone()) {
-                bail!("duplicate command `{command}` in `capabilities.commands`");
-            }
-            commands.push(command);
-        }
-
-        Ok(ExternalCheckCapabilities { commands })
-    }
-}
-
 fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Result<()> {
     let expected = match mode {
-        RawExternalCheckMode::Wasm => EXTERNAL_CHECK_RUNTIME_V1,
+        RawExternalCheckMode::Component => EXTERNAL_CHECK_COMPONENT_RUNTIME_V1,
         RawExternalCheckMode::Declarative => EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
     };
     if runtime != expected {
@@ -413,23 +424,7 @@ fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Resul
     Ok(())
 }
 
-fn validate_capabilities(
-    mode: RawExternalCheckMode,
-    capabilities: Option<RawExternalCheckCapabilities>,
-) -> Result<ExternalCheckCapabilities> {
-    match (mode, capabilities) {
-        // Capabilities are a wasm-guest command-grant concept; the declarative
-        // tier runs binaries directly (framework-owned), so a `capabilities`
-        // block is meaningless there.
-        (RawExternalCheckMode::Declarative, Some(_)) => {
-            bail!("field `capabilities` is not allowed in `declarative` mode");
-        }
-        (_, Some(raw)) => raw.validate(),
-        (_, None) => Ok(ExternalCheckCapabilities::default()),
-    }
-}
-
-/// Reject declarative-only fields in artifact/exec modes.
+/// Reject declarative-only fields in non-declarative modes.
 fn reject_declarative_fields(declarative: &declarative::RawDeclarativeFields) -> Result<()> {
     if !declarative.is_empty() {
         bail!(
@@ -442,7 +437,7 @@ fn reject_declarative_fields(declarative: &declarative::RawDeclarativeFields) ->
 impl fmt::Display for RawExternalCheckMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Wasm => write!(f, "wasm"),
+            Self::Component => write!(f, "component"),
             Self::Declarative => write!(f, "declarative"),
         }
     }

@@ -122,11 +122,11 @@ fn manifest_requires_default_exit_outcome() {
 }
 
 #[test]
-fn declarative_fields_rejected_in_wasm_mode() {
+fn declarative_fields_rejected_in_component_mode() {
     let manifest = r#"
 id = "x"
-mode = "wasm"
-runtime = "sandbox-v1"
+mode = "component"
+runtime = "component-v1"
 api_version = "v1"
 artifact_path = "bin/x.wasm"
 artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

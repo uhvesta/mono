@@ -236,6 +236,15 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
     ) -> Result<CheckResult> {
         match &package.implementation {
+            ExternalCheckPackageImplementation::Component(_component) => {
+                // Component-model executor is implemented in T3/T8. Packages
+                // parsed from `mode = "component"` manifests land here once the
+                // full runtime is wired up.
+                bail!(
+                    "component-model runtime for package `{}` is not yet implemented",
+                    package.id
+                )
+            }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
                 if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
                     bail!(
