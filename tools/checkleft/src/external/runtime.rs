@@ -7,13 +7,15 @@ use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, Instance, Memory, Module, Store};
 
-use crate::input::{ChangeSet, SourceTree};
-use crate::output::{CheckResult, Finding};
+use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
+use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
+use super::component_bindings::checkleft::check::types as wit_types;
+use super::component_bindings::Check as WitCheck;
 use super::{
-    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCommandCapabilities,
-    run_declarative_check,
+    EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
+    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCommandCapabilities, run_declarative_check,
 };
 
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
@@ -22,6 +24,11 @@ const MEMORY_EXPORT: &str = "memory";
 const INPUT_OFFSET: usize = 0;
 const WASM_PAGE_SIZE_BYTES: usize = 65_536;
 const EXECUTION_FUEL_LIMIT: u64 = 10_000_000;
+
+/// Host data threaded through the wasmtime `Store`. Empty for T3 (no WASI);
+/// extended with `WasiCtx` in T4 when file capability is wired up.
+#[derive(Default)]
+struct HostState;
 
 #[derive(Debug)]
 enum CoreArtifactExecutionError {
@@ -218,6 +225,73 @@ impl DefaultExternalCheckExecutor {
         })
     }
 
+    fn execute_component_v1_artifact(
+        &self,
+        package: &ExternalCheckPackage,
+        artifact: &ExternalCheckArtifactPackage,
+        changeset: &ChangeSet,
+        config: &toml::Value,
+    ) -> Result<CheckResult> {
+        let artifact_path = self.resolve_artifact_path(&artifact.artifact_path)?;
+        let component_bytes = fs::read(&artifact_path)
+            .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
+        validate_artifact_sha256(package, artifact, &component_bytes)?;
+
+        let component = compile_component(&self.engine, &package.id, &component_bytes)?;
+        let linker = Linker::<HostState>::new(&self.engine);
+        let mut store = Store::new(&self.engine, HostState::default());
+        configure_store_fuel(&mut store)?;
+
+        let instance = wasmtime(linker.instantiate(&mut store, &component))
+            .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
+
+        let check_bindings = wasmtime(WitCheck::new(&mut store, &instance))
+            .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
+
+        let descriptors = wasmtime(check_bindings.call_list_checks(&mut store))
+            .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?;
+
+        let check_name = &package.id;
+        if !descriptors.iter().any(|d| d.name == *check_name) {
+            let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+            bail!(
+                "component `{}` does not export a check named `{}`; available: [{}]",
+                package.id,
+                check_name,
+                exported.join(", ")
+            );
+        }
+
+        let input = lower_check_input(changeset, config)?;
+
+        let run_result = wasmtime(check_bindings.call_run_check(&mut store, check_name, &input))
+            .with_context(|| {
+                format!(
+                    "`run-check` call failed for check `{}` in component `{}`",
+                    check_name, package.id
+                )
+            })?;
+
+        let findings = run_result.map_err(|e| match e {
+            wit_types::CheckError::UnknownCheck(name) => anyhow::anyhow!(
+                "component `{}` does not know check `{}` (list-checks validation passed)",
+                package.id,
+                name
+            ),
+            wit_types::CheckError::Failed(msg) => anyhow::anyhow!(
+                "check `{}` in component `{}` failed: {}",
+                check_name,
+                package.id,
+                msg
+            ),
+        })?;
+
+        Ok(CheckResult {
+            check_id: package.id.clone(),
+            findings: findings.into_iter().map(lift_finding).collect(),
+        })
+    }
+
     fn resolve_artifact_path(&self, artifact_path: &str) -> Result<PathBuf> {
         let path = Path::new(artifact_path);
         if path.is_absolute() {
@@ -258,22 +332,33 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 run_declarative_check(&self.root, &package.id, declarative, changeset, config)
             }
             ExternalCheckPackageImplementation::Artifact(artifact) => {
-                if package.runtime != EXTERNAL_CHECK_RUNTIME_V1 {
-                    bail!(
+                match package.runtime.as_str() {
+                    EXTERNAL_CHECK_COMPONENT_RUNTIME_V1 => {
+                        self.execute_component_v1_artifact(package, artifact, changeset, config)
+                    }
+                    EXTERNAL_CHECK_RUNTIME_V1 => {
+                        let command_capabilities =
+                            ExternalCommandCapabilities::from_manifest(&package.capabilities)
+                                .with_context(|| {
+                                    format!(
+                                        "invalid command capability declaration for package `{}`",
+                                        package.id
+                                    )
+                                })?;
+                        self.execute_artifact(
+                            package,
+                            artifact,
+                            &command_capabilities,
+                            changeset,
+                            config,
+                        )
+                    }
+                    _ => bail!(
                         "unsupported external runtime `{}` for artifact package `{}`",
                         package.runtime,
                         package.id
-                    );
+                    ),
                 }
-                let command_capabilities =
-                    ExternalCommandCapabilities::from_manifest(&package.capabilities)
-                        .with_context(|| {
-                            format!(
-                                "invalid command capability declaration for package `{}`",
-                                package.id
-                            )
-                        })?;
-                self.execute_artifact(package, artifact, &command_capabilities, changeset, config)
             }
         }
     }
@@ -362,7 +447,7 @@ fn call_component_run(
     wasmtime(run.call(store, (input_json,))).context("external component check execution failed")
 }
 
-fn configure_store_fuel(store: &mut Store<()>) -> Result<()> {
+fn configure_store_fuel<T>(store: &mut Store<T>) -> Result<()> {
     wasmtime(store.set_fuel(EXECUTION_FUEL_LIMIT)).context("failed to configure runtime fuel limit")
 }
 
@@ -419,6 +504,110 @@ struct ExternalCheckRuntimeCapabilities {
 #[derive(Deserialize)]
 struct ExternalCheckRuntimeOutput {
     findings: Vec<Finding>,
+}
+
+// --- Type lowering: host types → WIT types ---
+
+fn lower_change_kind(kind: ChangeKind) -> wit_types::ChangeKind {
+    match kind {
+        ChangeKind::Added => wit_types::ChangeKind::Added,
+        ChangeKind::Modified => wit_types::ChangeKind::Modified,
+        ChangeKind::Deleted => wit_types::ChangeKind::Deleted,
+        ChangeKind::Renamed => wit_types::ChangeKind::Renamed,
+    }
+}
+
+fn lower_changed_file(f: &ChangedFile) -> wit_types::ChangedFile {
+    wit_types::ChangedFile {
+        path: f.path.to_string_lossy().into_owned(),
+        kind: lower_change_kind(f.kind),
+        old_path: f.old_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    }
+}
+
+fn lower_diff_hunk(h: &DiffHunk) -> wit_types::DiffHunk {
+    wit_types::DiffHunk {
+        old_start: h.old_start as u32,
+        old_lines: h.old_lines as u32,
+        new_start: h.new_start as u32,
+        new_lines: h.new_lines as u32,
+        added_lines: h.added_lines as u32,
+        removed_lines: h.removed_lines as u32,
+    }
+}
+
+fn lower_file_diff(path: &Path, diff: &FileDiff) -> wit_types::FileDiff {
+    wit_types::FileDiff {
+        path: path.to_string_lossy().into_owned(),
+        hunks: diff.hunks.iter().map(lower_diff_hunk).collect(),
+    }
+}
+
+fn lower_changeset(changeset: &ChangeSet) -> wit_types::ChangeSet {
+    wit_types::ChangeSet {
+        changed_files: changeset.changed_files.iter().map(lower_changed_file).collect(),
+        file_diffs: changeset
+            .file_diffs
+            .iter()
+            .map(|(path, diff)| lower_file_diff(path, diff))
+            .collect(),
+        commit_description: changeset.commit_description.clone(),
+        pr_description: changeset.pr_description.clone(),
+        change_id: changeset.change_id.clone(),
+        repository: changeset.repository.clone(),
+    }
+}
+
+fn lower_check_input(changeset: &ChangeSet, config: &toml::Value) -> Result<wit_types::CheckInput> {
+    let config_json = serde_json::to_string(config)
+        .context("failed to serialize config to JSON for component input")?;
+    Ok(wit_types::CheckInput {
+        changeset: lower_changeset(changeset),
+        config_json,
+    })
+}
+
+// --- Type lifting: WIT types → host types ---
+
+fn lift_severity(s: wit_types::Severity) -> Severity {
+    match s {
+        wit_types::Severity::Error => Severity::Error,
+        wit_types::Severity::Warning => Severity::Warning,
+        wit_types::Severity::Info => Severity::Info,
+    }
+}
+
+fn lift_location(loc: wit_types::Location) -> Location {
+    Location {
+        path: PathBuf::from(loc.path),
+        line: loc.line,
+        column: loc.column,
+    }
+}
+
+fn lift_file_edit(edit: wit_types::FileEdit) -> FileEdit {
+    FileEdit {
+        path: PathBuf::from(edit.path),
+        old_text: edit.old_text,
+        new_text: edit.new_text,
+    }
+}
+
+fn lift_suggested_fix(fix: wit_types::SuggestedFix) -> SuggestedFix {
+    SuggestedFix {
+        description: fix.description,
+        edits: fix.edits.into_iter().map(lift_file_edit).collect(),
+    }
+}
+
+fn lift_finding(f: wit_types::Finding) -> Finding {
+    Finding {
+        severity: lift_severity(f.severity),
+        message: f.message,
+        location: f.location.map(lift_location),
+        remediations: f.remediations,
+        suggested_fix: f.suggested_fix.map(lift_suggested_fix),
+    }
 }
 
 fn validate_artifact_sha256(
