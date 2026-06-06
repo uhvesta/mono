@@ -301,13 +301,28 @@ fn run_repo(
             workspace_prefix,
             source,
         } => {
+            eprintln!("cube: `repo add` is deprecated — use `cube repo ensure --origin {origin}` instead.");
+            let defaults = if let Some(d) = repo_ensure_defaults {
+                d.clone()
+            } else {
+                default_repo_ensure_defaults()?
+            };
+            let workspace_root = workspace_root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| defaults.workspace_root.clone());
+            let workspace_prefix = workspace_prefix
+                .unwrap_or_else(|| format!("{repo}-agent-"));
+            // Never write source=null: derive the default path when --source is omitted.
+            let source = source
+                .map(PathBuf::from)
+                .unwrap_or_else(|| defaults.repo_root.join(&repo));
             let config = RepoRecord {
                 repo,
                 origin,
                 main_branch,
-                workspace_root: PathBuf::from(workspace_root),
+                workspace_root,
                 workspace_prefix,
-                source: source.map(PathBuf::from),
+                source: Some(source),
                 clone_command: None,
             };
             let record = store.upsert_repo(&config)?;
@@ -461,6 +476,7 @@ fn ensure_repo_by_name(
 
     // Step 1: the reponame already names a registered slug.
     if let Some(existing) = store.get_repo(name)? {
+        let existing = heal_source_if_missing(store, &existing, defaults)?;
         fs::create_dir_all(&existing.workspace_root).map_err(|e| {
             CubeError::WorkspaceDirCreate {
                 path: existing.workspace_root.clone(),
@@ -509,6 +525,35 @@ fn ensure_repo_by_name(
     )))
 }
 
+/// Heal a degenerate repo record whose `source` is `None` by deriving the
+/// standard path and persisting it. Returns the (possibly updated) record.
+///
+/// This is the fix for the incident root cause: `cube repo add` without
+/// `--source` writes `source=null`, and a later `cube repo ensure` would find
+/// the existing record and call `materialize_repo_source_if_missing`, which
+/// early-returns when `source` is `None` — so the clone was silently skipped.
+/// Now `ensure` heals the record first so the clone always runs.
+fn heal_source_if_missing(
+    store: &Store,
+    record: &RepoRecord,
+    defaults: &RepoEnsureDefaults,
+) -> Result<RepoRecord> {
+    if record.source.is_none() {
+        let derived = defaults.repo_root.join(&record.repo);
+        eprintln!(
+            "cube: healing repo `{}`: source was null, deriving default `{}`",
+            record.repo,
+            derived.display()
+        );
+        let healed = RepoRecord {
+            source: Some(derived),
+            ..record.clone()
+        };
+        return store.upsert_repo(&healed);
+    }
+    Ok(record.clone())
+}
+
 /// Register and materialize a repo given a fully-resolved origin and clone
 /// strategy. `clone_command` (already `{name}`-substituted) is used in place
 /// of `jj git clone` when present. Idempotent: an existing repo matched by
@@ -522,6 +567,7 @@ fn ensure_repo_core(
     defaults: &RepoEnsureDefaults,
 ) -> Result<RepoRecord> {
     if let Some(record) = store.get_repo_by_origin(origin)? {
+        let record = heal_source_if_missing(store, &record, defaults)?;
         fs::create_dir_all(&record.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
             path: record.workspace_root.clone(),
             source: e,
@@ -565,6 +611,7 @@ fn ensure_repo_core(
                 existing.repo, existing.origin
             )));
         }
+        let existing = heal_source_if_missing(store, &existing, defaults)?;
         fs::create_dir_all(&existing.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
             path: existing.workspace_root.clone(),
             source: e,
@@ -621,6 +668,11 @@ fn normalize_origin(origin: &str) -> Result<String> {
             "origin must not be empty".to_string(),
         ));
     }
+    // Expand a bare `owner/repo` shorthand to a canonical GitHub SSH URL so
+    // `cube repo ensure --origin brianduff/flunge` Just Works.
+    if let Some((org, repo)) = parse_org_name_shape(trimmed) {
+        return Ok(format!("git@github.com:{org}/{repo}.git"));
+    }
     Ok(trimmed.to_string())
 }
 
@@ -650,6 +702,24 @@ fn materialize_repo_source_if_missing(
 
     if source.exists() {
         if source.is_dir() {
+            // A pre-existing git repo without a jj overlay was likely cloned
+            // before the --colocate requirement. Repair it in-place so cube
+            // lease steps that expect a jj workspace can succeed.
+            if source.join(".git").is_dir() && !source.join(".jj").is_dir() {
+                eprintln!(
+                    "cube: running `jj git init --colocate` in {} (git repo without jj overlay)",
+                    source.display()
+                );
+                runner.run(&CommandInvocation {
+                    cwd: source.to_path_buf(),
+                    program: "jj".to_string(),
+                    args: vec![
+                        "git".to_string(),
+                        "init".to_string(),
+                        "--colocate".to_string(),
+                    ],
+                })?;
+            }
             return Ok(None);
         }
         return Err(CubeError::InvalidArgument(format!(
@@ -722,7 +792,7 @@ fn materialize_repo_source_if_missing(
         // remote's default branch to record as the repo's `main_branch`.
         Ok(detect_remote_default_branch(runner, source, &record.origin))
     } else {
-        eprintln!("cube: using `jj git clone` for repo `{}`", record.repo);
+        eprintln!("cube: using `jj git clone --colocate` for repo `{}`", record.repo);
         // Detect the remote's default branch up front so we can both track the
         // right bookmark below and record it as the repo's `main_branch`.
         let default_branch = detect_remote_default_branch(runner, parent, &record.origin);
@@ -732,6 +802,7 @@ fn materialize_repo_source_if_missing(
             args: vec![
                 "git".to_string(),
                 "clone".to_string(),
+                "--colocate".to_string(),
                 record.origin.clone(),
                 source.display().to_string(),
             ],
@@ -4989,6 +5060,7 @@ mod tests {
     use std::process::ExitCode;
 
     use clap::Parser;
+    use rusqlite;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -5156,6 +5228,7 @@ mod tests {
                 &[
                     "git",
                     "clone",
+                    "--colocate",
                     "git@github.com:spinyfin/mono.git",
                     &source_path.display().to_string(),
                 ],
@@ -5210,6 +5283,7 @@ mod tests {
                 &[
                     "git",
                     "clone",
+                    "--colocate",
                     "git@github.com:spinyfin/mono.git",
                     &source_path.display().to_string(),
                 ],
@@ -5340,7 +5414,7 @@ mod tests {
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
-                &["git", "clone", origin, &source_path.display().to_string()],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
             .creating_dir(source_path.clone()),
@@ -5433,7 +5507,7 @@ mod tests {
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
-                &["git", "clone", origin, &source_path.display().to_string()],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
             .creating_dir(source_path.clone()),
@@ -5485,7 +5559,7 @@ mod tests {
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
-                &["git", "clone", origin, &source_path.display().to_string()],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
             .creating_dir(source_path.clone()),
@@ -5533,7 +5607,7 @@ mod tests {
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
-                &["git", "clone", origin, &source_path.display().to_string()],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
             .creating_dir(source_path.clone()),
@@ -5601,7 +5675,7 @@ mod tests {
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
-                &["git", "clone", origin, &source_path.display().to_string()],
+                &["git", "clone", "--colocate", origin, &source_path.display().to_string()],
                 "",
             )
             .creating_dir(source_path.clone()),
@@ -5657,6 +5731,227 @@ mod tests {
         let out = "0123456789abcdef0123456789abcdef01234567\tHEAD";
         assert_eq!(super::parse_symref_default_branch(out), None);
         assert_eq!(super::parse_symref_default_branch(""), None);
+    }
+
+    #[test]
+    fn normalize_origin_expands_owner_repo_shorthand() {
+        // `owner/repo` shorthand must expand to a canonical GitHub SSH URL.
+        assert_eq!(
+            super::normalize_origin("brianduff/flunge").unwrap(),
+            "git@github.com:brianduff/flunge.git"
+        );
+        assert_eq!(
+            super::normalize_origin("spinyfin/mono").unwrap(),
+            "git@github.com:spinyfin/mono.git"
+        );
+        // Full URLs must pass through unchanged.
+        assert_eq!(
+            super::normalize_origin("git@github.com:spinyfin/mono.git").unwrap(),
+            "git@github.com:spinyfin/mono.git"
+        );
+        assert_eq!(
+            super::normalize_origin("https://github.com/spinyfin/mono").unwrap(),
+            "https://github.com/spinyfin/mono"
+        );
+        // Bare single-segment names are not slugs, pass through.
+        assert_eq!(
+            super::normalize_origin("mono").unwrap(),
+            "mono"
+        );
+    }
+
+    #[test]
+    fn repo_ensure_accepts_owner_repo_origin_shorthand() {
+        // `cube repo ensure --origin owner/repo` should expand the shorthand and
+        // clone from the canonical GitHub SSH URL.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("flunge");
+        let expanded_origin = "git@github.com:brianduff/flunge.git";
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(
+                defaults.repo_root.clone(),
+                expanded_origin,
+                "main",
+            ),
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    expanded_origin,
+                    &source_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "brianduff/flunge",
+        ]);
+        let result =
+            run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
+                .expect("ensure with owner/repo shorthand");
+
+        assert_eq!(result.message, "Ensured repo `flunge`.");
+        assert_eq!(result.payload["repo"]["origin"], expanded_origin);
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn repo_ensure_heals_source_null_from_prior_add() {
+        // Reproduces the incident root cause: `cube repo add` without --source
+        // writes source=null. A later `cube repo ensure` must heal the record
+        // (derive the default source path) and clone instead of silently no-op'ing.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("mono");
+
+        // Register via `add` without --source → source=null in the DB.
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+        ]);
+        // add now derives a default source, so the record will have source set.
+        // But we simulate the old broken state by setting source=null via the store
+        // after the add to ensure heal logic fires.
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        // Patch the stored record to set source=null, simulating the pre-fix state
+        // where `repo add` wrote source=null.
+        {
+            let conn = rusqlite::Connection::open(&database_path).expect("db conn");
+            conn.execute(
+                "UPDATE repos SET source_path = NULL WHERE repo = 'mono'",
+                [],
+            )
+            .expect("patch source to null");
+        }
+
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ls_remote_symref(
+                defaults.repo_root.clone(),
+                "git@github.com:spinyfin/mono.git",
+                "main",
+            ),
+            ExpectedCommand::ok(
+                defaults.repo_root.clone(),
+                "jj",
+                &[
+                    "git",
+                    "clone",
+                    "--colocate",
+                    "git@github.com:spinyfin/mono.git",
+                    &source_path.display().to_string(),
+                ],
+                "",
+            )
+            .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "main@origin"],
+                "",
+            ),
+            ExpectedCommand::no_such_remote_bookmark(
+                source_path.clone(),
+                "jj",
+                &["bookmark", "track", "master@origin"],
+            ),
+        ]);
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+        ]);
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
+            .expect("ensure must heal source=null and clone");
+
+        assert_eq!(result.message, "Ensured repo `mono`.");
+        assert_eq!(
+            result.payload["repo"]["source"],
+            source_path.display().to_string()
+        );
+        runner.assert_exhausted();
+    }
+
+    #[test]
+    fn materialize_colocate_inits_git_repo_without_jj_overlay() {
+        // When the source dir already exists and has a .git/ but no .jj/,
+        // `materialize_repo_source_if_missing` must run `jj git init --colocate`
+        // so the source is a proper colocated jj workspace.
+        let (tempdir, database_path) = with_database_path();
+        let defaults = repo_ensure_defaults(&tempdir);
+        let source_path = defaults.repo_root.join("mono");
+
+        // Create the source dir with a .git/ but no .jj/ (pre-fix state).
+        std::fs::create_dir_all(source_path.join(".git")).expect("create .git");
+
+        let add = Cli::parse_from([
+            "cube",
+            "repo",
+            "add",
+            "mono",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+            "--workspace-root",
+            &defaults.workspace_root.display().to_string(),
+            "--workspace-prefix",
+            "mono-agent-",
+            "--source",
+            &source_path.display().to_string(),
+        ]);
+        run_with_dependencies(add, Some(&database_path), &FakeRunner::default()).expect("repo add");
+
+        // The runner must see a `jj git init --colocate` call.
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            source_path.clone(),
+            "jj",
+            &["git", "init", "--colocate"],
+            "",
+        )]);
+
+        let ensure = Cli::parse_from([
+            "cube",
+            "repo",
+            "ensure",
+            "--origin",
+            "git@github.com:spinyfin/mono.git",
+        ]);
+        run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
+            .expect("ensure must colocate-init an existing git repo");
+
+        runner.assert_exhausted();
     }
 
     #[test]
