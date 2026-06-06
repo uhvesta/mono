@@ -1,0 +1,37 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q1: How should per-check config (today an arbitrary toml::Value) cross the WIT boundary in v1?",
+    "choices": [
+      "Pass as a JSON string (config-json); guest SDK deserializes with serde into the author's own config struct (recommended, pragmatic)",
+      "Model config as WIT records / a recursive variant (typed at the boundary, but forces a schema or dynamic-value modeling)",
+      "Generic typed-per-check config baked into the SDK macro (most ergonomic, most SDK complexity)"
+    ],
+    "anchor": "wit-contract"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q3: What should the default timeout mechanism be?",
+    "choices": [
+      "Epoch-based wall-clock deadline by default; fuel available as an opt-in determinism knob (recommended)",
+      "Fuel by default (deterministic but tuning-sensitive, like the current prototype)",
+      "Both always on (epoch + fuel)"
+    ],
+    "anchor": "limit-timeout-policy"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Q4: Which mechanism should provide per-file capability scoping in v1? File access is always via std::fs — this question is only about how the host enforces which files are reachable.",
+    "choices": [
+      "WASI-p2 sandbox dir: host builds a per-invocation temp dir, hardlinks/symlinks allowlisted files at their repo-relative paths, and preopens it as WASI root (recommended; std::fs just works; capability enforcement is structural)",
+      "Custom/virtual host FS: wasmtime_wasi::Dir backed by SourceTree, no disk materialization (more flexible for in-memory/base-revision trees; more complex to implement; treat as a v1-optional optimization)",
+      "Host-imported read-file(path) ABI (last resort only — breaks std::fs ergonomic; must be justified by documented failure of both above approaches)"
+    ],
+    "anchor": "file-capability-model-allowlist-policy"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Q5: Remove the sandbox-v1 runtime immediately once the component path lands (T11), rather than keeping both tiers running in parallel during migration?",
+    "anchor": "disposition-of-prior-work"
+  }
+]
