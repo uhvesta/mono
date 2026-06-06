@@ -18,6 +18,14 @@ extension ChatViewModel {
         engine.sendListFeatureFlags()
     }
 
+    /// Returns true when the `editorial_controls` engine flag is ON.
+    /// Drives all editorial-controls UI gating: toolbar button, sheet, and
+    /// any other entry points. Defaults to false until the flag snapshot
+    /// arrives from the engine.
+    var isEditorialControlsEnabled: Bool {
+        featureFlags.first(where: { $0.name == "editorial_controls" })?.enabled ?? false
+    }
+
     /// Toggle a feature flag. Optimistically patches the cached
     /// snapshot so the UI feels instantaneous; the engine's
     /// `feature_flag_set` echo reconciles state once the on-disk

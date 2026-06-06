@@ -308,7 +308,7 @@ struct ContentView: View {
             )
         }
         .sheet(isPresented: Binding(
-            get: { model.editorialControlsProductID != nil },
+            get: { model.editorialControlsProductID != nil && model.isEditorialControlsEnabled },
             set: { if !$0 { model.editorialControlsProductID = nil } }
         )) {
             if let productID = model.editorialControlsProductID {
@@ -466,17 +466,19 @@ struct ContentView: View {
                         .padding(.trailing, 56)
 
                         HStack(spacing: 4) {
-                            Button {
-                                if let productID = model.selectedProduct?.id {
-                                    model.openEditorialControls(productID: productID)
+                            if model.isEditorialControlsEnabled {
+                                Button {
+                                    if let productID = model.selectedProduct?.id {
+                                        model.openEditorialControls(productID: productID)
+                                    }
+                                } label: {
+                                    Image(systemName: "doc.text.magnifyingglass")
+                                        .frame(width: 16, height: 16)
                                 }
-                            } label: {
-                                Image(systemName: "doc.text.magnifyingglass")
-                                    .frame(width: 16, height: 16)
+                                .buttonStyle(.borderless)
+                                .help("Editorial Rules")
+                                .disabled(model.selectedProduct == nil || !model.isConnected)
                             }
-                            .buttonStyle(.borderless)
-                            .help("Editorial Rules")
-                            .disabled(model.selectedProduct == nil || !model.isConnected)
 
                             Button {
                                 model.presentEditSelectedProduct()
