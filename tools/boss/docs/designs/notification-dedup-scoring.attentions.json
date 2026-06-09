@@ -1,0 +1,24 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Ship the feature flag off by default (BOSS_NOTIFICATION_DEDUP, off-safe), flipping on per-product after observing sweep behavior on real data?",
+    "anchor": "risks-open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which model tier should run the creation-time dedup decision (frequent, bounded binary judgment)?",
+    "choices": ["Haiku (cheapest; default proposed)", "Sonnet (higher precision, higher cost)", "Opus (max precision, only if false-fold cost is high)"],
+    "anchor": "risks-open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "At creation time, when a High/Medium-confidence duplicate is detected, should we fully suppress the candidate or stage it?",
+    "choices": ["Suppress candidate, score++ only (proposed)", "Stage: score++ AND still surface the candidate with a 'possible duplicate' hint for the first rollout"],
+    "anchor": "risks-open-questions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Include canonical-edit-on-merge in v1 (bounded append-only edits to rationale/description), or defer it to a follow-up and ship score-only folds first?",
+    "anchor": "canonical-edit-on-merge-bounded-recorded"
+  }
+]
