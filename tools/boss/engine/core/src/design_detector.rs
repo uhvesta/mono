@@ -369,6 +369,20 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     let root: serde_json::Value = serde_json::from_str(&stdout)
         .with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))?;
 
+    Ok(parse_pr_scan(&root))
+}
+
+/// Pure parse of the `gh pr view --json files,headRefName,baseRefName`
+/// JSON into a [`PrScanResult`]. Kept separate from [`do_scan_pr`] so the
+/// gh shell-out stays in `do_scan_pr` and the selection/extraction logic
+/// is unit-testable without invoking `gh`.
+///
+/// - `head_ref_name`/`base_ref_name`: the corresponding string fields, with
+///   missing keys and empty strings both mapped to `None`.
+/// - `doc_path`: the single design-doc path among `files[].path` (per
+///   [`is_design_doc_path`]). Zero or multiple matches yield `None`. A
+///   missing or non-array `files` key is treated as zero matches.
+pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
     let head_ref_name = root
         .get("headRefName")
         .and_then(|v| v.as_str())
@@ -396,7 +410,6 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
         1 => Some(matches.into_iter().next().unwrap()),
         0 => {
             tracing::warn!(
-                pr_url,
                 "design detector: no `docs/designs/*.md` file in PR changed files; \
                  design-doc pointer not updated — add the file and re-push, or set \
                  manually with `boss project set-design-doc`"
@@ -405,7 +418,6 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
         }
         n => {
             tracing::warn!(
-                pr_url,
                 count = n,
                 "design detector: multiple `docs/designs/*.md` files in PR; \
                  skipping auto-populate — use `boss project set-design-doc` to resolve"
@@ -414,11 +426,11 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
         }
     };
 
-    Ok(PrScanResult {
+    PrScanResult {
         doc_path,
         head_ref_name,
         base_ref_name,
-    })
+    }
 }
 
 /// Return `true` when `path` is a direct child of any `docs/designs/`
@@ -495,5 +507,150 @@ mod tests {
         assert!(!is_design_doc_path(
             "tools/checkleft/docs/designs/doc.txt"
         ));
+    }
+
+    /// Build a `files` array value from a list of paths, shaped like
+    /// `gh pr view --json files` output (`[{"path": "..."}, ...]`).
+    fn files_json(paths: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            paths
+                .iter()
+                .map(|p| serde_json::json!({ "path": p }))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn parse_pr_scan_single_design_doc_is_adopted() {
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/src/main.rs",
+                "tools/boss/docs/designs/my-feature.md",
+                "README.md",
+            ]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(
+            scan.doc_path.as_deref(),
+            Some("tools/boss/docs/designs/my-feature.md")
+        );
+    }
+
+    #[test]
+    fn parse_pr_scan_zero_design_docs_yields_none() {
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/src/main.rs",
+                "README.md",
+                "tools/boss/docs/other/notes.md",
+            ]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
+    }
+
+    #[test]
+    fn parse_pr_scan_multiple_design_docs_is_ambiguous_none() {
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/docs/designs/feature-a.md",
+                "tools/checkleft/docs/designs/feature-b.md",
+            ]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
+    }
+
+    #[test]
+    fn parse_pr_scan_excludes_subdir_and_non_markdown_from_match_set() {
+        // A subdirectory entry and a non-markdown entry under docs/designs/
+        // must NOT count toward the match set, so the single direct-child
+        // markdown file remains the unambiguous adoption.
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/docs/designs/sub/nested.md",
+                "tools/boss/docs/designs/diagram.png",
+                "tools/boss/docs/designs/real-doc.md",
+            ]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(
+            scan.doc_path.as_deref(),
+            Some("tools/boss/docs/designs/real-doc.md")
+        );
+    }
+
+    #[test]
+    fn parse_pr_scan_excludes_count_make_match_unambiguous() {
+        // With only excluded (subdir / non-markdown) entries present and no
+        // direct-child markdown, the match set is empty -> None.
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/docs/designs/sub/nested.md",
+                "tools/boss/docs/designs/diagram.png",
+            ]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
+    }
+
+    #[test]
+    fn parse_pr_scan_extracts_present_ref_names() {
+        let root = serde_json::json!({
+            "files": files_json(&[]),
+            "headRefName": "boss/exec_18b07a506d2518d0_1b",
+            "baseRefName": "main",
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(
+            scan.head_ref_name.as_deref(),
+            Some("boss/exec_18b07a506d2518d0_1b")
+        );
+        assert_eq!(scan.base_ref_name.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parse_pr_scan_missing_ref_keys_yield_none() {
+        let root = serde_json::json!({
+            "files": files_json(&[]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.head_ref_name, None);
+        assert_eq!(scan.base_ref_name, None);
+    }
+
+    #[test]
+    fn parse_pr_scan_empty_ref_strings_are_filtered_to_none() {
+        let root = serde_json::json!({
+            "files": files_json(&[]),
+            "headRefName": "",
+            "baseRefName": "",
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.head_ref_name, None);
+        assert_eq!(scan.base_ref_name, None);
+    }
+
+    #[test]
+    fn parse_pr_scan_missing_files_key_yields_none_without_panic() {
+        let root = serde_json::json!({
+            "headRefName": "feature",
+            "baseRefName": "main",
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
+        // Ref extraction still works with files absent.
+        assert_eq!(scan.head_ref_name.as_deref(), Some("feature"));
+        assert_eq!(scan.base_ref_name.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn parse_pr_scan_non_array_files_key_yields_none_without_panic() {
+        // `files` present but not an array -> treated as zero matches.
+        let root = serde_json::json!({
+            "files": "not-an-array",
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
     }
 }
