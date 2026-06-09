@@ -191,7 +191,9 @@ mod command_policy;
 pub use command_policy::ExternalCommandCapabilities;
 mod component_bindings;
 mod runtime;
-pub use runtime::{DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
+pub use runtime::{
+    ComponentAotCache, DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor,
+};
 pub mod sandbox;
 pub use sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
 

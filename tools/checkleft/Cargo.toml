@@ -36,6 +36,11 @@ name = "config_resolution_bench"
 path = "examples/config_resolution_bench.rs"
 required-features = ["benchmarking"]
 
+[[example]]
+name = "wasm_aot_cache_bench"
+path = "examples/wasm_aot_cache_bench.rs"
+required-features = ["benchmarking"]
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

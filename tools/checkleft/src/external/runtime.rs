@@ -23,6 +23,9 @@ use super::{
     ExternalCommandCapabilities, run_declarative_check,
 };
 
+mod cwasm_cache;
+pub use cwasm_cache::ComponentAotCache;
+
 const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
 const COMPONENT_ENTRYPOINT_EXPORT: &str = "run";
 const MEMORY_EXPORT: &str = "memory";
@@ -214,6 +217,10 @@ pub struct DefaultExternalCheckExecutor {
     root: PathBuf,
     engine: Arc<Engine>,
     _ticker: EpochTicker,
+    /// AOT `.cwasm` cache for component-v1 artifacts.  `None` when the cache
+    /// directory could not be created (disk full, read-only FS, etc.); in that
+    /// case every component-v1 invocation falls back to JIT compilation.
+    component_cache: Option<ComponentAotCache>,
 }
 
 impl DefaultExternalCheckExecutor {
@@ -232,10 +239,49 @@ impl DefaultExternalCheckExecutor {
         let engine = Arc::new(build_wasmtime_engine()?);
         let ticker = EpochTicker::start(Arc::clone(&engine));
 
+        let cache_dir = root.join(".checkleft-cwasm");
+        let component_cache = ComponentAotCache::open(&cache_dir)
+            .map(Some)
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    "failed to open .cwasm cache at {}; component-v1 will use JIT compilation",
+                    cache_dir.display()
+                );
+                None
+            });
+
         Ok(Self {
             root,
             engine,
             _ticker: ticker,
+            component_cache,
+        })
+    }
+
+    /// Construct an executor with an explicit AOT cache directory.
+    ///
+    /// Primarily used in tests and benchmarks where the caller controls the
+    /// cache location.
+    pub fn new_with_cache(root: impl Into<PathBuf>, cache_dir: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let root = root.canonicalize().with_context(|| {
+            format!(
+                "failed to canonicalize check runtime root {}",
+                root.display()
+            )
+        })?;
+        if !root.is_dir() {
+            bail!("check runtime root is not a directory: {}", root.display());
+        }
+
+        let engine = Arc::new(build_wasmtime_engine()?);
+        let ticker = EpochTicker::start(Arc::clone(&engine));
+        let component_cache = Some(ComponentAotCache::open(cache_dir)?);
+        Ok(Self {
+            root,
+            engine,
+            _ticker: ticker,
+            component_cache,
         })
     }
 
@@ -390,12 +436,17 @@ impl DefaultExternalCheckExecutor {
             .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
         validate_artifact_sha256(package, artifact, &component_bytes)?;
 
+        let wasm_component = self.load_or_compile_component(
+            &package.id,
+            &component_bytes,
+            &artifact.artifact_sha256,
+        )?;
         run_component_check(
             &self.engine,
             &self.root,
             package,
             &package.id,
-            &component_bytes,
+            &wasm_component,
             changeset,
             source_tree,
             config,
@@ -431,16 +482,40 @@ impl DefaultExternalCheckExecutor {
             );
         }
 
+        let wasm_component = self.load_or_compile_component(
+            &package.id,
+            &component_bytes,
+            &component.artifact_sha256,
+        )?;
         run_component_check(
             &self.engine,
             &self.root,
             package,
             &component.check_name,
-            &component_bytes,
+            &wasm_component,
             changeset,
             source_tree,
             config,
         )
+    }
+
+    /// Load a `Component` from the AOT cache or compile it from bytes.
+    ///
+    /// When the cache is available the first call for a given `artifact_sha256`
+    /// precompiles and stores the result; subsequent calls deserialize from disk
+    /// in low milliseconds.  When the cache is unavailable (not created or disk
+    /// error), falls back to JIT compilation on every call.
+    fn load_or_compile_component(
+        &self,
+        package_id: &str,
+        component_bytes: &[u8],
+        artifact_sha256: &str,
+    ) -> Result<Component> {
+        if let Some(cache) = &self.component_cache {
+            cache.load_or_compile(&self.engine, package_id, component_bytes, artifact_sha256)
+        } else {
+            compile_component(&self.engine, package_id, component_bytes)
+        }
     }
 
     fn resolve_artifact_path(&self, artifact_path: &str) -> Result<PathBuf> {
@@ -655,12 +730,11 @@ fn run_component_check(
     root: &Path,
     package: &ExternalCheckPackage,
     check_name: &str,
-    component_bytes: &[u8],
+    component: &Component,
     changeset: &ChangeSet,
     source_tree: &dyn SourceTree,
     config: &toml::Value,
 ) -> Result<CheckResult> {
-    let component = compile_component(engine, &package.id, component_bytes)?;
     let linker = build_component_v1_linker(engine)?;
 
     // Phase 1: instantiate with an empty WASI context (no preopens) to call

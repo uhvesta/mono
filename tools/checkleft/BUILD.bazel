@@ -22,6 +22,15 @@ rust_library(
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
+    # IFCHANGE(wasmtime-version): keep in sync with the wasmtime dependency in
+    # Cargo.toml.  CHECKLEFT_WASMTIME_VERSION is part of the .cwasm AOT cache
+    # key (src/external/runtime/cwasm_cache.rs); it must change whenever
+    # wasmtime is bumped so that stale .cwasm files are never deserialized.
+    # build.rs emits the same value for cargo builds by reading Cargo.lock.
+    # THENCHANGE(Cargo.toml)
+    rustc_env = {
+        "CHECKLEFT_WASMTIME_VERSION": "42.0.2",
+    },
     visibility = ["//:__subpackages__"],
     deps = all_crate_deps(normal = True) + [
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",

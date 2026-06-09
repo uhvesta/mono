@@ -243,7 +243,7 @@ fn component_v1_non_component_bytes_give_compile_error() {
         )
         .expect_err("core wasm bytes must not parse as a component");
     assert!(
-        error.to_string().contains("failed to compile component"),
+        error.to_string().contains("failed to precompile component"),
         "unexpected error: {error}"
     );
 }
