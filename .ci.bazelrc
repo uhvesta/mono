@@ -13,7 +13,7 @@ build:ci --curses=no
 build:ci --show_progress_rate_limit=5.0
 build:ci --announce_rc
 
-startup:ci --max_idle_secs=259200
+startup:ci --max_idle_secs=7200
 
 # Linux cache configuration
 build:ci-linux --config=ci
