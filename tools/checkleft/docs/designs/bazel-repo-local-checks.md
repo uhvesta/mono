@@ -31,7 +31,6 @@ componentizing every language into wasm.
 
 The current external-check design is centered on wasm:
 
-- `source` mode currently builds JavaScript and TypeScript into wasm,
 - `artifact` mode currently executes wasm artifacts,
 - the long-term sandbox contract assumes deterministic host APIs and deny-by-
   default capabilities.

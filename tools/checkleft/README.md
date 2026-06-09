@@ -36,8 +36,9 @@ system.
   (the Rust/Bazel/workflow/docs conventions). **External checks** are resolved
   from packages — referenced by file path or as generated/exec implementations —
   letting a repo (or a shared, remotely hosted config) define checks that aren't
-  baked into the binary. JS/TS external checks compile to WebAssembly and run in
-  a `wasmtime` sandbox.
+  baked into the binary. External checks run either as WebAssembly Component
+  Model artifacts (component mode, via `wasmtime`) or as declarative invocations
+  (declarative mode, where the framework owns binary execution and transform).
 
 - **Runner and output.** The runner takes the change plan, the resolved config,
   and the registry, schedules each applicable check, applies per-check policy

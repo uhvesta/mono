@@ -62,7 +62,6 @@ intended static patterns.
 This feature should be implemented as a built-in Checkleft check rather than
 as an external package:
 
-- the current external-source path is limited to JavaScript and TypeScript,
 - the feature needs direct access to Checkleft's change-scoped file model,
 - lightweight parsing and type resolution are likely to be reused by future
   built-in code-pattern policies.

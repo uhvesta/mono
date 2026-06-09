@@ -4,8 +4,6 @@ module(
 
 bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "buildifier_prebuilt", version = "7.3.1")
-bazel_dep(name = "rules_nodejs", version = "6.7.3")
-bazel_dep(name = "aspect_rules_js", version = "2.8.2")
 bazel_dep(name = "rules_rust", version = "0.70.0")
 bazel_dep(name = "rules_shell", version = "0.8.0")
 bazel_dep(name = "apple_support", version = "2.2.0", repo_name = "build_bazel_apple_support")
@@ -43,26 +41,6 @@ use_repo(hermetic_cc_toolchain_config, "zig_sdk")
 register_toolchains(
     "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
     "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
-)
-
-node = use_extension("@rules_nodejs//nodejs:extensions.bzl", "node")
-node.toolchain(
-    node_version = "22.11.0",
-)
-use_repo(node, "nodejs_toolchains")
-
-pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
-pnpm.pnpm(pnpm_version_from = "//:package.json")
-use_repo(pnpm, "pnpm")
-
-npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
-npm.npm_translate_lock(
-    name = "npm",
-    pnpm_lock = "//:pnpm-lock.yaml",
-)
-use_repo(
-    npm,
-    "npm",
 )
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
