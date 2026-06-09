@@ -330,12 +330,13 @@ private struct AddHostSheet: View {
                 }
 
                 Section {
-                    TextField("1", text: $poolSizeString)
+                    TextField("Worker pool size", text: $poolSizeString, prompt: Text("1"))
                         .onChange(of: poolSizeString) { _, v in
                             if v.isEmpty { return }
                             poolSizeString = v.filter { $0.isNumber }
                             if poolSizeString.isEmpty { poolSizeString = "1" }
                         }
+                        .help("Number of concurrent worker slots Boss may run on this host. Defaults to 1.")
                     TextField("os=macos arch=arm64 …", text: $tagsString)
                         .autocorrectionDisabled()
                         .help("Space-separated capability tags. You can add or remove tags later.")
