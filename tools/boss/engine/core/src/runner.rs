@@ -10,6 +10,7 @@ use crate::ci_log_reader::{parse_buildkite_build_id, parse_buildkite_pipeline_sl
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis::ConflictDiagnosis;
 use crate::coordinator::{pool_model_override_for_worker_id, slot_id_from_worker_id};
+use crate::driver::AgentDriver;
 use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
@@ -465,9 +466,11 @@ impl ExecutionRunner for PaneSpawnRunner {
         // bazel-run mode where BOSS_BIN_DIR is unset.
         let initial_input = format!(
             "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; {}",
-            spawn_config.claude_invocation(
-                spawner.non_opus_auto_mode(),
+            crate::driver::ClaudeDriver.spawn_invocation(
+                &spawn_config.model,
+                spawn_config.claude_effort,
                 Some(&worker_settings_path),
+                spawner.non_opus_auto_mode(),
             ),
         );
 

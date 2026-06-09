@@ -13,6 +13,8 @@ use std::path::Path;
 
 use boss_protocol::EffortLevel;
 
+use crate::driver::AgentDriver;
+
 /// Engine default Claude model slug used when neither
 /// `tasks.model_override`, the row's effort-level default, nor the
 /// parent product's `default_model` is set (design §Q3 step 4).
@@ -117,51 +119,23 @@ pub struct SpawnConfig {
 
 impl SpawnConfig {
     /// Worker spawn line written into the libghostty pane via the
-    /// spawn RPC's `initial_input`. `--model` is always present;
-    /// `--effort` is present only when the row carries an effort
-    /// level (per design §Q2: omit and let `claude` fall through to
-    /// `high` for untagged rows).
+    /// spawn RPC's `initial_input`. Delegates to
+    /// [`crate::driver::ClaudeDriver::spawn_invocation`], which owns the
+    /// Claude-specific command-line logic (Spawn capability, P1422 Depth 1).
     ///
-    /// Permission mode rules (corp env vs personal laptop observations,
-    /// 2026-05-14):
-    /// - Opus: always `--permission-mode auto`. Corp env does not default to
-    ///   it, so it must be explicit.
-    /// - Sonnet/Haiku: controlled by `non_opus_auto_mode` (the
-    ///   `workers.non_opus_permission_mode` setting). `false` (default, personal
-    ///   laptop) → `--dangerously-skip-permissions`. `true` (corp laptop, where
-    ///   dangerously-skip is forbidden) → `--permission-mode auto`.
-    ///
-    /// `settings_path`, when `Some`, is added as `--settings <path>` so
-    /// claude loads the engine's worker hooks/deny rules from a file
-    /// *outside* the workspace (merged on top of the repo's own
-    /// `.claude/settings.json`). See [`crate::worker_setup`] for why
-    /// the settings never live in the workspace tree.
-    ///
-    /// The trailing newline is what the pane treats as the user
-    /// hitting return — match today's behaviour byte-for-byte.
+    /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
+    /// need to construct a driver instance directly.
     pub fn claude_invocation(
         &self,
         non_opus_auto_mode: bool,
         settings_path: Option<&Path>,
     ) -> String {
-        let mut cmd = format!("claude --model {}", self.model);
-        if let Some(effort) = self.claude_effort {
-            cmd.push_str(" --effort ");
-            cmd.push_str(effort);
-        }
-        if model_requires_auto_permissions(&self.model) || non_opus_auto_mode {
-            cmd.push_str(" --permission-mode auto");
-        } else {
-            cmd.push_str(" --dangerously-skip-permissions");
-        }
-        if let Some(settings) = settings_path {
-            // Single-quote the path so a `$TMPDIR` with spaces survives
-            // the pane's shell. Worker settings paths never contain a
-            // single quote, so naive single-quoting is sufficient.
-            cmd.push_str(&format!(" --settings '{}'", settings.display()));
-        }
-        cmd.push_str(" \"$(cat .claude/initial-prompt.txt)\"\n");
-        cmd
+        crate::driver::ClaudeDriver.spawn_invocation(
+            &self.model,
+            self.claude_effort,
+            settings_path,
+            non_opus_auto_mode,
+        )
     }
 }
 

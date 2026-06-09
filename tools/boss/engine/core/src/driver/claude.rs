@@ -1,6 +1,7 @@
-//! `ClaudeDriver` stub — the reference implementation of [`AgentDriver`] for
-//! Claude Code. Behavioural methods are `unimplemented!()` pending the
-//! per-capability extraction tasks (Depth 1–2 in the design).
+//! `ClaudeDriver` — the reference implementation of [`AgentDriver`] for
+//! Claude Code. The `Spawn` capability is live; remaining behavioural methods
+//! are `unimplemented!()` pending their per-capability extraction tasks
+//! (Depth 1–2 in the design).
 
 use std::path::{Path, PathBuf};
 
@@ -55,13 +56,29 @@ impl AgentDriver for ClaudeDriver {
 
     fn spawn_invocation(
         &self,
-        _model: &str,
-        _effort: Option<&str>,
-        _settings_path: Option<&Path>,
-        _non_opus_auto_mode: bool,
+        model: &str,
+        effort: Option<&str>,
+        settings_path: Option<&Path>,
+        non_opus_auto_mode: bool,
     ) -> String {
-        // TODO(@brianduff,2026-12-31): extract from effort::SpawnConfig::claude_invocation
-        unimplemented!("extracted in the Spawn capability task")
+        let mut cmd = format!("claude --model {model}");
+        if let Some(e) = effort {
+            cmd.push_str(" --effort ");
+            cmd.push_str(e);
+        }
+        if crate::effort::model_requires_auto_permissions(model) || non_opus_auto_mode {
+            cmd.push_str(" --permission-mode auto");
+        } else {
+            cmd.push_str(" --dangerously-skip-permissions");
+        }
+        if let Some(settings) = settings_path {
+            // Single-quote the path so a `$TMPDIR` with spaces survives
+            // the pane's shell. Worker settings paths never contain a
+            // single quote, so naive single-quoting is sufficient.
+            cmd.push_str(&format!(" --settings '{}'", settings.display()));
+        }
+        cmd.push_str(" \"$(cat .claude/initial-prompt.txt)\"\n");
+        cmd
     }
 
     async fn provision_workspace(
