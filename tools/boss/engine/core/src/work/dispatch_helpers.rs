@@ -997,3 +997,449 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
             .build(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Open a fresh per-test in-memory `WorkDb`. Mirrors the
+    /// `temp_db_path` convention in `work/tests.rs`: each
+    /// `WorkDb::open(":memory:")` allocates a unique shared-cache db.
+    fn open_db() -> WorkDb {
+        WorkDb::open(PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// Create a product with the given repo default (or none). Returns
+    /// the product id.
+    fn product_with_repo(db: &WorkDb, repo: Option<&str>) -> String {
+        db.create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: repo.map(str::to_owned),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap()
+        .id
+    }
+
+    /// Raw-insert a task row with full control over `kind` and
+    /// `deleted_at`, bypassing the create-time repo invariant. Mirrors
+    /// the legacy-row inserts in `work/tests/t01.rs`. Returns the id.
+    fn insert_raw_task(
+        conn: &Connection,
+        product_id: &str,
+        kind: &str,
+        deleted_at: Option<&str>,
+    ) -> String {
+        let id = next_id("task");
+        let now = now_string();
+        conn.execute(
+            "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via)
+             VALUES (?1, ?2, NULL, ?3, 'Raw', '', 'todo', NULL, NULL, ?4, ?5, ?5, 1, 'medium', 'test')",
+            params![id, product_id, kind, deleted_at, now],
+        )
+        .unwrap();
+        id
+    }
+
+    // ── attention_target_from_input ─────────────────────────────────────────
+
+    #[test]
+    fn attention_target_accepts_execution_only() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product)
+                    .name("Chore")
+                    .build(),
+            )
+            .unwrap();
+        let exec = db
+            .request_execution(RequestExecutionInput::builder().work_item_id(chore.id).build())
+            .unwrap();
+
+        let conn = db.connect().unwrap();
+        let input = CreateAttentionItemInput {
+            execution_id: Some(exec.id.clone()),
+            ..Default::default()
+        };
+        let (resolved_exec, resolved_work) = attention_target_from_input(&conn, &input).unwrap();
+        assert_eq!(resolved_exec.as_deref(), Some(exec.id.as_str()));
+        assert_eq!(resolved_work, None);
+    }
+
+    #[test]
+    fn attention_target_accepts_work_item_only() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+        let work_id = insert_raw_task(&conn, &product, "chore", None);
+
+        let input = CreateAttentionItemInput {
+            work_item_id: Some(work_id.clone()),
+            ..Default::default()
+        };
+        let (resolved_exec, resolved_work) = attention_target_from_input(&conn, &input).unwrap();
+        assert_eq!(resolved_exec, None);
+        assert_eq!(resolved_work.as_deref(), Some(work_id.as_str()));
+    }
+
+    #[test]
+    fn attention_target_rejects_both_set() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let input = CreateAttentionItemInput {
+            execution_id: Some("exec_x".to_owned()),
+            work_item_id: Some("task_x".to_owned()),
+            ..Default::default()
+        };
+        let err = attention_target_from_input(&conn, &input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must reference either execution_id or work_item_id, not both"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn attention_target_rejects_neither_set() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let input = CreateAttentionItemInput::default();
+        let err = attention_target_from_input(&conn, &input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must reference either execution_id or work_item_id"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn attention_target_treats_empty_strings_as_absent() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+        let work_id = insert_raw_task(&conn, &product, "chore", None);
+
+        // An empty-string execution_id is filtered out, so the work_item_id
+        // alone governs — no "both set" error.
+        let input = CreateAttentionItemInput {
+            execution_id: Some(String::new()),
+            work_item_id: Some(work_id.clone()),
+            ..Default::default()
+        };
+        let (resolved_exec, resolved_work) = attention_target_from_input(&conn, &input).unwrap();
+        assert_eq!(resolved_exec, None);
+        assert_eq!(resolved_work.as_deref(), Some(work_id.as_str()));
+
+        // Both empty → treated as neither set.
+        let empty = CreateAttentionItemInput {
+            execution_id: Some(String::new()),
+            work_item_id: Some(String::new()),
+            ..Default::default()
+        };
+        let err = attention_target_from_input(&conn, &empty).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must reference either execution_id or work_item_id"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn attention_target_surfaces_unknown_execution() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let input = CreateAttentionItemInput {
+            execution_id: Some("exec_does_not_exist".to_owned()),
+            ..Default::default()
+        };
+        let err = attention_target_from_input(&conn, &input).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown execution: exec_does_not_exist"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn attention_target_surfaces_unknown_work_item() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let input = CreateAttentionItemInput {
+            work_item_id: Some("task_does_not_exist".to_owned()),
+            ..Default::default()
+        };
+        let err = attention_target_from_input(&conn, &input).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown task: task_does_not_exist"),
+            "unexpected error: {err}",
+        );
+    }
+
+    // ── repo_unresolved_kind_label ──────────────────────────────────────────
+
+    #[test]
+    fn kind_label_chore_task_returns_chore() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+        let chore_id = insert_raw_task(&conn, &product, "chore", None);
+        assert_eq!(repo_unresolved_kind_label(&conn, &chore_id).unwrap(), "chore");
+    }
+
+    #[test]
+    fn kind_label_non_chore_task_kinds_return_task() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+        for kind in ["task", "design", "investigation", "project_task", "revision"] {
+            let id = insert_raw_task(&conn, &product, kind, None);
+            assert_eq!(
+                repo_unresolved_kind_label(&conn, &id).unwrap(),
+                "task",
+                "kind `{kind}` should map to the `task` label",
+            );
+        }
+    }
+
+    #[test]
+    fn kind_label_project_and_product_ids() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        // Project / product ids classify by prefix and never hit the DB.
+        assert_eq!(
+            repo_unresolved_kind_label(&conn, "proj_abc").unwrap(),
+            "project"
+        );
+        assert_eq!(
+            repo_unresolved_kind_label(&conn, "prod_abc").unwrap(),
+            "product"
+        );
+    }
+
+    #[test]
+    fn kind_label_errors_on_soft_deleted_or_unknown_task() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+
+        let deleted = insert_raw_task(&conn, &product, "chore", Some("2026-01-01T00:00:00Z"));
+        let err = repo_unresolved_kind_label(&conn, &deleted).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown task"),
+            "soft-deleted task should be unknown (got `{err}`)",
+        );
+
+        let err = repo_unresolved_kind_label(&conn, "task_missing").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown task: task_missing"),
+            "unexpected error: {err}",
+        );
+    }
+
+    // ── repo_unresolved_attention_body ──────────────────────────────────────
+
+    #[test]
+    fn attention_body_pins_exact_message_format() {
+        // This is the single-source message the design's R1 mitigation
+        // depends on; pin it so the CLI hint and attention surface can't
+        // drift apart.
+        assert_eq!(
+            repo_unresolved_attention_body("task_42", "chore"),
+            "work item task_42 has no repo resolution; set one with `boss chore update --repo <url>` or set a product default.",
+        );
+        assert_eq!(
+            repo_unresolved_attention_body("proj_9", "project"),
+            "work item proj_9 has no repo resolution; set one with `boss project update --repo <url>` or set a product default.",
+        );
+    }
+
+    // ── record_repo_unresolved_attention ────────────────────────────────────
+
+    #[test]
+    fn record_attention_inserts_open_row_then_dedupes() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+        let work_id = insert_raw_task(&conn, &product, "chore", None);
+
+        record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
+        let items = db.list_attention_items_for_work_item(&work_id).unwrap();
+        assert_eq!(items.len(), 1, "first call inserts one row");
+        let item = &items[0];
+        assert_eq!(item.kind, "repo_unresolved");
+        assert_eq!(item.status, "open");
+        assert_eq!(item.execution_id, None);
+        assert_eq!(item.work_item_id.as_deref(), Some(work_id.as_str()));
+        assert_eq!(
+            item.body_markdown,
+            repo_unresolved_attention_body(&work_id, "chore"),
+        );
+
+        // Second call while one is already open does NOT duplicate.
+        record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
+        assert_eq!(
+            db.list_attention_items_for_work_item(&work_id).unwrap().len(),
+            1,
+            "idempotent: no duplicate while an open row exists",
+        );
+    }
+
+    // ── ensure_dispatch_repo_resolvable ─────────────────────────────────────
+
+    #[test]
+    fn ensure_dispatch_ok_and_writes_no_attention_when_repo_resolves() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product)
+                    .name("Chore")
+                    .build(),
+            )
+            .unwrap();
+
+        let mut conn = db.connect().unwrap();
+        ensure_dispatch_repo_resolvable(&mut conn, &chore.id).unwrap();
+        assert!(
+            db.list_attention_items_for_work_item(&chore.id)
+                .unwrap()
+                .is_empty(),
+            "a resolvable work item must not raise an attention item",
+        );
+    }
+
+    #[test]
+    fn ensure_dispatch_bails_and_writes_one_sticky_attention_when_unresolvable() {
+        let db = open_db();
+        let product = product_with_repo(&db, None);
+        let conn = db.connect().unwrap();
+        let chore_id = insert_raw_task(&conn, &product, "chore", None);
+        drop(conn);
+
+        let mut conn = db.connect().unwrap();
+        let err = ensure_dispatch_repo_resolvable(&mut conn, &chore_id).unwrap_err();
+        // Bails with the exact single-source message.
+        assert_eq!(
+            err.to_string(),
+            repo_unresolved_attention_body(&chore_id, "chore"),
+        );
+        drop(conn);
+
+        // The sticky row was committed despite the bail, and exactly one
+        // exists (a second precheck dedupes rather than piling up).
+        let items = db.list_attention_items_for_work_item(&chore_id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "repo_unresolved");
+        assert_eq!(items[0].status, "open");
+
+        let mut conn = db.connect().unwrap();
+        let _ = ensure_dispatch_repo_resolvable(&mut conn, &chore_id).unwrap_err();
+        assert_eq!(
+            db.list_attention_items_for_work_item(&chore_id).unwrap().len(),
+            1,
+            "repeated prechecks stay sticky-deduped",
+        );
+    }
+
+    // ── retired_spawning_attempt_status ─────────────────────────────────────
+
+    /// Build a minimal `Task` carrying only the `created_via` value the
+    /// classifier inspects; every other field is a fixed placeholder.
+    fn task_with_created_via(created_via: &str) -> Task {
+        Task::builder()
+            .id("task_test")
+            .product_id("prod_test")
+            .kind(TaskKind::Revision)
+            .name("Rev")
+            .description("desc")
+            .status(TaskStatus::Todo)
+            .created_via(created_via)
+            .created_at("2026-01-01T00:00:00Z")
+            .updated_at("2026-01-01T00:00:00Z")
+            .build()
+    }
+
+    #[test]
+    fn retired_status_none_for_non_engine_spawned() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        assert_eq!(
+            retired_spawning_attempt_status(&conn, &task_with_created_via("human")).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn retired_status_none_for_empty_attempt_id() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}");
+        assert_eq!(
+            retired_spawning_attempt_status(&conn, &task_with_created_via(&created_via)).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn retired_status_none_when_attempt_row_missing() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let created_via = format!("{CREATED_VIA_CI_FIX_PREFIX}cir_missing");
+        assert_eq!(
+            retired_spawning_attempt_status(&conn, &task_with_created_via(&created_via)).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn retired_status_none_while_attempt_active_some_when_terminal() {
+        let db = open_db();
+        let conn = db.connect().unwrap();
+        let now = now_string();
+        let attempt_id = next_id("crz");
+        // A conflict_resolutions row routed via the merge-conflict prefix.
+        conn.execute(
+            "INSERT INTO conflict_resolutions
+                 (id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch, status, created_at)
+             VALUES (?1, 'prod_test', 'task_owner', 'https://example/pr/1', 1, 'feat', 'main', 'pending', ?2)",
+            params![attempt_id, now],
+        )
+        .unwrap();
+        let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}{attempt_id}");
+        let task = task_with_created_via(&created_via);
+
+        // Active statuses are filtered out → None.
+        assert_eq!(
+            retired_spawning_attempt_status(&conn, &task).unwrap(),
+            None,
+            "pending attempt is still active",
+        );
+        conn.execute(
+            "UPDATE conflict_resolutions SET status = 'running' WHERE id = ?1",
+            params![attempt_id],
+        )
+        .unwrap();
+        assert_eq!(
+            retired_spawning_attempt_status(&conn, &task).unwrap(),
+            None,
+            "running attempt is still active",
+        );
+
+        // A terminal status surfaces as Some(status).
+        conn.execute(
+            "UPDATE conflict_resolutions SET status = 'succeeded' WHERE id = ?1",
+            params![attempt_id],
+        )
+        .unwrap();
+        assert_eq!(
+            retired_spawning_attempt_status(&conn, &task).unwrap(),
+            Some("succeeded".to_owned()),
+        );
+    }
+}
