@@ -49,6 +49,7 @@ pub mod metrics;
 pub mod nudge_breaker;
 pub mod orphan_sweep;
 pub mod pane_summary;
+pub mod planner_validation;
 pub mod pool_claim_sweep;
 pub use boss_pr_template as pr_template;
 pub mod pr_review;
