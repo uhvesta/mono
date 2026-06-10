@@ -363,14 +363,17 @@ version = 2
 fn composite_provider_reports_conflicts() {
     let package = ExternalCheckPackage {
         id: "domain-typo-check".to_owned(),
-        runtime: "sandbox-v1".to_owned(),
+        runtime: "component-v1".to_owned(),
         api_version: "v1".to_owned(),
-        capabilities: Default::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(
-            super::ExternalCheckArtifactPackage {
+        implementation: ExternalCheckPackageImplementation::Component(
+            super::ExternalCheckComponentPackage {
                 artifact_path: "check.wasm".to_owned(),
                 artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                     .to_owned(),
+                artifact_bytes: None,
+                check_name: "domain-typo-check".to_owned(),
+                limits: None,
+                checks: None,
                 provenance: None,
             },
         ),
@@ -406,7 +409,6 @@ fn composite_provider_resolves_component_package() {
         id: "my-check".to_owned(),
         runtime: super::EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: super::EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: Default::default(),
         implementation: ExternalCheckPackageImplementation::Component(
             super::ExternalCheckComponentPackage {
                 artifact_path: "checks/my_check.wasm".to_owned(),
@@ -454,7 +456,6 @@ fn composite_provider_no_conflict_when_only_one_resolves_component() {
         id: "unique-check".to_owned(),
         runtime: super::EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: super::EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: Default::default(),
         implementation: ExternalCheckPackageImplementation::Component(
             super::ExternalCheckComponentPackage {
                 artifact_path: "checks/unique.wasm".to_owned(),

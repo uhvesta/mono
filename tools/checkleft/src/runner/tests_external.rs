@@ -92,15 +92,18 @@ allow_bypass = true
     let provider = StaticExternalProvider {
         package: Some(ExternalCheckPackage {
             id: "different-id".to_owned(),
-            runtime: "sandbox-v1".to_owned(),
+            runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Artifact(
-                ExternalCheckArtifactPackage {
+            implementation: ExternalCheckPackageImplementation::Component(
+                ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
                     artifact_sha256:
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_owned(),
+                    artifact_bytes: None,
+                    check_name: "different-id".to_owned(),
+                    limits: None,
+                    checks: None,
                     provenance: None,
                 },
             ),
@@ -150,15 +153,18 @@ allow_bypass = true
     let provider = StaticExternalProvider {
         package: Some(ExternalCheckPackage {
             id: "domain-typo-check".to_owned(),
-            runtime: "sandbox-v1".to_owned(),
+            runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Artifact(
-                ExternalCheckArtifactPackage {
+            implementation: ExternalCheckPackageImplementation::Component(
+                ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
                     artifact_sha256:
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_owned(),
+                    artifact_bytes: None,
+                    check_name: "domain-typo-check".to_owned(),
+                    limits: None,
+                    checks: None,
                     provenance: None,
                 },
             ),
@@ -289,15 +295,18 @@ severity = "error"
     let provider = StaticExternalProvider {
         package: Some(ExternalCheckPackage {
             id: "domain-typo-check".to_owned(),
-            runtime: "sandbox-v1".to_owned(),
+            runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Artifact(
-                ExternalCheckArtifactPackage {
+            implementation: ExternalCheckPackageImplementation::Component(
+                ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
                     artifact_sha256:
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_owned(),
+                    artifact_bytes: None,
+                    check_name: "domain-typo-check".to_owned(),
+                    limits: None,
+                    checks: None,
                     provenance: None,
                 },
             ),
@@ -361,15 +370,18 @@ allow_bypass = true
     let provider = StaticExternalProvider {
         package: Some(ExternalCheckPackage {
             id: "domain-typo-check".to_owned(),
-            runtime: "sandbox-v1".to_owned(),
+            runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Artifact(
-                ExternalCheckArtifactPackage {
+            implementation: ExternalCheckPackageImplementation::Component(
+                ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
                     artifact_sha256:
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_owned(),
+                    artifact_bytes: None,
+                    check_name: "domain-typo-check".to_owned(),
+                    limits: None,
+                    checks: None,
                     provenance: None,
                 },
             ),
@@ -437,15 +449,18 @@ implementation = "generated:domain-typo-check"
     let provider = StaticExternalProvider {
         package: Some(ExternalCheckPackage {
             id: "domain-typo-check".to_owned(),
-            runtime: "sandbox-v1".to_owned(),
+            runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            capabilities: Default::default(),
-            implementation: ExternalCheckPackageImplementation::Artifact(
-                ExternalCheckArtifactPackage {
+            implementation: ExternalCheckPackageImplementation::Component(
+                ExternalCheckComponentPackage {
                     artifact_path: "check.wasm".to_owned(),
                     artifact_sha256:
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_owned(),
+                    artifact_bytes: None,
+                    check_name: "domain-typo-check".to_owned(),
+                    limits: None,
+                    checks: None,
                     provenance: None,
                 },
             ),

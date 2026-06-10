@@ -4,18 +4,19 @@ This page freezes the initial external-check contracts for the sandboxed work.
 
 Scope for this phase:
 
-1. Manifest schema (`wasm` and `declarative` modes).
+1. Manifest schema (`component` and `declarative` modes).
 2. Implementation reference syntax (`generated:` and file path refs).
 3. Capability policy contract shape.
 4. Host API operation names and semantics.
 
-> **Runtime unification.** There are two external-check runtimes: `wasm`
-> (sandboxed pure computation, runtime tag `sandbox-v1`) and `declarative`
+> **Runtime tiers.** There are two external-check runtimes: `component`
+> (WebAssembly Component Model, runtime tag `component-v1`) and `declarative`
 > (framework-owned invocation of declared binaries + declarative transforms,
 > runtime tag `declarative-v1`). The former `exec` mode / `exec-v1` runtime has
 > been **folded into the declarative runtime**: a custom binary that emits a
 > checkleft findings document is now expressed as a declarative invocation with
-> the `passthrough` transform.
+> the `passthrough` transform. The legacy `wasm` / `sandbox-v1` tier has been
+> removed.
 
 Non-goals for this phase:
 
@@ -75,23 +76,26 @@ Required common fields:
 1. `id`
 2. `runtime`
 3. `api_version` (currently must be `v1`)
-4. `mode` (`wasm` or `declarative`)
-5. Optional `[capabilities]` table for the `wasm` mode only
+4. `mode` (`component` or `declarative`)
 
-### `wasm` mode fields
+### `component` mode fields
 
-`runtime = "sandbox-v1"`. Required:
+`runtime = "component-v1"`. Required:
 
-1. `artifact_path` (safe relative path)
-2. `artifact_sha256`
+1. `artifact_path` (safe relative path to the `.wasm` artifact)
+2. `artifact_sha256` (64-character lowercase hex SHA-256 digest)
 
 Optional:
 
-1. `[provenance]`
+1. `[limits]`
+   - `timeout_ms`
+   - `max_memory_mb`
+2. `checks` (list of check IDs exported by this component; used for defense-in-depth validation)
+3. `[provenance]`
    - `generator`
    - `target`
 
-Not allowed in `wasm` mode:
+Not allowed in `component` mode:
 
 1. `executable_path`, `args`
 2. `applies_to`, `needs`, `invocations` (declarative-only)
@@ -119,35 +123,8 @@ Transform strategies:
 
 Not allowed in `declarative` mode:
 
-1. `[capabilities]`
-2. `artifact_path`, `artifact_sha256`
-3. `executable_path`, `args` (top-level), `[provenance]`
-
-## Capability Contract
-
-Capabilities are deny-by-default.
-
-Current contract:
-
-```toml
-[capabilities]
-commands = ["grep", "sed"]
-```
-
-Validation requirements:
-
-1. Commands must be bare command names (not paths).
-2. Commands must not contain whitespace.
-3. Duplicate command names are invalid.
-
-Runtime policy (enforced later in execution wiring):
-
-1. Effective allowed commands = global checkleft command ceiling ∩ manifest `commands`.
-2. Shell entrypoints remain hard-blocked.
-
-`declarative` packages do not support capabilities. The framework owns binary
-invocation directly (the runtime, not the check, runs the binary), so the
-`[capabilities]` table — a `wasm`-guest command-grant concept — must be omitted.
+1. `artifact_path`, `artifact_sha256`
+2. `executable_path`, `args` (top-level), `[provenance]`
 
 ## Host API Contract Surface (Names Frozen)
 

@@ -31,10 +31,9 @@ use sha2::{Digest, Sha256};
 use anyhow::{Context, Result};
 
 use super::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckCapabilities,
-    ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    parse_external_check_manifest,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage,
+    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, parse_external_check_manifest,
 };
 
 /// A first-party definition compiled into the binary.
@@ -147,7 +146,6 @@ fn build_bundled_component_package(check_name: &str, bytes: &'static [u8]) -> Ex
         id: check_name.to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
         implementation: ExternalCheckPackageImplementation::Component(
             ExternalCheckComponentPackage {
                 artifact_path: String::new(),

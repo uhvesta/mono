@@ -4,9 +4,8 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use crate::external::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckArtifactPackage,
-    ExternalCheckCapabilities, ExternalCheckComponentLimits, ExternalCheckPackage,
-    ExternalCheckPackageImplementation,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentLimits,
+    ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
 use crate::output::Severity;
@@ -14,200 +13,16 @@ use crate::source_tree::LocalSourceTree;
 
 use super::{
     DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HostState,
-    MemoryLimiter, WASM_PAGE_SIZE_BYTES, build_wasmtime_engine, is_interrupt_error,
-    resolve_component_limits, sha256_hex,
+    MemoryLimiter, build_wasmtime_engine, is_interrupt_error, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
-
-#[test]
-fn executes_artifact_module_and_parses_findings() {
-    let temp = tempdir().expect("temp dir");
-    let output_json = r#"{"findings":[{"severity":"info","message":"hello","location":null,"remediation":null,"suggested_fix":null}]}"#;
-    let output_offset = 1024_u64;
-    let output_len = output_json.len() as u64;
-    let encoded = (output_offset << 32) | output_len;
-    let wat = format!(
-        r#"(module
-  (memory (export "memory") 1)
-  (data (i32.const {offset}) {output:?})
-  (func (export "checkleft_run") (param i32 i32) (result i64)
-i64.const {encoded}
-  )
-)"#,
-        offset = output_offset,
-        output = output_json,
-        encoded = encoded,
-    );
-    let wasm_bytes = wat::parse_str(&wat).expect("parse wat");
-    fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
-    let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("check.wasm")).expect("read wasm"));
-
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
-    let package = ExternalCheckPackage {
-        id: "example-check".to_owned(),
-        runtime: "sandbox-v1".to_owned(),
-        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(
-            ExternalCheckArtifactPackage {
-                artifact_path: "check.wasm".to_owned(),
-                artifact_sha256,
-                provenance: None,
-            },
-        ),
-    };
-
-    let result = executor
-        .execute(
-            &package,
-            &ChangeSet::default(),
-            &LocalSourceTree::new(temp.path()).expect("tree"),
-            &toml::Value::Table(Default::default()),
-        )
-        .expect("execute");
-
-    assert_eq!(result.check_id, "example-check");
-    assert_eq!(result.findings.len(), 1);
-    assert_eq!(result.findings[0].severity, Severity::Info);
-    assert_eq!(result.findings[0].message, "hello");
-}
-
-#[test]
-fn artifact_digest_mismatch_is_rejected() {
-    let temp = tempdir().expect("temp dir");
-    let wasm_bytes = wat::parse_str(
-        r#"(module
-  (memory (export "memory") 1)
-  (func (export "checkleft_run") (param i32 i32) (result i64)
-i64.const 0
-  )
-)"#,
-    )
-    .expect("parse wat");
-    fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
-
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
-    let package = ExternalCheckPackage {
-        id: "example-check".to_owned(),
-        runtime: "sandbox-v1".to_owned(),
-        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(
-            ExternalCheckArtifactPackage {
-                artifact_path: "check.wasm".to_owned(),
-                artifact_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                    .to_owned(),
-                provenance: None,
-            },
-        ),
-    };
-
-    let error = executor
-        .execute(
-            &package,
-            &ChangeSet::default(),
-            &LocalSourceTree::new(temp.path()).expect("tree"),
-            &toml::Value::Table(Default::default()),
-        )
-        .expect_err("must reject digest mismatch");
-    assert!(error.to_string().contains("artifact sha256 mismatch"));
-}
-#[test]
-fn core_runtime_trap_does_not_fall_back_to_component_mode() {
-    let temp = tempdir().expect("temp dir");
-    let wasm_bytes = wat::parse_str(
-        r#"(module
-  (memory (export "memory") 1)
-  (func (export "checkleft_run") (param i32 i32) (result i64)
-    unreachable
-  )
-)"#,
-    )
-    .expect("parse wat");
-    fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
-    let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("check.wasm")).expect("read wasm"));
-
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
-    let package = ExternalCheckPackage {
-        id: "example-check".to_owned(),
-        runtime: "sandbox-v1".to_owned(),
-        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(
-            ExternalCheckArtifactPackage {
-                artifact_path: "check.wasm".to_owned(),
-                artifact_sha256,
-                provenance: None,
-            },
-        ),
-    };
-
-    let error = executor
-        .execute(
-            &package,
-            &ChangeSet::default(),
-            &LocalSourceTree::new(temp.path()).expect("tree"),
-            &toml::Value::Table(Default::default()),
-        )
-        .expect_err("core trap must surface as runtime execution failure");
-    let rendered = format!("{error:#}");
-    assert!(rendered.contains("external wasm check execution failed"));
-    assert!(!rendered.contains("failed to compile component"));
-}
-
-#[test]
-fn package_declaring_shell_command_is_rejected() {
-    let temp = tempdir().expect("temp dir");
-    let wasm_bytes = wat::parse_str(
-        r#"(module
-  (memory (export "memory") 1)
-  (func (export "checkleft_run") (param i32 i32) (result i64)
-i64.const 0
-  )
-)"#,
-    )
-    .expect("parse wat");
-    fs::write(temp.path().join("check.wasm"), wasm_bytes).expect("write wasm");
-    let artifact_sha256 = sha256_hex(&fs::read(temp.path().join("check.wasm")).expect("read"));
-
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
-    let package = ExternalCheckPackage {
-        id: "example-check".to_owned(),
-        runtime: "sandbox-v1".to_owned(),
-        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities {
-            commands: vec!["sh".to_owned()],
-        },
-        implementation: ExternalCheckPackageImplementation::Artifact(
-            ExternalCheckArtifactPackage {
-                artifact_path: "check.wasm".to_owned(),
-                artifact_sha256,
-                provenance: None,
-            },
-        ),
-    };
-
-    let error = executor
-        .execute(
-            &package,
-            &ChangeSet::default(),
-            &LocalSourceTree::new(temp.path()).expect("tree"),
-            &toml::Value::Table(Default::default()),
-        )
-        .expect_err("shell declarations must be rejected");
-    assert!(
-        error
-            .to_string()
-            .contains("invalid command capability declaration")
-    );
-}
 
 // --- component-v1 error-path tests ---
 
 #[test]
 fn component_v1_non_component_bytes_give_compile_error() {
     // Passing core-wasm bytes to the component-v1 path must fail at the compile
-    // step (not silently fall back to the core path).
+    // step (not silently succeed via some other path).
     let temp = tempdir().expect("temp dir");
     let wasm_bytes = wat::parse_str(
         r#"(module
@@ -226,10 +41,13 @@ fn component_v1_non_component_bytes_give_compile_error() {
         id: "example-check".to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(ExternalCheckArtifactPackage {
+        implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
             artifact_path: "check.wasm".to_owned(),
             artifact_sha256,
+            artifact_bytes: None,
+            check_name: "example-check".to_owned(),
+            limits: None,
+            checks: None,
             provenance: None,
         }),
     };
@@ -267,11 +85,14 @@ fn component_v1_digest_mismatch_is_rejected() {
         id: "example-check".to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        capabilities: ExternalCheckCapabilities::default(),
-        implementation: ExternalCheckPackageImplementation::Artifact(ExternalCheckArtifactPackage {
+        implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
             artifact_path: "check.wasm".to_owned(),
             artifact_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
                 .to_owned(),
+            artifact_bytes: None,
+            check_name: "example-check".to_owned(),
+            limits: None,
+            checks: None,
             provenance: None,
         }),
     };
@@ -652,7 +473,8 @@ fn host_state_with_sandbox_root_preopens_the_directory() {
     let dir = tempdir().expect("temp dir");
     fs::write(dir.path().join("probe.txt"), b"hello").expect("write probe file");
     let state =
-        super::HostState::with_sandbox_root(dir.path()).expect("build HostState with sandbox root");
+        super::HostState::with_sandbox_root(dir.path(), usize::MAX)
+            .expect("build HostState with sandbox root");
     // The HostState was created — the preopened_dir call did not fail.
     // (Runtime behavior is verified by the full component integration path once a
     // test component binary is available.)
@@ -798,7 +620,7 @@ fn memory_cap_trip_via_resource_limiter() {
     let engine = build_wasmtime_engine().unwrap();
 
     // Allow exactly 1 wasm page (64 KiB).
-    let one_page = WASM_PAGE_SIZE_BYTES;
+    let one_page = 65_536_usize;
     let mut store: Store<HostState> = Store::new(&engine, HostState::new(one_page));
     store.limiter(|state| &mut state.limiter);
     store.set_fuel(u64::MAX).unwrap();

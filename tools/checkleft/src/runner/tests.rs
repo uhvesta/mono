@@ -11,9 +11,9 @@ use crate::check::{Check, CheckRegistry, ConfiguredCheck};
 use crate::checks::register_builtin_checks;
 use crate::config::ConfigResolver;
 use crate::external::{
-    BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor,
-    ExternalCheckArtifactPackage, ExternalCheckExecutor, ExternalCheckImplementationRef,
-    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor, ExternalCheckExecutor,
+    ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
     parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};

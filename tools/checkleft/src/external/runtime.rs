@@ -4,10 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Instance, Memory, Module, ResourceLimiter, Store};
+use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
@@ -17,20 +16,14 @@ use super::component_bindings::checkleft::check::types as wit_types;
 use super::component_bindings::Check as WitCheck;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
-    EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1,
-    EXTERNAL_CHECK_RUNTIME_V1, ExternalCheckArtifactPackage, ExternalCheckComponentLimits,
+    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits,
     ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCommandCapabilities, run_declarative_check,
+    run_declarative_check,
 };
 
 mod cwasm_cache;
 pub use cwasm_cache::ComponentAotCache;
 
-const CORE_ENTRYPOINT_EXPORT: &str = "checkleft_run";
-const COMPONENT_ENTRYPOINT_EXPORT: &str = "run";
-const MEMORY_EXPORT: &str = "memory";
-const INPUT_OFFSET: usize = 0;
-const WASM_PAGE_SIZE_BYTES: usize = 65_536;
 const EXECUTION_FUEL_LIMIT: u64 = 10_000_000;
 
 /// Default wall-clock timeout for component-v1 checks (5 seconds).
@@ -86,9 +79,8 @@ impl ResourceLimiter for MemoryLimiter {
 /// Holds the WASI context (filesystem preopens, stdio, env) and the resource
 /// table required by `WasiView`, plus a `MemoryLimiter`. Phase-1 stores use an
 /// empty context (no preopens) so that `list-checks` can be called to discover
-/// the access scope; phase-2 stores use a context preopened at the capability
-/// sandbox root. The `limiter` field is uncapped (`usize::MAX`) for WASI-path
-/// stores and set from manifest limits for the artifact-v1 path.
+/// the access scope; phase-2 stores preopen the capability sandbox root and
+/// enforce the manifest memory cap via `store.limiter()`.
 struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
@@ -121,13 +113,13 @@ impl HostState {
 
     /// Build host state with the sandbox root preopened read-only at `"/"`.
     /// Used for the `run-check` execution phase.
-    fn with_sandbox_root(sandbox_root: &Path) -> Result<Self> {
+    fn with_sandbox_root(sandbox_root: &Path, max_memory_bytes: usize) -> Result<Self> {
         let mut builder = WasiCtxBuilder::new();
         builder.preopened_dir(sandbox_root, "/", DirPerms::READ, FilePerms::READ)?;
         Ok(Self {
             ctx: builder.build(),
             table: ResourceTable::new(),
-            limiter: MemoryLimiter { max_bytes: usize::MAX },
+            limiter: MemoryLimiter { max_bytes: max_memory_bytes },
         })
     }
 }
@@ -166,22 +158,6 @@ impl Drop for EpochTicker {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
-    }
-}
-
-#[derive(Debug)]
-enum CoreArtifactExecutionError {
-    ArtifactMismatch(anyhow::Error),
-    Execution(anyhow::Error),
-}
-
-impl CoreArtifactExecutionError {
-    fn mismatch(err: anyhow::Error) -> Self {
-        Self::ArtifactMismatch(err)
-    }
-
-    fn execution(err: anyhow::Error) -> Self {
-        Self::Execution(err)
     }
 }
 
@@ -285,177 +261,6 @@ impl DefaultExternalCheckExecutor {
         })
     }
 
-    fn execute_artifact(
-        &self,
-        package: &ExternalCheckPackage,
-        artifact: &ExternalCheckArtifactPackage,
-        command_capabilities: &ExternalCommandCapabilities,
-        changeset: &ChangeSet,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let artifact_path = self.resolve_artifact_path(&artifact.artifact_path)?;
-        let module_bytes = fs::read(&artifact_path)
-            .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
-        validate_artifact_sha256(package, artifact, &module_bytes)?;
-
-        match self.execute_core_artifact(
-            package,
-            &module_bytes,
-            command_capabilities,
-            changeset,
-            config,
-        ) {
-            Ok(result) => Ok(result),
-            Err(CoreArtifactExecutionError::ArtifactMismatch(core_error)) => self
-                .execute_component_artifact(
-                    package,
-                    &module_bytes,
-                    command_capabilities,
-                    changeset,
-                    config,
-                )
-                .with_context(|| {
-                    format!(
-                        "failed to execute package `{}` as component after core mismatch: {core_error:#}",
-                        package.id
-                    )
-                }),
-            Err(CoreArtifactExecutionError::Execution(error)) => Err(error),
-        }
-    }
-
-    fn execute_core_artifact(
-        &self,
-        package: &ExternalCheckPackage,
-        module_bytes: &[u8],
-        command_capabilities: &ExternalCommandCapabilities,
-        changeset: &ChangeSet,
-        config: &toml::Value,
-    ) -> std::result::Result<CheckResult, CoreArtifactExecutionError> {
-        let module = compile_core_module(&self.engine, package.id.as_str(), module_bytes)
-            .map_err(CoreArtifactExecutionError::mismatch)?;
-        let mut store = Store::new(&self.engine, ());
-        configure_store_fuel(&mut store).map_err(CoreArtifactExecutionError::execution)?;
-        // The core (sandbox-v1) path uses fuel for throttling, not epoch. Set
-        // the epoch deadline to u64::MAX so the always-enabled epoch mechanism
-        // does not interrupt this store — wasmtime defaults to 0 (immediate trap).
-        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
-
-        let instance = instantiate_core_module(&mut store, &module, package.id.as_str())
-            .map_err(CoreArtifactExecutionError::mismatch)?;
-
-        let memory = instance
-            .get_memory(&mut store, MEMORY_EXPORT)
-            .context("wasm module must export `memory`")
-            .map_err(CoreArtifactExecutionError::mismatch)?;
-        let run = get_core_run_function(&instance, &mut store)
-            .map_err(CoreArtifactExecutionError::mismatch)?;
-
-        let input =
-            ExternalCheckRuntimeInput::with_capabilities(changeset, config, command_capabilities);
-        let input_bytes = serde_json::to_vec(&input)
-            .context("failed to encode runtime input payload as JSON")
-            .map_err(CoreArtifactExecutionError::execution)?;
-
-        ensure_memory_capacity(&memory, &mut store, INPUT_OFFSET, input_bytes.len())
-            .map_err(CoreArtifactExecutionError::execution)?;
-        write_memory(&memory, &mut store, INPUT_OFFSET, &input_bytes)
-            .map_err(CoreArtifactExecutionError::execution)?;
-
-        let input_offset = i32::try_from(INPUT_OFFSET).context("input offset does not fit in i32");
-        let input_offset = input_offset.map_err(CoreArtifactExecutionError::execution)?;
-        let input_len =
-            i32::try_from(input_bytes.len()).context("runtime input length exceeds i32");
-        let input_len = input_len.map_err(CoreArtifactExecutionError::execution)?;
-        let output_range_encoded = call_core_run(&run, &mut store, input_offset, input_len)
-            .map_err(CoreArtifactExecutionError::execution)?;
-        let (output_offset, output_len) = decode_output_range(output_range_encoded)
-            .map_err(CoreArtifactExecutionError::execution)?;
-
-        ensure_memory_capacity(&memory, &mut store, output_offset, output_len)
-            .map_err(CoreArtifactExecutionError::execution)?;
-        let mut output_bytes = vec![0_u8; output_len];
-        read_memory(&memory, &mut store, output_offset, &mut output_bytes)
-            .map_err(CoreArtifactExecutionError::execution)?;
-
-        let output: ExternalCheckRuntimeOutput = serde_json::from_slice(&output_bytes)
-            .context("runtime output was not valid JSON CheckResult payload")
-            .map_err(CoreArtifactExecutionError::execution)?;
-
-        Ok(CheckResult {
-            check_id: package.id.clone(),
-            findings: output.findings,
-        })
-    }
-
-    fn execute_component_artifact(
-        &self,
-        package: &ExternalCheckPackage,
-        component_bytes: &[u8],
-        command_capabilities: &ExternalCommandCapabilities,
-        changeset: &ChangeSet,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let component = compile_component(&self.engine, package.id.as_str(), component_bytes)?;
-        let linker = Linker::<()>::new(&self.engine);
-        let mut store = Store::new(&self.engine, ());
-        configure_store_fuel(&mut store)?;
-        // Legacy path uses fuel; disable epoch the same way as execute_core_artifact.
-        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
-        let instance = instantiate_component(&linker, &mut store, &component, package.id.as_str())?;
-        let run = get_component_run_function(&instance, &mut store)?;
-
-        let input =
-            ExternalCheckRuntimeInput::with_capabilities(changeset, config, command_capabilities);
-        let input_json =
-            serde_json::to_string(&input).context("failed to encode component runtime input")?;
-        let (output_json,) = call_component_run(&run, &mut store, input_json)?;
-        let output: ExternalCheckRuntimeOutput =
-            serde_json::from_str(&output_json).context("component output was not valid JSON")?;
-
-        Ok(CheckResult {
-            check_id: package.id.clone(),
-            findings: output.findings,
-        })
-    }
-
-    /// Execute a component-v1 (WIT) artifact. Applies epoch-based deadline and
-    /// memory `ResourceLimiter` from `limits`, falling back to generous defaults
-    /// clamped by the host ceiling. Pass `None` for `limits` to use defaults.
-    fn execute_component_v1_artifact(
-        &self,
-        package: &ExternalCheckPackage,
-        artifact: &ExternalCheckArtifactPackage,
-        limits: Option<&ExternalCheckComponentLimits>,
-        changeset: &ChangeSet,
-        source_tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
-        let artifact_path = self.resolve_artifact_path(&artifact.artifact_path)?;
-        let component_bytes = fs::read(&artifact_path)
-            .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?;
-        validate_artifact_sha256(package, artifact, &component_bytes)?;
-
-        let wasm_component = self.load_or_compile_component(
-            &package.id,
-            &component_bytes,
-            &artifact.artifact_sha256,
-        )?;
-        run_component_check(
-            &self.engine,
-            &self.root,
-            ComponentRun {
-                package,
-                check_name: &package.id,
-                component: &wasm_component,
-                limits,
-                changeset,
-                source_tree,
-                config,
-            },
-        )
-    }
-
     fn execute_component_check(
         &self,
         package: &ExternalCheckPackage,
@@ -557,35 +362,6 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 // them at the repo root. Sandboxing is deferred by design.
                 run_declarative_check(&self.root, &package.id, declarative, changeset, config)
             }
-            ExternalCheckPackageImplementation::Artifact(artifact) => {
-                match package.runtime.as_str() {
-                    EXTERNAL_CHECK_COMPONENT_RUNTIME_V1 => self.execute_component_v1_artifact(
-                        package, artifact, None, changeset, source_tree, config,
-                    ),
-                    EXTERNAL_CHECK_RUNTIME_V1 => {
-                        let command_capabilities =
-                            ExternalCommandCapabilities::from_manifest(&package.capabilities)
-                                .with_context(|| {
-                                    format!(
-                                        "invalid command capability declaration for package `{}`",
-                                        package.id
-                                    )
-                                })?;
-                        self.execute_artifact(
-                            package,
-                            artifact,
-                            &command_capabilities,
-                            changeset,
-                            config,
-                        )
-                    }
-                    _ => bail!(
-                        "unsupported external runtime `{}` for artifact package `{}`",
-                        package.runtime,
-                        package.id
-                    ),
-                }
-            }
         }
     }
 }
@@ -648,42 +424,6 @@ fn lift_access_scope(scope: Option<&wit_types::AccessScope>) -> AccessScope {
     }
 }
 
-fn compile_core_module(engine: &Engine, package_id: &str, module_bytes: &[u8]) -> Result<Module> {
-    wasmtime(Module::new(engine, module_bytes))
-        .with_context(|| format!("failed to compile core wasm module for `{package_id}`"))
-}
-
-fn instantiate_core_module(
-    store: &mut Store<()>,
-    module: &Module,
-    package_id: &str,
-) -> Result<Instance> {
-    wasmtime(Instance::new(store, module, &[]))
-        .with_context(|| format!("failed to instantiate wasm module for `{package_id}`"))
-}
-
-fn get_core_run_function(
-    instance: &Instance,
-    store: &mut Store<()>,
-) -> Result<wasmtime::TypedFunc<(i32, i32), i64>> {
-    wasmtime(instance.get_typed_func::<(i32, i32), i64>(store, CORE_ENTRYPOINT_EXPORT))
-        .with_context(|| {
-            format!(
-                "core wasm module must export `{CORE_ENTRYPOINT_EXPORT}` with signature (i32, i32) -> i64"
-            )
-        })
-}
-
-fn call_core_run(
-    run: &wasmtime::TypedFunc<(i32, i32), i64>,
-    store: &mut Store<()>,
-    input_offset: i32,
-    input_len: i32,
-) -> Result<i64> {
-    wasmtime(run.call(store, (input_offset, input_len)))
-        .context("external wasm check execution failed")
-}
-
 fn compile_component(
     engine: &Engine,
     package_id: &str,
@@ -693,44 +433,12 @@ fn compile_component(
         .with_context(|| format!("failed to compile component for `{package_id}`"))
 }
 
-fn instantiate_component(
-    linker: &Linker<()>,
-    store: &mut Store<()>,
-    component: &Component,
-    package_id: &str,
-) -> Result<wasmtime::component::Instance> {
-    wasmtime(linker.instantiate(store, component))
-        .with_context(|| format!("failed to instantiate component for `{package_id}`"))
-}
-
-fn get_component_run_function(
-    instance: &wasmtime::component::Instance,
-    store: &mut Store<()>,
-) -> Result<wasmtime::component::TypedFunc<(String,), (String,)>> {
-    wasmtime(instance.get_typed_func::<(String,), (String,)>(store, COMPONENT_ENTRYPOINT_EXPORT))
-        .with_context(|| {
-            format!(
-                "component must export `{COMPONENT_ENTRYPOINT_EXPORT}` with signature (string) -> (string)"
-            )
-        })
-}
-
-fn call_component_run(
-    run: &wasmtime::component::TypedFunc<(String,), (String,)>,
-    store: &mut Store<()>,
-    input_json: String,
-) -> Result<(String,)> {
-    wasmtime(run.call(store, (input_json,))).context("external component check execution failed")
-}
-
 fn configure_store_fuel<T>(store: &mut Store<T>) -> Result<()> {
     wasmtime(store.set_fuel(EXECUTION_FUEL_LIMIT)).context("failed to configure runtime fuel limit")
 }
 
 /// Instantiate a component from raw bytes and execute the named check via the
-/// `list-checks` / `run-check` WIT interface. Shared by both the file-based
-/// (`Component` implementation variant) and the legacy artifact-wrapped
-/// (`Artifact` with `runtime = "component-v1"`) execution paths.
+/// `list-checks` / `run-check` WIT interface.
 struct ComponentRun<'a> {
     package: &'a ExternalCheckPackage,
     check_name: &'a str,
@@ -751,7 +459,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         source_tree,
         config,
     } = run;
-    let (timeout_ticks, _max_memory_bytes) = resolve_component_limits(limits);
+    let (timeout_ticks, max_memory_bytes) = resolve_component_limits(limits);
     let linker = build_component_v1_linker(engine)?;
 
     // Phase 1: instantiate with an empty WASI context (no preopens) to call
@@ -795,10 +503,12 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     // Phase 2: re-instantiate with a WASI context that preopens the sandbox
     // root at "/". The guest reads via std::fs with no checkleft-specific
     // call; enforcement is structural (only sandboxed files exist).
-    let host_state = HostState::with_sandbox_root(sandbox.root.path()).with_context(|| {
-        format!("failed to configure WASI context for check `{}`", package.id)
-    })?;
+    let host_state =
+        HostState::with_sandbox_root(sandbox.root.path(), max_memory_bytes).with_context(|| {
+            format!("failed to configure WASI context for check `{}`", package.id)
+        })?;
     let mut store = Store::new(engine, host_state);
+    store.limiter(|state| &mut state.limiter);
     store.set_epoch_deadline(timeout_ticks);
     configure_store_fuel(&mut store)?;
     let instance = wasmtime(linker.instantiate(&mut store, component))
@@ -845,61 +555,6 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         check_id: package.id.clone(),
         findings: findings.into_iter().map(lift_finding).collect(),
     })
-}
-
-fn write_memory(memory: &Memory, store: &mut Store<()>, offset: usize, bytes: &[u8]) -> Result<()> {
-    any_result(memory.write(store, offset, bytes))
-        .context("failed to write runtime input into wasm memory")
-}
-
-fn read_memory(
-    memory: &Memory,
-    store: &mut Store<()>,
-    offset: usize,
-    bytes: &mut [u8],
-) -> Result<()> {
-    any_result(memory.read(store, offset, bytes))
-        .context("failed to read runtime output from wasm memory")
-}
-
-#[derive(Serialize)]
-struct ExternalCheckRuntimeInput<'a> {
-    changeset: &'a ChangeSet,
-    config: &'a toml::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    capabilities: Option<ExternalCheckRuntimeCapabilities>,
-}
-
-impl<'a> ExternalCheckRuntimeInput<'a> {
-    fn with_capabilities(
-        changeset: &'a ChangeSet,
-        config: &'a toml::Value,
-        command_capabilities: &ExternalCommandCapabilities,
-    ) -> Self {
-        Self {
-            changeset,
-            config,
-            capabilities: Some(ExternalCheckRuntimeCapabilities {
-                commands: command_capabilities.allowed_commands().to_vec(),
-                command_timeout_ms: command_capabilities.timeout_ms(),
-                max_stdout_bytes: command_capabilities.max_stdout_bytes(),
-                max_stderr_bytes: command_capabilities.max_stderr_bytes(),
-            }),
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct ExternalCheckRuntimeCapabilities {
-    commands: Vec<String>,
-    command_timeout_ms: u64,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
-}
-
-#[derive(Deserialize)]
-struct ExternalCheckRuntimeOutput {
-    findings: Vec<Finding>,
 }
 
 // --- Type lowering: host types → WIT types ---
@@ -1006,25 +661,6 @@ fn lift_finding(f: wit_types::Finding) -> Finding {
     }
 }
 
-fn validate_artifact_sha256(
-    package: &ExternalCheckPackage,
-    artifact: &ExternalCheckArtifactPackage,
-    bytes: &[u8],
-) -> Result<()> {
-    let actual_sha256 = sha256_hex(bytes);
-    if actual_sha256 == artifact.artifact_sha256 {
-        return Ok(());
-    }
-
-    bail!(
-        "artifact sha256 mismatch for package `{}` (path `{}`): expected `{}`, got `{}`",
-        package.id,
-        artifact.artifact_path,
-        artifact.artifact_sha256,
-        actual_sha256
-    );
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(digest.len() * 2);
@@ -1035,46 +671,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
-fn ensure_memory_capacity(
-    memory: &Memory,
-    store: &mut Store<()>,
-    offset: usize,
-    len: usize,
-) -> Result<()> {
-    let required_size = offset
-        .checked_add(len)
-        .context("requested wasm memory range overflows usize")?;
-    let current_size = memory.data_size(&mut *store);
-    if required_size <= current_size {
-        return Ok(());
-    }
-
-    let needed_bytes = required_size - current_size;
-    let additional_pages = needed_bytes.div_ceil(WASM_PAGE_SIZE_BYTES);
-    wasmtime(memory.grow(
-        &mut *store,
-        u64::try_from(additional_pages).context("page count does not fit in u64")?,
-    ))
-    .context("failed to grow wasm memory")?;
-    Ok(())
-}
-
-fn decode_output_range(encoded: i64) -> Result<(usize, usize)> {
-    let encoded = u64::try_from(encoded).context("runtime returned negative output range")?;
-    let offset = usize::try_from((encoded >> 32) as u32).context("output offset does not fit")?;
-    let len = usize::try_from((encoded & 0xffff_ffff) as u32).context("output len does not fit")?;
-    Ok((offset, len))
-}
-
 fn wasmtime<T>(result: std::result::Result<T, wasmtime::Error>) -> Result<T> {
     result.map_err(anyhow::Error::from)
-}
-
-fn any_result<T, E>(result: std::result::Result<T, E>) -> Result<T>
-where
-    E: Into<anyhow::Error>,
-{
-    result.map_err(Into::into)
 }
 
 #[cfg(test)]
