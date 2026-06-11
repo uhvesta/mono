@@ -12,8 +12,10 @@ use crate::output::Severity;
 use crate::source_tree::LocalSourceTree;
 
 use super::{
-    DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HostState,
-    MemoryLimiter, build_wasmtime_engine, is_interrupt_error, resolve_component_limits,
+    BASE_COMPONENT_TIMEOUT_MS, DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER,
+    ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState, MemoryLimiter,
+    PER_FILE_COMPONENT_TIMEOUT_MS, build_wasmtime_engine, is_interrupt_error,
+    resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -458,7 +460,6 @@ fn build_component_v1_linker_succeeds() {
     use wasmtime::{Config, Engine};
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
     let engine = Engine::new(&config).expect("build engine");
     super::build_component_v1_linker(&engine).expect("build component-v1 linker with WASI");
 }
@@ -484,12 +485,37 @@ fn host_state_with_sandbox_root_preopens_the_directory() {
 // --- Limit / timeout policy tests (T5) ---
 
 #[test]
-fn resolve_limits_uses_defaults_when_none() {
-    let (timeout_ms, max_bytes) = resolve_component_limits(None);
-    assert_eq!(timeout_ms, super::DEFAULT_COMPONENT_TIMEOUT_MS);
+fn resolve_limits_uses_proportional_default_when_none() {
+    // No limits, 0 files → BASE only
+    let (timeout_ms, max_bytes) = resolve_component_limits(None, 0);
+    assert_eq!(timeout_ms, BASE_COMPONENT_TIMEOUT_MS);
     assert_eq!(
         max_bytes,
         super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024
+    );
+}
+
+#[test]
+fn resolve_limits_proportional_scales_with_file_count() {
+    let (t5, _) = resolve_component_limits(None, 5);
+    assert_eq!(t5, BASE_COMPONENT_TIMEOUT_MS + PER_FILE_COMPONENT_TIMEOUT_MS * 5);
+
+    let (t50, _) = resolve_component_limits(None, 50);
+    assert_eq!(t50, BASE_COMPONENT_TIMEOUT_MS + PER_FILE_COMPONENT_TIMEOUT_MS * 50);
+
+    // Large N: verify proportional is strictly larger than small N.
+    let (t500, _) = resolve_component_limits(None, 500);
+    assert!(t500 > t50, "500-file timeout must exceed 50-file timeout");
+}
+
+#[test]
+fn resolve_limits_proportional_clamped_to_ceiling() {
+    // A large enough file count must hit the ceiling.
+    let n_huge = (HOST_CEILING_TIMEOUT_MS / PER_FILE_COMPONENT_TIMEOUT_MS + 1) as usize;
+    let (timeout_ms, _) = resolve_component_limits(None, n_huge);
+    assert_eq!(
+        timeout_ms, HOST_CEILING_TIMEOUT_MS,
+        "proportional timeout must be clamped to HOST_CEILING_TIMEOUT_MS for very large N"
     );
 }
 
@@ -499,19 +525,32 @@ fn resolve_limits_respects_manifest_overrides() {
         timeout_ms: Some(2_000),
         max_memory_mb: Some(64),
     };
-    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits), 0);
     assert_eq!(timeout_ms, 2_000);
     assert_eq!(max_bytes, 64 * 1024 * 1024);
 }
 
 #[test]
+fn resolve_limits_explicit_override_ignores_file_count() {
+    // An explicit manifest timeout must be used as-is regardless of n_files.
+    let limits = ExternalCheckComponentLimits {
+        timeout_ms: Some(10_000),
+        max_memory_mb: None,
+    };
+    let (t_0, _) = resolve_component_limits(Some(&limits), 0);
+    let (t_500, _) = resolve_component_limits(Some(&limits), 500);
+    assert_eq!(t_0, 10_000, "explicit override must be applied with 0 files");
+    assert_eq!(t_500, 10_000, "explicit override must not scale with file count");
+}
+
+#[test]
 fn resolve_limits_clamps_to_host_ceiling() {
     let limits = ExternalCheckComponentLimits {
-        timeout_ms: Some(super::HOST_CEILING_TIMEOUT_MS + 60_000),
+        timeout_ms: Some(HOST_CEILING_TIMEOUT_MS + 60_000),
         max_memory_mb: Some(super::HOST_CEILING_MAX_MEMORY_MB + 256),
     };
-    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
-    assert_eq!(timeout_ms, super::HOST_CEILING_TIMEOUT_MS);
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits), 0);
+    assert_eq!(timeout_ms, HOST_CEILING_TIMEOUT_MS);
     assert_eq!(
         max_bytes,
         super::HOST_CEILING_MAX_MEMORY_MB as usize * 1024 * 1024
@@ -524,7 +563,7 @@ fn resolve_limits_partial_override_timeout_only() {
         timeout_ms: Some(1_000),
         max_memory_mb: None,
     };
-    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits), 0);
     assert_eq!(timeout_ms, 1_000);
     assert_eq!(
         max_bytes,
@@ -534,12 +573,16 @@ fn resolve_limits_partial_override_timeout_only() {
 
 #[test]
 fn resolve_limits_partial_override_memory_only() {
+    // No explicit timeout → proportional default (n_files=0 means BASE only).
     let limits = ExternalCheckComponentLimits {
         timeout_ms: None,
         max_memory_mb: Some(128),
     };
-    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits));
-    assert_eq!(timeout_ms, super::DEFAULT_COMPONENT_TIMEOUT_MS);
+    let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits), 0);
+    assert_eq!(
+        timeout_ms, BASE_COMPONENT_TIMEOUT_MS,
+        "no explicit timeout must yield BASE with 0 files"
+    );
     assert_eq!(max_bytes, 128 * 1024 * 1024);
 }
 
@@ -588,9 +631,7 @@ fn epoch_deadline_interrupts_spin_loop() {
     let module = Module::new(&engine, &wasm).unwrap();
 
     let mut store: Store<()> = Store::new(&engine, ());
-    // Disable fuel limit so only the epoch fires.
-    store.set_fuel(u64::MAX).unwrap();
-    // Deadline = 1 tick from now.
+    // Deadline = 1 tick from now (epoch is the only safety net; fuel is disabled).
     store.set_epoch_deadline(1);
 
     // Advance epoch past the deadline before executing.
@@ -623,7 +664,6 @@ fn memory_cap_trip_via_resource_limiter() {
     let one_page = 65_536_usize;
     let mut store: Store<HostState> = Store::new(&engine, HostState::new(one_page));
     store.limiter(|state| &mut state.limiter);
-    store.set_fuel(u64::MAX).unwrap();
     // This test exercises the ResourceLimiter, not epoch timeout. Disable epoch
     // so the default epoch-0 deadline does not trap immediately.
     store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
@@ -782,10 +822,11 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
     );
 }
 
-/// Regression test: the check must complete without a fuel-exhaustion crash when
-/// given a large Rust file (~3100 lines).  The original EXECUTION_FUEL_LIMIT of
-/// 10 million instructions was exhausted on the first syn parse of a large file,
-/// producing a generic "run-check call failed" trap with no file attribution.
+/// Regression test: the check must complete without crashing when given a large
+/// Rust file (~3100 lines). Previously, an instruction-counting fuel limit was
+/// exhausted on the first syn parse of a large file and produced a generic
+/// "run-check call failed" trap with no file attribution. Fuel has since been
+/// removed; epoch-only timeout is the safety net.
 #[test]
 fn bundled_giant_structs_check_handles_large_rs_file() {
     use crate::external::{

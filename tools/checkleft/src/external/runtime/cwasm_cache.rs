@@ -27,7 +27,7 @@ const WASMTIME_VERSION: &str = env!("CHECKLEFT_WASMTIME_VERSION");
 /// Update this constant whenever `build_wasmtime_engine` adds or removes a
 /// feature flag — a stale string here would allow the cache to serve artifacts
 /// compiled under a different configuration.
-const ENGINE_CONFIG_KEY: &str = "component-model=true,fuel=true,cranelift=true";
+const ENGINE_CONFIG_KEY: &str = "component-model=true,fuel=false,cranelift=true";
 
 /// On-disk `.cwasm` cache directory.
 ///
@@ -193,7 +193,6 @@ mod tests {
     fn test_engine() -> Engine {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        config.consume_fuel(true);
         Engine::new(&config).expect("create test engine")
     }
 

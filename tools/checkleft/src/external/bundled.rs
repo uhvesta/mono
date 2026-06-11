@@ -85,13 +85,11 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             // "source mode" and preserves CARGO_MANIFEST_DIR for bindgen!.
             bytes: checkleft_wasm_bundle::WASM,
         },
-        // Sized for whole-repo changesets: a reformat PR can touch hundreds of
-        // large Rust files that each require a full syn parse.  The 5 s default
-        // is tight; 30 s (the host ceiling) covers realistic worst-case inputs.
-        limits: Some(ExternalCheckComponentLimits {
-            timeout_ms: Some(30_000),
-            max_memory_mb: None,
-        }),
+        // No explicit timeout: uses the proportional default
+        // (BASE_COMPONENT_TIMEOUT_MS + PER_FILE_COMPONENT_TIMEOUT_MS × n_files),
+        // which scales naturally with whole-repo changesets without over-budgeting
+        // small PRs.
+        limits: None,
     },
 ];
 
@@ -306,7 +304,10 @@ mod tests {
     }
 
     #[test]
-    fn bundled_giant_structs_check_carries_30s_timeout() {
+    fn bundled_giant_structs_check_uses_proportional_timeout_by_default() {
+        // The bundled check must NOT carry an explicit timeout_ms so the runtime
+        // applies the proportional default (BASE + PER_FILE × n_files) rather
+        // than a flat limit that over-budgets small PRs and under-budgets large ones.
         let provider = BundledExternalCheckPackageProvider;
         let pkg = provider
             .resolve(&ExternalCheckImplementationRef::Bundled(
@@ -317,11 +318,12 @@ mod tests {
         let ExternalCheckPackageImplementation::Component(comp) = pkg.implementation else {
             panic!("expected Component implementation");
         };
-        let limits = comp.limits.expect("limits must be set for the bundled component check");
-        assert_eq!(
-            limits.timeout_ms,
-            Some(30_000),
-            "timeout must be 30s to handle whole-repo changesets"
+        // limits == None means the runtime uses the proportional formula.
+        assert!(
+            comp.limits.is_none()
+                || comp.limits.as_ref().is_some_and(|l| l.timeout_ms.is_none()),
+            "bundled check must not set an explicit timeout_ms; got: {:?}",
+            comp.limits,
         );
     }
 }

@@ -24,25 +24,21 @@ use super::{
 mod cwasm_cache;
 pub use cwasm_cache::ComponentAotCache;
 
-/// Fuel limit for component-v1 checks.
-///
-/// Fuel counts wasm instructions. The epoch-based wall-clock timeout is the
-/// primary safety net (see `DEFAULT_COMPONENT_TIMEOUT_MS`). This limit is set
-/// high enough that it never becomes the binding constraint for any realistic
-/// check workload — a check processing hundreds of large Rust files through
-/// `syn` would exhaust 10M fuel on the first file, but needs the full
-/// wall-clock budget. Epoch interruption catches runaway loops; fuel is kept
-/// only as a guard against pathological instruction counts that somehow slip
-/// past epoch checkpoints.
-const EXECUTION_FUEL_LIMIT: u64 = u64::MAX / 2;
-
-/// Default wall-clock timeout for component-v1 checks (5 seconds).
-pub(crate) const DEFAULT_COMPONENT_TIMEOUT_MS: u64 = 5_000;
+/// Base wall-clock budget for component-v1 checks (5 seconds). Used as the
+/// fixed component of the proportional timeout formula when no explicit
+/// `timeout_ms` override is set in the check manifest.
+pub(crate) const BASE_COMPONENT_TIMEOUT_MS: u64 = 5_000;
+/// Per-file wall-clock budget increment (100 ms per changed file). Combined
+/// with `BASE_COMPONENT_TIMEOUT_MS` to form a proportional default timeout:
+/// `effective_ms = BASE + PER_FILE * n_files`, clamped to
+/// `HOST_CEILING_TIMEOUT_MS`.
+pub(crate) const PER_FILE_COMPONENT_TIMEOUT_MS: u64 = 100;
 /// Default memory cap for component-v1 checks (256 MiB).
 pub(crate) const DEFAULT_COMPONENT_MAX_MEMORY_MB: u64 = 256;
-/// Maximum timeout a manifest may request (30 seconds). Requests above this
-/// are silently clamped so out-of-tree manifests cannot hang the host.
-pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 30_000;
+/// Maximum timeout a manifest may request (5 minutes). Requests above this
+/// are silently clamped so out-of-tree manifests cannot hang the host for an
+/// unbounded duration. Sized to accommodate whole-repo changesets.
+pub(crate) const HOST_CEILING_TIMEOUT_MS: u64 = 300_000;
 /// Maximum memory a manifest may request (512 MiB). Requests above this are
 /// silently clamped so out-of-tree manifests cannot exhaust host memory.
 pub(crate) const HOST_CEILING_MAX_MEMORY_MB: u64 = 512;
@@ -137,18 +133,40 @@ impl HostState {
 /// Background thread that increments the engine's epoch counter every
 /// millisecond. Stores that set an epoch deadline will be interrupted after
 /// approximately `timeout_ms` ticks, giving wall-clock timeout semantics.
+///
+/// A dead ticker silently disables all timeouts, so liveness is tracked via an
+/// atomic flag that the thread clears on exit (whether normal or panic). Callers
+/// check `is_alive()` before scheduling a timed check execution.
 struct EpochTicker {
     stop: Arc<AtomicBool>,
+    /// Set to `false` by the ticker thread when it exits (via RAII guard), so a
+    /// panicked ticker is detected rather than silently disabling timeouts.
+    alive: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl EpochTicker {
     fn start(engine: Arc<Engine>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+
         let stop_flag = Arc::clone(&stop);
+        let alive_flag = Arc::clone(&alive);
+
         let handle = std::thread::Builder::new()
             .name("checkleft-epoch-ticker".to_owned())
             .spawn(move || {
+                // RAII guard: clear `alive` on any exit path, including panics,
+                // so a dead ticker is detectable rather than silently disabling
+                // all epoch-based timeouts.
+                struct AliveGuard(Arc<AtomicBool>);
+                impl Drop for AliveGuard {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _guard = AliveGuard(alive_flag);
+
                 while !stop_flag.load(Ordering::Relaxed) {
                     std::thread::sleep(EPOCH_TICK_INTERVAL);
                     engine.increment_epoch();
@@ -157,8 +175,15 @@ impl EpochTicker {
             .expect("failed to spawn epoch ticker thread");
         Self {
             stop,
+            alive,
             handle: Some(handle),
         }
+    }
+
+    /// Returns `false` if the ticker thread has exited (normally or due to a
+    /// panic). Epoch-based timeouts are only reliable while this returns `true`.
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
@@ -202,7 +227,7 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
 pub struct DefaultExternalCheckExecutor {
     root: PathBuf,
     engine: Arc<Engine>,
-    _ticker: EpochTicker,
+    ticker: EpochTicker,
     /// AOT `.cwasm` cache for component-v1 artifacts.  `None` when the cache
     /// directory could not be created (disk full, read-only FS, etc.); in that
     /// case every component-v1 invocation falls back to JIT compilation.
@@ -239,7 +264,7 @@ impl DefaultExternalCheckExecutor {
         Ok(Self {
             root,
             engine,
-            _ticker: ticker,
+            ticker,
             component_cache,
         })
     }
@@ -266,7 +291,7 @@ impl DefaultExternalCheckExecutor {
         Ok(Self {
             root,
             engine,
-            _ticker: ticker,
+            ticker,
             component_cache,
         })
     }
@@ -279,6 +304,12 @@ impl DefaultExternalCheckExecutor {
         source_tree: &dyn SourceTree,
         config: &toml::Value,
     ) -> Result<CheckResult> {
+        if !self.ticker.is_alive() {
+            anyhow::bail!(
+                "epoch ticker thread has died; cannot enforce execution timeout for check `{}`",
+                package.id
+            );
+        }
         let component_bytes = if let Some(bytes) = component.artifact_bytes {
             bytes.to_vec()
         } else {
@@ -380,12 +411,23 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
 /// Manifest overrides are clamped to the host ceiling so out-of-tree manifests
 /// cannot grant themselves unbounded resources.
 ///
+/// When `limits.timeout_ms` is `Some(t)`, it is used as an absolute override
+/// (clamped to `HOST_CEILING_TIMEOUT_MS`). When `None`, the proportional
+/// default applies: `BASE_COMPONENT_TIMEOUT_MS + PER_FILE_COMPONENT_TIMEOUT_MS
+/// × n_files`, also clamped to the ceiling.
+///
 /// Returns `(timeout_ms, max_memory_bytes)`.
-fn resolve_component_limits(limits: Option<&ExternalCheckComponentLimits>) -> (u64, usize) {
-    let timeout_ms = limits
-        .and_then(|l| l.timeout_ms)
-        .unwrap_or(DEFAULT_COMPONENT_TIMEOUT_MS)
-        .min(HOST_CEILING_TIMEOUT_MS);
+fn resolve_component_limits(
+    limits: Option<&ExternalCheckComponentLimits>,
+    n_files: usize,
+) -> (u64, usize) {
+    let timeout_ms = if let Some(explicit) = limits.and_then(|l| l.timeout_ms) {
+        explicit.min(HOST_CEILING_TIMEOUT_MS)
+    } else {
+        let proportional = BASE_COMPONENT_TIMEOUT_MS
+            .saturating_add(PER_FILE_COMPONENT_TIMEOUT_MS.saturating_mul(n_files as u64));
+        proportional.min(HOST_CEILING_TIMEOUT_MS)
+    };
 
     let max_memory_mb = limits
         .and_then(|l| l.max_memory_mb)
@@ -402,15 +444,6 @@ fn is_interrupt_error(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<wasmtime::Trap>()
             .is_some_and(|t| *t == wasmtime::Trap::Interrupt)
-    })
-}
-
-/// Returns `true` if `err` was caused by the fuel budget being exhausted.
-fn is_fuel_exhausted_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<wasmtime::Trap>()
-            .is_some_and(|t| *t == wasmtime::Trap::OutOfFuel)
     })
 }
 
@@ -436,7 +469,6 @@ fn build_wasmtime_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
     config.epoch_interruption(true);
-    config.consume_fuel(true);
 
     wasmtime(Engine::new(&config)).context("failed to initialize Wasmtime engine")
 }
@@ -470,10 +502,6 @@ fn compile_component(
         .with_context(|| format!("failed to compile component for `{package_id}`"))
 }
 
-fn configure_store_fuel<T>(store: &mut Store<T>) -> Result<()> {
-    wasmtime(store.set_fuel(EXECUTION_FUEL_LIMIT)).context("failed to configure runtime fuel limit")
-}
-
 /// Instantiate a component from raw bytes and execute the named check via the
 /// `list-checks` / `run-check` WIT interface.
 struct ComponentRun<'a> {
@@ -496,7 +524,8 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         source_tree,
         config,
     } = run;
-    let (timeout_ticks, max_memory_bytes) = resolve_component_limits(limits);
+    let (timeout_ticks, max_memory_bytes) =
+        resolve_component_limits(limits, changeset.changed_files.len());
     let linker = build_component_v1_linker(engine)?;
 
     // Phase 1: instantiate with an empty WASI context (no preopens) to call
@@ -507,7 +536,6 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         // list-checks must never be interrupted by epoch; it returns static
         // metadata so there is no meaningful wall-clock bound to enforce here.
         store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
-        configure_store_fuel(&mut store)?;
         let instance = wasmtime(linker.instantiate(&mut store, component))
             .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
         let bindings = wasmtime(WitCheck::new(&mut store, &instance))
@@ -547,7 +575,6 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let mut store = Store::new(engine, host_state);
     store.limiter(|state| &mut state.limiter);
     store.set_epoch_deadline(timeout_ticks);
-    configure_store_fuel(&mut store)?;
     let instance = wasmtime(linker.instantiate(&mut store, component))
         .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
@@ -562,12 +589,6 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
                     "check `{}` in component `{}` exceeded its {} ms wall-clock limit \
                      while processing: {}",
                     check_name, package.id, timeout_ticks, file_list,
-                )
-            } else if is_fuel_exhausted_error(&err) {
-                anyhow::anyhow!(
-                    "check `{}` in component `{}` exhausted its instruction budget \
-                     while processing: {}",
-                    check_name, package.id, file_list,
                 )
             } else {
                 err.context(format!(

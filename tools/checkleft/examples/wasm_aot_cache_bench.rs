@@ -73,7 +73,6 @@ fn build_bench_component() -> Vec<u8> {
 fn build_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
-    config.consume_fuel(true);
     Ok(Engine::new(&config)?)
 }
 
