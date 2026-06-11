@@ -12,10 +12,5 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
-echo "+++ installing repobin tools into bin/"
-bazel build //tools/repobin:repobin
-
-./bazel-bin/tools/repobin/repobin install --bin-dir bin/ --no-defaults
-
 echo "--- [checks] running checks"
 bin/checkleft run
