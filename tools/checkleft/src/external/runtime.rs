@@ -24,7 +24,17 @@ use super::{
 mod cwasm_cache;
 pub use cwasm_cache::ComponentAotCache;
 
-const EXECUTION_FUEL_LIMIT: u64 = 10_000_000;
+/// Fuel limit for component-v1 checks.
+///
+/// Fuel counts wasm instructions. The epoch-based wall-clock timeout is the
+/// primary safety net (see `DEFAULT_COMPONENT_TIMEOUT_MS`). This limit is set
+/// high enough that it never becomes the binding constraint for any realistic
+/// check workload — a check processing hundreds of large Rust files through
+/// `syn` would exhaust 10M fuel on the first file, but needs the full
+/// wall-clock budget. Epoch interruption catches runaway loops; fuel is kept
+/// only as a guard against pathological instruction counts that somehow slip
+/// past epoch checkpoints.
+const EXECUTION_FUEL_LIMIT: u64 = u64::MAX / 2;
 
 /// Default wall-clock timeout for component-v1 checks (5 seconds).
 pub(crate) const DEFAULT_COMPONENT_TIMEOUT_MS: u64 = 5_000;
@@ -395,6 +405,33 @@ fn is_interrupt_error(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Returns `true` if `err` was caused by the fuel budget being exhausted.
+fn is_fuel_exhausted_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<wasmtime::Trap>()
+            .is_some_and(|t| *t == wasmtime::Trap::OutOfFuel)
+    })
+}
+
+/// Format up to five file paths from `changeset` for inclusion in error messages.
+fn format_file_list(changeset: &ChangeSet) -> String {
+    let files = &changeset.changed_files;
+    if files.is_empty() {
+        return "<no files>".to_owned();
+    }
+    let cap = files.len().min(5);
+    let head: Vec<String> = files[..cap]
+        .iter()
+        .map(|f| f.path.display().to_string())
+        .collect();
+    if files.len() > 5 {
+        format!("{} … ({} files total)", head.join(", "), files.len())
+    } else {
+        head.join(", ")
+    }
+}
+
 fn build_wasmtime_engine() -> Result<Engine> {
     let mut config = Config::new();
     config.wasm_component_model(true);
@@ -517,18 +554,26 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
 
     let input = lower_check_input(changeset, config)?;
+    let file_list = format_file_list(changeset);
     let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input))
         .map_err(|err| {
             if is_interrupt_error(&err) {
                 anyhow::anyhow!(
-                    "check `{}` in component `{}` exceeded its {timeout_ticks} ms wall-clock limit",
-                    check_name,
-                    package.id,
+                    "check `{}` in component `{}` exceeded its {} ms wall-clock limit \
+                     while processing: {}",
+                    check_name, package.id, timeout_ticks, file_list,
+                )
+            } else if is_fuel_exhausted_error(&err) {
+                anyhow::anyhow!(
+                    "check `{}` in component `{}` exhausted its instruction budget \
+                     while processing: {}",
+                    check_name, package.id, file_list,
                 )
             } else {
                 err.context(format!(
-                    "`run-check` call failed for check `{}` in component `{}`",
-                    check_name, package.id
+                    "`run-check` call failed for check `{}` in component `{}` \
+                     while processing: {}",
+                    check_name, package.id, file_list,
                 ))
             }
         })?;

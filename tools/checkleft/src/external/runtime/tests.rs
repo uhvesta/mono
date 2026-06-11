@@ -781,3 +781,80 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
         result.findings.len()
     );
 }
+
+/// Regression test: the check must complete without a fuel-exhaustion crash when
+/// given a large Rust file (~3100 lines).  The original EXECUTION_FUEL_LIMIT of
+/// 10 million instructions was exhausted on the first syn parse of a large file,
+/// producing a generic "run-check call failed" trap with no file attribution.
+#[test]
+fn bundled_giant_structs_check_handles_large_rs_file() {
+    use crate::external::{
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef,
+        ExternalCheckPackageProvider as _,
+    };
+    use std::path::Path;
+
+    // Build a ~3100-line source: many harmless one-line functions plus one
+    // violating struct at the end. The fuel limit must not be the binding
+    // constraint, so the check must run to completion and return a finding.
+    let source = build_large_rs_source_with_violation(3100);
+    assert!(
+        source.lines().count() >= 3100,
+        "source must be at least 3100 lines (got {})",
+        source.lines().count()
+    );
+
+    let temp = tempdir().expect("temp dir");
+    fs::write(temp.path().join("large.rs"), &source).expect("write source");
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("large.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let provider = BundledExternalCheckPackageProvider;
+    let package = provider
+        .resolve(&ExternalCheckImplementationRef::Bundled(
+            "rust-giant-structs-use-builder".to_owned(),
+        ))
+        .expect("resolve")
+        .expect("bundled package must exist");
+
+    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
+    let result = executor
+        .execute(
+            &package,
+            &changeset,
+            &tree,
+            &toml::Value::Table(Default::default()),
+        )
+        .expect("check must complete without fuel exhaustion or timeout on a large file");
+
+    assert_eq!(result.check_id, "rust-giant-structs-use-builder");
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "expected exactly one finding for the violating struct at the end of the large file"
+    );
+    let loc = result.findings[0].location.as_ref().expect("finding must have location");
+    assert_eq!(loc.path, Path::new("large.rs"));
+}
+
+/// Build a Rust source string with approximately `line_count` lines: a block of
+/// single-line functions followed by one 8-field struct that violates the rule.
+fn build_large_rs_source_with_violation(line_count: usize) -> String {
+    let struct_lines = 10; // pub struct { + 8 field lines + closing brace
+    let func_count = line_count.saturating_sub(struct_lines);
+    let mut s = String::with_capacity(line_count * 24);
+    for i in 0..func_count {
+        s.push_str(&format!("fn f{i}() {{}}\n"));
+    }
+    s.push_str("pub struct LargeViolation {\n");
+    for field in ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'] {
+        s.push_str(&format!("    {field}: u32,\n"));
+    }
+    s.push_str("}\n");
+    s
+}

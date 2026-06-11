@@ -421,6 +421,118 @@ id = "fails"
     assert_eq!(results[0].check_id, "fails");
     assert_eq!(results[0].findings[0].severity, Severity::Error);
     assert!(results[0].findings[0].message.contains("boom"));
+    // Execution failures must carry source attribution — not <unknown>.
+    assert!(
+        results[0].findings[0].location.is_some(),
+        "execution-failure finding must have a location (got <unknown>)"
+    );
+    assert_eq!(
+        results[0].findings[0]
+            .location
+            .as_ref()
+            .unwrap()
+            .path
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("CHECKS.toml"),
+        "execution-failure location must point at the CHECKS config file"
+    );
+}
+
+#[tokio::test]
+async fn runner_external_execution_failure_carries_source_attribution() {
+    // Verifies that when an external check executor returns Err, the resulting
+    // finding has a location pointing at the CHECKS config file — not <unknown>.
+    use crate::external::{
+        EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage,
+        ExternalCheckPackage, ExternalCheckPackageImplementation,
+    };
+    use std::path::Path;
+
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: my-ext-check
+    check: my-ext-check
+    implementation: bundled:my-ext-check
+"#,
+    )
+    .expect("write config");
+    fs::write(temp.path().join("src/a.rs"), "fn main() {}").expect("write source");
+
+    // Use a fake sha256 to trigger a digest-mismatch error from the executor.
+    let fake_pkg = ExternalCheckPackage {
+        id: "my-ext-check".to_owned(),
+        runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
+        api_version: EXTERNAL_CHECK_API_V1.to_owned(),
+        implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+            artifact_path: "nonexistent.wasm".to_owned(),
+            artifact_sha256: "a".repeat(64),
+            artifact_bytes: None,
+            check_name: "my-ext-check".to_owned(),
+            limits: None,
+            checks: None,
+            provenance: None,
+        }),
+    };
+
+    let seen_packages = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(StaticExternalExecutor {
+        result: None,
+        error_message: Some("simulated wasm crash".to_owned()),
+        seen_packages: Arc::clone(&seen_packages),
+    });
+    let provider = Arc::new(StaticExternalProvider {
+        package: Some(fake_pkg),
+    });
+
+    let runner = Runner::with_external(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        provider,
+        executor,
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("src/a.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|r| r.check_id == "my-ext-check")
+        .expect("must have result for my-ext-check");
+
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].severity, Severity::Error);
+    assert!(
+        result.findings[0].message.contains("simulated wasm crash"),
+        "error message must include the underlying error; got: {}",
+        result.findings[0].message
+    );
+    assert!(
+        result.findings[0].location.is_some(),
+        "execution-failure finding must have a location (got <unknown>)"
+    );
+    assert_eq!(
+        result.findings[0]
+            .location
+            .as_ref()
+            .unwrap()
+            .path
+            .file_name()
+            .and_then(|n| n.to_str()),
+        Some("CHECKS.yaml"),
+        "execution-failure location must point at the CHECKS config file"
+    );
 }
 
 #[tokio::test]

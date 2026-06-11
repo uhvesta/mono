@@ -31,9 +31,9 @@ use sha2::{Digest, Sha256};
 use anyhow::{Context, Result};
 
 use super::{
-    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentPackage,
-    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCheckPackageProvider, parse_external_check_manifest,
+    EXTERNAL_CHECK_API_V1, EXTERNAL_CHECK_COMPONENT_RUNTIME_V1, ExternalCheckComponentLimits,
+    ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider, parse_external_check_manifest,
 };
 
 /// A first-party definition compiled into the binary.
@@ -43,6 +43,9 @@ struct BundledCheckDef {
     /// it lists every check name the component exports (must match `list-checks`).
     check_names: &'static [&'static str],
     kind: BundledCheckDefKind,
+    /// Per-execution resource limits for component-mode definitions.
+    /// `None` uses the host's defaults (5 s timeout, 256 MiB memory).
+    limits: Option<ExternalCheckComponentLimits>,
 }
 
 enum BundledCheckDefKind {
@@ -71,6 +74,7 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             extension: "yaml",
             contents: include_str!("../../checks/buildifier/check.yaml"),
         },
+        limits: None,
     },
     BundledCheckDef {
         check_names: &["rust-giant-structs-use-builder"],
@@ -81,6 +85,13 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             // "source mode" and preserves CARGO_MANIFEST_DIR for bindgen!.
             bytes: checkleft_wasm_bundle::WASM,
         },
+        // Sized for whole-repo changesets: a reformat PR can touch hundreds of
+        // large Rust files that each require a full syn parse.  The 5 s default
+        // is tight; 30 s (the host ceiling) covers realistic worst-case inputs.
+        limits: Some(ExternalCheckComponentLimits {
+            timeout_ms: Some(30_000),
+            max_memory_mb: None,
+        }),
     },
 ];
 
@@ -125,7 +136,7 @@ fn resolve_from_defs(
                     .with_context(|| format!("invalid bundled check definition `{name}`"))?
             }
             BundledCheckDefKind::Component { bytes } => {
-                build_bundled_component_package(name, bytes)
+                build_bundled_component_package(name, bytes, def.limits.clone())
             }
         }));
     }
@@ -135,7 +146,11 @@ fn resolve_from_defs(
 /// Build an [`ExternalCheckPackage`] for a single check exported by a bundled
 /// component. The sha256 is computed from the embedded bytes at call time; for
 /// bundled-in-binary bytes this is a deterministic integrity check.
-fn build_bundled_component_package(check_name: &str, bytes: &'static [u8]) -> ExternalCheckPackage {
+fn build_bundled_component_package(
+    check_name: &str,
+    bytes: &'static [u8],
+    limits: Option<ExternalCheckComponentLimits>,
+) -> ExternalCheckPackage {
     let hash = Sha256::digest(bytes);
     let mut sha256 = String::with_capacity(64);
     for byte in hash {
@@ -152,7 +167,7 @@ fn build_bundled_component_package(check_name: &str, bytes: &'static [u8]) -> Ex
                 artifact_sha256: sha256,
                 artifact_bytes: Some(bytes),
                 check_name: check_name.to_owned(),
-                limits: None,
+                limits,
                 checks: None,
                 provenance: None,
             },
@@ -215,6 +230,7 @@ mod tests {
         let defs = [BundledCheckDef {
             check_names: &["check-alpha", "check-beta"],
             kind: BundledCheckDefKind::Component { bytes: fake_bytes },
+            limits: None,
         }];
 
         for expected_name in ["check-alpha", "check-beta"] {
@@ -239,6 +255,7 @@ mod tests {
         let defs = [BundledCheckDef {
             check_names: &["check-alpha"],
             kind: BundledCheckDefKind::Component { bytes: b"dummy" },
+            limits: None,
         }];
 
         let result = resolve_from_defs(&defs, "check-gamma").expect("resolve");
@@ -256,10 +273,12 @@ mod tests {
                     extension: "yaml",
                     contents: "",
                 },
+                limits: None,
             },
             BundledCheckDef {
                 check_names: &["comp-check-a", "comp-check-b"],
                 kind: BundledCheckDefKind::Component { bytes: b"x" },
+                limits: None,
             },
         ];
         let names: Vec<&str> = defs.iter().flat_map(|d| d.check_names.iter().copied()).collect();
@@ -269,8 +288,8 @@ mod tests {
     #[test]
     fn bundled_component_sha256_is_deterministic() {
         let bytes: &'static [u8] = b"test-component-bytes";
-        let pkg1 = build_bundled_component_package("my-check", bytes);
-        let pkg2 = build_bundled_component_package("my-check", bytes);
+        let pkg1 = build_bundled_component_package("my-check", bytes, None);
+        let pkg2 = build_bundled_component_package("my-check", bytes, None);
         let ExternalCheckPackageImplementation::Component(c1) = pkg1.implementation else {
             panic!();
         };
@@ -283,6 +302,26 @@ mod tests {
             c1.artifact_sha256.bytes().all(|b| b.is_ascii_hexdigit()),
             "sha256 must be hex: {}",
             c1.artifact_sha256
+        );
+    }
+
+    #[test]
+    fn bundled_giant_structs_check_carries_30s_timeout() {
+        let provider = BundledExternalCheckPackageProvider;
+        let pkg = provider
+            .resolve(&ExternalCheckImplementationRef::Bundled(
+                "rust-giant-structs-use-builder".to_owned(),
+            ))
+            .expect("resolve")
+            .expect("package must exist");
+        let ExternalCheckPackageImplementation::Component(comp) = pkg.implementation else {
+            panic!("expected Component implementation");
+        };
+        let limits = comp.limits.expect("limits must be set for the bundled component check");
+        assert_eq!(
+            limits.timeout_ms,
+            Some(30_000),
+            "timeout must be 30s to handle whole-repo changesets"
         );
     }
 }

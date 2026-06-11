@@ -136,6 +136,7 @@ impl Runner {
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
                     let run_policy = run.policy;
+                    let source_path = run.source_path;
                     let file_count = run_changeset.changed_files.len();
                     info!(
                         check_id = %configured_check_id,
@@ -152,7 +153,7 @@ impl Runner {
                                 result.check_id = configured_check_id.clone();
                                 apply_policy_to_result(result, &run_policy, &run_changeset)
                             })
-                            .map_err(|err| (configured_check_id, err))
+                            .map_err(|err| (configured_check_id, source_path, err))
                     });
                 }
                 ScheduledExecution::BuiltInMissing {
@@ -185,6 +186,7 @@ impl Runner {
                     let run_changeset = run.changeset;
                     let run_config = run.config;
                     let run_policy = run.policy;
+                    let source_path = run.source_path;
                     let file_count = run_changeset.changed_files.len();
                     info!(
                         check_id = %configured_check_id,
@@ -199,6 +201,7 @@ impl Runner {
                         // the thread.  spawn_blocking moves execution onto a thread-pool
                         // thread where no runtime is running.
                         let check_id_clone = configured_check_id.clone();
+                        let source_path_clone = source_path.clone();
                         tokio::task::spawn_blocking(move || {
                             external_executor
                                 .execute(
@@ -211,10 +214,12 @@ impl Runner {
                                     result.check_id = configured_check_id.clone();
                                     apply_policy_to_result(result, &run_policy, &run_changeset)
                                 })
-                                .map_err(|err| (configured_check_id, err))
+                                .map_err(|err| (configured_check_id, source_path, err))
                         })
                         .await
-                        .unwrap_or_else(|e| Err((check_id_clone, anyhow!("executor panicked: {e}"))))
+                        .unwrap_or_else(|e| {
+                            Err((check_id_clone, source_path_clone, anyhow!("executor panicked: {e}")))
+                        })
                     });
                 }
                 ScheduledExecution::Invalid {
@@ -242,13 +247,17 @@ impl Runner {
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
                 Ok(Ok(result)) => results.push(result),
-                Ok(Err((check_id, err))) => {
+                Ok(Err((check_id, source_path, err))) => {
                     results.push(CheckResult {
                         check_id,
                         findings: vec![Finding {
                             severity: Severity::Error,
-                            message: format!("check execution failed: {err}"),
-                            location: None,
+                            message: format!("check execution failed: {err:#}"),
+                            location: Some(Location {
+                                path: source_path,
+                                line: None,
+                                column: None,
+                            }),
                             remediations: vec![],
                             suggested_fix: None,
                         }],
