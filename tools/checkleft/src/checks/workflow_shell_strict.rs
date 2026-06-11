@@ -54,18 +54,13 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                 Err(error) => {
                     findings.push(Finding {
                         severity: Severity::Error,
-                        message: format!(
-                            "failed to parse workflow YAML while enforcing strict shell mode: {error}"
-                        ),
+                        message: format!("failed to parse workflow YAML while enforcing strict shell mode: {error}"),
                         location: Some(Location {
                             path: changed_file.path.clone(),
                             line: None,
                             column: None,
                         }),
-                        remediations: vec![
-                            "Fix YAML syntax so checks can validate `run:` script blocks."
-                                .to_owned(),
-                        ],
+                        remediations: vec!["Fix YAML syntax so checks can validate `run:` script blocks.".to_owned()],
                         suggested_fix: None,
                     });
                     continue;
@@ -85,8 +80,7 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                         column: None,
                     }),
                     remediations: vec![
-                        "Add `set -euo pipefail` as the first non-comment line in each `run:` script block."
-                            .to_owned(),
+                        "Add `set -euo pipefail` as the first non-comment line in each `run:` script block.".to_owned(),
                     ],
                     suggested_fix: None,
                 });
@@ -361,10 +355,6 @@ mod tests {
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert!(
-            result.findings[0]
-                .message
-                .contains("failed to parse workflow YAML")
-        );
+        assert!(result.findings[0].message.contains("failed to parse workflow YAML"));
     }
 }

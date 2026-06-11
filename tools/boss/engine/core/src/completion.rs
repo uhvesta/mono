@@ -48,10 +48,9 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use boss_protocol::{
-    AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK,
-    AUTOMATION_OUTCOME_SKIPPED, Attention, AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput,
-    ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind,
+    AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
+    AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
+    CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, TaskKind,
 };
 
 use crate::attentions_detector;
@@ -59,18 +58,16 @@ use crate::automation_triage::{TriageDecision, parse_triage_decision};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::merge_poller::{
-    MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState,
-    update_pr_poll_state,
+    MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };
 use crate::metrics::Registry;
 use crate::nudge_breaker::{DEFAULT_MAX_UNPRODUCTIVE_NUDGES, NudgeBreaker, NudgeDecision};
-use boss_github::pr_url::pr_number_from_url;
-use crate::work::{
-    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem,
-    WorkerPrCompletionTarget,
-};
 #[cfg(test)]
 use crate::work::TaskStatus;
+use crate::work::{
+    CreateAttentionItemInput, CreateExecutionInput, PendingMergeCheck, WorkDb, WorkItem, WorkerPrCompletionTarget,
+};
+use boss_github::pr_url::pr_number_from_url;
 
 // Phase-3 counter handles for the PR URL capture paths. The primary path
 // fires when the PostToolUse staging cache already holds the URL; the
@@ -332,11 +329,7 @@ pub trait PrDetector: Send + Sync {
     /// `Ok(PrStatus::None)` to keep the caller's idle-vs-completed
     /// logic clean. Errors are reserved for tool failures (`gh` auth
     /// broken, network blips, etc.).
-    async fn detect_pr(
-        &self,
-        repo_remote_url: &str,
-        expected_branch: &str,
-    ) -> Result<PrStatus>;
+    async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus>;
 }
 
 /// `PrDetector` that shells out to `gh pr list --head <branch>`. The
@@ -360,14 +353,9 @@ impl CommandPrDetector {
 
 #[async_trait]
 impl PrDetector for CommandPrDetector {
-    async fn detect_pr(
-        &self,
-        repo_remote_url: &str,
-        expected_branch: &str,
-    ) -> Result<PrStatus> {
-        let repo_slug = parse_repo_slug(repo_remote_url).with_context(|| {
-            format!("failed to parse repo slug from `{repo_remote_url}`")
-        })?;
+    async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus> {
+        let repo_slug = parse_repo_slug(repo_remote_url)
+            .with_context(|| format!("failed to parse repo slug from `{repo_remote_url}`"))?;
         let api_pr = match query_pr_for_branch(&repo_slug, expected_branch).await? {
             Some(pr) => pr,
             None => {
@@ -458,12 +446,7 @@ pub trait BranchVerifier: Send + Sync {
     /// between `base` and `head` in `repo_slug`. Used by the no-op /
     /// trivial-diff skip gate (P992 design §8) to detect pure rebases and
     /// trivially-small pushes that don't warrant a fresh reviewer pass.
-    async fn fetch_diff_line_count(
-        &self,
-        repo_slug: &str,
-        base: &str,
-        head: &str,
-    ) -> Result<u64>;
+    async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
 
     /// Returns the description/body of PR `pr_number` in `repo_slug`.
     /// Used by the metadata-only CI-fix finalize gate (issue #1252) to
@@ -495,12 +478,7 @@ impl BranchVerifier for CommandBranchVerifier {
         git_utils::gh_cli::fetch_pr_head_oid(repo_slug, pr_number).await
     }
 
-    async fn fetch_diff_line_count(
-        &self,
-        repo_slug: &str,
-        base: &str,
-        head: &str,
-    ) -> Result<u64> {
+    async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64> {
         fetch_diff_line_count_cmd(repo_slug, base, head).await
     }
 
@@ -533,7 +511,6 @@ async fn run_gh(args: &[&str], display: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-
 /// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and return
 /// the total number of changed lines (additions + deletions) across all files
 /// in the comparison. Returns `0` when the diff is empty (pure rebase with no
@@ -552,9 +529,10 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
         &format!("gh api {endpoint}"),
     )
     .await?;
-    let total: u64 = stdout.trim().parse().with_context(|| {
-        format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim())
-    })?;
+    let total: u64 = stdout
+        .trim()
+        .parse()
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim()))?;
     Ok(total)
 }
 
@@ -567,21 +545,12 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
     let pr_str = pr_number.to_string();
     run_gh(
         &[
-            "pr",
-            "view",
-            &pr_str,
-            "-R",
-            repo_slug,
-            "--json",
-            "body",
-            "--jq",
-            ".body",
+            "pr", "view", &pr_str, "-R", repo_slug, "--json", "body", "--jq", ".body",
         ],
         &format!("gh pr view {pr_number} -R {repo_slug} --json body"),
     )
     .await
 }
-
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
 #[derive(Debug, Clone)]
@@ -793,8 +762,7 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
 /// `gh` auth issue, etc.). Callers must propagate this as a detector
 /// failure rather than treating it as confirmation of an empty diff.
 async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
-    let pr_number = pr_number_from_url(pr_url)
-        .ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
+    let pr_number = pr_number_from_url(pr_url).ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
     let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
     let stdout = run_gh(
         &[
@@ -808,9 +776,10 @@ async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> 
         &format!("gh api {endpoint}"),
     )
     .await?;
-    let total: i64 = stdout.trim().parse().with_context(|| {
-        format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim())
-    })?;
+    let total: i64 = stdout
+        .trim()
+        .parse()
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {:?}", stdout.trim()))?;
     Ok(total > 0)
 }
 
@@ -962,9 +931,7 @@ impl WorkerCompletionHandler {
             pane_releaser,
             probe_queuer,
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
-            feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(
-                std::path::PathBuf::new(),
-            )),
+            feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())),
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
             merge_probe: Arc::new(NoopMergeProbe),
@@ -1021,10 +988,7 @@ impl WorkerCompletionHandler {
     /// creating a revision (P992 task 8). Tests inject
     /// `FakePrStateChecker::always(Open)` to avoid live `gh` calls.
     #[cfg(test)]
-    fn with_pr_state_checker(
-        mut self,
-        checker: Arc<dyn crate::work::PrStateChecker>,
-    ) -> Self {
+    fn with_pr_state_checker(mut self, checker: Arc<dyn crate::work::PrStateChecker>) -> Self {
         self.pr_state_checker = checker;
         self
     }
@@ -1046,10 +1010,7 @@ impl WorkerCompletionHandler {
     /// invoke it get the default empty cache from `new` and follow
     /// the legacy detector path — preserving the pre-change
     /// behaviour without a signature break.
-    pub fn with_staged_pr_urls(
-        mut self,
-        cache: Arc<crate::pr_url_capture::StagedPrUrlCache>,
-    ) -> Self {
+    pub fn with_staged_pr_urls(mut self, cache: Arc<crate::pr_url_capture::StagedPrUrlCache>) -> Self {
         self.staged_pr_urls = cache;
         self
     }
@@ -1070,10 +1031,7 @@ impl WorkerCompletionHandler {
     /// store loaded from `~/Library/Application Support/Boss/feature-flags.toml`.
     /// Tests that don't invoke it get the default store (every flag
     /// at its registry default), preserving the pre-change behaviour.
-    pub fn with_feature_flags(
-        mut self,
-        flags: Arc<crate::feature_flags::FeatureFlagsStore>,
-    ) -> Self {
+    pub fn with_feature_flags(mut self, flags: Arc<crate::feature_flags::FeatureFlagsStore>) -> Self {
         self.feature_flags = flags;
         self
     }
@@ -1096,10 +1054,10 @@ impl WorkerCompletionHandler {
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
         if let Ok(execution) = self.work_db.get_execution(execution_id)
-            && execution.kind == ExecutionKind::CiRemediation {
-                self.finalize_ci_remediation_attempt(&execution, &outcome)
-                    .await;
-            }
+            && execution.kind == ExecutionKind::CiRemediation
+        {
+            self.finalize_ci_remediation_attempt(&execution, &outcome).await;
+        }
         outcome
     }
 
@@ -1222,62 +1180,53 @@ impl WorkerCompletionHandler {
             );
             let repo_slug = parse_repo_slug(&execution.repo_remote_url);
             let branch_ok = match repo_slug {
-                Ok(ref slug) => {
-                    match pr_number_from_url(&staged_url) {
-                        Some(pr_num) => {
-                            match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                                Ok(ref head_ref)
-                                    if branches_identify_same_work_item(
-                                        head_ref,
-                                        &expected_branch,
-                                    ) =>
-                                {
-                                    if head_ref.as_str() != expected_branch.as_str() {
-                                        tracing::info!(
-                                            execution_id,
-                                            staged_pr_url = %staged_url,
-                                            staged_pr_branch = %head_ref,
-                                            %expected_branch,
-                                            "stop event: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
-                                        );
-                                    }
-                                    true
-                                }
-                                Ok(head_ref) => {
-                                    tracing::warn!(
-                                        execution_id,
-                                        staged_pr_url = %staged_url,
-                                        staged_pr_branch = %head_ref,
-                                        %expected_branch,
-                                        "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
-                                    );
-                                    PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                                    self.staged_pr_urls.forget(execution_id);
-                                    false
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        execution_id,
-                                        staged_pr_url = %staged_url,
-                                        ?err,
-                                        "stop event: branch verification failed; dropping staged URL for safety",
-                                    );
-                                    self.staged_pr_urls.forget(execution_id);
-                                    false
-                                }
+                Ok(ref slug) => match pr_number_from_url(&staged_url) {
+                    Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
+                        Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
+                            if head_ref.as_str() != expected_branch.as_str() {
+                                tracing::info!(
+                                    execution_id,
+                                    staged_pr_url = %staged_url,
+                                    staged_pr_branch = %head_ref,
+                                    %expected_branch,
+                                    "stop event: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                );
                             }
+                            true
                         }
-                        None => {
+                        Ok(head_ref) => {
                             tracing::warn!(
                                 execution_id,
                                 staged_pr_url = %staged_url,
-                                "stop event: cannot parse PR number from staged URL; dropping for safety",
+                                staged_pr_branch = %head_ref,
+                                %expected_branch,
+                                "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
+                            );
+                            PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                            self.staged_pr_urls.forget(execution_id);
+                            false
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id,
+                                staged_pr_url = %staged_url,
+                                ?err,
+                                "stop event: branch verification failed; dropping staged URL for safety",
                             );
                             self.staged_pr_urls.forget(execution_id);
                             false
                         }
+                    },
+                    None => {
+                        tracing::warn!(
+                            execution_id,
+                            staged_pr_url = %staged_url,
+                            "stop event: cannot parse PR number from staged URL; dropping for safety",
+                        );
+                        self.staged_pr_urls.forget(execution_id);
+                        false
                     }
-                }
+                },
                 Err(err) => {
                     tracing::warn!(
                         execution_id,
@@ -1408,21 +1357,18 @@ impl WorkerCompletionHandler {
                 // recheck_for_pr will finalize via the SHA-delta gate once the
                 // API recovers.
                 if execution.kind == ExecutionKind::RevisionImplementation
-                    && execution
-                        .pr_head_before
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .is_some()
-                    && let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution) {
-                        tracing::info!(
-                            execution_id,
-                            %bound_pr_url,
-                            "stop event: revision_implementation with pr_head_before set but \
-                             SHA-delta fetch failed — skipping cold-path nudge to avoid \
-                             probe loop; recheck_for_pr will finalize when API recovers"
-                        );
-                        return StopOutcome::AwaitingInput;
-                    }
+                    && execution.pr_head_before.as_deref().filter(|s| !s.is_empty()).is_some()
+                    && let Some(bound_pr_url) = self.resolve_bound_pr_url(&execution)
+                {
+                    tracing::info!(
+                        execution_id,
+                        %bound_pr_url,
+                        "stop event: revision_implementation with pr_head_before set but \
+                         SHA-delta fetch failed — skipping cold-path nudge to avoid \
+                         probe loop; recheck_for_pr will finalize when API recovers"
+                    );
+                    return StopOutcome::AwaitingInput;
+                }
                 // No bound `chore.pr_url`, or the snapshot/fetch was
                 // unavailable. Fall through to the existing
                 // branch-keyed cold-path detector (new-PR flow).
@@ -1549,13 +1495,7 @@ must not be asked to open one",
                     "stop event: worker idle without an active PR — probing to push and open one"
                 );
                 return self
-                    .nudge_or_park(
-                        &execution,
-                        PROBE_NO_PR,
-                        "no_pr",
-                        None,
-                        StopOutcome::AwaitingInput,
-                    )
+                    .nudge_or_park(&execution, PROBE_NO_PR, "no_pr", None, StopOutcome::AwaitingInput)
                     .await;
             }
             PrStatus::Stale { url, reason } => {
@@ -1592,17 +1532,14 @@ must not be asked to open one",
                         PROBE_EMPTY_PR,
                         &format!("empty:{url}"),
                         Some(&url),
-                        StopOutcome::EmptyDiffPr {
-                            pr_url: url.clone(),
-                        },
+                        StopOutcome::EmptyDiffPr { pr_url: url.clone() },
                     )
                     .await;
             }
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
         };
-        self.finalize_pr_transition(execution_id, pr_url, target, "stop")
-            .await
+        self.finalize_pr_transition(execution_id, pr_url, target, "stop").await
     }
 
     /// Periodic fallback for the merge poller. Re-runs PR detection
@@ -1652,62 +1589,53 @@ must not be asked to open one",
             );
             let repo_slug = parse_repo_slug(&execution.repo_remote_url);
             let branch_ok = match repo_slug {
-                Ok(ref slug) => {
-                    match pr_number_from_url(&staged_url) {
-                        Some(pr_num) => {
-                            match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
-                                Ok(ref head_ref)
-                                    if branches_identify_same_work_item(
-                                        head_ref,
-                                        &expected_branch,
-                                    ) =>
-                                {
-                                    if head_ref.as_str() != expected_branch.as_str() {
-                                        tracing::info!(
-                                            execution_id,
-                                            staged_pr_url = %staged_url,
-                                            staged_pr_branch = %head_ref,
-                                            %expected_branch,
-                                            "pr-recheck: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
-                                        );
-                                    }
-                                    true
-                                }
-                                Ok(head_ref) => {
-                                    tracing::warn!(
-                                        execution_id,
-                                        staged_pr_url = %staged_url,
-                                        staged_pr_branch = %head_ref,
-                                        %expected_branch,
-                                        "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
-                                    );
-                                    PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
-                                    self.staged_pr_urls.forget(execution_id);
-                                    false
-                                }
-                                Err(err) => {
-                                    tracing::warn!(
-                                        execution_id,
-                                        staged_pr_url = %staged_url,
-                                        ?err,
-                                        "pr-recheck: branch verification failed; dropping staged URL for safety",
-                                    );
-                                    self.staged_pr_urls.forget(execution_id);
-                                    false
-                                }
+                Ok(ref slug) => match pr_number_from_url(&staged_url) {
+                    Some(pr_num) => match self.branch_verifier.fetch_pr_head_ref(slug, pr_num).await {
+                        Ok(ref head_ref) if branches_identify_same_work_item(head_ref, &expected_branch) => {
+                            if head_ref.as_str() != expected_branch.as_str() {
+                                tracing::info!(
+                                    execution_id,
+                                    staged_pr_url = %staged_url,
+                                    staged_pr_branch = %head_ref,
+                                    %expected_branch,
+                                    "pr-recheck: staged PR branch prefix differs from expected but the work-item suffix matches; associating (prefix-agnostic match)",
+                                );
                             }
+                            true
                         }
-                        None => {
+                        Ok(head_ref) => {
                             tracing::warn!(
                                 execution_id,
                                 staged_pr_url = %staged_url,
-                                "pr-recheck: cannot parse PR number from staged URL; dropping for safety",
+                                staged_pr_branch = %head_ref,
+                                %expected_branch,
+                                "pr_recheck_staged_branch_mismatch: staged PR work-item suffix does not match expected; dropping staged URL",
+                            );
+                            PR_RECHECK_STAGED_BRANCH_MISMATCH.inc(&self.metrics);
+                            self.staged_pr_urls.forget(execution_id);
+                            false
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id,
+                                staged_pr_url = %staged_url,
+                                ?err,
+                                "pr-recheck: branch verification failed; dropping staged URL for safety",
                             );
                             self.staged_pr_urls.forget(execution_id);
                             false
                         }
+                    },
+                    None => {
+                        tracing::warn!(
+                            execution_id,
+                            staged_pr_url = %staged_url,
+                            "pr-recheck: cannot parse PR number from staged URL; dropping for safety",
+                        );
+                        self.staged_pr_urls.forget(execution_id);
+                        false
                     }
-                }
+                },
                 Err(err) => {
                     tracing::warn!(
                         execution_id,
@@ -1862,9 +1790,7 @@ must not be asked to open one",
         let (pr_url, target) = match pr_status {
             // Quiet returns — no probes, no awaiting-input publish.
             PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
-            PrStatus::Stale { url, reason } => {
-                return StopOutcome::StalePr { pr_url: url, reason }
-            }
+            PrStatus::Stale { url, reason } => return StopOutcome::StalePr { pr_url: url, reason },
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } => (url, WorkerPrCompletionTarget::InReview),
             PrStatus::Merged { url } => (url, WorkerPrCompletionTarget::Done),
@@ -1886,10 +1812,7 @@ must not be asked to open one",
     /// `waiting_human`). Instead, on a `Fresh` PR detection, it calls
     /// [`WorkDb::bind_pr_to_active_task_from_terminal_execution`] to
     /// advance only the task row.
-    pub async fn recheck_for_pr_late(
-        &self,
-        candidate: &crate::work::LatePrCandidate,
-    ) -> StopOutcome {
+    pub async fn recheck_for_pr_late(&self, candidate: &crate::work::LatePrCandidate) -> StopOutcome {
         let expected_branch = expected_branch_name(
             &candidate.execution_id,
             &candidate.branch_naming,
@@ -1913,9 +1836,7 @@ must not be asked to open one",
         };
         let pr_url = match pr_status {
             PrStatus::None | PrStatus::Closed { .. } => return StopOutcome::AwaitingInput,
-            PrStatus::Stale { url, reason } => {
-                return StopOutcome::StalePr { pr_url: url, reason }
-            }
+            PrStatus::Stale { url, reason } => return StopOutcome::StalePr { pr_url: url, reason },
             PrStatus::EmptyDiff { url } => return StopOutcome::EmptyDiffPr { pr_url: url },
             PrStatus::Fresh { url } | PrStatus::Merged { url } => url,
         };
@@ -1963,10 +1884,7 @@ must not be asked to open one",
     /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
     ///    `failed_will_retry` for a missing / ambiguous / unverifiable marker);
     /// 4. finalise the execution (`completed`) and release pane + workspace.
-    async fn finalize_automation_triage(
-        &self,
-        execution: &crate::work::WorkExecution,
-    ) -> StopOutcome {
+    async fn finalize_automation_triage(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let automation_id = execution.work_item_id.clone();
         let transcript = self.read_final_triage_message(&execution.id).await;
         let decision = match &transcript {
@@ -1976,70 +1894,66 @@ must not be asked to open one",
             // specific transcript state is folded into the detail below so the
             // run history distinguishes "ran but emitted no marker" from
             // "produced no transcript at all".
-            TriageTranscript::NoPath
-            | TriageTranscript::Unreadable
-            | TriageTranscript::NoAssistantText => TriageDecision::NoDecision,
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText => {
+                TriageDecision::NoDecision
+            }
         };
 
-        let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) =
-            match &decision {
-                TriageDecision::ProducedTask(marker_id) => {
-                    match self.work_db.get_work_item_resolving_short_id(marker_id) {
-                        Ok(Some(WorkItem::Task(t))) | Ok(Some(WorkItem::Chore(t)))
-                            if t.source_automation_id.as_deref()
-                                == Some(automation_id.as_str()) =>
-                        {
-                            // Explicit success detail (not `None`): it overwrites
-                            // the pessimistic dispatch-time placeholder so a row
-                            // that still reads "dispatched; awaiting …" can only
-                            // mean the worker never reached Stop (crashed/hung).
-                            (
-                                AUTOMATION_OUTCOME_PRODUCED_TASK,
-                                Some(t.id.clone()),
-                                Some(format!("produced task {}", t.id)),
-                            )
-                        }
-                        other => {
-                            tracing::warn!(
-                                execution_id = %execution.id,
-                                automation_id = %automation_id,
-                                marker_id,
-                                resolved_some = ?other.as_ref().map(|o| o.is_some()),
-                                "triage emitted a task marker but no task with this automation's \
-                                 provenance matched; leaving run failed_will_retry",
-                            );
-                            (
-                                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
-                                None,
-                                Some(format!(
-                                    "triage emitted `automation: task {marker_id}` but no task \
+        let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) = match &decision {
+            TriageDecision::ProducedTask(marker_id) => {
+                match self.work_db.get_work_item_resolving_short_id(marker_id) {
+                    Ok(Some(WorkItem::Task(t))) | Ok(Some(WorkItem::Chore(t)))
+                        if t.source_automation_id.as_deref() == Some(automation_id.as_str()) =>
+                    {
+                        // Explicit success detail (not `None`): it overwrites
+                        // the pessimistic dispatch-time placeholder so a row
+                        // that still reads "dispatched; awaiting …" can only
+                        // mean the worker never reached Stop (crashed/hung).
+                        (
+                            AUTOMATION_OUTCOME_PRODUCED_TASK,
+                            Some(t.id.clone()),
+                            Some(format!("produced task {}", t.id)),
+                        )
+                    }
+                    other => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            automation_id = %automation_id,
+                            marker_id,
+                            resolved_some = ?other.as_ref().map(|o| o.is_some()),
+                            "triage emitted a task marker but no task with this automation's \
+                             provenance matched; leaving run failed_will_retry",
+                        );
+                        (
+                            AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                            None,
+                            Some(format!(
+                                "triage emitted `automation: task {marker_id}` but no task \
                                      with this automation's provenance was found"
-                                )),
-                            )
-                        }
+                            )),
+                        )
                     }
                 }
-                TriageDecision::Skip(reason) => {
-                    let reason = if reason.is_empty() {
-                        "no reason given".to_owned()
-                    } else {
-                        reason.clone()
-                    };
-                    (AUTOMATION_OUTCOME_SKIPPED, None, Some(reason))
-                }
-                TriageDecision::NoDecision => (
-                    AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
-                    None,
-                    Some(triage_no_decision_detail(&transcript)),
-                ),
-                TriageDecision::Ambiguous(n) => (
-                    AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
-                    None,
-                    Some(format!(
-                        "triage emitted {n} decision markers; expected exactly one"
-                    )),
-                ),
-            };
+            }
+            TriageDecision::Skip(reason) => {
+                let reason = if reason.is_empty() {
+                    "no reason given".to_owned()
+                } else {
+                    reason.clone()
+                };
+                (AUTOMATION_OUTCOME_SKIPPED, None, Some(reason))
+            }
+            TriageDecision::NoDecision => (
+                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                None,
+                Some(triage_no_decision_detail(&transcript)),
+            ),
+            TriageDecision::Ambiguous(n) => (
+                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                None,
+                Some(format!("triage emitted {n} decision markers; expected exactly one")),
+            ),
+        };
 
         match self.work_db.finalize_automation_triage_run(
             &execution.id,
@@ -2093,14 +2007,15 @@ must not be asked to open one",
             ),
         }
         if let Some(lease_id) = lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    ?err,
-                    "triage finalisation: cube workspace release failed",
-                );
-            }
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id,
+                ?err,
+                "triage finalisation: cube workspace release failed",
+            );
+        }
         self.pane_releaser.release_pane(&execution.id).await;
         self.publisher
             .publish(
@@ -2149,29 +2064,24 @@ must not be asked to open one",
     ///
     /// In either case the reviewer execution is completed and its workspace
     /// released — it is always terminal after this handler runs.
-    async fn finalize_pr_review_pass(
-        &self,
-        execution: &crate::work::WorkExecution,
-    ) -> StopOutcome {
+    async fn finalize_pr_review_pass(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let producing_task_id = &execution.work_item_id;
 
         // Look up the producing task to retrieve its pr_url (stamped during
         // the PendingReview write when the reviewer was enqueued).
         let pr_url = match self.work_db.get_work_item(producing_task_id) {
-            Ok(WorkItem::Task(ref t)) | Ok(WorkItem::Chore(ref t)) => {
-                match t.pr_url.as_deref() {
-                    Some(url) if !url.is_empty() => url.to_owned(),
-                    _ => {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            producing_task_id,
-                            "pr_review finalize: producing task has no pr_url; \
-                             cannot advance to in_review",
-                        );
-                        return StopOutcome::DbError;
-                    }
+            Ok(WorkItem::Task(ref t)) | Ok(WorkItem::Chore(ref t)) => match t.pr_url.as_deref() {
+                Some(url) if !url.is_empty() => url.to_owned(),
+                _ => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        "pr_review finalize: producing task has no pr_url; \
+                         cannot advance to in_review",
+                    );
+                    return StopOutcome::DbError;
                 }
-            }
+            },
             Ok(other) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -2201,25 +2111,22 @@ must not be asked to open one",
         // scraper (`extract_review_result` + the balanced-brace hack) is kept
         // only as this fallback and can be deleted once the artifact path is
         // proven in production.
-        let from_artifact = crate::structured_output::read(
-            &self.structured_output_dir,
-            &execution.id,
-        )
-        .and_then(
-            |raw| match crate::pr_review::ReviewResult::from_json(&raw) {
-                Ok(result) => Some(result),
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        producing_task_id,
-                        ?err,
-                        "pr_review finalize: structured-output artifact present but did not \
-                         validate as ReviewResult; trying the transcript fallback",
-                    );
-                    None
+        let from_artifact =
+            crate::structured_output::read(&self.structured_output_dir, &execution.id).and_then(|raw| {
+                match crate::pr_review::ReviewResult::from_json(&raw) {
+                    Ok(result) => Some(result),
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            producing_task_id,
+                            ?err,
+                            "pr_review finalize: structured-output artifact present but did not \
+                             validate as ReviewResult; trying the transcript fallback",
+                        );
+                        None
+                    }
                 }
-            },
-        );
+            });
         let review_result = match from_artifact {
             Some(result) => Some(result),
             None => self
@@ -2236,16 +2143,12 @@ must not be asked to open one",
         // the shared auto-nudge breaker so a reviewer that never produces a
         // valid result cannot loop forever.
         if review_result.is_none() {
-            match self.nudge_breaker.record(
-                &execution.id,
-                "pr_review:awaiting_result",
-                self.max_unproductive_nudges,
-            ) {
+            match self
+                .nudge_breaker
+                .record(&execution.id, "pr_review:awaiting_result", self.max_unproductive_nudges)
+            {
                 NudgeDecision::Proceed { count } => {
-                    let output_path = crate::structured_output::path_in(
-                        &self.structured_output_dir,
-                        &execution.id,
-                    );
+                    let output_path = crate::structured_output::path_in(&self.structured_output_dir, &execution.id);
                     let probe = format!(
                         "Your review did not produce a valid ReviewResult. Write the \
                          ReviewResult JSON (matching the schema in your task prompt) to \
@@ -2272,8 +2175,7 @@ must not be asked to open one",
                          after re-prompting; advancing to in_review WITHOUT a revision and \
                          filing an attention",
                     );
-                    self.file_review_result_giveup_attention(execution, count)
-                        .await;
+                    self.file_review_result_giveup_attention(execution, count).await;
                     // Fall through with review_result = None → advance to
                     // in_review unimpeded (no revision).
                 }
@@ -2335,14 +2237,15 @@ must not be asked to open one",
         }
 
         if let Some(lease_id) = completion.released_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    lease_id,
-                    ?err,
-                    "pr_review finalize: cube workspace release failed",
-                );
-            }
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id,
+                ?err,
+                "pr_review finalize: cube workspace release failed",
+            );
+        }
         self.pane_releaser.release_pane(&execution.id).await;
 
         let product_id = work_item_product_id(&completion.work_item);
@@ -2384,11 +2287,7 @@ must not be asked to open one",
                         )
                         .await;
                     self.publisher
-                        .publish_work_item_changed(
-                            &product_id,
-                            &work_item_id,
-                            "pr_review_pass_revision_created",
-                        )
+                        .publish_work_item_changed(&product_id, &work_item_id, "pr_review_pass_revision_created")
                         .await;
                     return StopOutcome::ReviewPassRevisionCreated {
                         pr_url,
@@ -2411,12 +2310,7 @@ must not be asked to open one",
         }
 
         self.publisher
-            .publish(
-                &execution.id,
-                &work_item_id,
-                "completed",
-                "pr_review_pass_completed",
-            )
+            .publish(&execution.id, &work_item_id, "completed", "pr_review_pass_completed")
             .await;
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, "pr_review_pass_completed")
@@ -2451,11 +2345,7 @@ must not be asked to open one",
                 return TriageTranscript::NoPath;
             }
             Err(err) => {
-                tracing::warn!(
-                    execution_id,
-                    ?err,
-                    "triage finalisation: transcript lookup failed",
-                );
+                tracing::warn!(execution_id, ?err, "triage finalisation: transcript lookup failed",);
                 return TriageTranscript::Unreadable;
             }
         };
@@ -2478,9 +2368,7 @@ must not be asked to open one",
                 let all_text: Vec<String> = events
                     .iter()
                     .filter_map(|e| match &e.kind {
-                        crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => {
-                            Some(t.clone())
-                        }
+                        crate::transcript_markdown::TranscriptEventKind::AssistantText(t) => Some(t.clone()),
                         _ => None,
                     })
                     .collect();
@@ -2569,11 +2457,7 @@ must not be asked to open one",
         };
 
         // Fetch current PR head SHA.
-        let current_head = match self
-            .branch_verifier
-            .fetch_pr_head_oid(&repo_slug, pr_number)
-            .await
-        {
+        let current_head = match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
             Ok(sha) => sha,
             Err(err) => {
                 tracing::warn!(
@@ -2641,49 +2525,37 @@ must not be asked to open one",
         // to InReview with a sticky attention item for the human.
         // If the pr_review execution cannot be created (DB error), fall back
         // to the normal InReview path so the task is never left stuck.
-        let enqueued_reviewer = if !merged
-            && matches!(target, WorkerPrCompletionTarget::InReview)
-        {
+        let enqueued_reviewer = if !merged && matches!(target, WorkerPrCompletionTarget::InReview) {
             match self.work_db.get_execution(execution_id) {
                 Ok(ref producing)
                     if should_enqueue_reviewer_for_primary(&producing.kind)
                         || (producing.kind == ExecutionKind::RevisionImplementation
-                            && should_enqueue_reviewer_for_revision(
-                                &producing.work_item_id,
-                                &self.work_db,
-                            )) =>
+                            && should_enqueue_reviewer_for_revision(&producing.work_item_id, &self.work_db)) =>
                 {
                     // P992 tasks 9 & 10: read cycle state once — used by both
                     // the no-op gate (task 10) and the cycle-bound check (task 9).
                     let max_cycles = self.max_review_cycles;
-                    let (review_cycle, last_reviewed_sha) = match self
-                        .work_db
-                        .get_task_review_cycle_state(&producing.work_item_id)
-                    {
-                        Ok(state) => state,
-                        Err(err) => {
-                            // Fail open: treat as cycle=0, no prior SHA so both
-                            // gates pass through (don't skip on uncertainty).
-                            tracing::warn!(
-                                execution_id,
-                                work_item_id = %producing.work_item_id,
-                                ?err,
-                                "could not read review_cycle; assuming bound not reached",
-                            );
-                            (0i64, None)
-                        }
-                    };
+                    let (review_cycle, last_reviewed_sha) =
+                        match self.work_db.get_task_review_cycle_state(&producing.work_item_id) {
+                            Ok(state) => state,
+                            Err(err) => {
+                                // Fail open: treat as cycle=0, no prior SHA so both
+                                // gates pass through (don't skip on uncertainty).
+                                tracing::warn!(
+                                    execution_id,
+                                    work_item_id = %producing.work_item_id,
+                                    ?err,
+                                    "could not read review_cycle; assuming bound not reached",
+                                );
+                                (0i64, None)
+                            }
+                        };
 
                     // P992 task 10: no-op / trivial-diff skip gate. Runs before
                     // the cycle-bound check so a pure rebase doesn't consume a
                     // cycle slot or surface an attention item.
                     let noop_skip_reason = self
-                        .check_noop_skip(
-                            &pr_url,
-                            producing,
-                            review_cycle,
-                            last_reviewed_sha.as_deref(),
-                        )
+                        .check_noop_skip(&pr_url, producing, review_cycle, last_reviewed_sha.as_deref())
                         .await;
 
                     if let Some(skip_reason) = noop_skip_reason {
@@ -2695,26 +2567,23 @@ must not be asked to open one",
                         );
                         false
                     } else {
-                    // P992 task 9: cycle bound check.
-                    let cycle_bound_reached = (review_cycle as usize) >= max_cycles;
+                        // P992 task 9: cycle bound check.
+                        let cycle_bound_reached = (review_cycle as usize) >= max_cycles;
 
-                    if cycle_bound_reached {
-                        tracing::info!(
-                            execution_id,
-                            work_item_id = %producing.work_item_id,
-                            max_review_cycles = max_cycles,
-                            "pr_review cycle bound reached; skipping reviewer \
-                             and advancing to in_review",
-                        );
-                        // Surface a sticky attention item so the human can see
-                        // the cycle limit was hit when they open the PR card.
-                        let _ = self.work_db.create_attention_item(
-                            CreateAttentionItemInput {
+                        if cycle_bound_reached {
+                            tracing::info!(
+                                execution_id,
+                                work_item_id = %producing.work_item_id,
+                                max_review_cycles = max_cycles,
+                                "pr_review cycle bound reached; skipping reviewer \
+                                 and advancing to in_review",
+                            );
+                            // Surface a sticky attention item so the human can see
+                            // the cycle limit was hit when they open the PR card.
+                            let _ = self.work_db.create_attention_item(CreateAttentionItemInput {
                                 work_item_id: Some(producing.work_item_id.clone()),
                                 kind: "pr_review_cycle_bound".to_owned(),
-                                title: format!(
-                                    "Automated reviewer: cycle limit ({max_cycles}) reached"
-                                ),
+                                title: format!("Automated reviewer: cycle limit ({max_cycles}) reached"),
                                 body_markdown: format!(
                                     "The automated reviewer completed {max_cycles} \
                                      cycle(s) on this PR without resolving all findings. \
@@ -2725,41 +2594,40 @@ must not be asked to open one",
                                 execution_id: None,
                                 status: None,
                                 resolved_at: None,
-                            },
-                        );
-                        false
-                    } else {
-                        match self.work_db.create_execution(
-                            CreateExecutionInput::builder()
-                                .work_item_id(producing.work_item_id.clone())
-                                .kind(ExecutionKind::PrReview)
-                                .status(ExecutionStatus::Ready)
-                                .repo_remote_url(producing.repo_remote_url.clone())
-                                .build(),
-                        ) {
-                            Ok(review_exec) => {
-                                tracing::info!(
-                                    execution_id,
-                                    review_execution_id = %review_exec.id,
-                                    pr_url = %pr_url,
-                                    producing_kind = %producing.kind,
-                                    "pr_review execution enqueued; \
-                                     holding producing task for reviewer pass",
-                                );
-                                self.publisher.kick_scheduler();
-                                true
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    execution_id,
-                                    ?err,
-                                    "failed to create pr_review execution; \
+                            });
+                            false
+                        } else {
+                            match self.work_db.create_execution(
+                                CreateExecutionInput::builder()
+                                    .work_item_id(producing.work_item_id.clone())
+                                    .kind(ExecutionKind::PrReview)
+                                    .status(ExecutionStatus::Ready)
+                                    .repo_remote_url(producing.repo_remote_url.clone())
+                                    .build(),
+                            ) {
+                                Ok(review_exec) => {
+                                    tracing::info!(
+                                        execution_id,
+                                        review_execution_id = %review_exec.id,
+                                        pr_url = %pr_url,
+                                        producing_kind = %producing.kind,
+                                        "pr_review execution enqueued; \
+                                         holding producing task for reviewer pass",
+                                    );
+                                    self.publisher.kick_scheduler();
+                                    true
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        execution_id,
+                                        ?err,
+                                        "failed to create pr_review execution; \
                                      falling back to immediate in_review",
-                                );
-                                false
+                                    );
+                                    false
+                                }
                             }
                         }
-                    }
                     } // closes the `} else {` for the noop skip gate
                 }
                 Ok(_) => false, // non-reviewer-triggering execution; advance to in_review as normal
@@ -2783,21 +2651,14 @@ must not be asked to open one",
             target
         };
 
-        let completion = match self.work_db.record_worker_pr_completion(
-            execution_id,
-            &pr_url,
-            None,
-            effective_target,
-        ) {
+        let completion = match self
+            .work_db
+            .record_worker_pr_completion(execution_id, &pr_url, None, effective_target)
+        {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
             Err(err) => {
-                tracing::error!(
-                    execution_id,
-                    source,
-                    ?err,
-                    "pr completion: failed to record"
-                );
+                tracing::error!(execution_id, source, ?err, "pr completion: failed to record");
                 return StopOutcome::DbError;
             }
         };
@@ -2810,15 +2671,16 @@ must not be asked to open one",
         // count so a later unrelated nudge cycle starts clean.
         self.nudge_breaker.forget(execution_id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await {
-                tracing::error!(
-                    execution_id,
-                    source,
-                    lease_id,
-                    ?err,
-                    "pr completion: cube release failed"
-                );
-            }
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id,
+                source,
+                lease_id,
+                ?err,
+                "pr completion: cube release failed"
+            );
+        }
         self.pane_releaser.release_pane(execution_id).await;
         let product_id = work_item_product_id(&completion.work_item);
         let work_item_id = work_item_id(&completion.work_item);
@@ -2845,67 +2707,57 @@ must not be asked to open one",
         // here because they'd mask the successful PR transition.
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item
             && task.kind == TaskKind::Design
-                && let Some(ref project_id) = task.project_id {
-                    if merged {
-                        // Worker merged directly during its session; update
-                        // the branch to main (base_ref_name unknown here,
-                        // so the detector will fetch it from the PR).
-                        design_detector::on_design_pr_merged(
-                            &self.work_db,
-                            &task.id,
-                            &task.product_id,
-                            project_id,
-                            &pr_url,
-                            None,
-                        )
-                        .await;
-                    } else {
-                        design_detector::on_design_pr_detected(
-                            &self.work_db,
-                            &task.id,
-                            &task.product_id,
-                            project_id,
-                            &pr_url,
-                        )
-                        .await;
-                    }
+            && let Some(ref project_id) = task.project_id
+        {
+            if merged {
+                // Worker merged directly during its session; update
+                // the branch to main (base_ref_name unknown here,
+                // so the detector will fetch it from the PR).
+                design_detector::on_design_pr_merged(
+                    &self.work_db,
+                    &task.id,
+                    &task.product_id,
+                    project_id,
+                    &pr_url,
+                    None,
+                )
+                .await;
+            } else {
+                design_detector::on_design_pr_detected(&self.work_db, &task.id, &task.product_id, project_id, &pr_url)
+                    .await;
+            }
 
-                    // Attentions creation pipeline (design: attentions.md).
-                    // A design worker may ship a sibling `<slug>.attentions.json`
-                    // question manifest; parse it off the PR branch and upsert
-                    // the question group. Idempotent across re-detections.
-                    let questions_result =
-                        attentions_detector::reconcile_design_doc_questions(
-                            &self.work_db,
-                            &task.id,
-                            project_id,
-                            &pr_url,
-                            merged,
-                        )
-                        .await;
-                    if let Some((ref group, ref created)) = questions_result {
-                        self.publish_attentions_created(group, created).await;
-                    } else if self
-                        .feature_flags
-                        .is_enabled("attentions_questions_backstop")
-                    {
-                        // Primary found no manifest; fall back to the extraction
-                        // backstop which reads the doc's "Risks / open questions"
-                        // section (flagged `confidence_source = extracted`).
-                        if let Some((group, created)) =
-                            attentions_detector::extract_doc_questions_backstop(
-                                &self.work_db,
-                                &task.id,
-                                project_id,
-                                &pr_url,
-                                merged,
-                            )
-                            .await
-                        {
-                            self.publish_attentions_created(&group, &created).await;
-                        }
-                    }
+            // Attentions creation pipeline (design: attentions.md).
+            // A design worker may ship a sibling `<slug>.attentions.json`
+            // question manifest; parse it off the PR branch and upsert
+            // the question group. Idempotent across re-detections.
+            let questions_result = attentions_detector::reconcile_design_doc_questions(
+                &self.work_db,
+                &task.id,
+                project_id,
+                &pr_url,
+                merged,
+            )
+            .await;
+            if let Some((ref group, ref created)) = questions_result {
+                self.publish_attentions_created(group, created).await;
+            } else if self.feature_flags.is_enabled("attentions_questions_backstop") {
+                // Primary found no manifest; fall back to the extraction
+                // backstop which reads the doc's "Risks / open questions"
+                // section (flagged `confidence_source = extracted`).
+                if let Some((group, created)) = attentions_detector::extract_doc_questions_backstop(
+                    &self.work_db,
+                    &task.id,
+                    project_id,
+                    &pr_url,
+                    merged,
+                )
+                .await
+                {
+                    self.publish_attentions_created(&group, &created).await;
                 }
+            }
+        }
 
         // Followups: any completing implementation worker may surface
         // out-of-scope follow-on work. PRIMARY: the engine-owned
@@ -2913,11 +2765,7 @@ must not be asked to open one",
         // a `FOLLOWUPS:` block scraped from the transcript tail. A no-op (no
         // artifact / no transcript / no block) when absent; idempotent across
         // re-runs via the store's content dedup.
-        let transcript_path = self
-            .work_db
-            .transcript_path_for_execution(execution_id)
-            .ok()
-            .flatten();
+        let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
         let followups_result = attentions_detector::reconcile_task_followups(
             &self.work_db,
             &work_item_id,
@@ -2928,10 +2776,7 @@ must not be asked to open one",
         .await;
         if let Some((ref group, ref created)) = followups_result {
             self.publish_attentions_created(group, created).await;
-        } else if self
-            .feature_flags
-            .is_enabled("attentions_followups_backstop")
-        {
+        } else if self.feature_flags.is_enabled("attentions_followups_backstop") {
             // Primary found no FOLLOWUPS: block; fall back to the supervisor
             // extraction backstop (flagged `confidence_source = extracted`).
             if let Some((group, created)) = attentions_detector::extract_followups_backstop(
@@ -2992,13 +2837,7 @@ must not be asked to open one",
             tokio::spawn(async move {
                 match probe.probe(&candidate.pr_url).await {
                     Ok(lifecycle_probe) => {
-                        update_pr_poll_state(
-                            &work_db,
-                            publisher.as_ref(),
-                            &candidate,
-                            &lifecycle_probe,
-                        )
-                        .await;
+                        update_pr_poll_state(&work_db, publisher.as_ref(), &candidate, &lifecycle_probe).await;
                     }
                     Err(err) => {
                         tracing::debug!(
@@ -3053,11 +2892,7 @@ must not be asked to open one",
     /// [`WorkDb::mark_ci_remediation_failed`] WHERE-guards on
     /// `status IN ('pending', 'running')`, so a duplicate finaliser
     /// call after a terminal transition writes nothing.
-    pub async fn finalize_ci_remediation_attempt(
-        &self,
-        execution: &crate::work::WorkExecution,
-        outcome: &StopOutcome,
-    ) {
+    pub async fn finalize_ci_remediation_attempt(&self, execution: &crate::work::WorkExecution, outcome: &StopOutcome) {
         let attempt = match self
             .work_db
             .active_ci_remediation_for_work_item(&execution.work_item_id)
@@ -3085,10 +2920,7 @@ must not be asked to open one",
         // worker classified via `mark-failed` / `mark-retriggered`,
         // the poller already retired it, or some other path closed
         // the row. Nothing for the catch-all to do.
-        if attempt.status != "running"
-            || attempt.head_sha_after.is_some()
-            || attempt.failure_reason.is_some()
-        {
+        if attempt.status != "running" || attempt.head_sha_after.is_some() || attempt.failure_reason.is_some() {
             return;
         }
 
@@ -3104,9 +2936,7 @@ must not be asked to open one",
             StopOutcome::StalePr { .. } | StopOutcome::EmptyDiffPr { .. } => false,
             // Race with an already-finalized execution, or a stale Stop
             // from a superseded reused-workspace occupant.
-            StopOutcome::AlreadyTerminal
-            | StopOutcome::UnknownExecution
-            | StopOutcome::SupersededInWorkspace => false,
+            StopOutcome::AlreadyTerminal | StopOutcome::UnknownExecution | StopOutcome::SupersededInWorkspace => false,
             // Incident-001 gates (mirrors conflict finalizer).
             StopOutcome::RunningNoStagedPr => false,
             StopOutcome::FallbackDisabledByFlag => false,
@@ -3141,10 +2971,7 @@ must not be asked to open one",
             return;
         }
 
-        let updated = match self
-            .work_db
-            .mark_ci_remediation_failed(&attempt.id, CI_NO_PUSH_REASON)
-        {
+        let updated = match self.work_db.mark_ci_remediation_failed(&attempt.id, CI_NO_PUSH_REASON) {
             Ok(Some(row)) => row,
             Ok(None) => {
                 tracing::debug!(
@@ -3262,11 +3089,7 @@ must not be asked to open one",
     pub async fn cancel_and_release(&self, execution_id: &str, reason: &str) {
         match self.work_db.cancel_running_execution(execution_id) {
             Ok(true) => {
-                tracing::info!(
-                    execution_id,
-                    reason,
-                    "cancel_and_release: execution cancelled",
-                );
+                tracing::info!(execution_id, reason, "cancel_and_release: execution cancelled",);
             }
             Ok(false) => {
                 tracing::debug!(
@@ -3307,10 +3130,7 @@ must not be asked to open one",
     /// Idempotent: a second call for the same execution is a no-op
     /// at both the DB and the cube-release layers.
     pub async fn force_stop_execution(&self, execution_id: &str) {
-        let (exec_cancelled, task_demoted) = match self
-            .work_db
-            .cancel_running_execution_and_demote_task(execution_id)
-        {
+        let (exec_cancelled, task_demoted) = match self.work_db.cancel_running_execution_and_demote_task(execution_id) {
             Ok(result) => result,
             Err(err) => {
                 tracing::warn!(
@@ -3332,13 +3152,14 @@ must not be asked to open one",
             // Publish work-item-changed so the UI refreshes. Requires
             // looking up the execution's work_item_id + product_id.
             if let Ok(execution) = self.work_db.get_execution(execution_id)
-                && let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                    let product_id = work_item_product_id(&work_item);
-                    let wid = work_item_id(&work_item);
-                    self.publisher
-                        .publish_work_item_changed(&product_id, &wid, "worker_force_stopped")
-                        .await;
-                }
+                && let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id)
+            {
+                let product_id = work_item_product_id(&work_item);
+                let wid = work_item_id(&work_item);
+                self.publisher
+                    .publish_work_item_changed(&product_id, &wid, "worker_force_stopped")
+                    .await;
+            }
         }
 
         self.force_release(execution_id).await;
@@ -3375,26 +3196,21 @@ must not be asked to open one",
     fn resolve_bound_pr_url(&self, execution: &crate::work::WorkExecution) -> Option<String> {
         match self.work_db.get_work_item(&execution.work_item_id) {
             Ok(WorkItem::Task(task) | WorkItem::Chore(task)) => {
-                crate::runner::task_bound_pr_url(&task)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if execution.kind == ExecutionKind::RevisionImplementation {
-                            // Primary: execution.pr_url is stamped at dispatch time.
-                            // Fallback: walk the parent chain to find the chain root's
-                            // pr_url for executions where execution.pr_url was not set
-                            // (e.g. older executions predating reliable dispatch stamping).
-                            execution
-                                .pr_url
-                                .clone()
-                                .filter(|u| !u.is_empty())
-                                .or_else(|| {
-                                    self.work_db
-                                        .get_revision_chain_root_pr_url(&task.id)
-                                })
-                        } else {
-                            None
-                        }
-                    })
+                crate::runner::task_bound_pr_url(&task).map(str::to_owned).or_else(|| {
+                    if execution.kind == ExecutionKind::RevisionImplementation {
+                        // Primary: execution.pr_url is stamped at dispatch time.
+                        // Fallback: walk the parent chain to find the chain root's
+                        // pr_url for executions where execution.pr_url was not set
+                        // (e.g. older executions predating reliable dispatch stamping).
+                        execution
+                            .pr_url
+                            .clone()
+                            .filter(|u| !u.is_empty())
+                            .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
+                    } else {
+                        None
+                    }
+                })
             }
             _ => None,
         }
@@ -3423,11 +3239,10 @@ must not be asked to open one",
         bound_pr_url: Option<&str>,
         proceed_outcome: StopOutcome,
     ) -> StopOutcome {
-        match self.nudge_breaker.record(
-            &execution.id,
-            fingerprint,
-            self.max_unproductive_nudges,
-        ) {
+        match self
+            .nudge_breaker
+            .record(&execution.id, fingerprint, self.max_unproductive_nudges)
+        {
             NudgeDecision::Proceed { count } => {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -3440,13 +3255,8 @@ must not be asked to open one",
                 proceed_outcome
             }
             NudgeDecision::Trip { count } => {
-                self.park_for_unproductive_nudges(
-                    execution,
-                    count,
-                    bound_pr_url,
-                    "no new commit, PR, or state change",
-                )
-                .await
+                self.park_for_unproductive_nudges(execution, count, bound_pr_url, "no new commit, PR, or state change")
+                    .await
             }
         }
     }
@@ -3486,9 +3296,9 @@ must not be asked to open one",
             .work_db
             .list_attention_items(&execution.id)
             .map(|items| {
-                items.iter().any(|i| {
-                    i.kind == NUDGE_BREAKER_ATTENTION_KIND && i.status != "resolved"
-                })
+                items
+                    .iter()
+                    .any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND && i.status != "resolved")
             })
             .unwrap_or(false);
         if !already_filed {
@@ -3548,11 +3358,7 @@ must not be asked to open one",
     /// execution's terminal handling — the caller still finalises the reviewer
     /// pass and advances the producing task — it only surfaces the give-up to
     /// the human. Best-effort: a filing failure is logged and swallowed.
-    async fn file_review_result_giveup_attention(
-        &self,
-        execution: &crate::work::WorkExecution,
-        nudge_count: u32,
-    ) {
+    async fn file_review_result_giveup_attention(&self, execution: &crate::work::WorkExecution, nudge_count: u32) {
         let body = format!(
             "The automated reviewer for this PR stopped {nudge_count} time(s) without writing a \
              valid ReviewResult — neither the structured-output artifact nor the transcript \
@@ -3575,10 +3381,7 @@ must not be asked to open one",
                 if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
                     let product_id = work_item_product_id(&work_item);
                     self.publisher
-                        .publish_frontend_event_on_product(
-                            &product_id,
-                            FrontendEvent::AttentionItemCreated { item },
-                        )
+                        .publish_frontend_event_on_product(&product_id, FrontendEvent::AttentionItemCreated { item })
                         .await;
                 }
             }
@@ -3624,22 +3427,17 @@ must not be asked to open one",
                 // a PR).  Fall back to execution.pr_url (stamped at
                 // dispatch), then to a chain-root lookup for executions
                 // where execution.pr_url was not reliably set.
-                crate::runner::task_bound_pr_url(&task)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if execution.kind == ExecutionKind::RevisionImplementation {
-                            execution
-                                .pr_url
-                                .clone()
-                                .filter(|u| !u.is_empty())
-                                .or_else(|| {
-                                    self.work_db
-                                        .get_revision_chain_root_pr_url(&task.id)
-                                })
-                        } else {
-                            None
-                        }
-                    })
+                crate::runner::task_bound_pr_url(&task).map(str::to_owned).or_else(|| {
+                    if execution.kind == ExecutionKind::RevisionImplementation {
+                        execution
+                            .pr_url
+                            .clone()
+                            .filter(|u| !u.is_empty())
+                            .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
+                    } else {
+                        None
+                    }
+                })
             }
             Ok(_) => None,
             Err(err) => {
@@ -3685,11 +3483,7 @@ must not be asked to open one",
                 return;
             }
         };
-        let head_oid = match self
-            .branch_verifier
-            .fetch_pr_head_oid(&repo_slug, pr_number)
-            .await
-        {
+        let head_oid = match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
             Ok(oid) => oid,
             Err(err) => {
                 tracing::warn!(
@@ -3701,10 +3495,7 @@ must not be asked to open one",
                 return;
             }
         };
-        if let Err(err) = self
-            .work_db
-            .set_execution_pr_head_before(execution_id, &head_oid)
-        {
+        if let Err(err) = self.work_db.set_execution_pr_head_before(execution_id, &head_oid) {
             tracing::warn!(
                 execution_id,
                 ?err,
@@ -3727,11 +3518,7 @@ must not be asked to open one",
         // Best-effort and independent of downstream finalisation — an empty
         // body is a valid snapshot, but a fetch failure leaves it unset and
         // the gate treats that as inapplicable.
-        match self
-            .branch_verifier
-            .fetch_pr_body(&repo_slug, pr_number)
-            .await
-        {
+        match self.branch_verifier.fetch_pr_body(&repo_slug, pr_number).await {
             Ok(body) => {
                 if let Err(err) = self.work_db.set_execution_pr_body_before(execution_id, &body) {
                     tracing::warn!(
@@ -3850,180 +3637,167 @@ must not be asked to open one",
 
         // --- Conflict signal check ---
         if let Some(ref attempt) = conflict_attempt
-            && open_status.mergeability != OpenPrMergeability::Conflict {
-                tracing::info!(
-                    execution_id,
-                    attempt_id = %attempt.id,
-                    bound_pr_url,
-                    "stop event: conflict already cleared — retiring attempt without nudging"
-                );
-                // Mark the attempt succeeded.
-                match self
-                    .work_db
-                    .mark_conflict_resolution_succeeded(&attempt.id, None)
-                {
-                    Ok(Some(succeeded)) => {
-                        // Release old-style cube lease on the attempt (null for
-                        // new Phase 3 revision-backed attempts).
-                        if let Some(lease_id) = succeeded.cube_lease_id.as_deref()
-                            && let Err(err) =
-                                self.cube_client.release_workspace(lease_id).await
-                            {
-                                tracing::debug!(
-                                    attempt_id = %attempt.id,
-                                    lease_id,
-                                    ?err,
-                                    "signal-cleared: conflict lease release failed \
-                                     (likely already released)",
-                                );
-                            }
-                        self.publisher
-                            .publish_frontend_event_on_product(
-                                &product_id,
-                                FrontendEvent::ConflictResolutionSucceeded {
-                                    product_id: product_id.clone(),
-                                    work_item_id: parent_chore_id.clone(),
-                                    attempt_id: succeeded.id.clone(),
-                                    pr_url: bound_pr_url.to_owned(),
-                                },
-                            )
-                            .await;
-                    }
-                    Ok(None) => {
+            && open_status.mergeability != OpenPrMergeability::Conflict
+        {
+            tracing::info!(
+                execution_id,
+                attempt_id = %attempt.id,
+                bound_pr_url,
+                "stop event: conflict already cleared — retiring attempt without nudging"
+            );
+            // Mark the attempt succeeded.
+            match self.work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
+                Ok(Some(succeeded)) => {
+                    // Release old-style cube lease on the attempt (null for
+                    // new Phase 3 revision-backed attempts).
+                    if let Some(lease_id) = succeeded.cube_lease_id.as_deref()
+                        && let Err(err) = self.cube_client.release_workspace(lease_id).await
+                    {
                         tracing::debug!(
                             attempt_id = %attempt.id,
-                            "signal-cleared: conflict attempt already terminal"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
+                            lease_id,
                             ?err,
-                            "signal-cleared: failed to mark conflict_resolution succeeded"
+                            "signal-cleared: conflict lease release failed \
+                             (likely already released)",
                         );
                     }
+                    self.publisher
+                        .publish_frontend_event_on_product(
+                            &product_id,
+                            FrontendEvent::ConflictResolutionSucceeded {
+                                product_id: product_id.clone(),
+                                work_item_id: parent_chore_id.clone(),
+                                attempt_id: succeeded.id.clone(),
+                                pr_url: bound_pr_url.to_owned(),
+                            },
+                        )
+                        .await;
                 }
-                // Snap parent chore back to in_review.
-                match self.work_db.clear_chore_blocked_merge_conflict_for_attempt(
-                    &parent_chore_id,
-                    bound_pr_url,
-                    &attempt.id,
-                ) {
-                    Ok(Some(_)) => {
-                        self.publisher
-                            .publish_work_item_changed(
-                                &product_id,
-                                &parent_chore_id,
-                                "merge_conflict_resolved",
-                            )
-                            .await;
-                    }
-                    Ok(None) => {
-                        // WHERE guard missed — parent was already moved (e.g.
-                        // by a concurrent sweep or human). Fine.
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            work_item_id = %parent_chore_id,
-                            ?err,
-                            "signal-cleared: failed to clear blocked: merge_conflict"
-                        );
-                    }
+                Ok(None) => {
+                    tracing::debug!(
+                        attempt_id = %attempt.id,
+                        "signal-cleared: conflict attempt already terminal"
+                    );
                 }
-                let outcome = self
-                    .finalize_pr_transition(
-                        execution_id,
-                        bound_pr_url.to_owned(),
-                        WorkerPrCompletionTarget::InReview,
-                        "stop_conflict_cleared",
-                    )
-                    .await;
-                // Return the distinct outcome so tests and logs can identify this path.
-                return Some(match outcome {
-                    StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
-                        StopOutcome::SignalAlreadyCleared { pr_url }
-                    }
-                    other => other,
-                });
+                Err(err) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        ?err,
+                        "signal-cleared: failed to mark conflict_resolution succeeded"
+                    );
+                }
             }
+            // Snap parent chore back to in_review.
+            match self.work_db.clear_chore_blocked_merge_conflict_for_attempt(
+                &parent_chore_id,
+                bound_pr_url,
+                &attempt.id,
+            ) {
+                Ok(Some(_)) => {
+                    self.publisher
+                        .publish_work_item_changed(&product_id, &parent_chore_id, "merge_conflict_resolved")
+                        .await;
+                }
+                Ok(None) => {
+                    // WHERE guard missed — parent was already moved (e.g.
+                    // by a concurrent sweep or human). Fine.
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %parent_chore_id,
+                        ?err,
+                        "signal-cleared: failed to clear blocked: merge_conflict"
+                    );
+                }
+            }
+            let outcome = self
+                .finalize_pr_transition(
+                    execution_id,
+                    bound_pr_url.to_owned(),
+                    WorkerPrCompletionTarget::InReview,
+                    "stop_conflict_cleared",
+                )
+                .await;
+            // Return the distinct outcome so tests and logs can identify this path.
+            return Some(match outcome {
+                StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
+                    StopOutcome::SignalAlreadyCleared { pr_url }
+                }
+                other => other,
+            });
+        }
 
         // --- CI signal check ---
         if let Some(ref attempt) = ci_attempt
-            && ci_attempt_signal_cleared(&attempt.failed_checks, &open_status.ci) {
-                tracing::info!(
-                    execution_id,
-                    attempt_id = %attempt.id,
-                    bound_pr_url,
-                    "stop event: CI already cleared — retiring attempt without nudging"
-                );
-                match self
-                    .work_db
-                    .mark_ci_remediation_succeeded(&attempt.id, None)
-                {
-                    Ok(Some(_)) => {
-                        self.publisher
-                            .publish_frontend_event_on_product(
-                                &product_id,
-                                FrontendEvent::CiRemediationSucceeded {
-                                    product_id: product_id.clone(),
-                                    work_item_id: parent_chore_id.clone(),
-                                    attempt_id: attempt.id.clone(),
-                                    pr_url: bound_pr_url.to_owned(),
-                                },
-                            )
-                            .await;
-                    }
-                    Ok(None) => {
-                        tracing::debug!(
-                            attempt_id = %attempt.id,
-                            "signal-cleared: CI attempt already terminal"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            attempt_id = %attempt.id,
-                            ?err,
-                            "signal-cleared: failed to mark ci_remediation succeeded"
-                        );
-                    }
+            && ci_attempt_signal_cleared(&attempt.failed_checks, &open_status.ci)
+        {
+            tracing::info!(
+                execution_id,
+                attempt_id = %attempt.id,
+                bound_pr_url,
+                "stop event: CI already cleared — retiring attempt without nudging"
+            );
+            match self.work_db.mark_ci_remediation_succeeded(&attempt.id, None) {
+                Ok(Some(_)) => {
+                    self.publisher
+                        .publish_frontend_event_on_product(
+                            &product_id,
+                            FrontendEvent::CiRemediationSucceeded {
+                                product_id: product_id.clone(),
+                                work_item_id: parent_chore_id.clone(),
+                                attempt_id: attempt.id.clone(),
+                                pr_url: bound_pr_url.to_owned(),
+                            },
+                        )
+                        .await;
                 }
-                match self
-                    .work_db
-                    .clear_chore_blocked_ci_failure(&parent_chore_id, bound_pr_url)
-                {
-                    Ok(Some(_)) => {
-                        self.publisher
-                            .publish_work_item_changed(
-                                &product_id,
-                                &parent_chore_id,
-                                "ci_failure_resolved",
-                            )
-                            .await;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            work_item_id = %parent_chore_id,
-                            ?err,
-                            "signal-cleared: failed to clear blocked: ci_failure"
-                        );
-                    }
+                Ok(None) => {
+                    tracing::debug!(
+                        attempt_id = %attempt.id,
+                        "signal-cleared: CI attempt already terminal"
+                    );
                 }
-                let outcome = self
-                    .finalize_pr_transition(
-                        execution_id,
-                        bound_pr_url.to_owned(),
-                        WorkerPrCompletionTarget::InReview,
-                        "stop_ci_cleared",
-                    )
-                    .await;
-                return Some(match outcome {
-                    StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
-                        StopOutcome::SignalAlreadyCleared { pr_url }
-                    }
-                    other => other,
-                });
+                Err(err) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.id,
+                        ?err,
+                        "signal-cleared: failed to mark ci_remediation succeeded"
+                    );
+                }
             }
+            match self
+                .work_db
+                .clear_chore_blocked_ci_failure(&parent_chore_id, bound_pr_url)
+            {
+                Ok(Some(_)) => {
+                    self.publisher
+                        .publish_work_item_changed(&product_id, &parent_chore_id, "ci_failure_resolved")
+                        .await;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        work_item_id = %parent_chore_id,
+                        ?err,
+                        "signal-cleared: failed to clear blocked: ci_failure"
+                    );
+                }
+            }
+            let outcome = self
+                .finalize_pr_transition(
+                    execution_id,
+                    bound_pr_url.to_owned(),
+                    WorkerPrCompletionTarget::InReview,
+                    "stop_ci_cleared",
+                )
+                .await;
+            return Some(match outcome {
+                StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
+                    StopOutcome::SignalAlreadyCleared { pr_url }
+                }
+                other => other,
+            });
+        }
 
         None
     }
@@ -4075,11 +3849,7 @@ must not be asked to open one",
         };
         let repo_slug = parse_repo_slug(&execution.repo_remote_url).ok()?;
         let pr_number = pr_number_from_url(bound_pr_url)?;
-        let current = match self
-            .branch_verifier
-            .fetch_pr_body(&repo_slug, pr_number)
-            .await
-        {
+        let current = match self.branch_verifier.fetch_pr_body(&repo_slug, pr_number).await {
             Ok(body) => body,
             Err(err) => {
                 tracing::debug!(
@@ -4100,10 +3870,7 @@ must not be asked to open one",
         // boundary. Persist the positive-evidence marker BEFORE attempting
         // to finalize so a transient probe failure still lets the merge
         // poller finalize once CI goes green.
-        if let Err(err) = self
-            .work_db
-            .mark_execution_metadata_fix_confirmed(execution_id)
-        {
+        if let Err(err) = self.work_db.mark_execution_metadata_fix_confirmed(execution_id) {
             tracing::warn!(
                 execution_id,
                 ?err,
@@ -4171,8 +3938,7 @@ must not be asked to open one",
             // revision the worker did not actually rebase). Only a genuinely
             // review-ready PR advances.
             PrLifecycleState::Open(open)
-                if open.mergeability == OpenPrMergeability::Clean
-                    && matches!(open.ci, OpenPrCiStatus::Clean) =>
+                if open.mergeability == OpenPrMergeability::Clean && matches!(open.ci, OpenPrCiStatus::Clean) =>
             {
                 tracing::info!(
                     execution_id,
@@ -4197,13 +3963,8 @@ must not be asked to open one",
             _ => return None,
         };
         Some(
-            self.finalize_pr_transition(
-                execution_id,
-                bound_pr_url.to_owned(),
-                target,
-                "metadata_only_fix",
-            )
-            .await,
+            self.finalize_pr_transition(execution_id, bound_pr_url.to_owned(), target, "metadata_only_fix")
+                .await,
         )
     }
 
@@ -4250,10 +4011,8 @@ must not be asked to open one",
                             .pr_url
                             .clone()
                             .filter(|u| !u.is_empty())
-                            .or_else(|| {
-                                self.work_db
-                                    .get_revision_chain_root_pr_url(&task.id)
-                            }) {
+                            .or_else(|| self.work_db.get_revision_chain_root_pr_url(&task.id))
+                        {
                             Some(url) => url,
                             None => return ShaDeltaGateOutcome::Inapplicable,
                         }
@@ -4297,11 +4056,7 @@ must not be asked to open one",
                 return ShaDeltaGateOutcome::Inapplicable;
             }
         };
-        let head_now = match self
-            .branch_verifier
-            .fetch_pr_head_oid(&repo_slug, pr_number)
-            .await
-        {
+        let head_now = match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
             Ok(oid) => oid,
             Err(err) => {
                 tracing::warn!(
@@ -4320,9 +4075,7 @@ must not be asked to open one",
                 pr_head_before = %pr_head_before,
                 "sha-delta gate: bound PR head unchanged — worker did not contribute"
             );
-            ShaDeltaGateOutcome::NoContribution {
-                pr_url: bound_pr_url,
-            }
+            ShaDeltaGateOutcome::NoContribution { pr_url: bound_pr_url }
         } else {
             tracing::info!(
                 execution_id,
@@ -4443,11 +4196,8 @@ fn ci_attempt_signal_cleared(attempt_failed_checks: &str, ci: &OpenPrCiStatus) -
             if targeted.is_empty() {
                 return false;
             }
-            let failing_names: std::collections::HashSet<&str> =
-                failures.iter().map(|f| f.name.as_str()).collect();
-            !targeted
-                .iter()
-                .any(|name| failing_names.contains(name.as_str()))
+            let failing_names: std::collections::HashSet<&str> = failures.iter().map(|f| f.name.as_str()).collect();
+            !targeted.iter().any(|name| failing_names.contains(name.as_str()))
         }
     }
 }
@@ -4624,9 +4374,7 @@ impl TriageTranscript {
     fn into_message(self) -> Option<String> {
         match self {
             TriageTranscript::FinalMessage(text) => Some(text),
-            TriageTranscript::NoPath
-            | TriageTranscript::Unreadable
-            | TriageTranscript::NoAssistantText => None,
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText => None,
         }
     }
 }
@@ -4647,9 +4395,7 @@ fn triage_no_decision_detail(transcript: &TriageTranscript) -> String {
         TriageTranscript::NoPath => "triage produced no transcript (no transcript path \
              recorded; the worker session may have failed to start)"
             .to_owned(),
-        TriageTranscript::Unreadable => {
-            "triage transcript could not be read from disk".to_owned()
-        }
+        TriageTranscript::Unreadable => "triage transcript could not be read from disk".to_owned(),
         TriageTranscript::NoAssistantText => "triage transcript contained no assistant \
              message (worker emitted no prose before stopping)"
             .to_owned(),
@@ -4736,8 +4482,7 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
     };
 
     #[test]
@@ -4792,8 +4537,7 @@ mod tests {
 
     use crate::merge_poller::{MergeProbe, PrLifecycleProbe, PrLifecycleState};
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, FakePrStateChecker, PrOpenState,
-        WorkDb, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, FakePrStateChecker, PrOpenState, WorkDb, WorkItem,
     };
 
     /// Captured arguments from one `detect_pr` call. Tests assert on
@@ -4846,27 +4590,17 @@ mod tests {
         }
 
         fn call_count(&self) -> usize {
-            self.calls
-                .lock()
-                .expect("StubPrDetector calls mutex poisoned")
-                .len()
+            self.calls.lock().expect("StubPrDetector calls mutex poisoned").len()
         }
 
         fn calls_snapshot(&self) -> Vec<DetectCall> {
-            self.calls
-                .lock()
-                .expect("StubPrDetector calls mutex poisoned")
-                .clone()
+            self.calls.lock().expect("StubPrDetector calls mutex poisoned").clone()
         }
     }
 
     #[async_trait]
     impl PrDetector for StubPrDetector {
-        async fn detect_pr(
-            &self,
-            repo_remote_url: &str,
-            expected_branch: &str,
-        ) -> Result<PrStatus> {
+        async fn detect_pr(&self, repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus> {
             self.calls
                 .lock()
                 .expect("StubPrDetector calls mutex poisoned")
@@ -4950,12 +4684,7 @@ mod tests {
             }
         }
 
-        async fn fetch_diff_line_count(
-            &self,
-            _repo_slug: &str,
-            _base: &str,
-            _head: &str,
-        ) -> Result<u64> {
+        async fn fetch_diff_line_count(&self, _repo_slug: &str, _base: &str, _head: &str) -> Result<u64> {
             let guard = self.diff_line_count_result.lock().await;
             match &*guard {
                 Ok(count) => Ok(*count),
@@ -4988,10 +4717,7 @@ mod tests {
 
     impl RecordingProbeQueuer {
         fn snapshot(&self) -> Vec<(String, String)> {
-            self.calls
-                .lock()
-                .expect("RecordingProbeQueuer mutex poisoned")
-                .clone()
+            self.calls.lock().expect("RecordingProbeQueuer mutex poisoned").clone()
         }
     }
 
@@ -5015,11 +4741,7 @@ mod tests {
         ) -> Result<CubeWorkspaceLease> {
             unreachable!("not used in completion tests")
         }
-        async fn create_change(
-            &self,
-            _: &Path,
-            _: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
             unreachable!("not used in completion tests")
         }
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -5090,27 +4812,14 @@ mod tests {
                 reason.to_owned(),
             ));
         }
-        async fn publish_work_item_changed(
-            &self,
-            product_id: &str,
-            work_item_id: &str,
-            reason: &str,
-        ) {
-            self.work_events.lock().await.push((
-                product_id.to_owned(),
-                work_item_id.to_owned(),
-                reason.to_owned(),
-            ));
-        }
-        async fn publish_frontend_event_on_product(
-            &self,
-            product_id: &str,
-            event: boss_protocol::FrontendEvent,
-        ) {
-            self.typed_events
+        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+            self.work_events
                 .lock()
                 .await
-                .push((product_id.to_owned(), event));
+                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
+        }
+        async fn publish_frontend_event_on_product(&self, product_id: &str, event: boss_protocol::FrontendEvent) {
+            self.typed_events.lock().await.push((product_id.to_owned(), event));
         }
     }
 
@@ -5150,11 +4859,13 @@ mod tests {
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
 
         let (execution, run) = db
@@ -5185,9 +4896,7 @@ mod tests {
         (db, product.id, chore.id, execution.id)
     }
 
-    fn ci_remediation_fixture(
-        workspace_path: &Path,
-    ) -> (Arc<WorkDb>, String, String, String, String) {
+    fn ci_remediation_fixture(workspace_path: &Path) -> (Arc<WorkDb>, String, String, String, String) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
         std::mem::forget(dir);
@@ -5248,11 +4957,13 @@ mod tests {
             .unwrap();
 
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::CiRemediation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::CiRemediation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -5328,16 +5039,16 @@ mod tests {
         );
         let publisher_events = publisher.events.lock().await.clone();
         assert!(
-            publisher_events.iter().any(|(_, _, _, reason)| reason == "worker_pr_completed"),
+            publisher_events
+                .iter()
+                .any(|(_, _, _, reason)| reason == "worker_pr_completed"),
             "expected worker_pr_completed execution event, got {publisher_events:?}",
         );
         let work_events = publisher.work_events.lock().await.clone();
         assert!(
             work_events
                 .iter()
-                .any(|(p, w, reason)| p == &product_id
-                    && w == &chore_id
-                    && reason == "worker_pr_completed"),
+                .any(|(p, w, reason)| p == &product_id && w == &chore_id && reason == "worker_pr_completed"),
             "expected work-item invalidation for the chore, got {work_events:?}",
         );
         assert_eq!(
@@ -5375,10 +5086,7 @@ mod tests {
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-        staged_pr_urls.record_if_unset(
-            &execution_id,
-            "https://github.com/spinyfin/mono/pull/458",
-        );
+        staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -5389,7 +5097,11 @@ mod tests {
             probes.clone(),
         )
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None)));
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
 
         let outcome = handler.on_stop(&execution_id).await;
         // P992 task 7: chore_implementation holds the task and enqueues reviewer.
@@ -5449,8 +5161,7 @@ mod tests {
         // PR through the legacy jj+gh path).
         let workspace = tempdir().unwrap();
         let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-        let detector =
-            StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/12"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
@@ -5505,10 +5216,7 @@ mod tests {
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-        staged_pr_urls.record_if_unset(
-            &execution_id,
-            "https://github.com/spinyfin/mono/pull/458",
-        );
+        staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -5519,7 +5227,11 @@ mod tests {
             probes.clone(),
         )
         .with_staged_pr_urls(staged_pr_urls.clone())
-        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None)));
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
 
         // Detector intentionally returns Err — if recheck called it,
         // recheck would surface `DetectorFailed`. With the staged
@@ -5542,10 +5254,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(t.status, TaskStatus::Active);
-                assert_eq!(
-                    t.pr_url.as_deref(),
-                    Some("https://github.com/spinyfin/mono/pull/458"),
-                );
+                assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/458"),);
             }
             other => panic!("expected chore, got {other:?}"),
         }
@@ -5568,10 +5277,7 @@ mod tests {
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-        staged_pr_urls.record_if_unset(
-            &execution_id,
-            "https://github.com/spinyfin/mono/pull/579",
-        );
+        staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/579");
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -5596,7 +5302,8 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, TaskStatus::Active,
+                    t.status,
+                    TaskStatus::Active,
                     "branch-mismatched PR must NOT advance the chore to in_review",
                 );
                 assert!(t.pr_url.is_none(), "branch-mismatched PR must not bind pr_url");
@@ -5631,10 +5338,7 @@ mod tests {
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-        staged_pr_urls.record_if_unset(
-            &execution_id,
-            "https://github.com/spinyfin/mono/pull/458",
-        );
+        staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -5657,7 +5361,8 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, TaskStatus::Active,
+                    t.status,
+                    TaskStatus::Active,
                     "wrong-branch PR must NOT move chore to in_review",
                 );
                 assert!(t.pr_url.is_none());
@@ -5691,10 +5396,7 @@ mod tests {
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
-        staged_pr_urls.record_if_unset(
-            &execution_id,
-            "https://github.com/spinyfin/mono/pull/458",
-        );
+        staged_pr_urls.record_if_unset(&execution_id, "https://github.com/spinyfin/mono/pull/458");
 
         // The expected branch is `boss/<exec-id>` (BossExecPrefix), but
         // the PR's head branch is `bduff/<exec-id>` — same suffix, only
@@ -5702,7 +5404,10 @@ mod tests {
         let expected = expected_branch_name(&execution_id, &BranchNaming::BossExecPrefix, None);
         let suffix = branch_work_item_suffix(&expected);
         let divergent_branch = format!("bduff/{suffix}");
-        assert_ne!(divergent_branch, expected, "test must exercise a real prefix divergence");
+        assert_ne!(
+            divergent_branch, expected,
+            "test must exercise a real prefix divergence"
+        );
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -5783,10 +5488,7 @@ mod tests {
             events.iter().any(|(_, _, _, reason)| reason == "worker_awaiting_pr"),
             "expected worker_awaiting_pr event for the no-PR case, got {events:?}",
         );
-        assert!(
-            pane.calls.lock().await.is_empty(),
-            "no PR must NOT release the pane",
-        );
+        assert!(pane.calls.lock().await.is_empty(), "no PR must NOT release the pane",);
         let queued = probes.snapshot();
         assert_eq!(
             queued.len(),
@@ -5834,7 +5536,8 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, TaskStatus::Active,
+                    t.status,
+                    TaskStatus::Active,
                     "stale PR must NOT move the work item to in_review",
                 );
                 assert!(t.pr_url.is_none(), "stale PR must NOT stamp pr_url yet");
@@ -5913,10 +5616,7 @@ mod tests {
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
         assert!(publisher.events.lock().await.is_empty());
-        assert!(
-            probes.snapshot().is_empty(),
-            "unknown executions must NOT queue probes",
-        );
+        assert!(probes.snapshot().is_empty(), "unknown executions must NOT queue probes",);
     }
 
     #[tokio::test]
@@ -5999,9 +5699,7 @@ mod tests {
         let (db, _, _, execution_id) = fixture(workspace.path());
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::with_outcome(
-            PaneReleaseOutcome::NoLiveWorker,
-        ));
+        let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let handler = WorkerCompletionHandler::new(
@@ -6042,9 +5740,7 @@ mod tests {
         let (db, _, _, execution_id) = fixture(workspace.path());
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
-        let pane = Arc::new(RecordingPaneReleaser::with_outcome(
-            PaneReleaseOutcome::NoLiveWorker,
-        ));
+        let pane = Arc::new(RecordingPaneReleaser::with_outcome(PaneReleaseOutcome::NoLiveWorker));
         let probes = Arc::new(RecordingProbeQueuer::default());
 
         let handler = WorkerCompletionHandler::new(
@@ -6062,7 +5758,8 @@ mod tests {
 
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, ExecutionStatus::Cancelled,
+            execution.status,
+            ExecutionStatus::Cancelled,
             "the execution row must be cancelled so the reconciler won't redispatch it",
         );
         assert!(
@@ -6135,10 +5832,7 @@ mod tests {
         // pinned at `active` (pending review). The pane releaser is
         // invoked again here; production releasers must be idempotent
         // on their own (see `WorkerRegistry::take_slot_for_run`).
-        assert_eq!(
-            handler.on_stop(&execution_id).await,
-            StopOutcome::AlreadyTerminal,
-        );
+        assert_eq!(handler.on_stop(&execution_id).await, StopOutcome::AlreadyTerminal,);
         assert_eq!(cube.release_calls.lock().await.len(), 1);
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
@@ -6184,10 +5878,7 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(t.status, TaskStatus::Done, "merged-at-stop must skip in_review");
-                assert_eq!(
-                    t.pr_url.as_deref(),
-                    Some("https://github.com/foo/bar/pull/42"),
-                );
+                assert_eq!(t.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/42"),);
             }
             other => panic!("expected chore, got {other:?}"),
         }
@@ -6208,9 +5899,9 @@ mod tests {
         );
         let work_events = publisher.work_events.lock().await.clone();
         assert!(
-            work_events.iter().any(|(p, w, reason)| p == &product_id
-                && w == &chore_id
-                && reason == "worker_pr_merged"),
+            work_events
+                .iter()
+                .any(|(p, w, reason)| p == &product_id && w == &chore_id && reason == "worker_pr_merged"),
             "expected work-item invalidation tagged worker_pr_merged, got {work_events:?}",
         );
         assert!(
@@ -6290,14 +5981,7 @@ mod tests {
         let pane = Arc::new(RecordingPaneReleaser::default());
         let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube,
-            publisher.clone(),
-            pane,
-            probes,
-        );
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher.clone(), pane, probes);
         let _ = handler.on_stop(&execution_id).await;
 
         // The chore_implementation execution must not touch the
@@ -6326,11 +6010,7 @@ mod tests {
         struct PerBranchDetector;
         #[async_trait]
         impl PrDetector for PerBranchDetector {
-            async fn detect_pr(
-                &self,
-                _repo_remote_url: &str,
-                expected_branch: &str,
-            ) -> Result<PrStatus> {
+            async fn detect_pr(&self, _repo_remote_url: &str, expected_branch: &str) -> Result<PrStatus> {
                 Ok(PrStatus::Fresh {
                     url: format!("https://github.com/spinyfin/mono/pull/PR-for-{expected_branch}"),
                 })
@@ -6409,11 +6089,13 @@ mod tests {
             })
             .unwrap();
         let exec = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         let (_e, run) = db
             .start_execution_run(&exec.id, "worker", "mono", lease, workspace_id, workspace_path)
@@ -6498,7 +6180,8 @@ mod tests {
         // Its chore is not pushed to in_review and no lease is released.
         match db.get_work_item(&stale_chore).unwrap() {
             WorkItem::Chore(t) => assert_ne!(
-                t.status, TaskStatus::InReview,
+                t.status,
+                TaskStatus::InReview,
                 "the stale occupant's task must not transition on a leaked Stop",
             ),
             other => panic!("expected chore, got {other:?}"),
@@ -6557,11 +6240,13 @@ mod tests {
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         // `start_execution_run` flips the row to `running`. Do not
         // follow up with `finish_execution_run` — we want the row to
@@ -6606,11 +6291,7 @@ mod tests {
             StopOutcome::RunningNoStagedPr,
             "running execution with no staged URL must short-circuit, not invoke the detector",
         );
-        assert_eq!(
-            detector.call_count(),
-            0,
-            "running-status gate must not call detect_pr",
-        );
+        assert_eq!(detector.call_count(), 0, "running-status gate must not call detect_pr",);
         // Chore stays put, no probe queued, no publish.
         let item = db.get_work_item(&chore_id).unwrap();
         match item {
@@ -6702,7 +6383,8 @@ mod tests {
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, TaskStatus::Active,
+                    t.status,
+                    TaskStatus::Active,
                     "empty-diff PR must NOT move the work item to in_review",
                 );
                 assert!(t.pr_url.is_none(), "empty-diff PR must NOT stamp pr_url");
@@ -6716,7 +6398,10 @@ mod tests {
             cube.release_calls.lock().await.is_empty(),
             "empty-diff PR must NOT release the cube workspace",
         );
-        assert!(pane.calls.lock().await.is_empty(), "empty-diff PR must NOT release the pane");
+        assert!(
+            pane.calls.lock().await.is_empty(),
+            "empty-diff PR must NOT release the pane"
+        );
 
         let events = publisher.events.lock().await.clone();
         assert!(
@@ -6784,11 +6469,13 @@ PR #379. PR #379.";
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -6837,7 +6524,8 @@ PR #379. PR #379.";
         match item {
             WorkItem::Chore(t) => {
                 assert_eq!(
-                    t.status, TaskStatus::Active,
+                    t.status,
+                    TaskStatus::Active,
                     "chore with PR refs in description must stay active when the worker exits without a PR",
                 );
                 assert!(
@@ -6855,7 +6543,8 @@ PR #379. PR #379.";
 
         let exec_after = db.get_execution(&execution.id).unwrap();
         assert_eq!(
-            exec_after.status, ExecutionStatus::WaitingHuman,
+            exec_after.status,
+            ExecutionStatus::WaitingHuman,
             "execution must stay in waiting_human so a follow-up Stop can re-check",
         );
         assert_eq!(
@@ -6876,8 +6565,7 @@ PR #379. PR #379.";
     /// bind to *that* PR (the one the worker actually created), not
     /// to any of the PRs mentioned in the description text.
     #[tokio::test]
-    async fn chore_with_pr_references_in_description_binds_to_worker_created_pr_not_description_pr()
-    {
+    async fn chore_with_pr_references_in_description_binds_to_worker_created_pr_not_description_pr() {
         let workspace = tempdir().unwrap();
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -6913,11 +6601,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -6953,14 +6643,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let pane = Arc::new(RecordingPaneReleaser::default());
         let probes = Arc::new(RecordingProbeQueuer::default());
 
-        let handler = WorkerCompletionHandler::new(
-            db.clone(),
-            detector,
-            cube,
-            publisher,
-            pane,
-            probes,
-        );
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher, pane, probes);
         let outcome = handler.on_stop(&execution.id).await;
         // P992 task 7: chore_implementation holds task and enqueues reviewer.
         match outcome {
@@ -7006,9 +6689,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     /// recovers on the next 60s sweep.
     #[tokio::test]
     async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
-        use crate::merge_poller::{
-            MergeProbe, OpenPrStatus, PrLifecycleProbe, PrLifecycleState,
-        };
+        use crate::merge_poller::{MergeProbe, OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
 
         // Fixture leaves the chore in `active` and the execution in
         // `waiting_human` with a workspace_path — exactly the state
@@ -7058,14 +6739,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         let probe = NoOpProbe;
 
-        let outcome = crate::merge_poller::run_one_pass(
-            db.as_ref(),
-            &probe,
-            publisher.as_ref(),
-            None,
-            Some(handler.as_ref()),
-        )
-        .await;
+        let outcome =
+            crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(handler.as_ref()))
+                .await;
 
         assert_eq!(
             outcome.pr_recheck_recovered, 1,
@@ -7106,9 +6782,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // operators can see which path closed the chore.
         let work_events = publisher.work_events.lock().await.clone();
         assert!(
-            work_events
-                .iter()
-                .any(|(_, _, r)| r == "worker_pr_completed_recheck"),
+            work_events.iter().any(|(_, _, r)| r == "worker_pr_completed_recheck"),
             "expected worker_pr_completed_recheck publish reason, got {work_events:?}",
         );
     }
@@ -7258,11 +6932,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let exec2 = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore2.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore2.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         let (exec2, run2) = db
             .start_execution_run(
@@ -7304,11 +6980,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let exec3 = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore3.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore3.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
             .unwrap();
         let (exec3, run3) = db
             .start_execution_run(
@@ -7361,9 +7039,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             async fn probe(&self, _: &str) -> anyhow::Result<PrLifecycleProbe> {
                 Ok(PrLifecycleProbe {
                     url: String::new(),
-                    state: PrLifecycleState::Open(
-                        crate::merge_poller::OpenPrStatus::clean(),
-                    ),
+                    state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::clean()),
                     base_ref_oid: None,
                     head_ref_oid: None,
                     head_ref_name: None,
@@ -7376,14 +7052,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         let probe = NoOpProbe;
 
-        let outcome = crate::merge_poller::run_one_pass(
-            db.as_ref(),
-            &probe,
-            publisher.as_ref(),
-            None,
-            Some(&handler),
-        )
-        .await;
+        let outcome =
+            crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler)).await;
 
         // Pass 1 — pre-fix behaviour: the recheck reaches all three
         // candidates but the detector still returns Stale on each. The
@@ -7411,7 +7081,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         for execution_id in [e1.as_str(), exec2.id.as_str(), exec3.id.as_str()] {
             let execution = db.get_execution(execution_id).unwrap();
             assert_eq!(
-                execution.status, ExecutionStatus::WaitingHuman,
+                execution.status,
+                ExecutionStatus::WaitingHuman,
                 "execution must stay in waiting_human after a Stale recheck",
             );
             assert!(
@@ -7436,14 +7107,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         *detector.result.lock().await = Ok(PrStatus::Fresh {
             url: "https://github.com/spinyfin/mono/pull/433".into(),
         });
-        let outcome2 = crate::merge_poller::run_one_pass(
-            db.as_ref(),
-            &probe,
-            publisher.as_ref(),
-            None,
-            Some(&handler),
-        )
-        .await;
+        let outcome2 =
+            crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler)).await;
         assert_eq!(
             outcome2.pr_recheck_recovered, 3,
             "all three stuck workers must transition on the recovery pass, got {outcome2:?}",
@@ -7459,7 +7124,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             match item {
                 WorkItem::Chore(t) => {
                     assert_eq!(
-                        t.status, TaskStatus::Active,
+                        t.status,
+                        TaskStatus::Active,
                         "chore {chore_id} must be held in active (reviewer enqueued)",
                     );
                     assert_eq!(
@@ -7474,7 +7140,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         for execution_id in [e1.as_str(), exec2.id.as_str(), exec3.id.as_str()] {
             let execution = db.get_execution(execution_id).unwrap();
             assert_eq!(
-                execution.status, ExecutionStatus::Completed,
+                execution.status,
+                ExecutionStatus::Completed,
                 "execution {execution_id} must finalise on the recovery pass",
             );
             assert!(
@@ -7529,8 +7196,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Detector wired with a deliberately-wrong URL so any
         // accidental fall-through would surface as a wrong pr_url on
         // the chore.
-        let detector =
-            StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+        let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
@@ -7571,7 +7237,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         }
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, ExecutionStatus::WaitingHuman,
+            execution.status,
+            ExecutionStatus::WaitingHuman,
             "execution must remain `waiting_human` for the human to resolve",
         );
         assert!(
@@ -7597,15 +7264,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let (_db_product_id, execution_id, detector, cube, publisher, pane, probes, db) = {
             let (db, product_id, _chore_id, execution_id) = fixture(workspace.path());
-            let detector =
-                StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+            let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
             let cube = Arc::new(StubCubeClient::default());
             let publisher = Arc::new(RecordingPublisher::default());
             let pane = Arc::new(RecordingPaneReleaser::default());
             let probes = Arc::new(RecordingProbeQueuer::default());
-            (
-                product_id, execution_id, detector, cube, publisher, pane, probes, db,
-            )
+            (product_id, execution_id, detector, cube, publisher, pane, probes, db)
         };
 
         let flags_dir = tempdir().unwrap();
@@ -7715,8 +7379,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             },
         )
         .unwrap();
-        db.set_execution_pr_head_before(&execution_id, head_before)
-            .unwrap();
+        db.set_execution_pr_head_before(&execution_id, head_before).unwrap();
         (db, product_id, chore_id, execution_id)
     }
 
@@ -7731,8 +7394,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
         let head_before = "1111111111111111111111111111111111111111";
-        let (db, product_id, chore_id, execution_id) =
-            resume_fixture(workspace.path(), pr_url, head_before);
+        let (db, product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head_before);
         // Cold-path detector reports None — this is what the live
         // engine sees on a resume because the detector searches by
         // `boss/<new-execution-id>`, which has no PR.
@@ -7805,8 +7467,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/606";
         let head = "1111111111111111111111111111111111111111";
-        let (db, _product_id, chore_id, execution_id) =
-            resume_fixture(workspace.path(), pr_url, head);
+        let (db, _product_id, chore_id, execution_id) = resume_fixture(workspace.path(), pr_url, head);
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
@@ -7976,8 +7637,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn ci_remediation_with_bound_pr_never_creates_and_breaker_parks() {
         let workspace = tempdir().unwrap();
-        let (db, product_id, _chore_id, execution_id, _attempt_id) =
-            ci_remediation_fixture(workspace.path());
+        let (db, product_id, _chore_id, execution_id, _attempt_id) = ci_remediation_fixture(workspace.path());
         let bound_pr = "https://github.com/spinyfin/mono/pull/88";
         // Cold-path detector finds no PR on the remediation exec's own
         // branch — exactly the Worf false miss.
@@ -8035,18 +7695,17 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         // Idempotent: only one attention item despite the repeated trips.
         assert_eq!(
-            items
-                .iter()
-                .filter(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND)
-                .count(),
+            items.iter().filter(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND).count(),
             1,
             "repeated trips must not pile up duplicate attention items",
         );
         // Surfaced to the coordinator/UI.
         let typed = publisher.typed_events.lock().await.clone();
         assert!(
-            typed.iter().any(|(p, ev)| p == &product_id
-                && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })),
+            typed
+                .iter()
+                .any(|(p, ev)| p == &product_id
+                    && matches!(ev, boss_protocol::FrontendEvent::AttentionItemCreated { .. })),
             "an AttentionItemCreated event must be published; got {typed:?}",
         );
     }
@@ -8060,8 +7719,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // loop is the bug. It must also NOT mark the (already-terminal)
         // attempt failed.
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, execution_id, attempt_id) =
-            ci_remediation_fixture(workspace.path());
+        let (db, _product_id, chore_id, execution_id, attempt_id) = ci_remediation_fixture(workspace.path());
         // The worker's marker: flip the attempt terminal + arm the signal.
         db.mark_ci_remediation_retriggered(&attempt_id)
             .unwrap()
@@ -8152,7 +7810,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         let queued = probes.snapshot();
         assert_eq!(queued.len(), 2, "the legitimate produce-a-PR nudge fires up to the cap");
-        assert_eq!(queued[0].1, PROBE_NO_PR, "healthy no-PR case must still nudge to create");
+        assert_eq!(
+            queued[0].1, PROBE_NO_PR,
+            "healthy no-PR case must still nudge to create"
+        );
         assert_eq!(queued[1].1, PROBE_NO_PR);
         assert!(matches!(o1, StopOutcome::AwaitingInput));
         assert!(matches!(o2, StopOutcome::AwaitingInput));
@@ -8193,8 +7854,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         parent_pr_url: &str,
     ) -> (Arc<WorkDb>, String, String, String) {
-        use boss_protocol::CreateRevisionInput;
         use crate::work::{FakePrStateChecker, PrOpenState};
+        use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -8332,8 +7993,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // PROBE_NO_PR.  A parked revision surfaces as an attention item
         // for a human to investigate; PROBE_NO_PR would contradict the
         // worker's own task instructions.
-        use boss_protocol::CreateRevisionInput;
         use crate::work::{FakePrStateChecker, PrOpenState};
+        use boss_protocol::CreateRevisionInput;
 
         let workspace = tempdir().unwrap();
         let dir = tempdir().unwrap();
@@ -8490,8 +8151,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             probes.clone(),
         );
 
-        assert!(matches!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput));
-        assert!(matches!(handler.on_stop(&execution_id).await, StopOutcome::AwaitingInput));
+        assert!(matches!(
+            handler.on_stop(&execution_id).await,
+            StopOutcome::AwaitingInput
+        ));
+        assert!(matches!(
+            handler.on_stop(&execution_id).await,
+            StopOutcome::AwaitingInput
+        ));
         // The worker finally opens a real PR before the breaker trips.
         detector
             .set_result(PrStatus::Fresh {
@@ -8533,9 +8200,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let pane = Arc::new(RecordingPaneReleaser::default());
         let probes = Arc::new(RecordingProbeQueuer::default());
         let verifier = StubBranchVerifier::ok("boss/exec_old");
-        verifier
-            .set_head_oid(Ok("abcdef0123456789".into()))
-            .await;
+        verifier.set_head_oid(Ok("abcdef0123456789".into())).await;
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -8548,10 +8213,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         .with_branch_verifier(verifier);
 
         // Before the hook: no snapshot.
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().pr_head_before,
-            None
-        );
+        assert_eq!(db.get_execution(&execution_id).unwrap().pr_head_before, None);
         handler.on_execution_started(&execution_id).await;
         assert_eq!(
             db.get_execution(&execution_id).unwrap().pr_head_before.as_deref(),
@@ -8627,12 +8289,14 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let execution = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .repo_remote_url("git@github.com:spinyfin/mono.git")
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         let (execution, run) = db
             .start_execution_run(
@@ -8664,8 +8328,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn recheck_for_pr_late_binds_pr_to_active_task() {
         let (db, _product_id, chore_id, execution_id) = abandoned_execution_fixture();
-        let detector =
-            StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
+        let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/42"));
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
         let pane = Arc::new(RecordingPaneReleaser::default());
@@ -8690,10 +8353,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(task.status, TaskStatus::InReview);
-        assert_eq!(
-            task.pr_url.as_deref(),
-            Some("https://github.com/spinyfin/mono/pull/42")
-        );
+        assert_eq!(task.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/42"));
         // Execution itself stays abandoned — recheck_for_pr_late does not
         // touch the execution row.
         let exec = db.get_execution(&execution_id).unwrap();
@@ -8758,8 +8418,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         parent_pr_url: &str,
         head_before: &str,
     ) -> (Arc<WorkDb>, String, String, String) {
-        use boss_protocol::CreateRevisionInput;
         use crate::work::{FakePrStateChecker, PrOpenState};
+        use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -8840,8 +8500,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             )
             .unwrap();
         // Snapshot the parent PR's head SHA as `on_execution_started` does.
-        db.set_execution_pr_head_before(&execution.id, head_before)
-            .unwrap();
+        db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
         (db, product.id, revision.id, execution.id)
     }
 
@@ -8896,10 +8555,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         match item {
             WorkItem::Task(t) => {
                 assert_eq!(t.status, TaskStatus::InReview, "revision must move to in_review");
-                assert!(
-                    t.pr_url.is_none(),
-                    "revision pr_url must stay NULL; parent owns the PR"
-                );
+                assert!(t.pr_url.is_none(), "revision pr_url must stay NULL; parent owns the PR");
             }
             other => panic!("expected task, got {other:?}"),
         }
@@ -8915,7 +8571,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Work-item changed event must fire so the kanban updates.
         let work_events = publisher.work_events.lock().await.clone();
         assert!(
-            work_events.iter().any(|(p, w, _)| p == &product_id && w == &revision_id),
+            work_events
+                .iter()
+                .any(|(p, w, _)| p == &product_id && w == &revision_id),
             "work-item invalidation must fire for the revision, got {work_events:?}",
         );
         // No probe must be queued — the revision is done.
@@ -8936,8 +8594,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/922";
         let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
         let publisher = Arc::new(RecordingPublisher::default());
@@ -9000,10 +8657,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     struct FixedStateProbe(crate::merge_poller::PrLifecycleState);
     #[async_trait]
     impl MergeProbe for FixedStateProbe {
-        async fn probe(
-            &self,
-            _pr_url: &str,
-        ) -> anyhow::Result<crate::merge_poller::PrLifecycleProbe> {
+        async fn probe(&self, _pr_url: &str) -> anyhow::Result<crate::merge_poller::PrLifecycleProbe> {
             Ok(crate::merge_poller::PrLifecycleProbe {
                 url: String::new(),
                 state: self.0.clone(),
@@ -9025,8 +8679,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1252";
         let head = "1111111111111111111111111111111111111111";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         // Worker edited the PR body during this run: live body differs from
         // the run-start snapshot. Head SHA unchanged → NoContribution.
         db.set_execution_pr_body_before(&execution_id, "## Summary\nold body")
@@ -9037,8 +8690,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .set_body(Ok("## Summary\nold body\n\n## Testing\nfixed PR-template check".into()))
             .await;
         // The PR-template check went green after the edit.
-        let probe: Arc<dyn MergeProbe> =
-            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
@@ -9093,13 +8745,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1253";
         let head = "2222222222222222222222222222222222222222";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
-        db.set_execution_pr_body_before(&execution_id, "old body")
-            .unwrap();
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        db.set_execution_pr_body_before(&execution_id, "old body").unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await;
-        verifier.set_body(Ok("edited body that fixes the template".into())).await;
+        verifier
+            .set_body(Ok("edited body that fixes the template".into()))
+            .await;
         // The PR-template check is still re-running after the edit.
         let failures = vec![RequiredCheckFailure {
             name: "pr-template".into(),
@@ -9108,9 +8760,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             provider: crate::merge_poller::CiProvider::GithubActions,
             provider_job_id: None,
         }];
-        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(
-            OpenPrStatus::ci_failing(failures),
-        )));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::ci_failing(
+            failures,
+        ))));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
@@ -9145,7 +8797,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman
+        );
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
         assert!(
@@ -9164,8 +8819,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1254";
         let head = "3333333333333333333333333333333333333333";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         db.set_execution_pr_body_before(&execution_id, "unchanged body")
             .unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
@@ -9194,12 +8848,16 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
-                t.status, TaskStatus::Active,
+                t.status,
+                TaskStatus::Active,
                 "a no-contribution run must not be finalized as a metadata-only fix",
             ),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman
+        );
         assert!(cube.release_calls.lock().await.is_empty());
         assert!(pane.calls.lock().await.is_empty());
     }
@@ -9214,14 +8872,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1255";
         let head = "4444444444444444444444444444444444444444";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         // Simulate the marker on_stop stamped on a prior turn.
         db.mark_execution_metadata_fix_confirmed(&execution_id).unwrap();
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await; // head unchanged → NoContribution
-        let probe: Arc<dyn MergeProbe> =
-            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
@@ -9249,7 +8905,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Completed);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Completed
+        );
         assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
         assert!(probes.snapshot().is_empty(), "recovery must not nudge");
     }
@@ -9267,15 +8926,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let workspace = tempdir().unwrap();
         let parent_pr_url = "https://github.com/spinyfin/mono/pull/1256";
         let head = "5555555555555555555555555555555555555555";
-        let (db, _product_id, revision_id, execution_id) =
-            revision_fixture(workspace.path(), parent_pr_url, head);
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
         // NO marker stamped (the load-bearing difference from the test above).
         let verifier = StubBranchVerifier::ok("boss/exec_parent");
         verifier.set_head_oid(Ok(head.into())).await; // head unchanged → NoContribution
         // CI is green — proving we gate on the marker, not on "head
         // unchanged + CI green".
-        let probe: Arc<dyn MergeProbe> =
-            Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
 
         let detector = StubPrDetector::ok(None);
         let cube = Arc::new(StubCubeClient::default());
@@ -9301,12 +8958,16 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         );
         match db.get_work_item(&revision_id).unwrap() {
             WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
-                t.status, TaskStatus::Active,
+                t.status,
+                TaskStatus::Active,
                 "the #1262 regression must stay fixed: no marker means no finalize",
             ),
             other => panic!("expected task, got {other:?}"),
         }
-        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::WaitingHuman);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman
+        );
         assert!(
             cube.release_calls.lock().await.is_empty(),
             "an unmarked revision's lease must stay held (not reaped)",
@@ -9394,7 +9055,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Work-item invalidation must fire.
         let work_events = publisher.work_events.lock().await.clone();
         assert!(
-            work_events.iter().any(|(p, w, _)| p == &product_id && w == &revision_id),
+            work_events
+                .iter()
+                .any(|(p, w, _)| p == &product_id && w == &revision_id),
             "work-item invalidation must fire for the revision, got {work_events:?}",
         );
     }
@@ -9452,7 +9115,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Execution must still be waiting_human — not completed, not parked.
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, ExecutionStatus::WaitingHuman,
+            execution.status,
+            ExecutionStatus::WaitingHuman,
             "execution must remain in waiting_human until merge poller finalizes it",
         );
     }
@@ -9480,8 +9144,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         parent_pr_url: &str,
         head_before: &str,
     ) -> (Arc<WorkDb>, String, String, String, String, String) {
-        use boss_protocol::CreateRevisionInput;
         use crate::work::{ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState};
+        use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -9580,16 +9244,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 None,
             )
             .unwrap();
-        db.set_execution_pr_head_before(&execution.id, head_before)
-            .unwrap();
-        (
-            db,
-            product.id,
-            parent.id,
-            revision.id,
-            execution.id,
-            attempt.id,
-        )
+        db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
+        (db, product.id, parent.id, revision.id, execution.id, attempt.id)
     }
 
     #[tokio::test]
@@ -9666,7 +9322,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            parent.status, TaskStatus::InReview,
+            parent.status,
+            TaskStatus::InReview,
             "parent chore must be snapped back to in_review",
         );
 
@@ -9735,9 +9392,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
                 Ok(PrLifecycleProbe {
                     url: url.to_owned(),
-                    state: PrLifecycleState::Open(
-                        crate::merge_poller::OpenPrStatus::conflict_only(),
-                    ),
+                    state: PrLifecycleState::Open(crate::merge_poller::OpenPrStatus::conflict_only()),
                     base_ref_oid: None,
                     head_ref_oid: None,
                     head_ref_name: None,
@@ -9800,8 +9455,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         head: &str,
         failed_checks: &str,
     ) -> (Arc<WorkDb>, String, String, String, String, String) {
-        use boss_protocol::CreateRevisionInput;
         use crate::work::{FakePrStateChecker, PrOpenState};
+        use boss_protocol::CreateRevisionInput;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("boss.db");
@@ -9902,16 +9557,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
                 None,
             )
             .unwrap();
-        db.set_execution_pr_head_before(&execution.id, head)
-            .unwrap();
-        (
-            db,
-            product.id,
-            parent.id,
-            revision.id,
-            execution.id,
-            attempt.id,
-        )
+        db.set_execution_pr_head_before(&execution.id, head).unwrap();
+        (db, product.id, parent.id, revision.id, execution.id, attempt.id)
     }
 
     /// Build a `PrLifecycleProbe` for an open PR with the given CI status.
@@ -10011,7 +9658,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            parent.status, TaskStatus::InReview,
+            parent.status,
+            TaskStatus::InReview,
             "parent chore must be snapped back to in_review",
         );
 
@@ -10159,10 +9807,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     fn ci_signal_cleared_clean_always_clears() {
         // Clean clears any attempt, including one with no targeted-check info.
         assert!(ci_attempt_signal_cleared("[]", &OpenPrCiStatus::Clean));
-        assert!(ci_attempt_signal_cleared(
-            r#"[{"name":"x"}]"#,
-            &OpenPrCiStatus::Clean
-        ));
+        assert!(ci_attempt_signal_cleared(r#"[{"name":"x"}]"#, &OpenPrCiStatus::Clean));
     }
 
     #[test]
@@ -10240,7 +9885,10 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let exec_id = "exec_18b44d2630b1df80_66";
         let branch = expected_branch_name(exec_id, &BranchNaming::BossExecPrefix, None);
         assert_eq!(branch, "boss/exec_18b44d2630b1df80_66");
-        assert!(branch.contains(exec_id), "BossExecPrefix must embed the full execution id");
+        assert!(
+            branch.contains(exec_id),
+            "BossExecPrefix must embed the full execution id"
+        );
     }
 
     #[test]
@@ -10251,8 +9899,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // prefix carries its own trailing `/` and is concatenated
         // verbatim, and the full execution id is preserved.
         let exec_id = "exec_18b44d2630b1df80_66";
-        let branch =
-            expected_branch_name(exec_id, &BranchNaming::BossExecPrefix, Some("bduff/"));
+        let branch = expected_branch_name(exec_id, &BranchNaming::BossExecPrefix, Some("bduff/"));
         assert_eq!(branch, "bduff/exec_18b44d2630b1df80_66");
     }
 
@@ -10262,12 +9909,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // rule and wins over the plain `worker_branch_prefix` column, which
         // only shapes the default `BossExecPrefix` strategy.
         let exec_id = "exec_18b44d2630b1df80_66";
-        let opaque =
-            expected_branch_name(exec_id, &BranchNaming::OpaqueHash, Some("bduff/"));
+        let opaque = expected_branch_name(exec_id, &BranchNaming::OpaqueHash, Some("bduff/"));
         assert!(opaque.starts_with("boss/"), "OpaqueHash ignores worker_branch_prefix");
         let custom = expected_branch_name(
             exec_id,
-            &BranchNaming::CustomPrefix { prefix: "lnkd".to_owned() },
+            &BranchNaming::CustomPrefix {
+                prefix: "lnkd".to_owned(),
+            },
             Some("bduff/"),
         );
         assert!(custom.starts_with("lnkd/"), "CustomPrefix ignores worker_branch_prefix");
@@ -10309,18 +9957,30 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let exec_id = "exec_18b44d2630b1df80_66";
         let branch = expected_branch_name(
             exec_id,
-            &BranchNaming::CustomPrefix { prefix: "bduff".to_owned() },
+            &BranchNaming::CustomPrefix {
+                prefix: "bduff".to_owned(),
+            },
             None,
         );
-        assert!(branch.starts_with("bduff/"), "CustomPrefix branch must start with the given prefix");
+        assert!(
+            branch.starts_with("bduff/"),
+            "CustomPrefix branch must start with the given prefix"
+        );
         let suffix = branch.strip_prefix("bduff/").unwrap();
-        assert_eq!(suffix.len(), 8, "CustomPrefix suffix must be 8 hex chars, got: {suffix}");
+        assert_eq!(
+            suffix.len(),
+            8,
+            "CustomPrefix suffix must be 8 hex chars, got: {suffix}"
+        );
         assert!(
             suffix.chars().all(|c| c.is_ascii_hexdigit()),
             "CustomPrefix suffix must be hex digits, got: {suffix}",
         );
         // Must NOT expose the execution id.
-        assert!(!branch.contains(exec_id), "CustomPrefix must not embed the execution id");
+        assert!(
+            !branch.contains(exec_id),
+            "CustomPrefix must not embed the execution id"
+        );
     }
 
     #[test]
@@ -10329,7 +9989,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let opaque = expected_branch_name(exec_id, &BranchNaming::OpaqueHash, None);
         let custom = expected_branch_name(
             exec_id,
-            &BranchNaming::CustomPrefix { prefix: "bduff".to_owned() },
+            &BranchNaming::CustomPrefix {
+                prefix: "bduff".to_owned(),
+            },
             None,
         );
         // Same hash suffix but different prefix → different branch names.
@@ -10363,10 +10025,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
     #[test]
     fn parse_api_pr_tsv_parses_all_six_fields() {
-        let pr = parse_api_pr_tsv(
-            "https://github.com/o/r/pull/7\topen\t2026-01-02T03:04:05Z\t3\t10\t4",
-        )
-        .expect("a non-empty url yields Some");
+        let pr = parse_api_pr_tsv("https://github.com/o/r/pull/7\topen\t2026-01-02T03:04:05Z\t3\t10\t4")
+            .expect("a non-empty url yields Some");
         assert_eq!(pr.url, "https://github.com/o/r/pull/7");
         assert_eq!(pr.state, "open");
         assert_eq!(pr.merged_at.as_deref(), Some("2026-01-02T03:04:05Z"));
@@ -10426,10 +10086,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             "boss/exec_18b5023342a35418_18",
         ));
         // Identical branches still match.
-        assert!(branches_identify_same_work_item(
-            "boss/exec_x",
-            "boss/exec_x",
-        ));
+        assert!(branches_identify_same_work_item("boss/exec_x", "boss/exec_x",));
         // Hash-suffix strategies match across prefixes too.
         assert!(branches_identify_same_work_item("bduff/a7f3e9c2", "boss/a7f3e9c2"));
         // Different suffixes (the incident's #1004 case:
@@ -10576,8 +10233,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn noop_skip_gate_first_review_never_skipped() {
         let workspace = tempdir().unwrap();
         // last_reviewed_sha = None → first review
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), None);
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), None);
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Return a 0-line diff — if the gate were applied, this would trigger a skip.
@@ -10608,8 +10264,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn noop_skip_gate_skips_when_sha_unchanged() {
         const SAME_SHA: &str = "sha_abc123";
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), Some(SAME_SHA));
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some(SAME_SHA));
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Current head == last_reviewed_sha → skip.
@@ -10639,8 +10294,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_skips_on_empty_diff() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Different head SHA (new commit) but 0 changed lines → pure rebase.
@@ -10670,8 +10324,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_skips_trivial_diff_when_threshold_set() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
@@ -10702,8 +10355,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_does_not_skip_when_diff_meets_threshold() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
@@ -10734,8 +10386,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_default_does_not_skip_nonzero_diff() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         verifier.set_head_oid(Ok("sha_new".to_owned())).await;
@@ -10767,14 +10418,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn noop_skip_gate_fails_open_on_head_oid_error() {
         let workspace = tempdir().unwrap();
-        let (db, _chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), Some("sha_old"));
+        let (db, _chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), Some("sha_old"));
 
         let verifier = StubBranchVerifier::ok(&branch);
         // Simulate a GitHub API failure when fetching the PR head OID.
-        verifier
-            .set_head_oid(Err("simulated API error".to_owned()))
-            .await;
+        verifier.set_head_oid(Err("simulated API error".to_owned())).await;
 
         let handler = WorkerCompletionHandler::new(
             db.clone(),
@@ -10810,8 +10458,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     /// Uses `serde_json` for the outer object so the `text` field is properly
     /// escaped regardless of what characters appear in the ReviewResult JSON.
     fn make_review_transcript_jsonl(review_result_json: &str) -> String {
-        let text =
-            format!("Here is my automated PR review.\n\n```json\n{review_result_json}\n```");
+        let text = format!("Here is my automated PR review.\n\n```json\n{review_result_json}\n```");
         let obj = serde_json::json!({
             "type": "assistant",
             "message": {
@@ -10946,23 +10593,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         // Optionally write a pre-built JSONL transcript and register its path.
         if let Some(jsonl) = transcript_jsonl {
-            let transcript_path =
-                workspace_path.join(format!("transcript-{}.jsonl", pr_review_exec.id));
+            let transcript_path = workspace_path.join(format!("transcript-{}.jsonl", pr_review_exec.id));
             std::fs::write(&transcript_path, jsonl.as_bytes()).unwrap();
-            db.set_run_transcript_path_if_unset(
-                &pr_review_exec.id,
-                transcript_path.to_str().unwrap(),
-            )
-            .unwrap();
+            db.set_run_transcript_path_if_unset(&pr_review_exec.id, transcript_path.to_str().unwrap())
+                .unwrap();
         }
 
-        (
-            db,
-            product.id,
-            chore.id,
-            pr_review_exec.id,
-            PR_URL.to_owned(),
-        )
+        (db, product.id, chore.id, pr_review_exec.id, PR_URL.to_owned())
     }
 
     /// Produce a minimal valid `ReviewResult` JSON with no qualifying findings
@@ -11088,11 +10725,18 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected task/chore, got {other:?}"),
         };
-        assert_eq!(task.status, TaskStatus::InReview, "chore must advance to in_review after reviewer approves");
+        assert_eq!(
+            task.status,
+            TaskStatus::InReview,
+            "chore must advance to in_review after reviewer approves"
+        );
 
         // review_cycle must be incremented (0 → 1) by the completion handler.
         let (review_cycle, last_sha) = db.get_task_review_cycle_state(&chore_id).unwrap();
-        assert_eq!(review_cycle, 1, "review_cycle must be incremented after each reviewer pass");
+        assert_eq!(
+            review_cycle, 1,
+            "review_cycle must be incremented after each reviewer pass"
+        );
         assert_eq!(
             last_sha.as_deref(),
             Some("sha_reviewed_abc123"),
@@ -11123,9 +10767,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
 
         let outcome = handler.on_stop(&pr_review_exec_id).await;
         let revision_task_id = match &outcome {
-            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => {
-                revision_task_id.clone()
-            }
+            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => revision_task_id.clone(),
             other => panic!("high finding must yield ReviewPassRevisionCreated; got {other:?}"),
         };
 
@@ -11136,7 +10778,9 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("revision is not a task/chore: {other:?}"),
         };
         assert!(
-            revision.created_via.starts_with(boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX),
+            revision
+                .created_via
+                .starts_with(boss_protocol::CREATED_VIA_PR_REVIEW_PREFIX),
             "revision created_via must carry the pr_review prefix so the \
              RevisionImplementation re-triggers a reviewer pass; got: {:?}",
             revision.created_via,
@@ -11157,7 +10801,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            task.status, TaskStatus::InReview,
+            task.status,
+            TaskStatus::InReview,
             "producing task must advance to in_review after reviewer pass",
         );
     }
@@ -11201,8 +10846,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
         let workspace = tempdir().unwrap();
         // No review result JSON → no transcript written, no artifact written.
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
-            pr_review_exec_fixture(workspace.path(), None);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
         let probe_queuer = Arc::new(RecordingProbeQueuer::default());
 
@@ -11240,8 +10884,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let probes = probe_queuer.snapshot();
         assert_eq!(probes.len(), 1, "exactly one probe must be queued");
         assert_eq!(probes[0].0, pr_review_exec_id, "probe keyed to the reviewer exec");
-        let expected_path =
-            crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id);
+        let expected_path = crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id);
         assert!(
             probes[0].1.contains(&expected_path.display().to_string()),
             "probe must name the artifact path; got: {}",
@@ -11256,8 +10899,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() {
         let workspace = tempdir().unwrap();
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
-            pr_review_exec_fixture(workspace.path(), None);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
 
         let handler = WorkerCompletionHandler::new(
@@ -11301,9 +10943,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // An attention item must record that the PR advanced unreviewed.
         let attentions = db.list_attention_items(&pr_review_exec_id).unwrap();
         assert!(
-            attentions
-                .iter()
-                .any(|i| i.kind == REVIEW_RESULT_GIVEUP_ATTENTION_KIND),
+            attentions.iter().any(|i| i.kind == REVIEW_RESULT_GIVEUP_ATTENTION_KIND),
             "a review-result-missing attention must be filed; got {attentions:?}",
         );
     }
@@ -11317,8 +10957,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         let json = high_finding_review_result_json(pr_url);
         // No transcript — the artifact is the only source.
-        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
-            pr_review_exec_fixture(workspace.path(), None);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
         let out_dir = tempdir().unwrap();
         std::fs::write(
             crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
@@ -11413,7 +11052,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(
-            task.status, TaskStatus::InReview,
+            task.status,
+            TaskStatus::InReview,
             "producing task must advance to in_review after bare-JSON review pass",
         );
     }
@@ -11427,8 +11067,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
     #[tokio::test]
     async fn pr_review_cycle_bound_skips_reviewer_and_creates_attention_item() {
         let workspace = tempdir().unwrap();
-        let (db, chore_id, execution_id, staged, branch) =
-            noop_skip_fixture(workspace.path(), None);
+        let (db, chore_id, execution_id, staged, branch) = noop_skip_fixture(workspace.path(), None);
 
         // Pre-increment the cycle counter to `max_review_cycles` so the bound
         // is already reached when the producing worker finishes.
@@ -11467,7 +11106,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(task.status, TaskStatus::InReview, "task must be in_review after cycle bound");
+        assert_eq!(
+            task.status,
+            TaskStatus::InReview,
+            "task must be in_review after cycle bound"
+        );
 
         // The attention item is created on the task (work_item_id), not on
         // the execution, so we query it via the task.
@@ -11501,8 +11144,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         let staged = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         staged.record_if_unset(&chore_exec_id, PR_URL);
 
-        let chore_branch =
-            expected_branch_name(&chore_exec_id, &BranchNaming::BossExecPrefix, None);
+        let chore_branch = expected_branch_name(&chore_exec_id, &BranchNaming::BossExecPrefix, None);
         let verifier = StubBranchVerifier::ok(&chore_branch);
         // diff line count: non-trivial so no-op gate doesn't fire (first review
         // is never skipped by the trivial rule, but set it anyway for realism).
@@ -11565,17 +11207,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .path()
             .join(format!("transcript-{}.jsonl", pr_review_exec_1.id));
         std::fs::write(&transcript1, make_review_transcript_jsonl(&high_json).as_bytes()).unwrap();
-        db.set_run_transcript_path_if_unset(
-            &pr_review_exec_1.id,
-            transcript1.to_str().unwrap(),
-        )
-        .unwrap();
+        db.set_run_transcript_path_if_unset(&pr_review_exec_1.id, transcript1.to_str().unwrap())
+            .unwrap();
 
         let outcome2 = handler.on_stop(&pr_review_exec_1.id).await;
         let revision_task_id = match &outcome2 {
-            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => {
-                revision_task_id.clone()
-            }
+            StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => revision_task_id.clone(),
             other => panic!("step 2: expected ReviewPassRevisionCreated; got {other:?}"),
         };
 
@@ -11585,9 +11222,16 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             WorkItem::Chore(t) | WorkItem::Task(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(chore_task.status, TaskStatus::InReview, "step 2: chore must be in_review");
+        assert_eq!(
+            chore_task.status,
+            TaskStatus::InReview,
+            "step 2: chore must be in_review"
+        );
         let (cycle_after_r1, _) = db.get_task_review_cycle_state(&chore_id).unwrap();
-        assert_eq!(cycle_after_r1, 1, "step 2: review_cycle must be 1 after first reviewer pass");
+        assert_eq!(
+            cycle_after_r1, 1,
+            "step 2: review_cycle must be 1 after first reviewer pass"
+        );
 
         // ── Step 3: RevisionImplementation finishes → reviewer re-enqueued ───
         // Create and run a RevisionImplementation execution for the revision task.
@@ -11689,11 +11333,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .path()
             .join(format!("transcript-{}.jsonl", pr_review_exec_2.id));
         std::fs::write(&transcript2, make_review_transcript_jsonl(&clean_json).as_bytes()).unwrap();
-        db.set_run_transcript_path_if_unset(
-            &pr_review_exec_2.id,
-            transcript2.to_str().unwrap(),
-        )
-        .unwrap();
+        db.set_run_transcript_path_if_unset(&pr_review_exec_2.id, transcript2.to_str().unwrap())
+            .unwrap();
 
         let outcome4 = handler.on_stop(&pr_review_exec_2.id).await;
         assert!(
@@ -11708,7 +11349,8 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             other => panic!("expected task, got {other:?}"),
         };
         assert_eq!(
-            rev_task.status, TaskStatus::InReview,
+            rev_task.status,
+            TaskStatus::InReview,
             "step 4: revision task must be in_review after clean reviewer pass",
         );
     }

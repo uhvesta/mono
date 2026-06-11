@@ -4,8 +4,8 @@ use std::time::Duration;
 use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
 use super::{
-    ColorLevel, ExternalProviderMode, OutputStyle, normalize_optional_description,
-    parse_external_provider_mode, render_human_results, sort_results_for_output,
+    ColorLevel, ExternalProviderMode, OutputStyle, normalize_optional_description, parse_external_provider_mode,
+    render_human_results, sort_results_for_output,
 };
 
 #[test]
@@ -25,7 +25,9 @@ fn human_output_includes_line_and_column() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(12),
     );
 
@@ -58,7 +60,9 @@ fn human_output_omits_ansi_when_color_is_disabled() {
                 }),
             }],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(12),
     );
 
@@ -80,7 +84,9 @@ fn human_output_message_is_bold_when_color_enabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::Basic },
+        OutputStyle {
+            level: ColorLevel::Basic,
+        },
         Duration::from_secs(1),
     );
 
@@ -103,7 +109,9 @@ fn human_output_help_body_uses_256_gray_when_color256_enabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::Color256 },
+        OutputStyle {
+            level: ColorLevel::Color256,
+        },
         Duration::from_secs(1),
     );
 
@@ -123,7 +131,9 @@ fn human_output_help_body_uses_truecolor_gray_when_truecolor_enabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::TrueColor },
+        OutputStyle {
+            level: ColorLevel::TrueColor,
+        },
         Duration::from_secs(1),
     );
 
@@ -139,11 +149,17 @@ fn human_output_multi_line_remediation_renders_as_bullets() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
-                remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned(), "Do option C.".to_owned()],
+                remediations: vec![
+                    "Do option A.".to_owned(),
+                    "Do option B.".to_owned(),
+                    "Do option C.".to_owned(),
+                ],
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(1),
     );
 
@@ -167,7 +183,9 @@ fn human_output_multi_line_remediation_uses_circle_bullet_when_color_enabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::Basic },
+        OutputStyle {
+            level: ColorLevel::Basic,
+        },
         Duration::from_secs(1),
     );
 
@@ -188,7 +206,9 @@ fn finding_with_multiple_remediations_renders_as_bullet_list() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(1),
     );
 
@@ -210,7 +230,9 @@ fn finding_with_multiple_remediations_uses_circle_bullet_when_color_enabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::Basic },
+        OutputStyle {
+            level: ColorLevel::Basic,
+        },
         Duration::from_secs(1),
     );
 
@@ -231,7 +253,9 @@ fn finding_with_single_remediation_renders_inline() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(1),
     );
 
@@ -253,7 +277,9 @@ fn human_output_check_id_is_gray_when_color_enabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::Basic },
+        OutputStyle {
+            level: ColorLevel::Basic,
+        },
         Duration::from_secs(1),
     );
 
@@ -274,7 +300,9 @@ fn human_output_check_id_is_plain_when_color_disabled() {
                 suggested_fix: None,
             }],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(1),
     );
 
@@ -289,7 +317,9 @@ fn human_output_no_findings_includes_elapsed_time() {
             check_id: "example".to_owned(),
             findings: vec![],
         }],
-        OutputStyle { level: ColorLevel::None },
+        OutputStyle {
+            level: ColorLevel::None,
+        },
         Duration::from_secs(12),
     );
 
@@ -358,15 +388,8 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
 
     sort_results_for_output(&mut results);
 
-    let severities: Vec<_> = results[0]
-        .findings
-        .iter()
-        .map(|finding| finding.severity)
-        .collect();
-    assert_eq!(
-        severities,
-        vec![Severity::Error, Severity::Warning, Severity::Info]
-    );
+    let severities: Vec<_> = results[0].findings.iter().map(|finding| finding.severity).collect();
+    assert_eq!(severities, vec![Severity::Error, Severity::Warning, Severity::Info]);
 }
 
 #[test]
@@ -404,9 +427,5 @@ fn parse_external_provider_mode_accepts_supported_values() {
 #[test]
 fn parse_external_provider_mode_rejects_invalid_values() {
     let error = parse_external_provider_mode(Some("unknown".to_owned())).expect_err("must fail");
-    assert!(
-        error
-            .to_string()
-            .contains("invalid `CHECKLEFT_EXTERNAL_PROVIDER_MODE`")
-    );
+    assert!(error.to_string().contains("invalid `CHECKLEFT_EXTERNAL_PROVIDER_MODE`"));
 }

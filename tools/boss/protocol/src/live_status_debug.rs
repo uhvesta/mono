@@ -257,9 +257,7 @@ mod tests {
                 last_outcome_at: Some("2026-05-11T20:00:02Z".into()),
                 last_success_at: Some("2026-05-11T20:00:02Z".into()),
                 last_success_text: Some("running tests".into()),
-                transcript_path: Some(
-                    "/Users/u/.claude/projects/foo/sess.jsonl".into(),
-                ),
+                transcript_path: Some("/Users/u/.claude/projects/foo/sess.jsonl".into()),
                 last_redacted_bytes: Some(1234),
             }],
         };
@@ -288,18 +286,12 @@ mod tests {
         };
         let text = serde_json::to_string(&report).unwrap();
         assert!(text.contains("\"engine_build_sha\":\"deadbeef\""), "{text}");
-        assert!(
-            text.contains("\"engine_binary_fingerprint\":\"cafebabe\""),
-            "{text}"
-        );
+        assert!(text.contains("\"engine_binary_fingerprint\":\"cafebabe\""), "{text}");
         assert!(
             text.contains("\"engine_process_started_at\":\"2026-05-11T20:00:00Z\""),
             "{text}"
         );
-        assert!(
-            text.contains("\"anthropic_api_key_present\":false"),
-            "{text}"
-        );
+        assert!(text.contains("\"anthropic_api_key_present\":false"), "{text}");
         assert!(text.contains("\"tracked_slot_count\":0"), "{text}");
         assert!(text.contains("\"dispatcher_stats\""), "{text}");
         assert!(text.contains("\"hook_events_total\":0"), "{text}");

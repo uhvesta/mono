@@ -33,10 +33,7 @@ pub enum TailError {
     #[error("transcript bytes are not valid utf-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("transcript line is not valid JSON: {error} (line: {line:?})")]
-    Json {
-        error: serde_json::Error,
-        line: String,
-    },
+    Json { error: serde_json::Error, line: String },
 }
 
 #[derive(Debug)]
@@ -172,10 +169,7 @@ mod tests {
 
         // Second write: complete the partial + append another line.
         {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
             writeln!(f, r#" 3}}"#).unwrap();
             writeln!(f, r#"{{"i": 4}}"#).unwrap();
         }

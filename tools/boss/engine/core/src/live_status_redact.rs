@@ -93,9 +93,8 @@ pub fn is_mostly_redacted(s: &str) -> bool {
         return true;
     }
     let total = trimmed.len() as f32;
-    let redacted_chars =
-        (count_occurrences(trimmed, REDACTED) * REDACTED.len()) as f32 +
-        (count_occurrences(trimmed, TRUNCATED) * TRUNCATED.len()) as f32;
+    let redacted_chars = (count_occurrences(trimmed, REDACTED) * REDACTED.len()) as f32
+        + (count_occurrences(trimmed, TRUNCATED) * TRUNCATED.len()) as f32;
     redacted_chars / total > MAX_REDACTION_RATIO
 }
 
@@ -178,9 +177,10 @@ pub fn should_drop_entry(value: &Value) -> bool {
             return true;
         }
         if let Some(input) = value.get("tool_input")
-            && input_targets_sensitive_path(name, input) {
-                return true;
-            }
+            && input_targets_sensitive_path(name, input)
+        {
+            return true;
+        }
     }
     if let Some(content) = value.get("content").and_then(|v| v.as_array()) {
         for block in content {
@@ -192,9 +192,10 @@ pub fn should_drop_entry(value: &Value) -> bool {
                     return true;
                 }
                 if let Some(input) = obj.get("input")
-                    && input_targets_sensitive_path(name, input) {
-                        return true;
-                    }
+                    && input_targets_sensitive_path(name, input)
+                {
+                    return true;
+                }
             }
         }
     }
@@ -217,8 +218,7 @@ fn tool_name_is_sensitive(_name: &str) -> bool {
 /// sensitive locations or env-var dump shell snippets.
 fn input_targets_sensitive_path(tool_name: &str, input: &Value) -> bool {
     let path_candidates = match tool_name {
-        "Read" | "Write" | "Edit" | "MultiEdit" | "Glob" | "Grep" | "NotebookRead"
-        | "NotebookEdit" => vec![
+        "Read" | "Write" | "Edit" | "MultiEdit" | "Glob" | "Grep" | "NotebookRead" | "NotebookEdit" => vec![
             input.get("file_path").and_then(Value::as_str),
             input.get("path").and_then(Value::as_str),
             input.get("notebook_path").and_then(Value::as_str),
@@ -251,9 +251,7 @@ fn input_targets_sensitive_path(tool_name: &str, input: &Value) -> bool {
 /// keep the check cheap and intentionally over-eager.
 fn path_is_sensitive(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    SENSITIVE_PATH_FRAGMENTS
-        .iter()
-        .any(|frag| lower.contains(frag))
+    SENSITIVE_PATH_FRAGMENTS.iter().any(|frag| lower.contains(frag))
 }
 
 const SENSITIVE_PATH_FRAGMENTS: &[&str] = &[
@@ -292,22 +290,12 @@ fn bash_command_is_sensitive(cmd: &str) -> bool {
         return true;
     }
     // Common "dump everything" shapes.
-    const DUMP_FRAGMENTS: &[&str] = &[
-        "printenv",
-        "env | grep",
-        "env|grep",
-        "set | grep",
-        "echo $",
-    ];
+    const DUMP_FRAGMENTS: &[&str] = &["printenv", "env | grep", "env|grep", "set | grep", "echo $"];
     if DUMP_FRAGMENTS.iter().any(|f| lower.contains(f)) {
         return true;
     }
     // Cat'ing well-known credential files.
-    if lower.contains("cat ")
-        && SENSITIVE_PATH_FRAGMENTS
-            .iter()
-            .any(|frag| lower.contains(frag))
-    {
+    if lower.contains("cat ") && SENSITIVE_PATH_FRAGMENTS.iter().any(|frag| lower.contains(frag)) {
         return true;
     }
     false
@@ -398,16 +386,13 @@ mod tests {
 
     #[test]
     fn redacts_long_hex_digest() {
-        let out =
-            redact_text("digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        let out = redact_text("digest e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
         assert!(out.contains(REDACTED));
     }
 
     #[test]
     fn redacts_workspace_paths() {
-        let out = redact_text(
-            "writing to /Users/brian/Documents/dev/workspaces/mono-agent-003/foo/bar",
-        );
+        let out = redact_text("writing to /Users/brian/Documents/dev/workspaces/mono-agent-003/foo/bar");
         assert!(out.contains(REDACTED));
         assert!(!out.contains("mono-agent-003"));
     }

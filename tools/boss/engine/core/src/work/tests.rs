@@ -48,10 +48,7 @@ fn complete_design_for_project(db: &WorkDb, project_id: &str) {
 /// a project, a task, and an execution under it. Returns the stored
 /// product and execution so prefix denormalisation can be asserted.
 #[cfg(test)]
-fn product_task_execution_with_prefix(
-    db: &WorkDb,
-    worker_branch_prefix: Option<&str>,
-) -> (Product, WorkExecution) {
+fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<&str>) -> (Product, WorkExecution) {
     let product = db
         .create_product(CreateProductInput {
             name: "Prefix Co".to_owned(),
@@ -88,11 +85,13 @@ fn product_task_execution_with_prefix(
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(task.id.clone())
-            .kind(ExecutionKind::TaskImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(task.id.clone())
+                .kind(ExecutionKind::TaskImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
     (product, execution)
 }
@@ -191,11 +190,13 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
             force_duplicate: false,
         })
         .unwrap();
-    db.create_execution(CreateExecutionInput::builder()
-        .work_item_id(task.id)
-        .kind(ExecutionKind::TaskImplementation)
-        .status(ExecutionStatus::Ready)
-        .build())
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(task.id)
+            .kind(ExecutionKind::TaskImplementation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
     .unwrap()
 }
 
@@ -204,10 +205,7 @@ fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkEx
 /// whose own `repo_remote_url` is left `NULL`. Tests plant the
 /// override they want via `set_task_repo` and then exercise the
 /// helper.
-fn make_resolve_scaffold(
-    label: &str,
-    product_repo: Option<&str>,
-) -> (PathBuf, WorkDb, String, String) {
+fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, WorkDb, String, String) {
     // disk_db_path so that resolve_repo_errors_when_parent_product_is_missing
     // can open a second raw connection to the same database file.
     let path = disk_db_path(label);
@@ -308,22 +306,17 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
         })
         .unwrap();
     let exec = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .repo_remote_url("git@github.com:foo/bar.git")
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build(),
+        )
         .unwrap();
     let (exec, run) = db
-        .start_execution_run(
-            &exec.id,
-            "agent-1",
-            "repo-1",
-            "lease-1",
-            "ws-1",
-            "/workspaces/ws-1",
-        )
+        .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/workspaces/ws-1")
         .unwrap();
     db.finish_execution_run(
         &exec.id,
@@ -390,11 +383,11 @@ fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> S
     let id = next_id("task");
     let now = now_string();
     conn.execute(
-            "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
              VALUES (?1, ?2, 'revision', 'Test revision', '', 'todo', ?3, ?3, ?4)",
-            rusqlite::params![id, product_id, now, parent_task_id],
-        )
-        .unwrap();
+        rusqlite::params![id, product_id, now, parent_task_id],
+    )
+    .unwrap();
     id
 }
 
@@ -429,11 +422,8 @@ fn make_in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
 fn make_done_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
     let id = make_in_review_chore(db, product_id, pr_url);
     let conn = db.connect().unwrap();
-    conn.execute(
-        "UPDATE tasks SET status = 'done' WHERE id = ?1",
-        rusqlite::params![id],
-    )
-    .unwrap();
+    conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?1", rusqlite::params![id])
+        .unwrap();
     id
 }
 

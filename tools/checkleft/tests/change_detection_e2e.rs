@@ -37,9 +37,7 @@ use tempfile::{TempDir, tempdir};
 use checkleft::change_detection::base::EmptyReason;
 use checkleft::change_detection::environment::CiEnvironment;
 use checkleft::change_detection::scenario::Scenario;
-use checkleft::change_detection::{
-    ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan,
-};
+use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
 use checkleft::input::ChangeSet;
 use checkleft::vcs::{BaseRevision, Vcs};
 
@@ -80,10 +78,7 @@ fn git_out(root: &Path, args: &[&str]) -> String {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout)
-        .expect("utf-8")
-        .trim()
-        .to_owned()
+    String::from_utf8(out.stdout).expect("utf-8").trim().to_owned()
 }
 
 /// Create a fresh temp repo with the initial branch pinned to `default_branch`.
@@ -142,9 +137,7 @@ fn base_sha(plan: &ChangePlan) -> Option<&str> {
 fn scoped_paths(vcs: &Vcs, plan: &ChangePlan) -> Vec<String> {
     let changeset: ChangeSet = match plan {
         ChangePlan::All => vcs.all_files_changeset().expect("all files changeset"),
-        ChangePlan::Scoped { base_sha, .. } => {
-            vcs.changeset_since(base_sha).expect("changeset since base")
-        }
+        ChangePlan::Scoped { base_sha, .. } => vcs.changeset_since(base_sha).expect("changeset since base"),
         ChangePlan::Empty { .. } => ChangeSet::default(),
     };
     let mut paths: Vec<String> = changeset
@@ -234,12 +227,7 @@ fn pr_with_base_drift() -> (TempDir, String) {
     git(&root, &["checkout", "-b", "pr-branch"]);
     commit(&root, "feature.rs", "fn feature() {}\n", "P: feature");
     git(&root, &["checkout", "main"]);
-    commit(
-        &root,
-        "only_on_main.rs",
-        "fn drift() {}\n",
-        "D: main-only drift",
-    );
+    commit(&root, "only_on_main.rs", "fn drift() {}\n", "D: main-only drift");
     git(&root, &["checkout", "pr-branch"]);
     (dir, fork)
 }
@@ -272,16 +260,7 @@ fn merge_queue_topology() -> (TempDir, String, String) {
         "B: unrelated main-only change",
     );
     // Build the GitHub-style merge commit: parent1 = main tip (B), parent2 = P.
-    git(
-        &root,
-        &[
-            "merge",
-            "--no-ff",
-            "pr-branch",
-            "-m",
-            "M: merge pr into main",
-        ],
-    );
+    git(&root, &["merge", "--no-ff", "pr-branch", "-m", "M: merge pr into main"]);
     (dir, fork, queue_base)
 }
 
@@ -320,10 +299,7 @@ fn regular_pr_github_scopes_to_pr_only_excluding_base_drift() {
     );
 
     // The base-tree reads must use the SAME sha as the diff (consistency invariant).
-    assert_eq!(
-        base_revision_from_plan(&vcs, &plan),
-        Some(BaseRevision::Git(fork)),
-    );
+    assert_eq!(base_revision_from_plan(&vcs, &plan), Some(BaseRevision::Git(fork)),);
 }
 
 /// Row 1 (Buildkite PR). Same regression via the Buildkite signal path.
@@ -398,11 +374,7 @@ fn github_merge_queue_without_payload_falls_back_to_head_parent() {
 
     let plan = resolve(&env, &vcs, auto());
 
-    assert_eq!(
-        base_sha(&plan),
-        Some(queue_base.as_str()),
-        "fallback base == HEAD^1"
-    );
+    assert_eq!(base_sha(&plan), Some(queue_base.as_str()), "fallback base == HEAD^1");
     assert_eq!(scoped_paths(&vcs, &plan), vec!["feature.rs"]);
 }
 
@@ -441,12 +413,7 @@ fn push_to_default_scopes_to_last_commit() {
     let dir = init_repo("main");
     let root = dir.path();
     let first = commit(root, "base.txt", "base\n", "A: base");
-    commit(
-        root,
-        "more.rs",
-        "fn more() {}\n",
-        "B: another commit on main",
-    );
+    commit(root, "more.rs", "fn more() {}\n", "B: another commit on main");
     let vcs = detect(root);
     let env = env_gha_push("refs/heads/main");
 
@@ -462,11 +429,7 @@ fn push_to_default_scopes_to_last_commit() {
         ),
         "expected Scoped PushToDefault, got {plan:?}"
     );
-    assert_eq!(
-        base_sha(&plan),
-        Some(first.as_str()),
-        "push-to-default base == HEAD^1"
-    );
+    assert_eq!(base_sha(&plan), Some(first.as_str()), "push-to-default base == HEAD^1");
     assert_eq!(scoped_paths(&vcs, &plan), vec!["more.rs"]);
 }
 
@@ -496,11 +459,7 @@ fn push_to_non_default_branch_scopes_against_default() {
         ),
         "expected Scoped PushToBranch, got {plan:?}"
     );
-    assert_eq!(
-        base_sha(&plan),
-        Some(fork.as_str()),
-        "base == merge-base(main, HEAD)"
-    );
+    assert_eq!(base_sha(&plan), Some(fork.as_str()), "base == merge-base(main, HEAD)");
     assert_eq!(scoped_paths(&vcs, &plan), vec!["feature.rs"]);
 }
 
@@ -562,10 +521,7 @@ fn first_commit_no_merge_base_yields_empty() {
         },
         "unrelated histories must yield Empty {{ NoMergeBase }}, got {plan:?}"
     );
-    assert!(
-        scoped_paths(&vcs, &plan).is_empty(),
-        "nothing should be scoped"
-    );
+    assert!(scoped_paths(&vcs, &plan).is_empty(), "nothing should be scoped");
 }
 
 // ══ Row 8 — Detached HEAD ══════════════════════════════════════════════════════
@@ -642,12 +598,7 @@ fn shallow_pr_clone() -> (TempDir, TempDir, String) {
     let fork = commit(&remote, "base.txt", "base\n", "A: base (fork point)");
     // Several more commits on main, including a main-only drift file.
     commit(&remote, "c1.txt", "c1\n", "main commit 1");
-    commit(
-        &remote,
-        "only_on_main.rs",
-        "fn drift() {}\n",
-        "main-only drift",
-    );
+    commit(&remote, "only_on_main.rs", "fn drift() {}\n", "main-only drift");
     commit(&remote, "c3.txt", "c3\n", "main commit 3");
     // PR branch forked from the root (fork point), adds the PR file.
     git(&remote, &["checkout", "-b", "pr-branch", &fork]);
@@ -658,10 +609,7 @@ fn shallow_pr_clone() -> (TempDir, TempDir, String) {
     git(&clone, &["init", "-b", "pr-branch"]);
     git(&clone, &["config", "user.email", "test@checkleft.example"]);
     git(&clone, &["config", "user.name", "Checkleft Test"]);
-    git(
-        &clone,
-        &["remote", "add", "origin", remote.to_str().unwrap()],
-    );
+    git(&clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
     git(&clone, &["fetch", "--depth=1", "origin", "pr-branch"]);
     git(&clone, &["checkout", "-b", "pr-branch", "FETCH_HEAD"]);
     git(&clone, &["fetch", "--depth=1", "origin", "main"]);
@@ -711,17 +659,14 @@ fn shallow_base_permanently_unreachable_errors() {
     // GITHUB_BASE_REF is the bare branch name; the code adds "origin/" prefix.
     let env = env_gha_pull_request("totally-nonexistent-branch");
 
-    let err = resolve_change_plan(&env, &vcs, &auto())
-        .expect_err("unreachable base must error, not silently mis-scope");
+    let err =
+        resolve_change_plan(&env, &vcs, &auto()).expect_err("unreachable base must error, not silently mis-scope");
     let msg = err.to_string();
     assert!(
         msg.contains("origin/totally-nonexistent-branch"),
         "error must name the unreachable ref: {msg}"
     );
-    assert!(
-        msg.contains("git fetch origin"),
-        "error must include the remedy: {msg}"
-    );
+    assert!(msg.contains("git fetch origin"), "error must include the remedy: {msg}");
     drop(remote_dir);
 }
 
@@ -843,11 +788,14 @@ fn shallow_push_clone() -> (TempDir, TempDir, String) {
     // Override the fetch refspec to cover ONLY the boss branch (not all of
     // refs/heads/*). This prevents a bare `git fetch origin` from pulling in main,
     // exactly matching a Buildkite single-branch shallow clone.
-    git(&clone, &[
-        "config",
-        "remote.origin.fetch",
-        "+refs/heads/boss/exec_test:refs/remotes/origin/boss/exec_test",
-    ]);
+    git(
+        &clone,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/boss/exec_test:refs/remotes/origin/boss/exec_test",
+        ],
+    );
     git(&clone, &["fetch", "--depth=1", "origin", "boss/exec_test"]);
     git(&clone, &["checkout", "-b", "boss/exec_test", "FETCH_HEAD"]);
 
@@ -946,10 +894,7 @@ fn push_to_branch_shallow_nonexistent_default_branch_errors_loudly() {
         msg.contains("origin/totally-nonexistent"),
         "error must name the unreachable ref: {msg}"
     );
-    assert!(
-        msg.contains("git fetch origin"),
-        "error must include the remedy: {msg}"
-    );
+    assert!(msg.contains("git fetch origin"), "error must include the remedy: {msg}");
 
     drop(remote_dir);
 }
@@ -995,11 +940,7 @@ fn jj_colocated_pr_scopes_to_pr_only_excluding_drift() {
     }
 
     let vcs = detect(root);
-    assert_eq!(
-        vcs.kind(),
-        checkleft::vcs::VcsKind::Jujutsu,
-        "must detect as jj"
-    );
+    assert_eq!(vcs.kind(), checkleft::vcs::VcsKind::Jujutsu, "must detect as jj");
 
     let env = CiEnvironment::default(); // Local developer scenario
     let plan = resolve(&env, &vcs, auto());
@@ -1010,10 +951,7 @@ fn jj_colocated_pr_scopes_to_pr_only_excluding_drift() {
         "jj base resolution must use the colocated git merge-base (the fork point)"
     );
     // The base-tree reads use a jj revision carrying the same git sha.
-    assert_eq!(
-        base_revision_from_plan(&vcs, &plan),
-        Some(BaseRevision::Jujutsu(fork)),
-    );
+    assert_eq!(base_revision_from_plan(&vcs, &plan), Some(BaseRevision::Jujutsu(fork)),);
 
     let scoped = scoped_paths(&vcs, &plan);
     assert!(
@@ -1041,14 +979,9 @@ fn vendored_github_merge_group_event_payload_parses() {
         ..Default::default()
     };
 
-    let payload = env
-        .read_github_event_payload()
-        .expect("merge_group fixture must parse");
+    let payload = env.read_github_event_payload().expect("merge_group fixture must parse");
     let mg = payload.merge_group.expect("merge_group present");
-    assert_eq!(
-        mg.base_sha.as_deref(),
-        Some("1234567890abcdef1234567890abcdef12345678")
-    );
+    assert_eq!(mg.base_sha.as_deref(), Some("1234567890abcdef1234567890abcdef12345678"));
     assert_eq!(mg.base_ref.as_deref(), Some("refs/heads/main"));
     assert_eq!(
         payload.repository.and_then(|r| r.default_branch).as_deref(),

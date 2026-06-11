@@ -76,18 +76,16 @@ pub(super) fn parse_config(config: &toml::Value) -> Result<CompiledCodePatternsC
         other => bail!("unsupported code-patterns `lang`: {other}"),
     };
 
-    let default_severity =
-        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_severity = Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
     let default_message = normalize_optional_string(parsed.message, "message")?;
     let default_remediation = normalize_optional_string(parsed.remediation, "remediation")?;
 
     let mut rules = Vec::with_capacity(parsed.rules.len());
     for rule in parsed.rules {
         let pattern = parse_nocall_pattern(&rule.nocall)?;
-        let message =
-            normalize_optional_string(rule.message, "message")?.or_else(|| default_message.clone());
-        let remediation = normalize_optional_string(rule.remediation, "remediation")?
-            .or_else(|| default_remediation.clone());
+        let message = normalize_optional_string(rule.message, "message")?.or_else(|| default_message.clone());
+        let remediation =
+            normalize_optional_string(rule.remediation, "remediation")?.or_else(|| default_remediation.clone());
 
         rules.push(CompiledNoCallRule {
             pattern,

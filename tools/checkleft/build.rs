@@ -22,8 +22,7 @@ fn main() {
 fn read_wasmtime_version_from_lock() -> String {
     let lock_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
     let lock = std::fs::read_to_string(&lock_path).unwrap_or_default();
-    extract_wasmtime_version_from_lock(&lock)
-        .unwrap_or_else(|| "unknown".to_owned())
+    extract_wasmtime_version_from_lock(&lock).unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn extract_wasmtime_version_from_lock(lock: &str) -> Option<String> {

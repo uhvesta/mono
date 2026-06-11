@@ -554,10 +554,7 @@ fn create_automation_task_stamps_provenance_and_enforces_cap() {
     assert_eq!(task.project_id, None);
     assert!(task.autostart);
     assert_eq!(task.source_automation_id.as_deref(), Some(automation.id.as_str()));
-    assert_eq!(
-        db.count_open_tasks_for_automation(&automation.id).unwrap(),
-        1
-    );
+    assert_eq!(db.count_open_tasks_for_automation(&automation.id).unwrap(), 1);
 
     // Second create must be rejected by the transactional cap re-check.
     let err = db
@@ -641,9 +638,7 @@ fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
 
     // The triage agent created the produced task (real row — `produced_task_id`
     // is a FK into `tasks`, so a verified id is required).
-    let produced = db
-        .create_automation_task(&automation.id, "fix clippy", None)
-        .unwrap();
+    let produced = db.create_automation_task(&automation.id, "fix clippy", None).unwrap();
 
     // Detector flips the run to produced_task once the worker emitted the marker.
     let updated = db
@@ -676,12 +671,13 @@ fn finalize_automation_triage_run_records_outcome_without_rewinding_schedule() {
     );
 
     // Finalising an unknown execution id is a no-op, not an error.
-    assert!(!db
-        .finalize_automation_triage_run(
+    assert!(
+        !db.finalize_automation_triage_run(
             "exec_nonexistent",
             boss_protocol::AUTOMATION_OUTCOME_SKIPPED,
             None,
             Some("x"),
         )
-        .unwrap());
+        .unwrap()
+    );
 }

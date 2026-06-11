@@ -182,11 +182,7 @@ pub async fn run_one_pass(
     // live-state entry IS the execution id (see dead_pid_sweep). A claim
     // whose execution is in this set is still owned by a live pane and
     // its teardown path — leave it alone.
-    let live_run_ids: HashSet<String> = live_states
-        .snapshot()
-        .into_iter()
-        .map(|state| state.run_id)
-        .collect();
+    let live_run_ids: HashSet<String> = live_states.snapshot().into_iter().map(|state| state.run_id).collect();
 
     for (pool, pool_name) in [
         (coordinator.worker_pool(), "main"),
@@ -235,10 +231,7 @@ pub async fn run_one_pass(
             // never race the happy path. A missing/unparseable
             // finished_at (data anomaly — every terminal path stamps it)
             // falls through as past-grace.
-            let finished_epoch = execution
-                .finished_at
-                .as_deref()
-                .and_then(|s| s.parse::<i64>().ok());
+            let finished_epoch = execution.finished_at.as_deref().and_then(|s| s.parse::<i64>().ok());
             if matches!(finished_epoch, Some(t) if t > grace_cutoff) {
                 outcome.grace_skipped += 1;
                 continue;
@@ -268,18 +261,14 @@ pub async fn run_one_pass(
             outcome.released += 1;
             dispatch_events
                 .emit(
-                    DispatchEvent::new(
-                        Stage::PoolClaimReconcile,
-                        Outcome::Ok,
-                        &claim.execution_id,
-                    )
-                    .with_work_item(&execution.work_item_id)
-                    .with_worker(&claim.worker_id)
-                    .with_details(serde_json::json!({
-                        "pool": pool_name,
-                        "worker_id": claim.worker_id,
-                        "execution_status": execution.status,
-                    })),
+                    DispatchEvent::new(Stage::PoolClaimReconcile, Outcome::Ok, &claim.execution_id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(&claim.worker_id)
+                        .with_details(serde_json::json!({
+                            "pool": pool_name,
+                            "worker_id": claim.worker_id,
+                            "execution_status": execution.status,
+                        })),
                 )
                 .await;
         }
@@ -299,8 +288,8 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionCoordinator, WorkerPool,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionCoordinator, WorkerPool,
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -414,13 +403,9 @@ mod tests {
 
     fn create_execution(db: &WorkDb, work_item_id: &str) -> String {
         use boss_protocol::RequestExecutionInput;
-        db.request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(work_item_id)
-                .build(),
-        )
-        .unwrap()
-        .id
+        db.request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
+            .unwrap()
+            .id
     }
 
     /// Raw UPDATE to drive an execution to `completed` — exercises the
@@ -518,8 +503,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.released, 3, "all three leaked claims must be freed");
         assert_eq!(outcome.live_backed_skipped, 0);
@@ -530,10 +514,7 @@ mod tests {
             3,
             "automation pool must be fully idle after the sweep — dispatch unwedged",
         );
-        assert!(
-            pool.claimed_execution_ids().await.is_empty(),
-            "no claims may remain",
-        );
+        assert!(pool.claimed_execution_ids().await.is_empty(), "no claims may remain",);
 
         // One pool_claim_reconcile event per freed slot, carrying the
         // worker_id and terminal status so the leak is diagnosable.
@@ -565,8 +546,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.released, 0);
         assert_eq!(outcome.non_terminal_skipped, 1);
@@ -593,15 +573,13 @@ mod tests {
         let exec = create_execution(&db, &create_active_chore(&db, &product_id, "a"));
         let worker_id = pool.claim_worker(&exec, None).await.unwrap();
         // auto-worker-1 → slot 9.
-        db.mark_execution_orphaned(&exec, "terminal but pane still up")
-            .unwrap();
+        db.mark_execution_orphaned(&exec, "terminal but pane still up").unwrap();
 
         let live_states = LiveWorkerStateRegistry::new();
         register_live_pane(&live_states, 9, &exec);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.released, 0, "live-backed claim must not be released");
         assert_eq!(outcome.live_backed_skipped, 1);
@@ -634,8 +612,7 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.released, 0, "fresh terminal claim must wait out the grace");
         assert_eq!(outcome.grace_skipped, 1);
@@ -666,15 +643,17 @@ mod tests {
         let live_states = LiveWorkerStateRegistry::new();
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let first =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let first = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
         assert_eq!(first.released, 1);
         assert_eq!(pool.idle_count().await, 2, "main pool fully idle after release");
 
         // Second pass: nothing left to release.
-        let second =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let second = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
         assert_eq!(second.released, 0);
-        assert_eq!(sink.events().await.len(), 1, "no duplicate event on the idempotent pass");
+        assert_eq!(
+            sink.events().await.len(),
+            1,
+            "no duplicate event on the idempotent pass"
+        );
     }
 }

@@ -98,8 +98,7 @@ pub const PLANNER_ATTEMPTS: usize = 2;
 pub const TOOL_NAME: &str = "emit_task_graph";
 
 /// One-line tool description shown to the model alongside the schema.
-const TOOL_DESCRIPTION: &str =
-    "Emit the proposed implementation task graph extracted from the design \
+const TOOL_DESCRIPTION: &str = "Emit the proposed implementation task graph extracted from the design \
      document: the tasks to create (with kind and effort), the dependency \
      edges between them by handle, the confidence, whether a breakdown was \
      found, the per-task [effort-classification] audit lines, and a notes \
@@ -155,9 +154,7 @@ impl PlannerOutcome {
                     out.breakdown_found,
                 )
             }
-            PlannerOutcome::NoApiKey => {
-                "ANTHROPIC_API_KEY not configured on the engine".to_owned()
-            }
+            PlannerOutcome::NoApiKey => "ANTHROPIC_API_KEY not configured on the engine".to_owned(),
             PlannerOutcome::ApiError { status, snippet } => {
                 format!("anthropic returned {status}: {snippet}")
             }
@@ -188,9 +185,7 @@ impl Planner {
     pub async fn plan(api_key: Option<&str>, input: &PlannerInput) -> PlannerOutcome {
         match api_key {
             None => {
-                tracing::error!(
-                    "planner: skipped — ANTHROPIC_API_KEY not configured",
-                );
+                tracing::error!("planner: skipped — ANTHROPIC_API_KEY not configured",);
                 PlannerOutcome::NoApiKey
             }
             Some(key) => plan_with_url(ANTHROPIC_MESSAGES_URL, key, input).await,
@@ -336,9 +331,7 @@ impl From<PlannerCallError> for PlannerOutcome {
             },
             // Both Transport and Decode are "we couldn't get usable bytes
             // back" — bucket them together, matching live_status.
-            PlannerCallError::Transport(msg) | PlannerCallError::Decode(msg) => {
-                PlannerOutcome::Transport(msg)
-            }
+            PlannerCallError::Transport(msg) | PlannerCallError::Decode(msg) => PlannerOutcome::Transport(msg),
             PlannerCallError::InvalidOutput(msg) => PlannerOutcome::InvalidOutput(msg),
         }
     }
@@ -346,11 +339,7 @@ impl From<PlannerCallError> for PlannerOutcome {
 
 /// One round trip: POST the request and extract the forced tool call's input
 /// as a [`PlannerOutput`].
-async fn call_anthropic(
-    url: &str,
-    api_key: &str,
-    body: &Value,
-) -> Result<PlannerOutput, PlannerCallError> {
+async fn call_anthropic(url: &str, api_key: &str, body: &Value) -> Result<PlannerOutput, PlannerCallError> {
     let client = http_client();
     let resp = client
         .post(url)
@@ -380,9 +369,7 @@ fn planner_output_from_response_json(body: &Value) -> Result<PlannerOutput, Plan
     let content = body
         .get("content")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            PlannerCallError::InvalidOutput("response had no content array".to_owned())
-        })?;
+        .ok_or_else(|| PlannerCallError::InvalidOutput("response had no content array".to_owned()))?;
     let input = content
         .iter()
         .find(|block| {
@@ -390,15 +377,9 @@ fn planner_output_from_response_json(body: &Value) -> Result<PlannerOutput, Plan
                 && block.get("name").and_then(Value::as_str) == Some(TOOL_NAME)
         })
         .and_then(|block| block.get("input"))
-        .ok_or_else(|| {
-            PlannerCallError::InvalidOutput(format!(
-                "model did not call the {TOOL_NAME} tool"
-            ))
-        })?;
+        .ok_or_else(|| PlannerCallError::InvalidOutput(format!("model did not call the {TOOL_NAME} tool")))?;
     serde_json::from_value::<PlannerOutput>(input.clone()).map_err(|err| {
-        PlannerCallError::InvalidOutput(format!(
-            "tool input did not match the PlannerOutput schema: {err}"
-        ))
+        PlannerCallError::InvalidOutput(format!("tool input did not match the PlannerOutput schema: {err}"))
     })
 }
 
@@ -552,9 +533,7 @@ chose the edges, and anything a human reviewer should know.\
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::{
-        Confidence, DocRef, ProductContext, ProjectContext, TaskBrief,
-    };
+    use boss_protocol::{Confidence, DocRef, ProductContext, ProjectContext, TaskBrief};
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -641,10 +620,7 @@ mod tests {
         assert_eq!(body["tool_choice"]["name"], TOOL_NAME);
         assert_eq!(body["tools"][0]["name"], TOOL_NAME);
         // The forced tool's input_schema is the contract schema.
-        assert_eq!(
-            body["tools"][0]["input_schema"],
-            planner_output_schema(),
-        );
+        assert_eq!(body["tools"][0]["input_schema"], planner_output_schema(),);
         // System prompt + a single user turn.
         assert!(body["system"].as_str().unwrap().contains("Boss Planner"));
         assert_eq!(body["messages"][0]["role"], "user");
@@ -689,8 +665,7 @@ mod tests {
 
     #[test]
     fn parses_a_well_formed_tool_use_response() {
-        let out = planner_output_from_response_json(&tool_use_response())
-            .expect("valid tool_use response parses");
+        let out = planner_output_from_response_json(&tool_use_response()).expect("valid tool_use response parses");
         assert_eq!(out.tasks.len(), 2);
         assert_eq!(out.tasks[0].handle, "protocol-types");
         assert_eq!(out.tasks[0].effort, boss_protocol::EffortLevel::Small);
@@ -771,12 +746,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(
-            &format!("{}/v1/messages", server.uri()),
-            "test-key",
-            &sample_input(),
-        )
-        .await;
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
 
         match outcome {
             PlannerOutcome::Success(out) => {
@@ -804,12 +774,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(
-            &format!("{}/v1/messages", server.uri()),
-            "test-key",
-            &sample_input(),
-        )
-        .await;
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after one retry, got {outcome:?}",
@@ -827,12 +792,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let outcome = plan_with_url(
-            &format!("{}/v1/messages", server.uri()),
-            "test-key",
-            &sample_input(),
-        )
-        .await;
+        let outcome = plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
         match outcome {
             PlannerOutcome::ApiError { status, .. } => assert_eq!(status, 401),
             other => panic!("expected ApiError, got {other:?}"),
@@ -844,16 +804,14 @@ mod tests {
     fn outcome_tags_are_stable() {
         assert_eq!(PlannerOutcome::NoApiKey.tag(), "no_api_key");
         assert_eq!(
-            PlannerOutcome::ApiError { status: 429, snippet: "x".into() }.tag(),
+            PlannerOutcome::ApiError {
+                status: 429,
+                snippet: "x".into()
+            }
+            .tag(),
             "api_error",
         );
-        assert_eq!(
-            PlannerOutcome::Transport("boom".into()).tag(),
-            "transport_error",
-        );
-        assert_eq!(
-            PlannerOutcome::InvalidOutput("nope".into()).tag(),
-            "invalid_output",
-        );
+        assert_eq!(PlannerOutcome::Transport("boom".into()).tag(), "transport_error",);
+        assert_eq!(PlannerOutcome::InvalidOutput("nope".into()).tag(), "invalid_output",);
     }
 }

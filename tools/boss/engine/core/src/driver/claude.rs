@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
-use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, WorkerErrorClass,
-};
+use super::{AgentDriver, Capability, CapabilitySet, DriverDescriptor, WorkerErrorClass};
 
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     name: "claude",
@@ -81,12 +79,7 @@ impl AgentDriver for ClaudeDriver {
         cmd
     }
 
-    async fn provision_workspace(
-        &self,
-        _workspace: &Path,
-        _prompt_text: &str,
-        _run_id: &str,
-    ) -> anyhow::Result<()> {
+    async fn provision_workspace(&self, _workspace: &Path, _prompt_text: &str, _run_id: &str) -> anyhow::Result<()> {
         // TODO(@brianduff,2026-12-31): extract from worker_setup::write_workspace_files
         unimplemented!("extracted in the WorkspaceProvisioning task")
     }
@@ -131,10 +124,7 @@ mod tests {
             Capability::ToolProvisioning,
             Capability::PromptComposition,
         ] {
-            assert!(
-                caps.provides(cap),
-                "ClaudeDriver must provide {cap:?}",
-            );
+            assert!(caps.provides(cap), "ClaudeDriver must provide {cap:?}",);
         }
     }
 

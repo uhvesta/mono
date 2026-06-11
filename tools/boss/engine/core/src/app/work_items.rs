@@ -24,12 +24,7 @@ pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
     else {
         unreachable!()
     };
-    match work_db.list_tasks(
-        &product_id,
-        project_id.as_deref(),
-        dep_filter.as_ref(),
-        include_deleted,
-    ) {
+    match work_db.list_tasks(&product_id, project_id.as_deref(), dep_filter.as_ref(), include_deleted) {
         Ok(tasks) => {
             send_response_with_revision(
                 &sink,
@@ -139,11 +134,7 @@ pub(super) async fn handle_get_work_item_by_short_id(ctx: Dispatch, req: Fronten
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::GetWorkItemByShortId {
-        product_id,
-        short_id,
-    } = req
-    else {
+    let FrontendRequest::GetWorkItemByShortId { product_id, short_id } = req else {
         unreachable!()
     };
     match work_db.get_work_item_by_short_id(&product_id, short_id) {
@@ -224,15 +215,13 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         if input.created_via.is_none() {
-            input.created_via =
-                Some(transport_default_created_via(&server_state, &session_id).await);
+            input.created_via = Some(transport_default_created_via(&server_state, &session_id).await);
         }
         // A `--repo <slug>` override (e.g. `bduff`) names a
         // registered cube repo, not a git URL. Resolve it to the
         // canonical origin now so the durable row is dispatchable
         // and `cube repo ensure` never sees a bare slug (#861).
-        repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url])
-            .await;
+        repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
         match work_db.create_task(input) {
             Ok(task) => {
                 let item = WorkItem::Task(task);
@@ -247,12 +236,7 @@ pub(super) async fn handle_create_task(ctx: Dispatch, req: FrontendRequest) {
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemCreated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
             Err(err) => {
                 send_response(&sink, &request_id, duplicate_or_work_error(err));
@@ -275,13 +259,11 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         if input.created_via.is_none() {
-            input.created_via =
-                Some(transport_default_created_via(&server_state, &session_id).await);
+            input.created_via = Some(transport_default_created_via(&server_state, &session_id).await);
         }
         // Resolve a `--repo <slug>` override to its canonical cube
         // origin before persisting (#861); see the CreateTask arm.
-        repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url])
-            .await;
+        repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut [&mut input.repo_remote_url]).await;
         match work_db.create_chore(input) {
             Ok(task) => {
                 let item = WorkItem::Chore(task);
@@ -296,12 +278,7 @@ pub(super) async fn handle_create_chore(ctx: Dispatch, req: FrontendRequest) {
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemCreated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
             Err(err) => {
                 send_response(&sink, &request_id, duplicate_or_work_error(err));
@@ -332,11 +309,7 @@ pub(super) async fn handle_create_many_tasks(ctx: Dispatch, req: FrontendRequest
         // Resolve any `--repo <slug>` overrides in the batch to
         // canonical cube origins in a single registry round-trip (#861).
         {
-            let mut fields: Vec<&mut Option<String>> = input
-                .items
-                .iter_mut()
-                .map(|i| &mut i.repo_remote_url)
-                .collect();
+            let mut fields: Vec<&mut Option<String>> = input.items.iter_mut().map(|i| &mut i.repo_remote_url).collect();
             repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut fields).await;
         }
         handle_create_many(
@@ -374,11 +347,7 @@ pub(super) async fn handle_create_many_chores(ctx: Dispatch, req: FrontendReques
         // Resolve any `--repo <slug>` overrides in the batch to
         // canonical cube origins in a single registry round-trip (#861).
         {
-            let mut fields: Vec<&mut Option<String>> = input
-                .items
-                .iter_mut()
-                .map(|i| &mut i.repo_remote_url)
-                .collect();
+            let mut fields: Vec<&mut Option<String>> = input.items.iter_mut().map(|i| &mut i.repo_remote_url).collect();
             repo_slug::resolve_repo_slugs(&server_state.cube_client, &mut fields).await;
         }
         handle_create_many(
@@ -436,41 +405,43 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
             && previous_task_status
                 .as_ref()
                 .is_some_and(|prev| *prev != TaskStatus::Active);
-        if intends_active_transition && work_item_needs_dispatch(&work_db, &id)
-            && let Err(err) = work_db.precheck_dispatch_repo(&id) {
-                let work_item_id_for_event = id.clone();
-                let from_status = previous_task_status.clone();
-                let error_message = format!("{err:#}");
-                let details = serde_json::json!({
-                    "from_status": from_status,
-                    "to_status": "active",
-                    "did_dispatch": false,
-                    "rejected": true,
-                    "reason_if_skipped": error_message,
-                    "dispatched_execution_id": serde_json::Value::Null,
-                });
-                server_state
-                    .dispatch_events
-                    .emit(
-                        crate::dispatch_events::DispatchEvent::new(
-                            crate::dispatch_events::Stage::StatusTransition,
-                            crate::dispatch_events::Outcome::Error,
-                            work_item_id_for_event.clone(),
-                        )
-                        .with_work_item(work_item_id_for_event)
-                        .with_error(&err)
-                        .with_details(details),
+        if intends_active_transition
+            && work_item_needs_dispatch(&work_db, &id)
+            && let Err(err) = work_db.precheck_dispatch_repo(&id)
+        {
+            let work_item_id_for_event = id.clone();
+            let from_status = previous_task_status.clone();
+            let error_message = format!("{err:#}");
+            let details = serde_json::json!({
+                "from_status": from_status,
+                "to_status": "active",
+                "did_dispatch": false,
+                "rejected": true,
+                "reason_if_skipped": error_message,
+                "dispatched_execution_id": serde_json::Value::Null,
+            });
+            server_state
+                .dispatch_events
+                .emit(
+                    crate::dispatch_events::DispatchEvent::new(
+                        crate::dispatch_events::Stage::StatusTransition,
+                        crate::dispatch_events::Outcome::Error,
+                        work_item_id_for_event.clone(),
                     )
-                    .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkError {
-                        message: err.to_string(),
-                    },
-                );
-                return;
-            }
+                    .with_work_item(work_item_id_for_event)
+                    .with_error(&err)
+                    .with_details(details),
+                )
+                .await;
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
         let actor = resolve_status_actor(&server_state, peer_pid);
         match work_db.update_work_item_as_actor(&id, patch, actor) {
             Ok(item) => {
@@ -516,16 +487,11 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 // status is already `todo` from the patch above;
                 // autostart was cleared to 0 when the task first
                 // entered Doing, so it will not be re-dispatched.
-                if let Some(execution_id) =
-                    active_to_todo_execution(&work_db, &previous_task_status, &item)
-                {
+                if let Some(execution_id) = active_to_todo_execution(&work_db, &previous_task_status, &item) {
                     let handler = server_state.completion_handler.clone();
                     tokio::spawn(async move {
                         handler
-                            .cancel_and_release(
-                                &execution_id,
-                                "kanban drag: active → todo (dragged back to Backlog)",
-                            )
+                            .cancel_and_release(&execution_id, "kanban drag: active → todo (dragged back to Backlog)")
                             .await;
                     });
                 }
@@ -558,16 +524,15 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 if task_transitioned_to_active(&previous_task_status, &item) {
                     let work_item_id_for_event = work_item_id(&item);
                     let from_status = previous_task_status.clone();
-                    let needs_dispatch =
-                        work_item_needs_dispatch(&work_db, &work_item_id_for_event);
+                    let needs_dispatch = work_item_needs_dispatch(&work_db, &work_item_id_for_event);
                     let (dispatched_execution_id, did_dispatch, skip_reason) = if needs_dispatch {
                         let live_states = server_state.live_worker_states.clone();
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())
                             .build();
-                        match work_db.request_execution_with_live_check(dispatch_input, |run_id| {
-                            live_states.is_run_live(run_id)
-                        }) {
+                        match work_db
+                            .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))
+                        {
                             Ok(execution) => {
                                 server_state.execution_coordinator.kick();
                                 (Some(execution.id), true, None)
@@ -649,35 +614,27 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 // in sequence — that's acceptable per the acceptance
                 // criteria.
                 if let Some((old_name, old_description)) = previous_spec
-                    && let Some(run_id) = active_chore_run_id(&server_state, &item) {
-                        let (new_name, new_description) = match &item {
-                            WorkItem::Task(t) | WorkItem::Chore(t) => {
-                                (t.name.clone(), t.description.clone())
+                    && let Some(run_id) = active_chore_run_id(&server_state, &item)
+                {
+                    let (new_name, new_description) = match &item {
+                        WorkItem::Task(t) | WorkItem::Chore(t) => (t.name.clone(), t.description.clone()),
+                        _ => unreachable!("active_chore_run_id only returns Some for tasks/chores"),
+                    };
+                    if let Some(msg) =
+                        build_chore_update_message(&old_name, &new_name, &old_description, &new_description)
+                    {
+                        let server_for_notify = server_state.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = server_for_notify.send_input_to_worker(&run_id, msg).await {
+                                tracing::warn!(
+                                    ?err,
+                                    %run_id,
+                                    "chore-update: failed to notify live worker",
+                                );
                             }
-                            _ => unreachable!(
-                                "active_chore_run_id only returns Some for tasks/chores"
-                            ),
-                        };
-                        if let Some(msg) = build_chore_update_message(
-                            &old_name,
-                            &new_name,
-                            &old_description,
-                            &new_description,
-                        ) {
-                            let server_for_notify = server_state.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) =
-                                    server_for_notify.send_input_to_worker(&run_id, msg).await
-                                {
-                                    tracing::warn!(
-                                        ?err,
-                                        %run_id,
-                                        "chore-update: failed to notify live worker",
-                                    );
-                                }
-                            });
-                        }
+                        });
                     }
+                }
                 let revision = publish_work_invalidation(
                     &server_state,
                     &session_id,
@@ -688,12 +645,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => {
                 send_response(
@@ -738,10 +690,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     let handler = server_state.completion_handler.clone();
                     tokio::spawn(async move {
                         handler
-                            .cancel_and_release(
-                                &execution_id,
-                                "work item deleted while a worker was active",
-                            )
+                            .cancel_and_release(&execution_id, "work item deleted while a worker was active")
                             .await;
                     });
                 }
@@ -756,12 +705,7 @@ pub(super) async fn handle_delete_work_item(ctx: Dispatch, req: FrontendRequest)
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemDeleted { id },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemDeleted { id });
             }
             Err(err) => {
                 send_response(
@@ -815,12 +759,7 @@ pub(super) async fn handle_restore_work_item(ctx: Dispatch, req: FrontendRequest
                 vec![work_item_id(&item)],
             )
             .await;
-            send_response_with_revision(
-                &sink,
-                &request_id,
-                revision,
-                FrontendEvent::WorkItemRestored { item },
-            );
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemRestored { item });
         }
         Err(err) => {
             send_response(
@@ -911,11 +850,7 @@ pub(super) async fn handle_reveal_work_item(ctx: Dispatch, req: FrontendRequest)
                     canonical_id = %canonical_id,
                     "reveal_work_item: card highlighted",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkItemRevealed { id: canonical_id },
-                );
+                send_response(&sink, &request_id, FrontendEvent::WorkItemRevealed { id: canonical_id });
             }
             Err(err) => {
                 tracing::warn!(?err, id = %id, "reveal_work_item failed");
@@ -958,12 +893,7 @@ pub(super) async fn handle_create_investigation(ctx: Dispatch, req: FrontendRequ
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemCreated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
             Err(err) => send_response(
                 &sink,
@@ -1003,12 +933,7 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemCreated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
             Err(err) => send_response(
                 &sink,

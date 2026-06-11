@@ -66,21 +66,24 @@ pub fn embedded_config() -> Result<AppConfig> {
     // always sets the vars (to "" when no --define override is passed),
     // so option_env! returns Some("") for dev builds. Treat that the same
     // as absent so the sentinel error fires instead of an empty-creds failure.
-    let app_id = EMBEDDED_APP_ID.filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!(
+    let app_id = EMBEDDED_APP_ID.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow!(
             "this build was produced without shake credentials; \
              see tools/boss/cli/README.md for developer setup instructions"
-        ))?;
-    let installation_id = EMBEDDED_INSTALLATION_ID.filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!(
+        )
+    })?;
+    let installation_id = EMBEDDED_INSTALLATION_ID.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow!(
             "this build was produced without shake credentials; \
              see tools/boss/cli/README.md for developer setup instructions"
-        ))?;
-    let private_key_pem = EMBEDDED_PRIVATE_KEY_PEM.filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!(
+        )
+    })?;
+    let private_key_pem = EMBEDDED_PRIVATE_KEY_PEM.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow!(
             "this build was produced without shake credentials; \
              see tools/boss/cli/README.md for developer setup instructions"
-        ))?;
+        )
+    })?;
     Ok(AppConfig {
         app_id: app_id.to_owned(),
         installation_id: installation_id.to_owned(),
@@ -122,8 +125,8 @@ pub fn build_jwt(app_id: &str, private_key_pem: &[u8]) -> Result<String> {
 
 /// `build_jwt` with the issued-at time injected so tests can pin it.
 fn build_jwt_at(app_id: &str, private_key_pem: &[u8], iat: u64) -> Result<String> {
-    let key = EncodingKey::from_rsa_pem(private_key_pem)
-        .context("parse GitHub App private key (must be PEM-encoded RSA)")?;
+    let key =
+        EncodingKey::from_rsa_pem(private_key_pem).context("parse GitHub App private key (must be PEM-encoded RSA)")?;
 
     #[derive(Serialize)]
     struct Claims<'a> {
@@ -177,11 +180,7 @@ fn github_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
 /// `{context} returned {status}: {body}`, optionally followed by a
 /// `hint` line. On success the response is returned for further
 /// decoding.
-async fn ensure_success(
-    resp: reqwest::Response,
-    context: &str,
-    hint: Option<&str>,
-) -> Result<reqwest::Response> {
+async fn ensure_success(resp: reqwest::Response, context: &str, hint: Option<&str>) -> Result<reqwest::Response> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -211,10 +210,7 @@ async fn fetch_installation_token(
         .with_context(|| format!("POST {url}"))?;
 
     let resp = ensure_success(resp, "installation token exchange", None).await?;
-    let parsed: InstallationTokenResponse = resp
-        .json()
-        .await
-        .context("decode installation token response")?;
+    let parsed: InstallationTokenResponse = resp.json().await.context("decode installation token response")?;
     Ok(parsed.token)
 }
 
@@ -241,11 +237,7 @@ async fn create_issue(
     token: &str,
     client: &reqwest::Client,
 ) -> Result<IssueResponse> {
-    let url = format!(
-        "{}/repos/{}/issues",
-        api_base.trim_end_matches('/'),
-        repo
-    );
+    let url = format!("{}/repos/{}/issues", api_base.trim_end_matches('/'), repo);
     // Append a hidden attribution comment so the issue source is
     // traceable even if the via-shake label is manually removed.
     let attributed_body = format!("{body}\n\n<!-- via boss shake -->");
@@ -328,20 +320,18 @@ pub async fn add_issue_to_project(
     )
     .await?;
 
-    let parsed: GraphqlResponse = resp
-        .json()
-        .await
-        .context("decode add-to-project GraphQL response")?;
+    let parsed: GraphqlResponse = resp.json().await.context("decode add-to-project GraphQL response")?;
 
     if let Some(errors) = parsed.errors
-        && !errors.is_empty() {
-            let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
-            bail!(
-                "add-to-project GraphQL mutation failed: {}\n\
+        && !errors.is_empty()
+    {
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        bail!(
+            "add-to-project GraphQL mutation failed: {}\n\
                  hint: confirm the GitHub App has Projects read/write permission",
-                messages.join("; ")
-            );
-        }
+            messages.join("; ")
+        );
+    }
 
     Ok(())
 }
@@ -475,8 +465,7 @@ mod tests {
             .and(path("/app/installations/67890/access_tokens"))
             .and(header("user-agent", USER_AGENT))
             .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_json(serde_json::json!({"token": "v1.installation-token"})),
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({"token": "v1.installation-token"})),
             )
             .mount(&server)
             .await;
@@ -518,10 +507,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/app/installations/67890/access_tokens"))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_json(serde_json::json!({"token": "v1.token"})),
-            )
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({"token": "v1.token"})))
             .mount(&server)
             .await;
 
@@ -553,13 +539,9 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/issues"))
             .expect("issue-create request was not captured");
-        let body: serde_json::Value =
-            serde_json::from_slice(&issue_req.body).expect("issue body is JSON");
+        let body: serde_json::Value = serde_json::from_slice(&issue_req.body).expect("issue body is JSON");
         let labels = body["labels"].as_array().expect("labels is an array");
-        let label_strs: Vec<&str> = labels
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
+        let label_strs: Vec<&str> = labels.iter().filter_map(|v| v.as_str()).collect();
         assert!(
             label_strs.contains(&"via-shake"),
             "via-shake must be in the labels array; got: {label_strs:?}"
@@ -575,10 +557,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/app/installations/67890/access_tokens"))
-            .respond_with(
-                ResponseTemplate::new(401)
-                    .set_body_string("{\"message\":\"Bad credentials\"}"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("{\"message\":\"Bad credentials\"}"))
             .mount(&server)
             .await;
 
@@ -629,16 +608,13 @@ mod tests {
             .iter()
             .find(|r| r.url.path() == "/graphql")
             .expect("graphql request was not captured");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).expect("request body is JSON");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("request body is JSON");
         assert_eq!(
-            body["variables"]["projectId"],
-            "PVT_kwDOAvvvSM4BX0pJ",
+            body["variables"]["projectId"], "PVT_kwDOAvvvSM4BX0pJ",
             "projectId variable must match"
         );
         assert_eq!(
-            body["variables"]["contentId"],
-            "I_kwDOAvvvSM4BX0pJ",
+            body["variables"]["contentId"], "I_kwDOAvvvSM4BX0pJ",
             "contentId variable must match"
         );
     }
@@ -687,10 +663,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/graphql"))
-            .respond_with(
-                ResponseTemplate::new(403)
-                    .set_body_string("{\"message\":\"Forbidden\"}"),
-            )
+            .respond_with(ResponseTemplate::new(403).set_body_string("{\"message\":\"Forbidden\"}"))
             .mount(&server)
             .await;
 
@@ -707,10 +680,7 @@ mod tests {
         .unwrap_err();
 
         let msg = err.to_string();
-        assert!(
-            msg.contains("403"),
-            "error should surface HTTP 403: {msg}"
-        );
+        assert!(msg.contains("403"), "error should surface HTTP 403: {msg}");
         assert!(
             msg.contains("Projects read/write permission"),
             "error should hint about missing permission: {msg}"

@@ -145,10 +145,7 @@ mod tests {
 
     #[test]
     fn prepare_creates_dir_and_clears_stale() {
-        let root = std::env::temp_dir().join(format!(
-            "boss-so-test-prepare-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("boss-so-test-prepare-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join("nested");
         // Pre-seed a stale artifact so prepare must clear it.
@@ -166,10 +163,7 @@ mod tests {
 
     #[test]
     fn read_roundtrips_written_content_and_treats_empty_as_absent() {
-        let dir = std::env::temp_dir().join(format!(
-            "boss-so-test-read-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("boss-so-test-read-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -187,10 +181,7 @@ mod tests {
 
     #[test]
     fn clear_removes_file_and_is_idempotent() {
-        let dir = std::env::temp_dir().join(format!(
-            "boss-so-test-clear-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("boss-so-test-clear-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = path_in(&dir, "e1");

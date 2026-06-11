@@ -5,10 +5,9 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use super::{
-    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
-    GeneratedExternalCheckPackageProvider, parse_external_check_package_manifest,
+    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider, ExternalCheckImplementationRef,
+    ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider, parse_external_check_package_manifest,
 };
 
 struct StaticProvider {
@@ -204,8 +203,8 @@ artifact_sha256 = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABC
 
 #[test]
 fn parses_generated_implementation_ref() {
-    let implementation_ref = ExternalCheckImplementationRef::parse("generated:domain-typo-check")
-        .expect("valid generated ref");
+    let implementation_ref =
+        ExternalCheckImplementationRef::parse("generated:domain-typo-check").expect("valid generated ref");
     assert!(matches!(
         implementation_ref,
         ExternalCheckImplementationRef::Generated(ref id) if id == "domain-typo-check"
@@ -215,13 +214,10 @@ fn parses_generated_implementation_ref() {
 #[test]
 fn parses_file_implementation_ref() {
     let implementation_ref =
-        ExternalCheckImplementationRef::parse("checks/workflow-shell-strict/check.toml")
-            .expect("valid file ref");
+        ExternalCheckImplementationRef::parse("checks/workflow-shell-strict/check.toml").expect("valid file ref");
     assert_eq!(
         implementation_ref,
-        ExternalCheckImplementationRef::File(PathBuf::from(
-            "checks/workflow-shell-strict/check.toml"
-        ))
+        ExternalCheckImplementationRef::File(PathBuf::from("checks/workflow-shell-strict/check.toml"))
     );
 }
 
@@ -233,8 +229,7 @@ fn rejects_empty_generated_id() {
 
 #[test]
 fn parses_bundled_implementation_ref() {
-    let implementation_ref =
-        ExternalCheckImplementationRef::parse("bundled:buildifier").expect("valid bundled ref");
+    let implementation_ref = ExternalCheckImplementationRef::parse("bundled:buildifier").expect("valid bundled ref");
     assert!(matches!(
         implementation_ref,
         ExternalCheckImplementationRef::Bundled(ref name) if name == "buildifier"
@@ -251,8 +246,7 @@ fn rejects_empty_bundled_name() {
 
 #[test]
 fn rejects_bundled_name_with_path_separator() {
-    let error =
-        ExternalCheckImplementationRef::parse("bundled:foo/bar").expect_err("must fail");
+    let error = ExternalCheckImplementationRef::parse("bundled:foo/bar").expect_err("must fail");
     assert!(error.to_string().contains("single segment"));
 }
 
@@ -281,10 +275,7 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 
     let provider = FileExternalCheckPackageProvider::new(temp.path()).expect("provider");
     let package = provider
-        .resolve(
-            &ExternalCheckImplementationRef::parse("checks/workflow/check.toml")
-                .expect("implementation"),
-        )
+        .resolve(&ExternalCheckImplementationRef::parse("checks/workflow/check.toml").expect("implementation"))
         .expect("resolve")
         .expect("package");
 
@@ -319,16 +310,11 @@ manifest = "./domain_typo.check.toml"
     )
     .expect("write index");
 
-    let provider = GeneratedExternalCheckPackageProvider::from_index_path(
-        temp.path(),
-        &PathBuf::from("generated/index.toml"),
-    )
-    .expect("provider");
+    let provider =
+        GeneratedExternalCheckPackageProvider::from_index_path(temp.path(), &PathBuf::from("generated/index.toml"))
+            .expect("provider");
     let package = provider
-        .resolve(
-            &ExternalCheckImplementationRef::parse("generated:domain-typo-check")
-                .expect("implementation"),
-        )
+        .resolve(&ExternalCheckImplementationRef::parse("generated:domain-typo-check").expect("implementation"))
         .expect("resolve")
         .expect("package");
 
@@ -347,11 +333,9 @@ version = 2
     )
     .expect("write index");
 
-    let error = GeneratedExternalCheckPackageProvider::from_index_path(
-        temp.path(),
-        &PathBuf::from("generated/index.toml"),
-    )
-    .expect_err("must reject unsupported version");
+    let error =
+        GeneratedExternalCheckPackageProvider::from_index_path(temp.path(), &PathBuf::from("generated/index.toml"))
+            .expect_err("must reject unsupported version");
     assert!(
         error
             .to_string()
@@ -365,18 +349,15 @@ fn composite_provider_reports_conflicts() {
         id: "domain-typo-check".to_owned(),
         runtime: "component-v1".to_owned(),
         api_version: "v1".to_owned(),
-        implementation: ExternalCheckPackageImplementation::Component(
-            super::ExternalCheckComponentPackage {
-                artifact_path: "check.wasm".to_owned(),
-                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_owned(),
-                artifact_bytes: None,
-                check_name: "domain-typo-check".to_owned(),
-                limits: None,
-                checks: None,
-                provenance: None,
-            },
-        ),
+        implementation: ExternalCheckPackageImplementation::Component(super::ExternalCheckComponentPackage {
+            artifact_path: "check.wasm".to_owned(),
+            artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            artifact_bytes: None,
+            check_name: "domain-typo-check".to_owned(),
+            limits: None,
+            checks: None,
+            provenance: None,
+        }),
     };
 
     let provider = CompositeExternalCheckPackageProvider::new(vec![
@@ -386,19 +367,11 @@ fn composite_provider_reports_conflicts() {
                 package: Some(package.clone()),
             }),
         ),
-        ConfiguredExternalCheckPackageProvider::new(
-            "p2",
-            Arc::new(StaticProvider {
-                package: Some(package),
-            }),
-        ),
+        ConfiguredExternalCheckPackageProvider::new("p2", Arc::new(StaticProvider { package: Some(package) })),
     ]);
 
     let error = provider
-        .resolve(
-            &ExternalCheckImplementationRef::parse("generated:domain-typo-check")
-                .expect("implementation"),
-        )
+        .resolve(&ExternalCheckImplementationRef::parse("generated:domain-typo-check").expect("implementation"))
         .expect_err("must fail");
     assert!(error.to_string().contains("multiple providers"));
 }
@@ -409,25 +382,19 @@ fn composite_provider_resolves_component_package() {
         id: "my-check".to_owned(),
         runtime: super::EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: super::EXTERNAL_CHECK_API_V1.to_owned(),
-        implementation: ExternalCheckPackageImplementation::Component(
-            super::ExternalCheckComponentPackage {
-                artifact_path: "checks/my_check.wasm".to_owned(),
-                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    .to_owned(),
-                artifact_bytes: None,
-                check_name: "my-check".to_owned(),
-                limits: None,
-                checks: None,
-                provenance: None,
-            },
-        ),
+        implementation: ExternalCheckPackageImplementation::Component(super::ExternalCheckComponentPackage {
+            artifact_path: "checks/my_check.wasm".to_owned(),
+            artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            artifact_bytes: None,
+            check_name: "my-check".to_owned(),
+            limits: None,
+            checks: None,
+            provenance: None,
+        }),
     };
 
     let provider = CompositeExternalCheckPackageProvider::new(vec![
-        ConfiguredExternalCheckPackageProvider::new(
-            "bundled",
-            Arc::new(StaticProvider { package: None }),
-        ),
+        ConfiguredExternalCheckPackageProvider::new("bundled", Arc::new(StaticProvider { package: None })),
         ConfiguredExternalCheckPackageProvider::new(
             "file",
             Arc::new(StaticProvider {
@@ -437,9 +404,7 @@ fn composite_provider_resolves_component_package() {
     ]);
 
     let resolved = provider
-        .resolve(
-            &ExternalCheckImplementationRef::parse("generated:my-check").expect("implementation"),
-        )
+        .resolve(&ExternalCheckImplementationRef::parse("generated:my-check").expect("implementation"))
         .expect("resolve")
         .expect("package");
 
@@ -456,38 +421,24 @@ fn composite_provider_no_conflict_when_only_one_resolves_component() {
         id: "unique-check".to_owned(),
         runtime: super::EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: super::EXTERNAL_CHECK_API_V1.to_owned(),
-        implementation: ExternalCheckPackageImplementation::Component(
-            super::ExternalCheckComponentPackage {
-                artifact_path: "checks/unique.wasm".to_owned(),
-                artifact_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                    .to_owned(),
-                artifact_bytes: None,
-                check_name: "unique-check".to_owned(),
-                limits: None,
-                checks: None,
-                provenance: None,
-            },
-        ),
+        implementation: ExternalCheckPackageImplementation::Component(super::ExternalCheckComponentPackage {
+            artifact_path: "checks/unique.wasm".to_owned(),
+            artifact_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
+            artifact_bytes: None,
+            check_name: "unique-check".to_owned(),
+            limits: None,
+            checks: None,
+            provenance: None,
+        }),
     };
 
     let provider = CompositeExternalCheckPackageProvider::new(vec![
-        ConfiguredExternalCheckPackageProvider::new(
-            "p-hit",
-            Arc::new(StaticProvider {
-                package: Some(package),
-            }),
-        ),
-        ConfiguredExternalCheckPackageProvider::new(
-            "p-miss",
-            Arc::new(StaticProvider { package: None }),
-        ),
+        ConfiguredExternalCheckPackageProvider::new("p-hit", Arc::new(StaticProvider { package: Some(package) })),
+        ConfiguredExternalCheckPackageProvider::new("p-miss", Arc::new(StaticProvider { package: None })),
     ]);
 
     let resolved = provider
-        .resolve(
-            &ExternalCheckImplementationRef::parse("generated:unique-check")
-                .expect("implementation"),
-        )
+        .resolve(&ExternalCheckImplementationRef::parse("generated:unique-check").expect("implementation"))
         .expect("resolve")
         .expect("package");
     assert_eq!(resolved.id, "unique-check");
@@ -533,8 +484,7 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
     let provider = FileExternalCheckPackageProvider::new(temp.path()).expect("provider");
     let package = provider
         .resolve(
-            &ExternalCheckImplementationRef::parse("checks/my-component-check/check.toml")
-                .expect("implementation"),
+            &ExternalCheckImplementationRef::parse("checks/my-component-check/check.toml").expect("implementation"),
         )
         .expect("resolve")
         .expect("package");

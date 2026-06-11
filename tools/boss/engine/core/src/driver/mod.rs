@@ -108,11 +108,7 @@ impl CapabilitySet {
 
     /// Override the absence disposition for a capability this driver does not
     /// provide. Chainable builder method.
-    pub fn with_absence_override(
-        mut self,
-        cap: Capability,
-        disposition: AbsenceDisposition,
-    ) -> Self {
+    pub fn with_absence_override(mut self, cap: Capability, disposition: AbsenceDisposition) -> Self {
         self.absence_overrides.insert(cap, disposition);
         self
     }
@@ -170,12 +166,9 @@ impl KindRequirements {
     /// Empty means no escalations beyond per-capability defaults.
     pub fn for_kind(kind: TaskKind) -> Self {
         let required_strict = match kind {
-            TaskKind::Design => [
-                Capability::StructuredOutput,
-                Capability::ToolUseInterception,
-            ]
-            .into_iter()
-            .collect(),
+            TaskKind::Design => [Capability::StructuredOutput, Capability::ToolUseInterception]
+                .into_iter()
+                .collect(),
             _ => HashSet::new(),
         };
         Self { required_strict }
@@ -250,12 +243,7 @@ pub trait AgentDriver: Send + Sync {
 
     /// Write per-session workspace files (prompt file, agent-rules, gitignore)
     /// and suppress the backend's first-run trust prompt.
-    async fn provision_workspace(
-        &self,
-        workspace: &Path,
-        prompt_text: &str,
-        run_id: &str,
-    ) -> anyhow::Result<()>;
+    async fn provision_workspace(&self, workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<()>;
 
     // ── PermissionPolicy capability ─────────────────────────────────────────
 
@@ -314,10 +302,7 @@ mod tests {
     #[test]
     fn provided_capability_resolves_to_none() {
         let reqs = KindRequirements::for_kind(TaskKind::Design);
-        let all_caps = CapabilitySet::new([
-            Capability::StructuredOutput,
-            Capability::ToolUseInterception,
-        ]);
+        let all_caps = CapabilitySet::new([Capability::StructuredOutput, Capability::ToolUseInterception]);
 
         assert_eq!(
             reqs.resolve_absence_disposition(Capability::StructuredOutput, &all_caps),
@@ -327,8 +312,8 @@ mod tests {
 
     #[test]
     fn absence_override_takes_precedence_over_default() {
-        let caps = CapabilitySet::new([])
-            .with_absence_override(Capability::ToolUseInterception, AbsenceDisposition::Refuse);
+        let caps =
+            CapabilitySet::new([]).with_absence_override(Capability::ToolUseInterception, AbsenceDisposition::Refuse);
 
         // Default for ToolUseInterception is Degrade; override makes it Refuse.
         assert_eq!(

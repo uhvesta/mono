@@ -12,8 +12,8 @@ use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 use super::rust_giant_struct_common::{
-    DEFAULT_MAX_FIELDS, has_cfg_test, is_excluded, is_literal_path, parse_exclude_files,
-    strip_visibility, struct_declaration_line,
+    DEFAULT_MAX_FIELDS, has_cfg_test, is_excluded, is_literal_path, parse_exclude_files, strip_visibility,
+    struct_declaration_line,
 };
 
 const CHECK_ID: &str = "rust-giant-struct-instantiation-use-builder";
@@ -84,11 +84,7 @@ impl Check for RustGiantStructInstantiationUseBuilderCheck {
         Ok(Arc::new(parse_config(config, None)?))
     }
 
-    fn configure_scoped(
-        &self,
-        config: &toml::Value,
-        config_dir: Option<&Path>,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_scoped(&self, config: &toml::Value, config_dir: Option<&Path>) -> Result<Arc<dyn ConfiguredCheck>> {
         Ok(Arc::new(parse_config(config, config_dir)?))
     }
 }
@@ -137,12 +133,7 @@ impl ConfiguredCheck for ParsedConfig {
 
             // Collect large struct literals (name, explicit field count) from this file.
             let mut large_literals: Vec<(String, usize)> = Vec::new();
-            collect_large_literals_in_items(
-                &parsed_file.items,
-                false,
-                self.max_fields,
-                &mut large_literals,
-            );
+            collect_large_literals_in_items(&parsed_file.items, false, self.max_fields, &mut large_literals);
 
             // Emit one finding per unique struct name (all literal sites for that name).
             let mut seen: HashSet<String> = HashSet::new();
@@ -168,8 +159,7 @@ impl ConfiguredCheck for ParsedConfig {
                     "Add `#[derive(bon::Builder)]` (and `#[builder(on(String, into))]` per \
                      the project convention) if the struct does not already have a builder."
                         .to_owned(),
-                    "Permanently exempt a struct by adding it to `exclude_structs` in the `CHECKS` file."
-                        .to_owned(),
+                    "Permanently exempt a struct by adding it to `exclude_structs` in the `CHECKS` file.".to_owned(),
                 ];
 
                 let lines = find_struct_literal_lines(source, name);
@@ -207,11 +197,7 @@ impl ConfiguredCheck for ParsedConfig {
         exclusion: &DeclaredExclusion,
         tree: &dyn SourceTree,
     ) -> Result<ExclusionStatus> {
-        let Some(spec) = self
-            .auditable_exclusions
-            .iter()
-            .find(|c| c.entry == exclusion.entry)
-        else {
+        let Some(spec) = self.auditable_exclusions.iter().find(|c| c.entry == exclusion.entry) else {
             return Ok(ExclusionStatus::Unknown);
         };
 
@@ -221,10 +207,7 @@ impl ConfiguredCheck for ParsedConfig {
                     Ok(ExclusionStatus::LoadBearing)
                 } else {
                     Ok(ExclusionStatus::Stale {
-                        reason: format!(
-                            "the excluded file `{}` no longer exists",
-                            spec.path.display()
-                        ),
+                        reason: format!("the excluded file `{}` no longer exists", spec.path.display()),
                     })
                 }
             }
@@ -262,27 +245,24 @@ impl ConfiguredCheck for ParsedConfig {
 
 /// Returns true if any named struct called `name` in `items` (or nested non-test mods)
 /// has more than `max_fields` named fields and is not in a `#[cfg(test)]` context.
-fn struct_is_giant(
-    items: &[syn::Item],
-    name: &str,
-    max_fields: usize,
-    in_test_mod: bool,
-) -> bool {
+fn struct_is_giant(items: &[syn::Item], name: &str, max_fields: usize, in_test_mod: bool) -> bool {
     for item in items {
         match item {
             syn::Item::Struct(s) if !in_test_mod && !has_cfg_test(&s.attrs) => {
                 if s.ident == name
                     && let syn::Fields::Named(named) = &s.fields
-                        && named.named.len() > max_fields {
-                            return true;
-                        }
+                    && named.named.len() > max_fields
+                {
+                    return true;
+                }
             }
             syn::Item::Mod(m) => {
                 let is_test = has_cfg_test(&m.attrs);
                 if let Some((_, sub_items)) = &m.content
-                    && struct_is_giant(sub_items, name, max_fields, in_test_mod || is_test) {
-                        return true;
-                    }
+                    && struct_is_giant(sub_items, name, max_fields, in_test_mod || is_test)
+                {
+                    return true;
+                }
             }
             _ => {}
         }
@@ -338,12 +318,7 @@ fn collect_large_literals_in_items(
             syn::Item::Mod(m) => {
                 let is_test = has_cfg_test(&m.attrs);
                 if let Some((_, sub_items)) = &m.content {
-                    collect_large_literals_in_items(
-                        sub_items,
-                        in_test_mod || is_test,
-                        max_fields,
-                        out,
-                    );
+                    collect_large_literals_in_items(sub_items, in_test_mod || is_test, max_fields, out);
                 }
             }
             _ => {}
@@ -351,11 +326,7 @@ fn collect_large_literals_in_items(
     }
 }
 
-fn collect_large_in_block(
-    block: &syn::Block,
-    max_fields: usize,
-    out: &mut Vec<(String, usize)>,
-) {
+fn collect_large_in_block(block: &syn::Block, max_fields: usize, out: &mut Vec<(String, usize)>) {
     for stmt in &block.stmts {
         match stmt {
             syn::Stmt::Local(l) => {
@@ -367,12 +338,7 @@ fn collect_large_in_block(
                 }
             }
             syn::Stmt::Item(item) => {
-                collect_large_literals_in_items(
-                    std::slice::from_ref(item),
-                    false,
-                    max_fields,
-                    out,
-                );
+                collect_large_literals_in_items(std::slice::from_ref(item), false, max_fields, out);
             }
             syn::Stmt::Expr(e, _) => collect_large_in_expr(e, max_fields, out),
             syn::Stmt::Macro(_) => {}
@@ -380,11 +346,7 @@ fn collect_large_in_block(
     }
 }
 
-fn collect_large_in_expr(
-    expr: &syn::Expr,
-    max_fields: usize,
-    out: &mut Vec<(String, usize)>,
-) {
+fn collect_large_in_expr(expr: &syn::Expr, max_fields: usize, out: &mut Vec<(String, usize)>) {
     match expr {
         syn::Expr::Struct(s) => {
             let name = s
@@ -519,11 +481,7 @@ fn find_struct_literal_lines(source: &str, struct_name: &str) -> Vec<u32> {
         }
         lines.push((i + 1) as u32);
     }
-    if lines.is_empty() {
-        vec![1]
-    } else {
-        lines
-    }
+    if lines.is_empty() { vec![1] } else { lines }
 }
 
 fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<ParsedConfig> {
@@ -559,10 +517,7 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
                 path: resolved.clone(),
                 kind: AuditKind::Struct(name_part.clone()),
             });
-            exclude_structs_qualified
-                .entry(resolved)
-                .or_default()
-                .insert(name_part);
+            exclude_structs_qualified.entry(resolved).or_default().insert(name_part);
         } else {
             exclude_structs.insert(entry);
         }
@@ -613,11 +568,7 @@ mod tests {
             kind: ChangeKind::Modified,
             old_path: None,
         }]);
-        check
-            .run(&changeset, &tree, &config)
-            .await
-            .expect("run check")
-            .findings
+        check.run(&changeset, &tree, &config).await.expect("run check").findings
     }
 
     async fn run_check(source: &str, config: toml::Value) -> Vec<String> {
@@ -655,7 +606,10 @@ fn make() -> Small {
 }
 "#;
         let messages = run_check(source, toml::Value::Table(toml::Table::new())).await;
-        assert!(messages.is_empty(), "small literal should not be flagged, got {messages:?}");
+        assert!(
+            messages.is_empty(),
+            "small literal should not be flagged, got {messages:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -784,7 +738,10 @@ fn make() -> Big { Big { a: String::new(), b: String::new(), c: String::new(), d
             .into_iter()
             .map(|f| f.message)
             .collect();
-        assert!(messages.is_empty(), "excluded file should not be flagged, got {messages:?}");
+        assert!(
+            messages.is_empty(),
+            "excluded file should not be flagged, got {messages:?}"
+        );
     }
 
     #[tokio::test]
@@ -792,12 +749,11 @@ fn make() -> Big { Big { a: String::new(), b: String::new(), c: String::new(), d
         let source = r#"
 fn make() -> Big { Big { a: String::new(), b: String::new(), c: String::new(), d: String::new(), e: String::new(), f: String::new() } }
 "#;
-        let messages = run_check(
-            source,
-            toml::Value::Table(toml::toml! { exclude_structs = ["Big"] }),
-        )
-        .await;
-        assert!(messages.is_empty(), "excluded struct should not be flagged, got {messages:?}");
+        let messages = run_check(source, toml::Value::Table(toml::toml! { exclude_structs = ["Big"] })).await;
+        assert!(
+            messages.is_empty(),
+            "excluded struct should not be flagged, got {messages:?}"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -813,7 +769,11 @@ fn make() -> Medium {
 "#;
         let config = toml::Value::Table(toml::toml! { max_fields = 2 });
         let messages = run_check(source, config).await;
-        assert_eq!(messages.len(), 1, "expected one finding with max_fields=2, got {messages:?}");
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected one finding with max_fields=2, got {messages:?}"
+        );
         assert!(messages[0].contains("Medium"), "{}", messages[0]);
     }
 
@@ -821,10 +781,7 @@ fn make() -> Medium {
     // Stale-exclusion auditing
     // -------------------------------------------------------------------------
 
-    fn configured(
-        config: toml::Value,
-        config_dir: Option<&Path>,
-    ) -> std::sync::Arc<dyn ConfiguredCheck> {
+    fn configured(config: toml::Value, config_dir: Option<&Path>) -> std::sync::Arc<dyn ConfiguredCheck> {
         RustGiantStructInstantiationUseBuilderCheck
             .configure_scoped(&config, config_dir)
             .expect("configure_scoped")
@@ -850,8 +807,7 @@ pub struct Big {
             toml::Value::Table(toml::toml! { exclude_structs = ["types.rs::Big"] }),
             Some(Path::new("")),
         );
-        let exclusion =
-            crate::exclusion::DeclaredExclusion::new("types.rs::Big", vec!["types.rs".into()]);
+        let exclusion = crate::exclusion::DeclaredExclusion::new("types.rs::Big", vec!["types.rs".into()]);
         let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         assert_eq!(status, ExclusionStatus::LoadBearing);
     }
@@ -865,8 +821,7 @@ pub struct Big {
             toml::Value::Table(toml::toml! { exclude_structs = ["types.rs::Big"] }),
             Some(Path::new("")),
         );
-        let exclusion =
-            crate::exclusion::DeclaredExclusion::new("types.rs::Big", vec!["types.rs".into()]);
+        let exclusion = crate::exclusion::DeclaredExclusion::new("types.rs::Big", vec!["types.rs".into()]);
         let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         match status {
             ExclusionStatus::Stale { reason } => {
@@ -887,8 +842,7 @@ pub struct Big {
             toml::Value::Table(toml::toml! { exclude_structs = ["types.rs::Big"] }),
             Some(Path::new("")),
         );
-        let exclusion =
-            crate::exclusion::DeclaredExclusion::new("types.rs::Big", vec!["types.rs".into()]);
+        let exclusion = crate::exclusion::DeclaredExclusion::new("types.rs::Big", vec!["types.rs".into()]);
         let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         match status {
             ExclusionStatus::Stale { reason } => {

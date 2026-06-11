@@ -17,12 +17,7 @@ use tokio::process::Command;
 /// `--method GET` is required so `-f ref=` lands in the query string (gh
 /// otherwise switches to POST once a field is added), which also makes gh
 /// URL-encode slashed branch / ref names like `boss/exec_*` correctly.
-pub async fn fetch_repo_file(
-    owner: &str,
-    repo: &str,
-    path: &str,
-    ref_name: &str,
-) -> anyhow::Result<Option<String>> {
+pub async fn fetch_repo_file(owner: &str, repo: &str, path: &str, ref_name: &str) -> anyhow::Result<Option<String>> {
     let endpoint = format!("repos/{owner}/{repo}/contents/{path}");
     let output = Command::new("gh")
         .args([
@@ -43,9 +38,7 @@ pub async fn fetch_repo_file(
         .await?;
 
     if output.status.success() {
-        return Ok(Some(
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ));
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -420,10 +420,7 @@ impl JsonlFileSink {
     }
 
     fn execution_path(&self, execution_id: &str) -> PathBuf {
-        self.root
-            .join("executions")
-            .join(execution_id)
-            .join("dispatch.jsonl")
+        self.root.join("executions").join(execution_id).join("dispatch.jsonl")
     }
 
     fn append_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
@@ -431,10 +428,7 @@ impl JsonlFileSink {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
         file.write_all(line)?;
         file.write_all(b"\n")?;
         Ok(())
@@ -508,32 +502,19 @@ mod tests {
         assert!(lines[1].contains("pane_spawned"));
         assert!(lines[1].contains("app refused spawn"));
 
-        let mirror =
-            fs::read_to_string(dir.path().join("executions/exec-a/dispatch.jsonl")).unwrap();
+        let mirror = fs::read_to_string(dir.path().join("executions/exec-a/dispatch.jsonl")).unwrap();
         assert_eq!(mirror.lines().count(), 2);
     }
 
     #[tokio::test]
     async fn recording_sink_collects_events_per_execution() {
         let sink = RecordingDispatchEventSink::new();
-        sink.emit(DispatchEvent::new(
-            Stage::RequestRecorded,
-            Outcome::Ok,
-            "exec-1",
-        ))
-        .await;
-        sink.emit(DispatchEvent::new(
-            Stage::WorkerClaimed,
-            Outcome::Skipped,
-            "exec-2",
-        ))
-        .await;
-        sink.emit(DispatchEvent::new(
-            Stage::PaneSpawned,
-            Outcome::Error,
-            "exec-1",
-        ))
-        .await;
+        sink.emit(DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1"))
+            .await;
+        sink.emit(DispatchEvent::new(Stage::WorkerClaimed, Outcome::Skipped, "exec-2"))
+            .await;
+        sink.emit(DispatchEvent::new(Stage::PaneSpawned, Outcome::Error, "exec-1"))
+            .await;
 
         let all = sink.events().await;
         assert_eq!(all.len(), 3);

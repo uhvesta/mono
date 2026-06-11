@@ -29,15 +29,14 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
-use crate::host_registry::Host;
 use crate::coordinator::{
-    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-    CubeWorkspaceStatus,
+    CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
+use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
-    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, bazel_prepush_gate_text,
-    compose_worker_spawn, work_item_name, work_item_task_kind,
+    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, bazel_prepush_gate_text, compose_worker_spawn,
+    work_item_name, work_item_task_kind,
 };
 use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
@@ -89,11 +88,7 @@ pub trait HostAdapter: Send + Sync {
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()>;
 
-    async fn create_change(
-        &self,
-        workspace_path: &Path,
-        title: &str,
-    ) -> Result<CubeChangeHandle>;
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle>;
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
 
@@ -134,11 +129,7 @@ pub trait HostAdapter: Send + Sync {
     /// [`SshHostAdapter`] overrides this to pull the byte suffix over its
     /// `ControlMaster` and returns `Ok(Some(jsonl))` — giving the
     /// transcript-tail RPC the same bytes a local run would have read.
-    async fn read_transcript_tail_bytes(
-        &self,
-        _path: &str,
-        _max_bytes: u64,
-    ) -> Result<Option<String>> {
+    async fn read_transcript_tail_bytes(&self, _path: &str, _max_bytes: u64) -> Result<Option<String>> {
         Ok(None)
     }
 
@@ -152,11 +143,7 @@ pub trait HostAdapter: Send + Sync {
     /// default (and [`LocalHostAdapter`]) is a no-op. [`SshHostAdapter`]
     /// overrides this to clear the stale remote socket and re-open the
     /// `ssh -R` forward, returning `Ok(true)` on success.
-    async fn reattach_events_forward(
-        &self,
-        _run_id: &str,
-        _engine_events_socket: &str,
-    ) -> Result<bool> {
+    async fn reattach_events_forward(&self, _run_id: &str, _engine_events_socket: &str) -> Result<bool> {
         Ok(false)
     }
 }
@@ -172,10 +159,7 @@ pub struct LocalHostAdapter {
 }
 
 impl LocalHostAdapter {
-    pub fn new(
-        cube_client: Arc<dyn CubeClient>,
-        execution_runner: Arc<dyn ExecutionRunner>,
-    ) -> Self {
+    pub fn new(cube_client: Arc<dyn CubeClient>, execution_runner: Arc<dyn ExecutionRunner>) -> Self {
         Self {
             cube_client,
             execution_runner,
@@ -218,11 +202,7 @@ impl HostAdapter for LocalHostAdapter {
         self.cube_client.force_release_lease(lease_id, reason).await
     }
 
-    async fn create_change(
-        &self,
-        workspace_path: &Path,
-        title: &str,
-    ) -> Result<CubeChangeHandle> {
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
         self.cube_client.create_change(workspace_path, title).await
     }
 
@@ -351,10 +331,7 @@ impl SshHostAdapter {
         workspace: &str,
         prompt_text: String,
     ) -> String {
-        if !matches!(
-            execution.kind.as_str(),
-            "task_implementation" | "chore_implementation"
-        ) {
+        if !matches!(execution.kind.as_str(), "task_implementation" | "chore_implementation") {
             return prompt_text;
         }
         // Single-string command so the remote shell evaluates the whole
@@ -386,13 +363,7 @@ impl SshHostAdapter {
     /// `mkdir -p` the parent dir on the remote, stage `contents` to a
     /// local temp file, and `scp` it to `remote_path`. `label` only feeds
     /// the staging filename + error context.
-    async fn ship_file(
-        &self,
-        remote_dir: &str,
-        remote_path: &str,
-        contents: &str,
-        label: &str,
-    ) -> Result<()> {
+    async fn ship_file(&self, remote_dir: &str, remote_path: &str, contents: &str, label: &str) -> Result<()> {
         let host = &self.transport.host_id;
         let mkdir = self
             .transport
@@ -405,8 +376,8 @@ impl SshHostAdapter {
                 non_empty(&mkdir.stderr, mkdir.status)
             );
         }
-        let staged = stage_local_file(label, contents)
-            .with_context(|| format!("staging remote {label} for host {host}"))?;
+        let staged =
+            stage_local_file(label, contents).with_context(|| format!("staging remote {label} for host {host}"))?;
         let push = self
             .transport
             .scp_push(staged.path(), remote_path)
@@ -442,13 +413,8 @@ fn stage_local_file(label: &str, contents: &str) -> Result<StagedFile> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = dir.join(format!(
-        "boss-remote-{label}.{}.{}.tmp",
-        std::process::id(),
-        nonce
-    ));
-    std::fs::write(&path, contents)
-        .with_context(|| format!("writing staging file {path:?}"))?;
+    let path = dir.join(format!("boss-remote-{label}.{}.{}.tmp", std::process::id(), nonce));
+    std::fs::write(&path, contents).with_context(|| format!("writing staging file {path:?}"))?;
     Ok(StagedFile(path))
 }
 
@@ -480,11 +446,9 @@ impl HostAdapter for SshHostAdapter {
         struct RepoEnsurePayload {
             repo_id: String,
         }
-        let payload: RepoEnsurePayload = serde_json::from_value(
-            self.run_cube_json(&crate::repo_slug::repo_ensure_args(origin))
-                .await?,
-        )
-        .context("decoding remote `cube repo ensure` payload")?;
+        let payload: RepoEnsurePayload =
+            serde_json::from_value(self.run_cube_json(&crate::repo_slug::repo_ensure_args(origin)).await?)
+                .context("decoding remote `cube repo ensure` payload")?;
         Ok(CubeRepoHandle {
             repo_id: payload.repo_id,
         })
@@ -550,8 +514,7 @@ impl HostAdapter for SshHostAdapter {
     }
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
-        let mut args: Vec<&str> =
-            vec!["--json", "workspace", "force-release", "--lease", lease_id];
+        let mut args: Vec<&str> = vec!["--json", "workspace", "force-release", "--lease", lease_id];
         if let Some(r) = reason {
             args.extend_from_slice(&["--reason", r]);
         }
@@ -559,11 +522,7 @@ impl HostAdapter for SshHostAdapter {
         Ok(())
     }
 
-    async fn create_change(
-        &self,
-        workspace_path: &Path,
-        title: &str,
-    ) -> Result<CubeChangeHandle> {
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
         #[derive(Deserialize)]
         struct ChangePayload {
             change: ChangeRecord,
@@ -609,14 +568,8 @@ impl HostAdapter for SshHostAdapter {
         }
         let workspace_arg = workspace_path.display().to_string();
         let payload: StatusPayload = serde_json::from_value(
-            self.run_cube_json(&[
-                "--json",
-                "workspace",
-                "status",
-                "--workspace",
-                workspace_arg.as_str(),
-            ])
-            .await?,
+            self.run_cube_json(&["--json", "workspace", "status", "--workspace", workspace_arg.as_str()])
+                .await?,
         )
         .context("decoding remote `cube workspace status` payload")?;
         Ok(CubeWorkspaceStatus {
@@ -647,9 +600,8 @@ impl HostAdapter for SshHostAdapter {
             leased_at_epoch_s: Option<i64>,
             lease_expires_at_epoch_s: Option<i64>,
         }
-        let payload: ListPayload =
-            serde_json::from_value(self.run_cube_json(&["--json", "workspace", "list"]).await?)
-                .context("decoding remote `cube workspace list` payload")?;
+        let payload: ListPayload = serde_json::from_value(self.run_cube_json(&["--json", "workspace", "list"]).await?)
+            .context("decoding remote `cube workspace list` payload")?;
         Ok(payload
             .workspaces
             .into_iter()
@@ -681,9 +633,8 @@ impl HostAdapter for SshHostAdapter {
             #[serde(default)]
             source: Option<PathBuf>,
         }
-        let payload: ListPayload =
-            serde_json::from_value(self.run_cube_json(&["--json", "repo", "list"]).await?)
-                .context("decoding remote `cube repo list` payload")?;
+        let payload: ListPayload = serde_json::from_value(self.run_cube_json(&["--json", "repo", "list"]).await?)
+            .context("decoding remote `cube repo list` payload")?;
         Ok(payload
             .repos
             .into_iter()
@@ -734,9 +685,10 @@ impl HostAdapter for SshHostAdapter {
         // 2. The coordinator leased the workspace + created the change on
         //    the remote before calling spawn; the lease id rides the
         //    execution row, and `workspace_path` is the REMOTE path.
-        let lease_id = execution.cube_lease_id.clone().context(
-            "execution missing cube_lease_id; coordinator must lease before remote spawn",
-        )?;
+        let lease_id = execution
+            .cube_lease_id
+            .clone()
+            .context("execution missing cube_lease_id; coordinator must lease before remote spawn")?;
         let run_id = execution.id.clone();
         let workspace = workspace_path.display().to_string();
 
@@ -767,9 +719,7 @@ impl HostAdapter for SshHostAdapter {
         // `compose_execution_prompt` decides the Bazel pre-push gate by
         // probing the LOCAL filesystem, which never matches a remote
         // workspace path — so probe the remote and append it ourselves.
-        let prompt_text = self
-            .append_remote_bazel_gate(execution, &workspace, prompt_text)
-            .await;
+        let prompt_text = self.append_remote_bazel_gate(execution, &workspace, prompt_text).await;
 
         // 4. Render the remote worker settings: the same boss-event hooks
         //    as a local worker, but pointed at the FORWARDED events
@@ -801,13 +751,8 @@ impl HostAdapter for SshHostAdapter {
         let remote_settings_path = format!("{remote_settings_dir}/{run_id}.json");
         self.ship_file(&remote_prompt_dir, &remote_prompt_path, &prompt_text, "prompt")
             .await?;
-        self.ship_file(
-            &remote_settings_dir,
-            &remote_settings_path,
-            &settings_json,
-            "settings",
-        )
-        .await?;
+        self.ship_file(&remote_settings_dir, &remote_settings_path, &settings_json, "settings")
+            .await?;
 
         // 6. Open the reverse events tunnel and launch the detached
         //    remote worker (PR1 orchestration over the one master
@@ -816,9 +761,7 @@ impl HostAdapter for SshHostAdapter {
             .run_id(run_id.clone())
             .lease_id(lease_id)
             .workspace_path(workspace)
-            .maybe_repo_remote_url(
-                (!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()),
-            )
+            .maybe_repo_remote_url((!execution.repo_remote_url.is_empty()).then(|| execution.repo_remote_url.clone()))
             .events_socket_path(remote_socket)
             .initial_input_file(remote_prompt_path)
             .settings_file(remote_settings_path)
@@ -893,32 +836,18 @@ impl HostAdapter for SshHostAdapter {
         })
     }
 
-    async fn read_transcript_tail_bytes(
-        &self,
-        path: &str,
-        max_bytes: u64,
-    ) -> Result<Option<String>> {
+    async fn read_transcript_tail_bytes(&self, path: &str, max_bytes: u64) -> Result<Option<String>> {
         // The recorded transcript_path is a path on the remote host's
         // filesystem; pull its byte suffix over the master so the RPC
         // sees the same JSONL a local read would.
-        let content =
-            crate::remote_transcript::pull_remote_transcript_tail(&self.transport, path, max_bytes)
-                .await?;
+        let content = crate::remote_transcript::pull_remote_transcript_tail(&self.transport, path, max_bytes).await?;
         Ok(Some(content))
     }
 
-    async fn reattach_events_forward(
-        &self,
-        run_id: &str,
-        engine_events_socket: &str,
-    ) -> Result<bool> {
+    async fn reattach_events_forward(&self, run_id: &str, engine_events_socket: &str) -> Result<bool> {
         let remote_socket = remote_events_socket_path(run_id);
-        let outcome = crate::ssh_spawn::reestablish_events_forward(
-            &self.transport,
-            &remote_socket,
-            engine_events_socket,
-        )
-        .await?;
+        let outcome =
+            crate::ssh_spawn::reestablish_events_forward(&self.transport, &remote_socket, engine_events_socket).await?;
         if !outcome.launched {
             let detail = outcome.detail.unwrap_or_default();
             bail!(
@@ -1033,12 +962,10 @@ impl HostAdapterProvider for SshHostAdapterProvider {
             return Ok(Arc::clone(adapter));
         }
 
-        let ssh_target = host.ssh_target.as_deref().with_context(|| {
-            format!(
-                "host '{}' has no ssh_target; cannot build an SSH adapter",
-                host.id
-            )
-        })?;
+        let ssh_target = host
+            .ssh_target
+            .as_deref()
+            .with_context(|| format!("host '{}' has no ssh_target; cannot build an SSH adapter", host.id))?;
         let transport = SshTransport::new(&host.id, ssh_target, &self.control_socket_dir);
         transport
             .open_control_master()
@@ -1087,10 +1014,7 @@ mod tests {
 
         // While the guard is live the file exists with the exact contents.
         assert!(staged.path().exists(), "staged file should exist on disk");
-        assert_eq!(
-            std::fs::read(staged.path()).expect("read staged file"),
-            b"hello world",
-        );
+        assert_eq!(std::fs::read(staged.path()).expect("read staged file"), b"hello world",);
 
         // The filename embeds the caller-supplied label for diagnosability.
         let file_name = staged
@@ -1112,9 +1036,6 @@ mod tests {
             staged.path().to_path_buf()
         };
         // Guard has dropped: the on-disk file is unlinked.
-        assert!(
-            !path.exists(),
-            "staging file should be removed once the guard drops",
-        );
+        assert!(!path.exists(), "staging file should be removed once the guard drops",);
     }
 }

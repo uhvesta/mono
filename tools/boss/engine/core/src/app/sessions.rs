@@ -73,14 +73,15 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
         // root was configured — test mode (`None`) stays
         // permissive so unit tests aren't pinned to a live pid.
         if let (Some(prior), Some(observed)) = (current_app_pid, peer_pid)
-            && prior != observed {
-                server_state.set_app_pid(observed);
-                tracing::info!(
-                    prior_app_pid = prior,
-                    new_app_pid = observed,
-                    "app session re-attached: trust root re-pinned to relaunched app",
-                );
-            }
+            && prior != observed
+        {
+            server_state.set_app_pid(observed);
+            tracing::info!(
+                prior_app_pid = prior,
+                new_app_pid = observed,
+                "app session re-attached: trust root re-pinned to relaunched app",
+            );
+        }
         server_state
             .register_app_session(session_id.clone(), sink.clone())
             .await;
@@ -128,20 +129,16 @@ pub(super) async fn handle_register_boss_session(ctx: Dispatch, req: FrontendReq
                 "register_boss_session rejected: caller is not the app session",
             );
             send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::Error {
-                            message: "register_boss_session: only the app session may install the Boss trust root"
-                                .to_owned(),
-                        },
-                    );
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: "register_boss_session: only the app session may install the Boss trust root".to_owned(),
+                },
+            );
             return;
         }
         server_state.set_boss_pid(shell_pid as libc::pid_t);
-        tracing::info!(
-            boss_pid = shell_pid,
-            "boss session registered as second trust root",
-        );
+        tracing::info!(boss_pid = shell_pid, "boss session registered as second trust root",);
         send_response(&sink, &request_id, FrontendEvent::BossSessionRegistered);
     }
 }
@@ -159,9 +156,7 @@ pub(super) async fn handle_register_boss_session(ctx: Dispatch, req: FrontendReq
 /// for a response.
 pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
-        server_state,
-        peer_pid,
-        ..
+        server_state, peer_pid, ..
     } = ctx;
     let FrontendRequest::UpdateWorkerShellPid { run_id, shell_pid } = req else {
         unreachable!()
@@ -183,15 +178,10 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
         return;
     }
     // Update the pid→run_id registry so hook-event ancestor walk works.
-    server_state
-        .worker_registry
-        .register(shell_pid, run_id.clone());
+    server_state.worker_registry.register(shell_pid, run_id.clone());
     // Update the live-state registry so dead-pid sweep and bossctl reaping
     // can signal the process when needed.
-    match server_state
-        .live_worker_states
-        .update_shell_pid(&run_id, shell_pid)
-    {
+    match server_state.live_worker_states.update_shell_pid(&run_id, shell_pid) {
         Some(slot_id) => {
             tracing::info!(
                 run_id = %run_id,

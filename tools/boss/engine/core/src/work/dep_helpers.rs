@@ -98,11 +98,7 @@ pub(crate) fn classify_id(id: &str) -> Result<ItemKind> {
 /// `kind = "unknown"` with empty name and `status = "missing"` —
 /// the human renderer surfaces it instead of dropping the row, so
 /// the user can spot dangling edges and clean them up.
-pub(crate) fn resolve_dependency_edge(
-    conn: &Connection,
-    peer_id: &str,
-    relation: &str,
-) -> Result<DependencyEdge> {
+pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation: &str) -> Result<DependencyEdge> {
     if peer_id.starts_with("proj_") {
         if let Some(project) = query_project(conn, peer_id)? {
             return Ok(DependencyEdge {
@@ -114,19 +110,20 @@ pub(crate) fn resolve_dependency_edge(
             });
         }
     } else if peer_id.starts_with("task_")
-        && let Some(task) = query_task(conn, peer_id)? {
-            let kind = match task.kind {
-                TaskKind::Chore => "chore",
-                _ => "task",
-            };
-            return Ok(DependencyEdge {
-                id: task.id,
-                relation: relation.to_owned(),
-                kind: kind.to_owned(),
-                name: task.name,
-                status: task.status.to_string(),
-            });
-        }
+        && let Some(task) = query_task(conn, peer_id)?
+    {
+        let kind = match task.kind {
+            TaskKind::Chore => "chore",
+            _ => "task",
+        };
+        return Ok(DependencyEdge {
+            id: task.id,
+            relation: relation.to_owned(),
+            kind: kind.to_owned(),
+            name: task.name,
+            status: task.status.to_string(),
+        });
+    }
     Ok(DependencyEdge {
         id: peer_id.to_owned(),
         relation: relation.to_owned(),
@@ -160,14 +157,12 @@ where
     match filter {
         DependencyFilter::PrerequisitesOf { id } => {
             let edges = deps::prerequisites_of(conn, id, None)?;
-            let allowed: HashSet<String> =
-                edges.into_iter().map(|edge| edge.prerequisite_id).collect();
+            let allowed: HashSet<String> = edges.into_iter().map(|edge| edge.prerequisite_id).collect();
             items.retain(|item| allowed.contains(id_of(item)));
         }
         DependencyFilter::DependentsOf { id } => {
             let edges = deps::dependents_of(conn, id, None)?;
-            let allowed: HashSet<String> =
-                edges.into_iter().map(|edge| edge.dependent_id).collect();
+            let allowed: HashSet<String> = edges.into_iter().map(|edge| edge.dependent_id).collect();
             items.retain(|item| allowed.contains(id_of(item)));
         }
         DependencyFilter::Unblocked => {
@@ -226,11 +221,7 @@ pub(crate) fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<S
 /// The reverse (cascade-on-prereq-regression) deliberately does NOT
 /// call this — see the comment on
 /// [`cascade_dependents_after_prereq_status_change`].
-pub(crate) fn maybe_engine_block_dependent(
-    conn: &Connection,
-    dependent_id: &str,
-    now_epoch: &str,
-) -> Result<()> {
+pub(crate) fn maybe_engine_block_dependent(conn: &Connection, dependent_id: &str, now_epoch: &str) -> Result<()> {
     let gating = deps::gating_prereqs_for(conn, dependent_id)?;
     if gating.is_empty() {
         return Ok(());
@@ -275,11 +266,7 @@ pub(crate) fn maybe_engine_block_dependent(
 /// fact in the engine log — without it, an auto-unblock that races
 /// past a sleeping observer is invisible and the next bug report
 /// degenerates into "did the cascade fire or not?".
-pub(crate) fn maybe_engine_unblock_dependent(
-    conn: &Connection,
-    dependent_id: &str,
-    now_epoch: &str,
-) -> Result<bool> {
+pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &str, now_epoch: &str) -> Result<bool> {
     let current = match deps::lookup_work_item_status(conn, dependent_id)? {
         Some(s) => s,
         None => return Ok(false),
@@ -365,8 +352,7 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     // full gating list via `gating_prereqs_for`, which is revision-
     // aware, so non-revision dependents are not inadvertently unblocked
     // by an `in_review` transition.
-    let might_satisfy =
-        deps::status_satisfies(prereq_id, new_prereq_status) || new_prereq_status == "in_review";
+    let might_satisfy = deps::status_satisfies(prereq_id, new_prereq_status) || new_prereq_status == "in_review";
     if !might_satisfy {
         return Ok(());
     }
@@ -426,15 +412,10 @@ pub(crate) fn refuse_manual_move_off_blocked_while_gated(
         return Ok(());
     }
     let names = gating.join(", ");
-    bail!(
-        "cannot move {work_item_id} to {new_status}: gated by [{names}] (use `boss <kind> depend rm` to remove)"
-    );
+    bail!("cannot move {work_item_id} to {new_status}: gated by [{names}] (use `boss <kind> depend rm` to remove)");
 }
 
-pub(crate) fn lookup_blocked_reason(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<Option<String>> {
+pub(crate) fn lookup_blocked_reason(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if work_item_id.starts_with("task_") {
         return conn
             .query_row(
@@ -449,10 +430,7 @@ pub(crate) fn lookup_blocked_reason(
     Ok(None)
 }
 
-pub(crate) fn lookup_last_status_actor(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<Option<String>> {
+pub(crate) fn lookup_last_status_actor(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if work_item_id.starts_with("proj_") {
         return conn
             .query_row(
@@ -517,14 +495,8 @@ mod tests {
 
     #[test]
     fn classify_id_recognises_each_prefix() {
-        assert!(matches!(
-            classify_id("prod_abc").unwrap(),
-            ItemKind::Product
-        ));
-        assert!(matches!(
-            classify_id("proj_abc").unwrap(),
-            ItemKind::Project
-        ));
+        assert!(matches!(classify_id("prod_abc").unwrap(), ItemKind::Product));
+        assert!(matches!(classify_id("proj_abc").unwrap(), ItemKind::Project));
         assert!(matches!(classify_id("task_abc").unwrap(), ItemKind::Task));
     }
 

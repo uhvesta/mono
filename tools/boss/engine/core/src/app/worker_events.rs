@@ -46,9 +46,7 @@ pub(super) async fn dispatch_live_worker_state(
         );
         return;
     };
-    server_state
-        .dispatcher_stats
-        .record_last_hook(run_id, event_kind);
+    server_state.dispatcher_stats.record_last_hook(run_id, event_kind);
     // Persist the transcript path the moment we see it on a hook
     // payload. `start_execution_run` inserts the work_runs row with
     // `transcript_path = NULL` (the engine has no way to know the
@@ -83,9 +81,7 @@ pub(super) async fn dispatch_live_worker_state(
     let (resolved_path, from_cache) = match payload_path {
         Some(path) => {
             server_state.dispatcher_stats.inc_with_transcript_path();
-            let _ = server_state
-                .transcript_path_cache
-                .record_if_unset(run_id, path);
+            let _ = server_state.transcript_path_cache.record_if_unset(run_id, path);
             (Some(path.to_owned()), false)
         }
         None => {
@@ -179,13 +175,8 @@ pub(super) async fn dispatch_live_worker_state(
     // are gated off so they don't emit a misleading "notify dropped — no
     // per-slot task" warn on every remote hook.
     let is_remote_slot = slot_id >= crate::worker_registry::REMOTE_SLOT_BASE;
-    let prior_activity = server_state
-        .live_worker_states
-        .get(slot_id)
-        .map(|s| s.activity);
-    let changed = server_state
-        .live_worker_states
-        .apply_event(slot_id, &incoming.event);
+    let prior_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
+    let changed = server_state.live_worker_states.apply_event(slot_id, &incoming.event);
     if changed {
         server_state.broadcast_live_worker_states().await;
     }
@@ -193,17 +184,11 @@ pub(super) async fn dispatch_live_worker_state(
     // The manager drops the trigger if no slot task is running, so a
     // hook arriving before `register_spawn` or after `release_slot`
     // is a benign no-op.
-    let new_activity = server_state
-        .live_worker_states
-        .get(slot_id)
-        .map(|s| s.activity);
+    let new_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
     match &incoming.event {
-        crate::protocol::WorkerEvent::Stop { .. }
-            if !is_remote_slot => {
-                server_state
-                    .live_status_manager
-                    .notify(slot_id, Trigger::Stop);
-            }
+        crate::protocol::WorkerEvent::Stop { .. } if !is_remote_slot => {
+            server_state.live_status_manager.notify(slot_id, Trigger::Stop);
+        }
         crate::protocol::WorkerEvent::PostToolUse {
             tool_name,
             tool_input,
@@ -211,9 +196,7 @@ pub(super) async fn dispatch_live_worker_state(
             ..
         } => {
             if !is_remote_slot {
-                server_state
-                    .live_status_manager
-                    .notify(slot_id, Trigger::PostToolUse);
+                server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
             }
             // Primary-path PR URL capture. Every worker that opens a
             // PR does it via a Bash `gh pr create` (and also
@@ -231,9 +214,7 @@ pub(super) async fn dispatch_live_worker_state(
             if tool_name == "Bash" {
                 // Check for any PR URL first so we can log a rejection
                 // when the command isn't a gh pr invocation.
-                if let Some(pr_url) =
-                    crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response)
-                {
+                if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response) {
                     if !crate::pr_url_capture::is_gh_pr_command(tool_input) {
                         tracing::info!(
                             execution_id = run_id,
@@ -253,20 +234,18 @@ pub(super) async fn dispatch_live_worker_state(
                             .get_execution(execution_id)
                             .map(|e| e.repo_remote_url);
                         let valid = match repo_url_result {
-                            Ok(ref repo_url) => {
-                                match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
-                                    Ok(()) => true,
-                                    Err(reason) => {
-                                        tracing::info!(
-                                            execution_id,
-                                            rejected_url = %pr_url,
-                                            %reason,
-                                            "pr_url_capture: dropping URL — failed product-repo gate",
-                                        );
-                                        false
-                                    }
+                            Ok(ref repo_url) => match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
+                                Ok(()) => true,
+                                Err(reason) => {
+                                    tracing::info!(
+                                        execution_id,
+                                        rejected_url = %pr_url,
+                                        %reason,
+                                        "pr_url_capture: dropping URL — failed product-repo gate",
+                                    );
+                                    false
                                 }
-                            }
+                            },
                             Err(err) => {
                                 tracing::warn!(
                                     execution_id,
@@ -278,8 +257,7 @@ pub(super) async fn dispatch_live_worker_state(
                             }
                         };
                         if valid {
-                            let outcome =
-                                server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
+                            let outcome = server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
                             match outcome {
                                 crate::pr_url_capture::StagePrUrlOutcome::Staged => {
                                     tracing::info!(
@@ -341,10 +319,7 @@ pub(super) async fn dispatch_live_worker_state(
 /// remote worker: a local run, a run with no recorded host, a run on a
 /// settled execution (late/duplicate hook for a finished worker), or
 /// when the remote slot range is exhausted.
-async fn register_remote_worker_slot(
-    server_state: &Arc<ServerState>,
-    run_id: &str,
-) -> Option<u8> {
+async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &str) -> Option<u8> {
     let host = server_state
         .work_db
         .latest_run_host_for_execution(run_id)
@@ -358,9 +333,7 @@ async fn register_remote_worker_slot(
     if execution.status.is_terminal() {
         return None;
     }
-    let (slot_id, freshly_allocated) = server_state
-        .worker_registry
-        .get_or_allocate_remote_slot(run_id)?;
+    let (slot_id, freshly_allocated) = server_state.worker_registry.get_or_allocate_remote_slot(run_id)?;
     if freshly_allocated {
         // Resolve the work item once for both the binding (name) and
         // the model label. `model_override` is the user's explicit
@@ -395,7 +368,6 @@ async fn register_remote_worker_slot(
     Some(slot_id)
 }
 
-
 /// The work item's explicit model override, if it carries one (only
 /// tasks/chores do). Used to label a remote worker's live state.
 fn remote_worker_model_override(item: &boss_protocol::WorkItem) -> Option<String> {
@@ -424,9 +396,7 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
     use std::path::Path;
 
     let WorkerEvent::PreToolUse {
-        tool_name,
-        tool_input,
-        ..
+        tool_name, tool_input, ..
     } = &incoming.event
     else {
         return;
@@ -463,10 +433,7 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
         };
 
     if product_id.is_empty() {
-        tracing::debug!(
-            execution_id,
-            "editorial_pretooluse: execution has no product; skipping",
-        );
+        tracing::debug!(execution_id, "editorial_pretooluse: execution has no product; skipping",);
         return;
     }
 
@@ -575,10 +542,7 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
     };
     server_state
         .topic_broker
-        .publish(
-            &topic,
-            FrontendEventEnvelope::push_with_revision(revision, event),
-        )
+        .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
         .await;
 }
 
@@ -604,10 +568,7 @@ pub(super) async fn dispatch_probe_on_stop(
         return;
     };
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
-        tracing::warn!(
-            run_id,
-            "probe ready but no slot mapping; dropping probe text",
-        );
+        tracing::warn!(run_id, "probe ready but no slot mapping; dropping probe text",);
         return;
     };
     // Capture the transcript path + current byte length *before* the
@@ -619,10 +580,7 @@ pub(super) async fn dispatch_probe_on_stop(
         slot_id,
         text: probe.text.clone(),
     });
-    match server_state
-        .send_to_app(request, Duration::from_secs(5))
-        .await
-    {
+    match server_state.send_to_app(request, Duration::from_secs(5)).await {
         Ok(_) => {
             tracing::info!(
                 run_id,
@@ -630,12 +588,7 @@ pub(super) async fn dispatch_probe_on_stop(
                 probe_id = %probe.probe_id,
                 "probe injected into pane",
             );
-            server_state.note_probe_dispatched(
-                run_id.to_owned(),
-                probe.probe_id,
-                transcript_path,
-                offset_bytes,
-            );
+            server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
             tracing::warn!(
@@ -694,10 +647,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
         probe
     };
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
-        tracing::warn!(
-            run_id,
-            "urgent probe ready but no slot mapping; dropping probe",
-        );
+        tracing::warn!(run_id, "urgent probe ready but no slot mapping; dropping probe",);
         return;
     };
     let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
@@ -706,10 +656,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
         slot_id,
         text: marked_text,
     });
-    match server_state
-        .send_to_app(request, Duration::from_secs(5))
-        .await
-    {
+    match server_state.send_to_app(request, Duration::from_secs(5)).await {
         Ok(_) => {
             tracing::info!(
                 run_id,
@@ -717,12 +664,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 probe_id = %probe.probe_id,
                 "urgent probe injected at tool boundary",
             );
-            server_state.note_probe_dispatched(
-                run_id.to_owned(),
-                probe.probe_id,
-                transcript_path,
-                offset_bytes,
-            );
+            server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
             tracing::warn!(
@@ -757,10 +699,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
 
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Worker not yet mapped to a slot (spawning) — probe stays queued.
-        tracing::debug!(
-            run_id,
-            "probe-if-idle: no slot mapping; probe waits for Stop"
-        );
+        tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
         return;
     };
     let is_idle = server_state
@@ -785,10 +724,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
         slot_id,
         text: probe.text.clone(),
     });
-    match server_state
-        .send_to_app(request, Duration::from_secs(5))
-        .await
-    {
+    match server_state.send_to_app(request, Duration::from_secs(5)).await {
         Ok(_) => {
             tracing::info!(
                 run_id,
@@ -796,12 +732,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
                 probe_id = %probe.probe_id,
                 "probe injected into idle worker pane (immediate dispatch)",
             );
-            server_state.note_probe_dispatched(
-                run_id.to_owned(),
-                probe.probe_id,
-                transcript_path,
-                offset_bytes,
-            );
+            server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
             tracing::warn!(
@@ -831,18 +762,11 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
 /// "Out of scope" section called out that `work_db.get_run(run_id)`
 /// was joining the wrong namespace). Fixed here alongside the
 /// `TranscriptPathResolver` impl.
-async fn transcript_offset_for_run(
-    server_state: &Arc<ServerState>,
-    run_id: &str,
-) -> (Option<String>, u64) {
+async fn transcript_offset_for_run(server_state: &Arc<ServerState>, run_id: &str) -> (Option<String>, u64) {
     let path = match server_state.work_db.transcript_path_for_execution(run_id) {
         Ok(path) => path,
         Err(err) => {
-            tracing::debug!(
-                run_id,
-                ?err,
-                "transcript path lookup failed for probe dispatch",
-            );
+            tracing::debug!(run_id, ?err, "transcript path lookup failed for probe dispatch",);
             None
         }
     };
@@ -920,10 +844,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
         probe_id: in_flight.probe_id.clone(),
         text,
     });
-    server_state
-        .topic_broker
-        .publish(&probe_topic(run_id), envelope)
-        .await;
+    server_state.topic_broker.publish(&probe_topic(run_id), envelope).await;
     tracing::info!(
         run_id,
         probe_id = %in_flight.probe_id,
@@ -936,10 +857,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
 /// last assistant-turn text found. Returns `Ok(None)` when no
 /// assistant turn appears in the new region (e.g. the worker
 /// errored out before producing one).
-async fn read_assistant_reply(
-    transcript_path: &str,
-    offset_bytes: u64,
-) -> std::io::Result<Option<String>> {
+async fn read_assistant_reply(transcript_path: &str, offset_bytes: u64) -> std::io::Result<Option<String>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     let mut file = tokio::fs::File::open(transcript_path).await?;
     let metadata = file.metadata().await?;
@@ -992,9 +910,10 @@ pub(super) fn extract_last_assistant_text(chunk: &str) -> Option<String> {
             }
         }
         if buf.is_empty()
-            && let Some(text) = message.get("text").and_then(|t| t.as_str()) {
-                buf.push_str(text);
-            }
+            && let Some(text) = message.get("text").and_then(|t| t.as_str())
+        {
+            buf.push_str(text);
+        }
         if !buf.is_empty() {
             latest = Some(buf);
         }

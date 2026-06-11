@@ -46,14 +46,12 @@ pub fn resolve_all(
 fn resolve_one(repo_root: &Path, name: &str, binding: &BinaryBinding) -> Result<PathBuf> {
     match binding {
         BinaryBinding::Path(path) => Ok(resolve_path_binding(repo_root, path)),
-        BinaryBinding::Bazel(target) => {
-            resolve_bazel_target_executable(repo_root, target).with_context(|| {
-                format!(
-                    "bazel resolution of `{name}` target `{target}` failed; this resolver needs a \
+        BinaryBinding::Bazel(target) => resolve_bazel_target_executable(repo_root, target).with_context(|| {
+            format!(
+                "bazel resolution of `{name}` target `{target}` failed; this resolver needs a \
                      Bazel workspace — set a `path` override for standalone use"
-                )
-            })
-        }
+            )
+        }),
     }
 }
 
@@ -89,9 +87,7 @@ fn override_binding(name: &str, config: &toml::Value) -> Option<Result<BinaryBin
         ))),
         (Some(bazel), None) => Some(Ok(BinaryBinding::Bazel(bazel.to_owned()))),
         (None, Some(path)) => Some(Ok(BinaryBinding::Path(path.to_owned()))),
-        (None, None) => Some(Err(anyhow::anyhow!(
-            "override for `{name}` must set `bazel` or `path`"
-        ))),
+        (None, None) => Some(Err(anyhow::anyhow!("override for `{name}` must set `bazel` or `path`"))),
     }
     .map(|result| {
         result.and_then(|binding| match &binding {

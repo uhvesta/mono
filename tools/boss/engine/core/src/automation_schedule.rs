@@ -144,12 +144,7 @@ fn parse_day_of_week(token: &str) -> Result<CronField, ScheduleParseError> {
     Ok(field)
 }
 
-fn parse_field(
-    token: &str,
-    min: u32,
-    max: u32,
-    label: &str,
-) -> Result<CronField, ScheduleParseError> {
+fn parse_field(token: &str, min: u32, max: u32, label: &str) -> Result<CronField, ScheduleParseError> {
     let is_star = token == "*";
     let mut allowed = BTreeSet::new();
 
@@ -182,9 +177,7 @@ fn parse_field(
         };
 
         if lo < min || hi > max {
-            return Err(err(format!(
-                "{label} value out of range {min}..={max}: {range_part:?}"
-            )));
+            return Err(err(format!("{label} value out of range {min}..={max}: {range_part:?}")));
         }
         if lo > hi {
             return Err(err(format!(
@@ -225,9 +218,7 @@ impl CronSchedule {
             return false;
         }
         let dom_ok = self.day_of_month.matches(date.day());
-        let dow_ok = self
-            .day_of_week
-            .matches(date.weekday().num_days_from_sunday());
+        let dow_ok = self.day_of_week.matches(date.weekday().num_days_from_sunday());
 
         match (self.day_of_month.is_star, self.day_of_week.is_star) {
             (true, true) => true,
@@ -337,10 +328,7 @@ mod tests {
     /// Epoch seconds for a local wall time in a given tz (single-resolution
     /// only — used to build unambiguous test anchors).
     fn local_epoch(tz: Tz, y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
-        tz.with_ymd_and_hms(y, mo, d, h, mi, 0)
-            .single()
-            .unwrap()
-            .timestamp()
+        tz.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap().timestamp()
     }
 
     #[test]
@@ -524,9 +512,7 @@ mod tests {
     #[test]
     fn str_wrapper_validates_and_computes() {
         let after = utc_epoch(2026, 5, 28, 13, 0);
-        let occ = next_occurrence_after_str("0 14 * * *", "UTC", after)
-            .unwrap()
-            .unwrap();
+        let occ = next_occurrence_after_str("0 14 * * *", "UTC", after).unwrap().unwrap();
         assert_eq!(occ, utc_epoch(2026, 5, 28, 14, 0));
         assert!(next_occurrence_after_str("bogus", "UTC", after).is_err());
         assert!(next_occurrence_after_str("0 14 * * *", "Mars/Phobos", after).is_err());

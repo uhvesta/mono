@@ -183,9 +183,7 @@ pub fn parse_origin(url: &str) -> Option<ParsedOrigin> {
             } else {
                 before_colon
             };
-            let path = after_colon
-                .trim_end_matches('/')
-                .trim_end_matches(".git");
+            let path = after_colon.trim_end_matches('/').trim_end_matches(".git");
             return Some(ParsedOrigin {
                 host: host.to_ascii_lowercase(),
                 path: path.to_string(),
@@ -283,10 +281,7 @@ mod tests {
     #[test]
     fn short_name_for_handles_ssh_and_https() {
         assert_eq!(short_name_for("git@github.com:spinyfin/mono.git"), "mono");
-        assert_eq!(
-            short_name_for("https://github.com/spinyfin/mono.git"),
-            "mono"
-        );
+        assert_eq!(short_name_for("https://github.com/spinyfin/mono.git"), "mono");
         assert_eq!(short_name_for("https://github.com/foo/bar"), "bar");
     }
 
@@ -521,10 +516,7 @@ mod tests {
         ];
         for a in &variants {
             for b in &variants {
-                assert!(
-                    origin_urls_equivalent(a, b),
-                    "{a} and {b} should be equivalent"
-                );
+                assert!(origin_urls_equivalent(a, b), "{a} and {b} should be equivalent");
             }
         }
     }

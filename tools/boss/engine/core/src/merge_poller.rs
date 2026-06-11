@@ -53,13 +53,13 @@ use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
 use crate::metrics::Registry;
-use boss_github::pr_url::{pr_number_from_url, repo_from_pr_url};
-use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
 #[cfg(test)]
 use crate::work::TaskStatus;
-use boss_protocol::{self, TaskKind};
+use crate::work::{LatePrCandidate, PendingMergeCheck, WorkDb};
+use boss_github::pr_url::{pr_number_from_url, repo_from_pr_url};
 #[cfg(test)]
 use boss_protocol::ExecutionKind;
+use boss_protocol::{self, TaskKind};
 
 /// Review-gating state of a PR at probe time. Derived from
 /// GitHub's `reviewDecision` field and the `reviews` array.
@@ -341,13 +341,7 @@ pub enum CiProvider {
 fn is_failure_conclusion(c: &str) -> bool {
     matches!(
         c.to_ascii_uppercase().as_str(),
-        "FAILURE"
-            | "ERROR"
-            | "TIMED_OUT"
-            | "CANCELLED"
-            | "STARTUP_FAILURE"
-            | "ACTION_REQUIRED"
-            | "STALE"
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "STARTUP_FAILURE" | "ACTION_REQUIRED" | "STALE"
     )
 }
 
@@ -356,10 +350,7 @@ fn is_failure_conclusion(c: &str) -> bool {
 /// `SKIPPED` do not gate merge per branch protection; `SUCCESS` is
 /// the happy path.
 fn is_pass_conclusion(c: &str) -> bool {
-    matches!(
-        c.to_ascii_uppercase().as_str(),
-        "SUCCESS" | "NEUTRAL" | "SKIPPED",
-    )
+    matches!(c.to_ascii_uppercase().as_str(), "SUCCESS" | "NEUTRAL" | "SKIPPED",)
 }
 
 /// Infer the CI provider from a check's `targetUrl` host.
@@ -374,8 +365,7 @@ fn provider_for_url(url: &str) -> CiProvider {
     // GitHub Actions URLs look like:
     //   https://github.com/<owner>/<repo>/actions/runs/<run-id>/job/<job-id>
     // (or the older /check-runs/ form). Either format → GHA.
-    if lower.contains("github.com") && (lower.contains("/actions/") || lower.contains("/check-runs/"))
-    {
+    if lower.contains("github.com") && (lower.contains("/actions/") || lower.contains("/check-runs/")) {
         return CiProvider::GithubActions;
     }
     CiProvider::Other
@@ -499,8 +489,7 @@ impl MergeProbe for CommandMergeProbe {
         // web UI). The legacy commit-status REST endpoint returns
         // `state:"pending"` in that case, which lets us show a non-green
         // indicator instead of a false-positive green.
-        let combined_state =
-            fetch_commit_combined_state_for_empty_rollup(&stdout, pr_url).await;
+        let combined_state = fetch_commit_combined_state_for_empty_rollup(&stdout, pr_url).await;
         let mut probe = parse_probe_json(pr_url, &stdout, combined_state.as_deref())?;
         // Query merge-queue status separately via GraphQL since `gh pr view --json`
         // does not expose `mergeQueueEntry` in all installed `gh` versions.
@@ -607,9 +596,7 @@ fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
-    let nodes = match body["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]
-        .as_array()
-    {
+    let nodes = match body["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"].as_array() {
         Some(arr) => arr,
         None => return Vec::new(),
     };
@@ -628,7 +615,10 @@ fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
             continue;
         }
         let before_commit_oid = node["beforeCommit"]["oid"].as_str().map(|s| s.to_owned());
-        events.push(MergeQueueDequeueEvent { reason, before_commit_oid });
+        events.push(MergeQueueDequeueEvent {
+            reason,
+            before_commit_oid,
+        });
     }
     events
 }
@@ -641,10 +631,7 @@ fn parse_dequeue_events_response(body: &[u8]) -> Vec<MergeQueueDequeueEvent> {
 /// commit has zero recorded statuses — GitHub reports `state:"pending"`
 /// even when `total_count == 0`, which would otherwise show up as a stuck
 /// yellow "waiting for CI" icon on PRs in repos with no checks configured.
-async fn fetch_commit_combined_state_for_empty_rollup(
-    json_body: &str,
-    pr_url: &str,
-) -> Option<String> {
+async fn fetch_commit_combined_state_for_empty_rollup(json_body: &str, pr_url: &str) -> Option<String> {
     let root: serde_json::Value = serde_json::from_str(json_body.trim()).ok()?;
     let rollup = root.get("statusCheckRollup").and_then(|v| v.as_array())?;
     if !rollup.is_empty() {
@@ -657,12 +644,7 @@ async fn fetch_commit_combined_state_for_empty_rollup(
     let repo = repo_from_pr_url(pr_url)?;
     let api_path = format!("repos/{repo}/commits/{head_sha}/status");
     let output = Command::new("gh")
-        .args([
-            "api",
-            &api_path,
-            "--jq",
-            "{state: .state, total_count: .total_count}",
-        ])
+        .args(["api", &api_path, "--jq", "{state: .state, total_count: .total_count}"])
         .stdin(Stdio::null())
         .output()
         .await
@@ -685,11 +667,7 @@ fn parse_combined_status_response(body: &str) -> Option<String> {
     if total_count == 0 {
         return None;
     }
-    let state = v
-        .get("state")
-        .and_then(|s| s.as_str())?
-        .trim()
-        .to_ascii_lowercase();
+    let state = v.get("state").and_then(|s| s.as_str())?.trim().to_ascii_lowercase();
     if state.is_empty() { None } else { Some(state) }
 }
 
@@ -708,19 +686,14 @@ fn parse_combined_status_response(body: &str) -> Option<String> {
 fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Result<PrLifecycleProbe> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return Err(anyhow!(
-            "`gh pr view {url}` returned an empty document"
-        ));
+        return Err(anyhow!("`gh pr view {url}` returned an empty document"));
     }
-    let root: serde_json::Value = serde_json::from_str(trimmed)
-        .with_context(|| format!("failed to parse `gh pr view {url}` JSON"))?;
+    let root: serde_json::Value =
+        serde_json::from_str(trimmed).with_context(|| format!("failed to parse `gh pr view {url}` JSON"))?;
     let raw_state = root.get("state").and_then(|v| v.as_str()).unwrap_or("");
     let merged_at = root.get("mergedAt").and_then(|v| v.as_str()).unwrap_or("");
     let mergeable = root.get("mergeable").and_then(|v| v.as_str()).unwrap_or("");
-    let merge_state_status = root
-        .get("mergeStateStatus")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let merge_state_status = root.get("mergeStateStatus").and_then(|v| v.as_str()).unwrap_or("");
     let base_ref_oid = root
         .get("baseRefOid")
         .and_then(|v| v.as_str())
@@ -769,10 +742,7 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
     let ci = classify_ci(&ci_leaves, combined_state);
     let state = classify_state(raw_state, merged_at, mergeable, merge_state_status, ci);
     let review_signal = classify_review_signal(&review_signal_leaves);
-    let review_decision = root
-        .get("reviewDecision")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let review_decision = root.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("");
     let reviews = root
         .get("reviews")
         .and_then(|v| v.as_array())
@@ -781,10 +751,7 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
     let review = classify_review(review_decision, &reviews, review_signal);
     // `mergeQueueEntry` is non-null when the PR is in GitHub's merge queue.
     // Null, missing, or explicit JSON null → not in queue.
-    let in_merge_queue = root
-        .get("mergeQueueEntry")
-        .map(|v| !v.is_null())
-        .unwrap_or(false);
+    let in_merge_queue = root.get("mergeQueueEntry").map(|v| !v.is_null()).unwrap_or(false);
     Ok(PrLifecycleProbe {
         url: url.to_owned(),
         state,
@@ -1013,10 +980,7 @@ enum LeafVerdict {
 /// because both fields read empty, which is why a green Buildkite-only
 /// PR stayed pinned on the yellow-clock badge indefinitely.
 fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
-    let typename = leaf
-        .get("__typename")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let typename = leaf.get("__typename").and_then(|v| v.as_str()).unwrap_or("");
 
     // StatusContext: `state` carries the verdict. Values per GitHub's
     // commit-status API: SUCCESS / FAILURE / ERROR / PENDING / EXPECTED.
@@ -1122,10 +1086,7 @@ fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> Op
     for leaf in leaves {
         // `isRequired` defaults to `true` when missing; only filter
         // out the explicit `false`.
-        let required = leaf
-            .get("isRequired")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let required = leaf.get("isRequired").and_then(|v| v.as_bool()).unwrap_or(true);
         if !required {
             continue;
         }
@@ -1188,10 +1149,7 @@ fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> Op
     // non-success combined state as InFlight so the kanban card shows a
     // waiting indicator instead of a false-positive green checkmark.
     if leaves.is_empty() {
-        match combined_state
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
+        match combined_state.map(|s| s.to_ascii_lowercase()).as_deref() {
             Some("pending") | Some("failure") | Some("error") => {
                 return OpenPrCiStatus::InFlight;
             }
@@ -1212,9 +1170,7 @@ pub const OPT_OUT_LABEL: &str = "boss/no-auto-rebase";
 /// case-preserving but the engine should tolerate casing drift the
 /// user introduces.
 pub fn pr_labels_opt_out(labels: &[String]) -> bool {
-    labels
-        .iter()
-        .any(|l| l.eq_ignore_ascii_case(OPT_OUT_LABEL))
+    labels.iter().any(|l| l.eq_ignore_ascii_case(OPT_OUT_LABEL))
 }
 
 /// Classification rules (design Q1):
@@ -1245,8 +1201,7 @@ fn classify_state(
     if raw_state.eq_ignore_ascii_case("CLOSED") {
         return PrLifecycleState::ClosedUnmerged;
     }
-    let conflicting = mergeable.eq_ignore_ascii_case("CONFLICTING")
-        && merge_state_status.eq_ignore_ascii_case("DIRTY");
+    let conflicting = mergeable.eq_ignore_ascii_case("CONFLICTING") && merge_state_status.eq_ignore_ascii_case("DIRTY");
     let mergeability = if conflicting {
         OpenPrMergeability::Conflict
     } else {
@@ -1374,40 +1329,28 @@ pub async fn run_one_pass(
     let blocked_conflict = match work_db.list_chores_blocked_on_merge_conflict() {
         Ok(items) => items,
         Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list chores blocked on merge_conflict",
-            );
+            tracing::warn!(?err, "merge poller: failed to list chores blocked on merge_conflict",);
             Vec::new()
         }
     };
     let blocked_ci = match work_db.list_chores_blocked_on_ci_failure() {
         Ok(items) => items,
         Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list chores blocked on ci_failure",
-            );
+            tracing::warn!(?err, "merge poller: failed to list chores blocked on ci_failure",);
             Vec::new()
         }
     };
     let pending_pr_recheck = match work_db.list_executions_pending_pr_detection() {
         Ok(items) => items,
         Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list executions pending PR detection",
-            );
+            tracing::warn!(?err, "merge poller: failed to list executions pending PR detection",);
             Vec::new()
         }
     };
     let stranded_ci_attempts = match work_db.list_stranded_ci_remediation_attempts() {
         Ok(items) => items,
         Err(err) => {
-            tracing::warn!(
-                ?err,
-                "merge poller: failed to list stranded ci remediation attempts",
-            );
+            tracing::warn!(?err, "merge poller: failed to list stranded ci remediation attempts",);
             Vec::new()
         }
     };
@@ -1431,10 +1374,7 @@ pub async fn run_one_pass(
         match work_db.list_recently_terminal_executions_pending_pr_detection(3600) {
             Ok(items) => items,
             Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    "merge poller: failed to list late PR candidates",
-                );
+                tracing::warn!(?err, "merge poller: failed to list late PR candidates",);
                 Vec::new()
             }
         }
@@ -1466,15 +1406,20 @@ pub async fn run_one_pass(
     // blocked-on-CI (shouldn't happen but defensive) only gets one
     // probe per sweep.
     let mut seen = std::collections::HashSet::new();
-    for candidate in in_review
-        .iter()
-        .chain(blocked_conflict.iter())
-        .chain(blocked_ci.iter())
-    {
+    for candidate in in_review.iter().chain(blocked_conflict.iter()).chain(blocked_ci.iter()) {
         if !seen.insert(candidate.work_item_id.clone()) {
             continue;
         }
-        sweep_one(work_db, probe, publisher, cube_client, completion_handler, candidate, &mut outcome).await;
+        sweep_one(
+            work_db,
+            probe,
+            publisher,
+            cube_client,
+            completion_handler,
+            candidate,
+            &mut outcome,
+        )
+        .await;
     }
     if let Some(handler) = completion_handler {
         for execution_id in &pending_pr_recheck {
@@ -1507,8 +1452,7 @@ pub async fn run_one_pass(
     // merge_conflict / ci_failure loop, and let the normal detection path
     // spawn a fresh revision.
     for candidate in &stranded_blocked {
-        sweep_stranded_blocked_remediation(work_db, probe, publisher, candidate, &mut outcome)
-            .await;
+        sweep_stranded_blocked_remediation(work_db, probe, publisher, candidate, &mut outcome).await;
     }
     // Late-PR sweep (Bug B): recover terminal executions whose pane
     // pushed a PR after the execution was marked abandoned.
@@ -1679,11 +1623,7 @@ async fn stop_worker_on_review_transition(
 /// [`WorkerCompletionHandler::recheck_for_pr`], which transitions the
 /// chore on `Fresh`/`Merged` and stays quiet on the no-PR / stale-PR
 /// branches so the poller doesn't spam probes or awaiting-input events.
-async fn sweep_pending_pr(
-    handler: &WorkerCompletionHandler,
-    execution_id: &str,
-    outcome: &mut SweepOutcome,
-) {
+async fn sweep_pending_pr(handler: &WorkerCompletionHandler, execution_id: &str, outcome: &mut SweepOutcome) {
     match handler.recheck_for_pr(execution_id).await {
         StopOutcome::PrDetected { pr_url } => {
             outcome.pr_recheck_recovered += 1;
@@ -1779,11 +1719,7 @@ async fn sweep_pending_pr(
 /// `AlreadyTerminal` gate and calls
 /// [`WorkDb::bind_pr_to_active_task_from_terminal_execution`] directly
 /// on a positive detection result.
-async fn sweep_late_pr(
-    handler: &WorkerCompletionHandler,
-    candidate: &LatePrCandidate,
-    outcome: &mut SweepOutcome,
-) {
+async fn sweep_late_pr(handler: &WorkerCompletionHandler, candidate: &LatePrCandidate, outcome: &mut SweepOutcome) {
     match handler.recheck_for_pr_late(candidate).await {
         StopOutcome::PrDetected { pr_url } | StopOutcome::PrMerged { pr_url } => {
             outcome.late_pr_recovered += 1;
@@ -1915,13 +1851,7 @@ async fn sweep_one(
             // already ran inside `mark_chore_pr_merged`'s transaction;
             // here we force-release their cube leases and mark them
             // terminal so the scheduler doesn't try to redispatch.
-            stop_active_revision_executions(
-                work_db,
-                completion_handler,
-                &candidate.work_item_id,
-                outcome,
-            )
-            .await;
+            stop_active_revision_executions(work_db, completion_handler, &candidate.work_item_id, outcome).await;
         }
         PrLifecycleState::Open(open) => {
             // Design §Q1: conflict pre-empts CI — the conflict-resolver
@@ -2026,13 +1956,7 @@ async fn sweep_one(
                         {
                             outcome.ci_cleared += 1;
                         }
-                        ci_watch::on_ci_in_flight(
-                            work_db,
-                            publisher,
-                            candidate,
-                            &probe_result,
-                        )
-                        .await;
+                        ci_watch::on_ci_in_flight(work_db, publisher, candidate, &probe_result).await;
                     }
                 }
             }
@@ -2166,11 +2090,10 @@ async fn reconcile_stranded(
     outcome: &mut SweepOutcome,
 ) {
     let recanonicalized = match kind {
-        SignalKind::MergeConflict => work_db
-            .recanonicalize_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url),
-        SignalKind::CiFailure => {
-            work_db.recanonicalize_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url)
+        SignalKind::MergeConflict => {
+            work_db.recanonicalize_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
         }
+        SignalKind::CiFailure => work_db.recanonicalize_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url),
     };
     match recanonicalized {
         Ok(Some(_)) => {}
@@ -2210,15 +2133,7 @@ async fn reconcile_stranded(
     let checker = crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open);
     match kind {
         SignalKind::MergeConflict => {
-            if conflict_watch::on_conflict_detected(
-                work_db,
-                publisher,
-                &checker,
-                candidate,
-                probe_result,
-            )
-            .await
-            {
+            if conflict_watch::on_conflict_detected(work_db, publisher, &checker, candidate, probe_result).await {
                 outcome.conflict_flagged += 1;
             }
         }
@@ -2230,15 +2145,7 @@ async fn reconcile_stranded(
                 },
                 _ => Vec::new(),
             };
-            if ci_watch::on_ci_failure_detected(
-                work_db,
-                publisher,
-                &checker,
-                candidate,
-                probe_result,
-                &failures,
-            )
-            .await
+            if ci_watch::on_ci_failure_detected(work_db, publisher, &checker, candidate, probe_result, &failures).await
             {
                 outcome.ci_flagged += 1;
             }
@@ -2340,15 +2247,7 @@ async fn maybe_clear_blocked(
     for signal in signals {
         match signal.reason.as_str() {
             "merge_conflict" => {
-                if conflict_watch::on_resolved(
-                    work_db,
-                    publisher,
-                    cube_client,
-                    candidate,
-                    labels,
-                )
-                .await
-                {
+                if conflict_watch::on_resolved(work_db, publisher, cube_client, candidate, labels).await {
                     outcome.conflict_cleared += 1;
                 }
             }
@@ -2364,13 +2263,8 @@ async fn maybe_clear_blocked(
                     // is typically still polling CI for the very fix the
                     // engine already observed) and otherwise holds its slot
                     // indefinitely (issue #898).
-                    stop_worker_on_review_transition(
-                        work_db,
-                        completion_handler,
-                        &candidate.work_item_id,
-                        outcome,
-                    )
-                    .await;
+                    stop_worker_on_review_transition(work_db, completion_handler, &candidate.work_item_id, outcome)
+                        .await;
                 }
             }
             other => {
@@ -2477,11 +2371,7 @@ pub(crate) async fn update_pr_poll_state(
         // State changed — emit event so the macOS kanban refreshes the
         // card's CI / review / merging indicators within the poll interval.
         publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "pr_poll_state_updated",
-            )
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "pr_poll_state_updated")
             .await;
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
@@ -2565,17 +2455,18 @@ async fn mark_merged(
     // Auto-populate the project's design-doc pointer on merge for
     // `kind=design` tasks. Errors are logged inside the detector.
     if updated.kind == TaskKind::Design
-        && let Some(ref project_id) = updated.project_id {
-            design_detector::on_design_pr_merged(
-                work_db,
-                &updated.id,
-                &candidate.product_id,
-                project_id,
-                &candidate.pr_url,
-                probe.base_ref_name.as_deref(),
-            )
-            .await;
-        }
+        && let Some(ref project_id) = updated.project_id
+    {
+        design_detector::on_design_pr_merged(
+            work_db,
+            &updated.id,
+            &candidate.product_id,
+            project_id,
+            &candidate.pr_url,
+            probe.base_ref_name.as_deref(),
+        )
+        .await;
+    }
     true
 }
 
@@ -2685,8 +2576,7 @@ pub fn spawn_loop(
             MERGE_QUEUE_REBOUNCED.inc_by(&metrics, outcome.merge_queue_rebounced as u64);
             LATE_PR_RECOVERED.inc_by(&metrics, outcome.late_pr_recovered as u64);
             REVISION_INVALIDATED.inc_by(&metrics, outcome.revision_invalidated as u64);
-            WORKER_STOPPED_ON_REVIEW
-                .inc_by(&metrics, outcome.worker_stopped_on_review as u64);
+            WORKER_STOPPED_ON_REVIEW.inc_by(&metrics, outcome.worker_stopped_on_review as u64);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
                 tracing::info!(
                     merged = outcome.merged,
@@ -2748,17 +2638,15 @@ mod tests {
 
     use super::*;
     use crate::completion::{
-        PaneReleaseOutcome, PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler,
-        WorkerPaneReleaser,
+        PaneReleaseOutcome, PrDetector, PrStatus, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
     };
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionPublisher,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionPublisher,
     };
     use crate::work::{
-        AddDependencyInput, ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput,
-        CreateProductInput, CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb, WorkItem,
-        WorkItemPatch,
+        AddDependencyInput, ConflictResolutionInsertInput, CreateChoreInput, CreateExecutionInput, CreateProductInput,
+        CreateProjectInput, CreateTaskInput, ExecutionStatus, WorkDb, WorkItem, WorkItemPatch,
     };
 
     struct StubProbe {
@@ -2800,13 +2688,7 @@ mod tests {
         /// missing). Stranded-recovery regression tests vary both across
         /// sweeps so a fresh attempt row (and a fresh revision) can be
         /// inserted for the re-conflict / re-failure.
-        fn set_with_base_head(
-            &self,
-            url: &str,
-            state: PrLifecycleState,
-            base_ref_oid: &str,
-            head_ref_oid: &str,
-        ) {
+        fn set_with_base_head(&self, url: &str, state: PrLifecycleState, base_ref_oid: &str, head_ref_oid: &str) {
             self.states.lock().unwrap().insert(
                 url.to_owned(),
                 Ok(PrLifecycleProbe {
@@ -2841,10 +2723,7 @@ mod tests {
         }
 
         fn set_err(&self, url: &str, msg: &str) {
-            self.states
-                .lock()
-                .unwrap()
-                .insert(url.to_owned(), Err(msg.to_owned()));
+            self.states.lock().unwrap().insert(url.to_owned(), Err(msg.to_owned()));
         }
     }
 
@@ -2909,23 +2788,13 @@ mod tests {
     #[async_trait]
     impl ExecutionPublisher for RecordingPublisher {
         async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-        async fn publish_work_item_changed(
-            &self,
-            product_id: &str,
-            work_item_id: &str,
-            reason: &str,
-        ) {
-            self.work_events.lock().await.push((
-                product_id.to_owned(),
-                work_item_id.to_owned(),
-                reason.to_owned(),
-            ));
+        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+            self.work_events
+                .lock()
+                .await
+                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
         }
-        async fn publish_frontend_event_on_product(
-            &self,
-            _product_id: &str,
-            event: boss_protocol::FrontendEvent,
-        ) {
+        async fn publish_frontend_event_on_product(&self, _product_id: &str, event: boss_protocol::FrontendEvent) {
             self.frontend_events.lock().await.push(event);
         }
     }
@@ -3115,8 +2984,7 @@ mod tests {
         let pr_chore = "https://github.com/foo/bar/pull/100";
         let pr_proj = "https://github.com/foo/bar/pull/101";
         let (_pid_c, chore_id) = make_chore_in_review(&db, "Cmix", pr_chore);
-        let (project_product_id, project_task_id) =
-            make_project_task_in_review(&db, "PTmix", pr_proj);
+        let (project_product_id, project_task_id) = make_project_task_in_review(&db, "PTmix", pr_proj);
 
         let probe = StubProbe::new();
         probe.set(pr_chore, PrLifecycleState::Merged);
@@ -3145,9 +3013,9 @@ mod tests {
         }
         let work_events = publisher.work_events.lock().await.clone();
         assert!(
-            work_events.iter().any(|(p, w, r)| p == &project_product_id
-                && w == &project_task_id
-                && r == "pr_merged"),
+            work_events
+                .iter()
+                .any(|(p, w, r)| p == &project_product_id && w == &project_task_id && r == "pr_merged"),
             "expected pr_merged work-item event for project_task, got {work_events:?}",
         );
     }
@@ -3265,10 +3133,7 @@ mod tests {
 
     #[async_trait]
     impl CubeClient for RecordingCubeClient {
-        async fn ensure_repo(
-            &self,
-            _origin: &str,
-        ) -> Result<crate::coordinator::CubeRepoHandle> {
+        async fn ensure_repo(&self, _origin: &str) -> Result<crate::coordinator::CubeRepoHandle> {
             unreachable!("not used in merge_poller tests")
         }
         async fn lease_workspace(
@@ -3281,41 +3146,26 @@ mod tests {
         ) -> Result<crate::coordinator::CubeWorkspaceLease> {
             unreachable!("not used in merge_poller tests")
         }
-        async fn create_change(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-        ) -> Result<crate::coordinator::CubeChangeHandle> {
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<crate::coordinator::CubeChangeHandle> {
             unreachable!("not used in merge_poller tests")
         }
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {
             self.releases.lock().await.push(lease_id.to_owned());
             Ok(())
         }
-        async fn workspace_status(
-            &self,
-            _: &std::path::Path,
-        ) -> Result<crate::coordinator::CubeWorkspaceStatus> {
+        async fn workspace_status(&self, _: &std::path::Path) -> Result<crate::coordinator::CubeWorkspaceStatus> {
             unreachable!()
         }
         async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> Result<()> {
             Ok(())
         }
-        async fn force_release_lease(
-            &self,
-            _: &str,
-            _: Option<&str>,
-        ) -> Result<()> {
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
             Ok(())
         }
-        async fn list_workspaces(
-            &self,
-        ) -> Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
+        async fn list_workspaces(&self) -> Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
             Ok(Vec::new())
         }
-        async fn list_repos(
-            &self,
-        ) -> Result<Vec<crate::coordinator::CubeRepoSummary>> {
+        async fn list_repos(&self) -> Result<Vec<crate::coordinator::CubeRepoSummary>> {
             Ok(Vec::new())
         }
     }
@@ -3475,13 +3325,7 @@ mod tests {
     /// Point a stub probe at `pr` reporting the dirty/red signal for `kind`,
     /// keyed on the given base/head SHAs so a fresh attempt row can be
     /// inserted for a re-conflict / re-failure.
-    fn set_dirty_probe(
-        probe: &StubProbe,
-        pr: &str,
-        kind: StrandKind,
-        base_sha: &str,
-        head_sha: &str,
-    ) {
+    fn set_dirty_probe(probe: &StubProbe, pr: &str, kind: StrandKind, base_sha: &str, head_sha: &str) {
         match kind {
             StrandKind::Conflict => probe.set_with_base_head(
                 pr,
@@ -3639,9 +3483,7 @@ mod tests {
             // still sits in `review` (revisions are not auto-advanced to done).
             let new_rev = match kind {
                 StrandKind::Conflict => {
-                    let rows = db
-                        .list_conflict_resolutions(None, &[], Some(&chore), None)
-                        .unwrap();
+                    let rows = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
                     assert_eq!(rows.len(), 2, "{reason}: a second attempt row for the re-dirty PR");
                     rows.iter()
                         .filter_map(|r| r.revision_task_id.clone())
@@ -3649,9 +3491,7 @@ mod tests {
                         .expect("a new conflict revision must spawn")
                 }
                 StrandKind::Ci => {
-                    let rows = db
-                        .list_ci_remediations(None, &[], Some(&chore), None)
-                        .unwrap();
+                    let rows = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
                     assert_eq!(rows.len(), 2, "{reason}: a second attempt row for the re-dirty PR");
                     rows.iter()
                         .filter_map(|r| r.revision_task_id.clone())
@@ -3662,7 +3502,11 @@ mod tests {
             assert_ne!(new_rev, prior_rev_id, "{reason}: new revision is distinct");
             match db.get_work_item(&prior_rev_id).unwrap() {
                 WorkItem::Task(t) => {
-                    assert_eq!(t.status, TaskStatus::InReview, "{reason}: prior revision stays in review");
+                    assert_eq!(
+                        t.status,
+                        TaskStatus::InReview,
+                        "{reason}: prior revision stays in review"
+                    );
                     assert_eq!(t.kind, TaskKind::Revision);
                 }
                 other => panic!("{reason}: expected prior revision task, got {other:?}"),
@@ -3670,7 +3514,11 @@ mod tests {
             match db.get_work_item(&new_rev).unwrap() {
                 WorkItem::Task(t) => {
                     assert_eq!(t.kind, TaskKind::Revision, "{reason}: new fix vehicle is a revision");
-                    assert_ne!(t.status, TaskStatus::Done, "{reason}: new revision is not auto-advanced");
+                    assert_ne!(
+                        t.status,
+                        TaskStatus::Done,
+                        "{reason}: new revision is not auto-advanced"
+                    );
                 }
                 other => panic!("{reason}: expected new revision task, got {other:?}"),
             }
@@ -3697,7 +3545,8 @@ mod tests {
             .active_conflict_resolution_for_work_item(&chore)
             .unwrap()
             .expect("prior crz");
-        db.mark_conflict_resolution_succeeded(&crz.id, Some("resolved")).unwrap();
+        db.mark_conflict_resolution_succeeded(&crz.id, Some("resolved"))
+            .unwrap();
         db.clear_merge_conflict_signal_only(&chore).unwrap();
 
         // Add an unsatisfied gating prerequisite, then model the strand
@@ -3734,10 +3583,7 @@ mod tests {
 
         // It surfaces in the stranded list and is genuinely gated...
         assert_eq!(db.list_chores_stranded_blocked_remediation().unwrap().len(), 1);
-        assert!(
-            !db.gating_prereqs_for(&chore).unwrap().is_empty(),
-            "gated precondition",
-        );
+        assert!(!db.gating_prereqs_for(&chore).unwrap().is_empty(), "gated precondition",);
 
         // ...so the recovery pass leaves it untouched even with a dirty PR.
         set_dirty_probe(&probe, pr, StrandKind::Conflict, "base-new", "head-new");
@@ -3754,7 +3600,9 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         }
         assert_eq!(
-            db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap().len(),
+            db.list_conflict_resolutions(None, &[], Some(&chore), None)
+                .unwrap()
+                .len(),
             1,
             "no fresh attempt spawned for a gated parent",
         );
@@ -3896,11 +3744,7 @@ mod tests {
 
         // Pass 2: probe still reports the same failure.
         let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-        assert_eq!(
-            outcome2.total_transitions(),
-            0,
-            "idempotent re-probe must not re-fire",
-        );
+        assert_eq!(outcome2.total_transitions(), 0, "idempotent re-probe must not re-fire",);
 
         // Pass 3: CI is clean. The blocked_ci slice picks the row up.
         probe
@@ -3935,10 +3779,7 @@ mod tests {
             .filter(|(p, w, r)| p == &product && w == &chore && r != "pr_poll_state_updated")
             .map(|(_, _, r)| r.clone())
             .collect();
-        assert_eq!(
-            reasons,
-            vec!["ci_revision_in_flight".to_owned()],
-        );
+        assert_eq!(reasons, vec!["ci_revision_in_flight".to_owned()],);
     }
 
     /// When the CI-remediation attempt budget is exhausted, `run_one_pass`
@@ -4025,22 +3866,12 @@ mod tests {
         let fe = publisher.frontend_events.lock().await;
         let exhausted = fe
             .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    boss_protocol::FrontendEvent::CiRemediationExhausted { .. }
-                )
-            })
+            .filter(|e| matches!(e, boss_protocol::FrontendEvent::CiRemediationExhausted { .. }))
             .count();
         assert_eq!(exhausted, 1, "CiRemediationExhausted event must be emitted");
         let attention_created = fe
             .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    boss_protocol::FrontendEvent::AttentionItemCreated { .. }
-                )
-            })
+            .filter(|e| matches!(e, boss_protocol::FrontendEvent::AttentionItemCreated { .. }))
             .count();
         assert_eq!(
             attention_created, 1,
@@ -4211,12 +4042,8 @@ mod tests {
         db.mark_chore_blocked_merge_conflict(&mc_chore, pr_mc).unwrap();
 
         let listed = db.list_chores_blocked_on_ci_failure().unwrap();
-        let ids: std::collections::HashSet<String> =
-            listed.iter().map(|c| c.work_item_id.clone()).collect();
-        assert!(
-            ids.contains(&ci_chore),
-            "ci_failure row must be listed; got {ids:?}",
-        );
+        let ids: std::collections::HashSet<String> = listed.iter().map(|c| c.work_item_id.clone()).collect();
+        assert!(ids.contains(&ci_chore), "ci_failure row must be listed; got {ids:?}",);
         assert!(
             ids.contains(&exh_chore),
             "ci_failure_exhausted row must be listed; got {ids:?}",
@@ -4227,11 +4054,7 @@ mod tests {
         );
         // The in_review row stays out (it doesn't satisfy
         // `status='blocked'`).
-        assert_eq!(
-            listed.len(),
-            2,
-            "exactly two CI-blocked rows should be returned",
-        );
+        assert_eq!(listed.len(), 2, "exactly two CI-blocked rows should be returned",);
     }
 
     #[tokio::test]
@@ -4286,10 +4109,7 @@ mod tests {
         labels: &[&str],
         rollup: serde_json::Value,
     ) -> String {
-        let labels_json: Vec<serde_json::Value> = labels
-            .iter()
-            .map(|n| serde_json::json!({ "name": n }))
-            .collect();
+        let labels_json: Vec<serde_json::Value> = labels.iter().map(|n| serde_json::json!({ "name": n })).collect();
         serde_json::json!({
             "state": state,
             "mergedAt": merged_at,
@@ -4474,11 +4294,8 @@ mod tests {
             vec!["needs-review".to_owned(), "boss/no-auto-rebase".to_owned()],
         );
 
-        let body_empty = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "abc", "", &[], serde_json::json!([]),
-        );
-        let probe_empty =
-            parse_probe_json("https://example.test/pr/3", &body_empty, None).unwrap();
+        let body_empty = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "abc", "", &[], serde_json::json!([]));
+        let probe_empty = parse_probe_json("https://example.test/pr/3", &body_empty, None).unwrap();
         assert!(probe_empty.labels.is_empty());
     }
 
@@ -4497,16 +4314,15 @@ mod tests {
             combined_state: Option<&'static str>,
             expect_ci: OpenPrCiStatus,
         }
-        let failing_check =
-            |name: &'static str, conclusion: &'static str, target: &'static str| {
-                serde_json::json!({
-                    "name": name,
-                    "status": "COMPLETED",
-                    "conclusion": conclusion,
-                    "targetUrl": target,
-                    "isRequired": true,
-                })
-            };
+        let failing_check = |name: &'static str, conclusion: &'static str, target: &'static str| {
+            serde_json::json!({
+                "name": name,
+                "status": "COMPLETED",
+                "conclusion": conclusion,
+                "targetUrl": target,
+                "isRequired": true,
+            })
+        };
         let success_check = |name: &'static str| {
             serde_json::json!({
                 "name": name,
@@ -4548,10 +4364,7 @@ mod tests {
             },
             Case {
                 label: "one required check FAILURE → Failing",
-                rollup: serde_json::json!([
-                    success_check("ci/build"),
-                    failing_check("ci/test", "FAILURE", ""),
-                ]),
+                rollup: serde_json::json!([success_check("ci/build"), failing_check("ci/test", "FAILURE", ""),]),
                 combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
@@ -4565,19 +4378,13 @@ mod tests {
             },
             Case {
                 label: "later leaf wins for the same name (re-run success masks earlier FAILURE)",
-                rollup: serde_json::json!([
-                    failing_check("ci/test", "FAILURE", ""),
-                    success_check("ci/test"),
-                ]),
+                rollup: serde_json::json!([failing_check("ci/test", "FAILURE", ""), success_check("ci/test"),]),
                 combined_state: None,
                 expect_ci: OpenPrCiStatus::Clean,
             },
             Case {
                 label: "later leaf wins for the same name (re-run FAILURE masks earlier success)",
-                rollup: serde_json::json!([
-                    success_check("ci/test"),
-                    failing_check("ci/test", "FAILURE", ""),
-                ]),
+                rollup: serde_json::json!([success_check("ci/test"), failing_check("ci/test", "FAILURE", ""),]),
                 combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
@@ -4740,10 +4547,7 @@ mod tests {
             },
             Case {
                 label: "all terminal, one failure → Failing (terminal gate satisfied)",
-                rollup: serde_json::json!([
-                    success_check("ci/lint"),
-                    failing_check("ci/test", "FAILURE", ""),
-                ]),
+                rollup: serde_json::json!([success_check("ci/lint"), failing_check("ci/test", "FAILURE", ""),]),
                 combined_state: None,
                 expect_ci: OpenPrCiStatus::Failing {
                     failures: vec![RequiredCheckFailure {
@@ -4767,8 +4571,7 @@ mod tests {
                     failures: vec![RequiredCheckFailure {
                         name: "buildkite/mono".into(),
                         conclusion: "FAILURE".into(),
-                        target_url:
-                            "https://buildkite.com/anthropic/mono/builds/42#01h-job-uuid".into(),
+                        target_url: "https://buildkite.com/anthropic/mono/builds/42#01h-job-uuid".into(),
                         provider: CiProvider::Buildkite,
                         provider_job_id: Some("01h-job-uuid".into()),
                     }],
@@ -4786,8 +4589,7 @@ mod tests {
                     failures: vec![RequiredCheckFailure {
                         name: "gha/build".into(),
                         conclusion: "FAILURE".into(),
-                        target_url:
-                            "https://github.com/anthropic/mono/actions/runs/12345/job/67890".into(),
+                        target_url: "https://github.com/anthropic/mono/actions/runs/12345/job/67890".into(),
                         provider: CiProvider::GithubActions,
                         provider_job_id: Some("67890".into()),
                     }],
@@ -4900,20 +4702,21 @@ mod tests {
         ];
         for case in cases {
             let body = json_doc(
-                "OPEN", "", "MERGEABLE", "CLEAN", "abc", "head-1", &[], case.rollup.clone(),
+                "OPEN",
+                "",
+                "MERGEABLE",
+                "CLEAN",
+                "abc",
+                "head-1",
+                &[],
+                case.rollup.clone(),
             );
-            let probe =
-                parse_probe_json("https://example.test/pr/ci", &body, case.combined_state)
-                    .unwrap();
+            let probe = parse_probe_json("https://example.test/pr/ci", &body, case.combined_state).unwrap();
             let actual_ci = match probe.state {
                 PrLifecycleState::Open(OpenPrStatus { ci, .. }) => ci,
                 other => panic!("case `{}`: expected Open, got {other:?}", case.label),
             };
-            assert_eq!(
-                actual_ci, case.expect_ci,
-                "case `{}`: CI status mismatch",
-                case.label,
-            );
+            assert_eq!(actual_ci, case.expect_ci, "case `{}`: CI status mismatch", case.label,);
         }
     }
 
@@ -5004,35 +4807,51 @@ mod tests {
         // PR in merge queue — mergeQueueEntry is a non-null object.
         let body_in_queue = {
             let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
-                "OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]),
+                "OPEN",
+                "",
+                "MERGEABLE",
+                "CLEAN",
+                "",
+                "",
+                &[],
+                serde_json::json!([]),
             ))
             .unwrap();
             doc["mergeQueueEntry"] = serde_json::json!({"state": "QUEUED"});
             doc.to_string()
         };
         let probe = parse_probe_json("https://example.test/pr/mq1", &body_in_queue, None).unwrap();
-        assert!(probe.in_merge_queue, "non-null mergeQueueEntry should set in_merge_queue");
+        assert!(
+            probe.in_merge_queue,
+            "non-null mergeQueueEntry should set in_merge_queue"
+        );
 
         // PR not in merge queue — mergeQueueEntry is JSON null.
         let body_null = {
             let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
-                "OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]),
+                "OPEN",
+                "",
+                "MERGEABLE",
+                "CLEAN",
+                "",
+                "",
+                &[],
+                serde_json::json!([]),
             ))
             .unwrap();
             doc["mergeQueueEntry"] = serde_json::Value::Null;
             doc.to_string()
         };
-        let probe_null =
-            parse_probe_json("https://example.test/pr/mq2", &body_null, None).unwrap();
-        assert!(!probe_null.in_merge_queue, "null mergeQueueEntry should clear in_merge_queue");
+        let probe_null = parse_probe_json("https://example.test/pr/mq2", &body_null, None).unwrap();
+        assert!(
+            !probe_null.in_merge_queue,
+            "null mergeQueueEntry should clear in_merge_queue"
+        );
 
         // PR not in merge queue — mergeQueueEntry field absent entirely
         // (older gh versions or repos without queue enabled).
-        let body_absent = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]),
-        );
-        let probe_absent =
-            parse_probe_json("https://example.test/pr/mq3", &body_absent, None).unwrap();
+        let body_absent = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "", "", &[], serde_json::json!([]));
+        let probe_absent = parse_probe_json("https://example.test/pr/mq3", &body_absent, None).unwrap();
         assert!(
             !probe_absent.in_merge_queue,
             "absent mergeQueueEntry should clear in_merge_queue",
@@ -5061,15 +4880,8 @@ mod tests {
             check_run("ci/build", "COMPLETED", "SUCCESS"),
             check_run("Owner Approval", "IN_PROGRESS", ""),
         ]);
-        let body = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
-        );
-        let probe = parse_probe_json(
-            "https://github.com/linkedin-multiproduct/mono/pull/1",
-            &body,
-            None,
-        )
-        .unwrap();
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let probe = parse_probe_json("https://github.com/linkedin-multiproduct/mono/pull/1", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -5092,23 +4904,23 @@ mod tests {
     /// PR as awaiting required review.
     #[test]
     fn owner_approval_pending_overrides_github_approved_decision() {
-        let rollup = serde_json::json!([
-            check_run("Owner Approval", "IN_PROGRESS", ""),
-        ]);
+        let rollup = serde_json::json!([check_run("Owner Approval", "IN_PROGRESS", ""),]);
         let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+            "OPEN",
+            "",
+            "MERGEABLE",
+            "CLEAN",
+            "base-1",
+            "head-1",
+            &[],
+            rollup,
         ))
         .unwrap();
         doc["reviewDecision"] = serde_json::json!("APPROVED");
         doc["reviews"] = serde_json::json!([
             {"author": {"login": "alice"}, "state": "APPROVED"},
         ]);
-        let probe = parse_probe_json(
-            "https://github.com/linkedin-eng/foo/pull/2",
-            &doc.to_string(),
-            None,
-        )
-        .unwrap();
+        let probe = parse_probe_json("https://github.com/linkedin-eng/foo/pull/2", &doc.to_string(), None).unwrap();
         assert_eq!(probe.review, PrReviewState::Required);
     }
 
@@ -5117,11 +4929,16 @@ mod tests {
     /// `Required` so the user still sees who blocked the PR.
     #[test]
     fn owner_approval_pending_preserves_changes_requested() {
-        let rollup = serde_json::json!([
-            check_run("Owner Approval", "IN_PROGRESS", ""),
-        ]);
+        let rollup = serde_json::json!([check_run("Owner Approval", "IN_PROGRESS", ""),]);
         let mut doc: serde_json::Value = serde_json::from_str(&json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
+            "OPEN",
+            "",
+            "MERGEABLE",
+            "CLEAN",
+            "base-1",
+            "head-1",
+            &[],
+            rollup,
         ))
         .unwrap();
         doc["reviewDecision"] = serde_json::json!("CHANGES_REQUESTED");
@@ -5136,7 +4953,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             probe.review,
-            PrReviewState::ChangesRequested { reviewers: vec!["bob".to_owned()] },
+            PrReviewState::ChangesRequested {
+                reviewers: vec!["bob".to_owned()]
+            },
         );
     }
 
@@ -5149,15 +4968,8 @@ mod tests {
             check_run("Owner Approval", "COMPLETED", "SUCCESS"),
             check_run("ci/build", "COMPLETED", "SUCCESS"),
         ]);
-        let body = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
-        );
-        let probe = parse_probe_json(
-            "https://github.com/linkedin-multiproduct/mono/pull/4",
-            &body,
-            None,
-        )
-        .unwrap();
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let probe = parse_probe_json("https://github.com/linkedin-multiproduct/mono/pull/4", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -5172,18 +4984,9 @@ mod tests {
     /// auto-remediate a human-approval refusal.
     #[test]
     fn owner_approval_failure_becomes_changes_requested() {
-        let rollup = serde_json::json!([
-            check_run("Owner Approval", "COMPLETED", "FAILURE"),
-        ]);
-        let body = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
-        );
-        let probe = parse_probe_json(
-            "https://github.com/linkedin-eng/foo/pull/5",
-            &body,
-            None,
-        )
-        .unwrap();
+        let rollup = serde_json::json!([check_run("Owner Approval", "COMPLETED", "FAILURE"),]);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let probe = parse_probe_json("https://github.com/linkedin-eng/foo/pull/5", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -5193,10 +4996,7 @@ mod tests {
             OpenPrCiStatus::Clean,
             "Owner Approval failure must not show as a CI failure",
         );
-        assert_eq!(
-            probe.review,
-            PrReviewState::ChangesRequested { reviewers: Vec::new() },
-        );
+        assert_eq!(probe.review, PrReviewState::ChangesRequested { reviewers: Vec::new() },);
     }
 
     /// Outside the configured LinkedIn orgs, an `Owner Approval` check
@@ -5205,18 +5005,9 @@ mod tests {
     /// repos where the check doesn't have ACL semantics.
     #[test]
     fn owner_approval_in_other_org_stays_a_ci_check() {
-        let rollup = serde_json::json!([
-            check_run("Owner Approval", "IN_PROGRESS", ""),
-        ]);
-        let body = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
-        );
-        let probe = parse_probe_json(
-            "https://github.com/spinyfin/mono/pull/6",
-            &body,
-            None,
-        )
-        .unwrap();
+        let rollup = serde_json::json!([check_run("Owner Approval", "IN_PROGRESS", ""),]);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let probe = parse_probe_json("https://github.com/spinyfin/mono/pull/6", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -5234,18 +5025,9 @@ mod tests {
     /// tolerate drift in user-supplied URLs.
     #[test]
     fn linkedin_org_match_is_case_insensitive() {
-        let rollup = serde_json::json!([
-            check_run("owner approval", "IN_PROGRESS", ""),
-        ]);
-        let body = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
-        );
-        let probe = parse_probe_json(
-            "https://github.com/LinkedIn-Multiproduct/mono/pull/7",
-            &body,
-            None,
-        )
-        .unwrap();
+        let rollup = serde_json::json!([check_run("owner approval", "IN_PROGRESS", ""),]);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let probe = parse_probe_json("https://github.com/LinkedIn-Multiproduct/mono/pull/7", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -5259,18 +5041,9 @@ mod tests {
     /// no review-signal verdict — both axes behave as normal.
     #[test]
     fn linkedin_org_without_owner_approval_is_unchanged() {
-        let rollup = serde_json::json!([
-            check_run("ci/build", "COMPLETED", "SUCCESS"),
-        ]);
-        let body = json_doc(
-            "OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup,
-        );
-        let probe = parse_probe_json(
-            "https://github.com/linkedin-multiproduct/mono/pull/8",
-            &body,
-            None,
-        )
-        .unwrap();
+        let rollup = serde_json::json!([check_run("ci/build", "COMPLETED", "SUCCESS"),]);
+        let body = json_doc("OPEN", "", "MERGEABLE", "CLEAN", "base-1", "head-1", &[], rollup);
+        let probe = parse_probe_json("https://github.com/linkedin-multiproduct/mono/pull/8", &body, None).unwrap();
         let open = match probe.state {
             PrLifecycleState::Open(open) => open,
             other => panic!("expected Open, got {other:?}"),
@@ -5458,18 +5231,17 @@ mod tests {
         // New-model: re-arm dispatches a fresh revision; the parent is
         // reconciled back to in_review. conflict_flagged = 1 because a state
         // transition occurred (blocked → in_review via reconcile path).
-        assert_eq!(outcome.conflict_flagged, 1, "stale-base re-arm must count as a new event");
+        assert_eq!(
+            outcome.conflict_flagged, 1,
+            "stale-base re-arm must count as a new event"
+        );
 
         // A new crz must exist with base_sha_at_trigger = "sha-new".
-        let crz_rows = db
-            .list_conflict_resolutions(None, &[], Some(&chore), None)
-            .unwrap();
+        let crz_rows = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
         let fresh_crz = crz_rows
             .iter()
             .find(|r| r.base_sha_at_trigger.as_deref() == Some("sha-new"))
-            .unwrap_or_else(|| {
-                panic!("expected a fresh crz with base_sha_at_trigger=sha-new; rows={crz_rows:?}")
-            });
+            .unwrap_or_else(|| panic!("expected a fresh crz with base_sha_at_trigger=sha-new; rows={crz_rows:?}"));
         assert_eq!(fresh_crz.status, "pending", "fresh crz must be pending");
 
         // Phase 3 cutover: the re-arm spawns an engine-triggered revision
@@ -5516,8 +5288,11 @@ mod tests {
             crate::work::WorkItem::Chore(t) => t,
             other => panic!("expected Chore, got {other:?}"),
         };
-        assert_eq!(task_after.status, TaskStatus::InReview,
-            "stale-base re-arm must reconcile parent to in_review (revision in flight)");
+        assert_eq!(
+            task_after.status,
+            TaskStatus::InReview,
+            "stale-base re-arm must reconcile parent to in_review (revision in flight)"
+        );
         assert!(task_after.blocked_reason.is_none());
     }
 
@@ -5544,8 +5319,7 @@ mod tests {
             })
             .unwrap()
             .expect("attempt insert must succeed");
-        db.mark_conflict_resolution_failed(&attempt.id, "worker_died")
-            .unwrap();
+        db.mark_conflict_resolution_failed(&attempt.id, "worker_died").unwrap();
 
         let probe = StubProbe::new();
         probe.set_with_base(
@@ -5620,7 +5394,9 @@ mod tests {
         // work_item_changed event must have fired.
         let events = publisher.work_events.lock().await;
         assert!(
-            events.iter().any(|(pid, wid, r)| pid == &product && wid == &chore && r == "merge_conflict_resolved"),
+            events
+                .iter()
+                .any(|(pid, wid, r)| pid == &product && wid == &chore && r == "merge_conflict_resolved"),
             "expected merge_conflict_resolved event; got {events:?}",
         );
     }
@@ -5704,8 +5480,7 @@ mod tests {
         // on_ci_resolved (which would have been a no-op anyway, but
         // the new shape skips the unconditional call entirely).
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-        let outcome =
-            run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.conflict_cleared, 1);
         assert_eq!(outcome.ci_cleared, 0);
 
@@ -5756,20 +5531,19 @@ mod tests {
         let publisher = Arc::new(RecordingPublisher::default());
 
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-        let outcome =
-            run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(outcome.ci_cleared, 1, "polymorphic dispatch fired on_ci_resolved");
-        assert_eq!(outcome.conflict_cleared, 0, "no merge_conflict signal => no conflict retire");
+        assert_eq!(
+            outcome.conflict_cleared, 0,
+            "no merge_conflict signal => no conflict retire"
+        );
 
         let active = db.active_blocked_signals(&chore).unwrap();
         assert!(active.is_empty(), "ci_failure signal cleared; got {active:?}");
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
                 assert_eq!(t.status, TaskStatus::InReview);
-                assert_eq!(
-                    t.ci_attempts_used, 0,
-                    "Phase 10 #32: full cycle resets budget to 0",
-                );
+                assert_eq!(t.ci_attempts_used, 0, "Phase 10 #32: full cycle resets budget to 0",);
             }
             other => panic!("expected chore, got {other:?}"),
         }
@@ -5817,10 +5591,7 @@ mod tests {
             .map(|s| s.reason)
             .collect();
         staged.sort();
-        assert_eq!(
-            staged,
-            vec!["ci_failure".to_owned(), "merge_conflict".to_owned()],
-        );
+        assert_eq!(staged, vec!["ci_failure".to_owned(), "merge_conflict".to_owned()],);
 
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
@@ -5858,8 +5629,7 @@ mod tests {
         // `ci_failure` row (via on_ci_resolved). Each fires
         // independently — neither hides the other.
         probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-        let outcome =
-            run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         // The conflict retire path is no-op against the side-table row
         // because the scalar is `ci_failure`; the WHERE guard in
         // `clear_chore_blocked_merge_conflict` misses. However, the
@@ -5867,10 +5637,7 @@ mod tests {
         // polymorphic iteration sees both reasons and routes
         // each — the CI retire fires (scalar matches), and the
         // conflict retire is a cheap no-op as designed.
-        assert_eq!(
-            outcome.ci_cleared, 1,
-            "ci_failure retired (scalar matched ci_failure)",
-        );
+        assert_eq!(outcome.ci_cleared, 1, "ci_failure retired (scalar matched ci_failure)",);
         match db.get_work_item(&chore).unwrap() {
             WorkItem::Chore(t) => {
                 assert_eq!(t.status, TaskStatus::InReview);
@@ -5919,7 +5686,9 @@ mod tests {
             url: pr.into(),
             state: PrLifecycleState::Open(OpenPrStatus {
                 mergeability: OpenPrMergeability::Conflict,
-                ci: OpenPrCiStatus::Failing { failures: failures.clone() },
+                ci: OpenPrCiStatus::Failing {
+                    failures: failures.clone(),
+                },
             }),
             base_ref_oid: Some("base-1".into()),
             head_ref_oid: Some("head-1".into()),
@@ -5953,7 +5722,9 @@ mod tests {
         // exercised here — we go straight to the next probe.)
         p1.state = PrLifecycleState::Open(OpenPrStatus {
             mergeability: OpenPrMergeability::Clean,
-            ci: OpenPrCiStatus::Failing { failures: failures.clone() },
+            ci: OpenPrCiStatus::Failing {
+                failures: failures.clone(),
+            },
         });
         p1.head_ref_oid = Some("head-2".into());
         probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
@@ -6118,11 +5889,7 @@ mod tests {
 
     #[async_trait]
     impl PrDetector for FixedPrDetector {
-        async fn detect_pr(
-            &self,
-            _repo_remote_url: &str,
-            _expected_branch: &str,
-        ) -> Result<PrStatus> {
+        async fn detect_pr(&self, _repo_remote_url: &str, _expected_branch: &str) -> Result<PrStatus> {
             Ok(match &self.0 {
                 Some(url) => PrStatus::Fresh { url: url.clone() },
                 None => PrStatus::None,
@@ -6152,7 +5919,14 @@ mod tests {
         async fn ensure_repo(&self, _origin: &str) -> Result<CubeRepoHandle> {
             unreachable!()
         }
-        async fn lease_workspace(&self, _: &str, _: &str, _: Option<&str>, _: bool, _: Option<u64>) -> Result<CubeWorkspaceLease> {
+        async fn lease_workspace(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: bool,
+            _: Option<u64>,
+        ) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
         async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
@@ -6204,18 +5978,27 @@ mod tests {
             })
             .unwrap();
         let exec = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .repo_remote_url("git@github.com:foo/bar.git")
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:foo/bar.git")
+                    .build(),
+            )
             .unwrap();
         let (exec, run) = db
             .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
             .unwrap();
         db.finish_execution_run(
-            &exec.id, &run.id, ExecutionStatus::WaitingHuman, "completed", None, None, false, None,
+            &exec.id,
+            &run.id,
+            ExecutionStatus::WaitingHuman,
+            "completed",
+            None,
+            None,
+            false,
+            None,
         )
         .unwrap();
         // Simulate orphan sweep abandoning exec_A.
@@ -6227,14 +6010,11 @@ mod tests {
     async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let (_, chore_id, _exec_id) =
-            make_abandoned_chore_with_workspace(&db, "late-pr-sweep-chore");
+        let (_, chore_id, _exec_id) = make_abandoned_chore_with_workspace(&db, "late-pr-sweep-chore");
 
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
-        let detector = Arc::new(FixedPrDetector(Some(
-            "https://github.com/foo/bar/pull/77".into(),
-        )));
+        let detector = Arc::new(FixedPrDetector(Some("https://github.com/foo/bar/pull/77".into())));
         let handler = WorkerCompletionHandler::new(
             db.clone(),
             detector,
@@ -6244,14 +6024,7 @@ mod tests {
             Arc::new(NoopProbeQueuer),
         );
 
-        let outcome = run_one_pass(
-            db.as_ref(),
-            probe.as_ref(),
-            publisher.as_ref(),
-            None,
-            Some(&handler),
-        )
-        .await;
+        let outcome = run_one_pass(db.as_ref(), probe.as_ref(), publisher.as_ref(), None, Some(&handler)).await;
 
         assert_eq!(
             outcome.late_pr_recovered, 1,
@@ -6263,18 +6036,14 @@ mod tests {
             other => panic!("expected chore, got {other:?}"),
         };
         assert_eq!(task.status, TaskStatus::InReview);
-        assert_eq!(
-            task.pr_url.as_deref(),
-            Some("https://github.com/foo/bar/pull/77")
-        );
+        assert_eq!(task.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/77"));
     }
 
     #[tokio::test]
     async fn run_one_pass_does_not_query_late_pr_candidates_without_handler() {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
-        let (_product_id, chore_id, _exec_id) =
-            make_abandoned_chore_with_workspace(&db, "late-pr-no-handler");
+        let (_product_id, chore_id, _exec_id) = make_abandoned_chore_with_workspace(&db, "late-pr-no-handler");
 
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
@@ -6312,29 +6081,25 @@ mod tests {
     /// worker execution still attached (status `running`). Mirrors the
     /// issue-#898 scenario: a worker that fixed CI but is left polling.
     /// Returns `(product_id, chore_id, execution_id)`.
-    fn make_blocked_ci_chore_with_live_worker(
-        db: &WorkDb,
-        name: &str,
-        pr: &str,
-    ) -> (String, String, String) {
+    fn make_blocked_ci_chore_with_live_worker(db: &WorkDb, name: &str, pr: &str) -> (String, String, String) {
         let (product_id, chore) = make_chore_in_review(db, name, pr);
         db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
         let exec = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(chore.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .repo_remote_url("git@github.com:foo/bar.git")
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:foo/bar.git")
+                    .build(),
+            )
             .unwrap();
         let (exec, _run) = db
             .start_execution_run(&exec.id, "agent-1", "repo-1", "lease-1", "ws-1", "/ws/1")
             .unwrap();
         // Precondition: the worker is live for the task.
         assert!(
-            db.get_live_execution_for_work_item(&chore, "")
-                .unwrap()
-                .is_some(),
+            db.get_live_execution_for_work_item(&chore, "").unwrap().is_some(),
             "setup: worker should be live before the sweep",
         );
         (product_id, chore, exec.id)
@@ -6351,8 +6116,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let pr = "https://github.com/foo/bar/pull/898";
-        let (_product_id, chore, exec_id) =
-            make_blocked_ci_chore_with_live_worker(&db, "C-898-stop", pr);
+        let (_product_id, chore, exec_id) = make_blocked_ci_chore_with_live_worker(&db, "C-898-stop", pr);
 
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
@@ -6367,14 +6131,7 @@ mod tests {
             Arc::new(NoopProbeQueuer),
         );
 
-        let outcome = run_one_pass(
-            db.as_ref(),
-            probe.as_ref(),
-            publisher.as_ref(),
-            None,
-            Some(&handler),
-        )
-        .await;
+        let outcome = run_one_pass(db.as_ref(), probe.as_ref(), publisher.as_ref(), None, Some(&handler)).await;
 
         assert_eq!(outcome.ci_cleared, 1, "ci_failure retired to in_review");
         assert_eq!(
@@ -6390,9 +6147,7 @@ mod tests {
         // The worker execution is now terminal and no longer live.
         assert_eq!(db.get_execution(&exec_id).unwrap().status, ExecutionStatus::Cancelled);
         assert!(
-            db.get_live_execution_for_work_item(&chore, "")
-                .unwrap()
-                .is_none(),
+            db.get_live_execution_for_work_item(&chore, "").unwrap().is_none(),
             "no live worker should remain for the task",
         );
     }
@@ -6405,8 +6160,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
         let pr = "https://github.com/foo/bar/pull/899";
-        let (_product_id, _chore, exec_id) =
-            make_blocked_ci_chore_with_live_worker(&db, "C-898-nohandler", pr);
+        let (_product_id, _chore, exec_id) = make_blocked_ci_chore_with_live_worker(&db, "C-898-nohandler", pr);
 
         let probe = StubProbe::new();
         let publisher = Arc::new(RecordingPublisher::default());
@@ -6563,10 +6317,11 @@ mod tests {
 
         // Pass 1: statusCheckRollup reports a FAILURE — simulates the initial
         // detection sweep that blocks the task.
-        probe.states.lock().unwrap().insert(
-            pr.to_owned(),
-            Ok(probe_ci_failing(pr, "head-1")),
-        );
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
         let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(out1.ci_flagged, 1, "first sweep must detect and block on CI failure");
 
@@ -6585,10 +6340,11 @@ mod tests {
         // (developer fixed the issue or flaky test re-ran green). The
         // blocked_ci re-poll set must re-check this PR and propagate the
         // recovery, clearing both the block and the CI indicator.
-        probe.states.lock().unwrap().insert(
-            pr.to_owned(),
-            Ok(probe_ci_clean(pr, "head-1")),
-        );
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
         let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(out2.ci_cleared, 1, "clean probe must retire the ci_failure block");
 
@@ -6596,7 +6352,11 @@ mod tests {
             WorkItem::Chore(t) => t,
             other => panic!("expected chore, got {other:?}"),
         };
-        assert_eq!(t.status, TaskStatus::InReview, "task must be back in_review after CI recovery");
+        assert_eq!(
+            t.status,
+            TaskStatus::InReview,
+            "task must be back in_review after CI recovery"
+        );
         assert!(t.blocked_reason.is_none(), "blocked_reason must be cleared");
         assert_eq!(
             t.ci_required_state.as_deref(),
@@ -6743,10 +6503,11 @@ mod tests {
 
         // Pass 1: CI fails — chore flips to blocked: ci_failure with a pending
         // ci_remediations row.
-        probe.states.lock().unwrap().insert(
-            pr.to_owned(),
-            Ok(probe_ci_failing(pr, "head-1")),
-        );
+        probe
+            .states
+            .lock()
+            .unwrap()
+            .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
         let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
         assert_eq!(out1.ci_flagged, 1);
         // Unified in_review model: the parent stays in_review with a CI-fix
@@ -6760,7 +6521,10 @@ mod tests {
         // Verify the pending ci_remediations row exists (its presence is what
         // drives the badge via sendListCiRemediations).
         let active = db.active_ci_remediation_for_work_item(&chore).unwrap();
-        assert!(active.is_some(), "a pending ci_remediations row must exist after detection");
+        assert!(
+            active.is_some(),
+            "a pending ci_remediations row must exist after detection"
+        );
 
         // Pass 2: GitHub reports the PR as MERGED while CI is still failing on
         // the head branch (force-merge / merge-queue scenario). The sweep must
@@ -6820,20 +6584,14 @@ mod tests {
         let cases: &[(&str, super::CiProvider)] = &[
             // Buildkite — host match is sufficient.
             ("https://buildkite.com/acme/mono/builds/42", Buildkite),
-            (
-                "https://buildkite.com/acme/mono/builds/42#01h-job-uuid",
-                Buildkite,
-            ),
+            ("https://buildkite.com/acme/mono/builds/42#01h-job-uuid", Buildkite),
             // GitHub Actions — github.com host PLUS an /actions/ or
             // /check-runs/ segment.
             (
                 "https://github.com/anthropic/mono/actions/runs/123/job/456",
                 GithubActions,
             ),
-            (
-                "https://github.com/anthropic/mono/check-runs/789",
-                GithubActions,
-            ),
+            ("https://github.com/anthropic/mono/check-runs/789", GithubActions),
             // Bare github.com without either segment → Other (e.g. a PR
             // or status URL we can't read logs from).
             ("https://github.com/anthropic/mono/pull/7", Other),
@@ -6842,21 +6600,11 @@ mod tests {
             ("https://app.codecov.io/gh/anthropic/mono", Other),
             ("https://sonarcloud.io/dashboard?id=mono", Other),
             // Case-insensitivity: an upper/mixed-case host still matches.
-            (
-                "HTTPS://BuildKite.COM/Acme/Mono/Builds/42",
-                Buildkite,
-            ),
-            (
-                "https://GITHUB.com/anthropic/mono/ACTIONS/runs/1/job/2",
-                GithubActions,
-            ),
+            ("HTTPS://BuildKite.COM/Acme/Mono/Builds/42", Buildkite),
+            ("https://GITHUB.com/anthropic/mono/ACTIONS/runs/1/job/2", GithubActions),
         ];
         for (url, expected) in cases {
-            assert_eq!(
-                super::provider_for_url(url),
-                *expected,
-                "provider_for_url({url:?})",
-            );
+            assert_eq!(super::provider_for_url(url), *expected, "provider_for_url({url:?})",);
         }
     }
 
@@ -6870,10 +6618,7 @@ mod tests {
         use super::CiProvider::*;
         // Buildkite: fragment after '#'.
         assert_eq!(
-            super::parse_provider_job_id(
-                Buildkite,
-                "https://buildkite.com/acme/mono/builds/123#job-uuid",
-            ),
+            super::parse_provider_job_id(Buildkite, "https://buildkite.com/acme/mono/builds/123#job-uuid",),
             Some("job-uuid".to_owned()),
         );
         // Buildkite with no fragment → None.
@@ -6907,10 +6652,7 @@ mod tests {
         );
         // GitHub Actions URL with no '/job/' segment → None.
         assert_eq!(
-            super::parse_provider_job_id(
-                GithubActions,
-                "https://github.com/anthropic/mono/actions/runs/12345",
-            ),
+            super::parse_provider_job_id(GithubActions, "https://github.com/anthropic/mono/actions/runs/12345",),
             None,
         );
         // CiProvider::Other never parses a job id, regardless of the URL.
@@ -6940,10 +6682,7 @@ mod tests {
         ];
         for c in failures {
             assert!(super::is_failure_conclusion(c), "{c} should be a failure");
-            assert!(
-                !super::is_pass_conclusion(c),
-                "{c} must not also be a pass",
-            );
+            assert!(!super::is_pass_conclusion(c), "{c} must not also be a pass",);
             // Case-insensitive: the lowercase form classifies identically.
             let lower = c.to_ascii_lowercase();
             assert!(
@@ -6955,10 +6694,7 @@ mod tests {
         let passes = ["SUCCESS", "NEUTRAL", "SKIPPED"];
         for c in passes {
             assert!(super::is_pass_conclusion(c), "{c} should be a pass");
-            assert!(
-                !super::is_failure_conclusion(c),
-                "{c} must not also be a failure",
-            );
+            assert!(!super::is_failure_conclusion(c), "{c} must not also be a failure",);
             let lower = c.to_ascii_lowercase();
             assert!(
                 super::is_pass_conclusion(&lower),
@@ -6972,10 +6708,7 @@ mod tests {
                 !super::is_failure_conclusion(unknown),
                 "{unknown:?} must not be a failure",
             );
-            assert!(
-                !super::is_pass_conclusion(unknown),
-                "{unknown:?} must not be a pass",
-            );
+            assert!(!super::is_pass_conclusion(unknown), "{unknown:?} must not be a pass",);
         }
     }
 
@@ -7011,10 +6744,7 @@ mod tests {
             "context": "buildkite/mono",
             "state": "FAILURE",
         });
-        assert_eq!(
-            leaf_tag(&super::normalize_leaf(&sc_failure)),
-            "Fail:FAILURE",
-        );
+        assert_eq!(leaf_tag(&super::normalize_leaf(&sc_failure)), "Fail:FAILURE",);
 
         let sc_pending = serde_json::json!({
             "__typename": "StatusContext",
@@ -7039,10 +6769,7 @@ mod tests {
             "status": "IN_PROGRESS",
             "conclusion": serde_json::Value::Null,
         });
-        assert_eq!(
-            leaf_tag(&super::normalize_leaf(&cr_in_progress)),
-            "InFlight",
-        );
+        assert_eq!(leaf_tag(&super::normalize_leaf(&cr_in_progress)), "InFlight",);
 
         // Completed + failing conclusion → Fail (uppercased, preserved).
         let cr_fail = serde_json::json!({
@@ -7088,22 +6815,10 @@ mod tests {
     fn classify_ci_collapses_leaves() {
         // Empty rollup → consult combined_state.
         assert_eq!(super::classify_ci(&[], None), OpenPrCiStatus::Clean);
-        assert_eq!(
-            super::classify_ci(&[], Some("pending")),
-            OpenPrCiStatus::InFlight,
-        );
-        assert_eq!(
-            super::classify_ci(&[], Some("failure")),
-            OpenPrCiStatus::InFlight,
-        );
-        assert_eq!(
-            super::classify_ci(&[], Some("error")),
-            OpenPrCiStatus::InFlight,
-        );
-        assert_eq!(
-            super::classify_ci(&[], Some("success")),
-            OpenPrCiStatus::Clean,
-        );
+        assert_eq!(super::classify_ci(&[], Some("pending")), OpenPrCiStatus::InFlight,);
+        assert_eq!(super::classify_ci(&[], Some("failure")), OpenPrCiStatus::InFlight,);
+        assert_eq!(super::classify_ci(&[], Some("error")), OpenPrCiStatus::InFlight,);
+        assert_eq!(super::classify_ci(&[], Some("success")), OpenPrCiStatus::Clean,);
 
         // Fast-fail: a single terminal failure surfaces `Failing`, carrying
         // the parsed provider + job id.
@@ -7176,10 +6891,7 @@ mod tests {
                 "isRequired": true,
             }),
         ];
-        assert_eq!(
-            super::classify_ci(&rerun_cleared, None),
-            OpenPrCiStatus::Clean,
-        );
+        assert_eq!(super::classify_ci(&rerun_cleared, None), OpenPrCiStatus::Clean,);
 
         // A non-required failing check does not gate: it's filtered out, so a
         // rollup whose only required check passes is Clean.
@@ -7197,10 +6909,7 @@ mod tests {
                 "isRequired": true,
             }),
         ];
-        assert_eq!(
-            super::classify_ci(&optional_fail, None),
-            OpenPrCiStatus::Clean,
-        );
+        assert_eq!(super::classify_ci(&optional_fail, None), OpenPrCiStatus::Clean,);
     }
 
     /// Build a minimal `RequiredCheckFailure` for the pure-helper tests
@@ -7218,18 +6927,12 @@ mod tests {
 
     #[test]
     fn parse_pr_number_extracts_from_standard_url() {
-        assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/123"),
-            Some(123),
-        );
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123"), Some(123),);
     }
 
     #[test]
     fn parse_pr_number_strips_query_and_fragment() {
-        assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/123?foo=bar"),
-            Some(123),
-        );
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123?foo=bar"), Some(123),);
         assert_eq!(
             parse_pr_number("https://github.com/o/r/pull/123#issuecomment-1"),
             Some(123),
@@ -7243,10 +6946,7 @@ mod tests {
 
     #[test]
     fn parse_pr_number_stops_at_trailing_path() {
-        assert_eq!(
-            parse_pr_number("https://github.com/o/r/pull/123/files"),
-            Some(123),
-        );
+        assert_eq!(parse_pr_number("https://github.com/o/r/pull/123/files"), Some(123),);
     }
 
     #[test]
@@ -7273,23 +6973,16 @@ mod tests {
     fn ci_state_str_maps_each_variant() {
         assert_eq!(ci_state_str(&OpenPrCiStatus::Clean), "success");
         assert_eq!(ci_state_str(&OpenPrCiStatus::InFlight), "in_progress");
-        assert_eq!(
-            ci_state_str(&OpenPrCiStatus::Failing { failures: vec![] }),
-            "fail",
-        );
+        assert_eq!(ci_state_str(&OpenPrCiStatus::Failing { failures: vec![] }), "fail",);
     }
 
     #[test]
     fn ci_detail_json_serializes_failing_checks() {
         let ci = OpenPrCiStatus::Failing {
-            failures: vec![
-                failure("ci/test", "FAILURE"),
-                failure("ci/lint", "TIMED_OUT"),
-            ],
+            failures: vec![failure("ci/test", "FAILURE"), failure("ci/lint", "TIMED_OUT")],
         };
         let json = ci_detail_json(&ci).expect("non-empty failures → Some");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(
             parsed,
             serde_json::json!([
@@ -7321,8 +7014,7 @@ mod tests {
     fn review_detail_json_serializes_logins() {
         let reviewers = vec!["alice".to_owned(), "bob".to_owned()];
         let json = review_detail_json(&reviewers).expect("non-empty → Some");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(parsed, serde_json::json!(["alice", "bob"]));
     }
 

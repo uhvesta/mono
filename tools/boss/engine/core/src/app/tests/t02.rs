@@ -44,11 +44,7 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let run = server_state
         .work_db
@@ -147,11 +143,7 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     // Start the run on a remote host — this stamps work_runs.host_id =
     // "zakalwe" and leaves the execution non-terminal ("running").
@@ -252,11 +244,7 @@ async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     server_state
         .work_db
@@ -351,11 +339,7 @@ async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     // Drive the real `start_execution_run` path so the run is
     // minted with a `run_*` id — production-shaped. Asserting
@@ -476,11 +460,7 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     // Intentionally skip `start_execution_run` — the execution
     // exists but has no `work_runs` row yet, mirroring the
@@ -573,11 +553,7 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let run = server_state
         .work_db
@@ -598,9 +574,7 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
     // transcript_path null". The slot is keyed on the execution
     // id (that's what `BOSS_RUN_ID` carries in production), not
     // on the work_runs.id.
-    server_state
-        .worker_registry
-        .register_run_slot(execution.id.clone(), 5);
+    server_state.worker_registry.register_run_slot(execution.id.clone(), 5);
 
     // Step 1: SessionStart populates the cache AND the row.
     let session_start = crate::events_socket::IncomingHookEvent {
@@ -634,12 +608,7 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
         .clear_run_transcript_path_for_test(&run.id)
         .unwrap();
     assert!(
-        server_state
-            .work_db
-            .get_run(&run.id)
-            .unwrap()
-            .transcript_path
-            .is_none(),
+        server_state.work_db.get_run(&run.id).unwrap().transcript_path.is_none(),
         "precondition: row is back to NULL, mirroring the race the chore reproduces",
     );
 
@@ -752,11 +721,7 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let run = server_state
         .work_db
@@ -779,20 +744,15 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
     server_state
         .worker_registry
         .register_run_slot(execution.id.clone(), slot_id);
-    server_state.live_worker_states.register_spawn(
-        slot_id,
-        execution.id.clone(),
-        "claude-opus-4-7",
-        0,
-        None,
-    );
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, execution.id.clone(), "claude-opus-4-7", 0, None);
 
     // Start a real per-slot task so the notify pathway is
     // exercised end-to-end. The summarizer's `resolver` returns
     // None, so the loop will skip to "no transcript path yet"
     // and never call the model — exactly what we want.
-    let broadcaster: std::sync::Arc<dyn LiveStatusBroadcaster> =
-        std::sync::Arc::new(NopBroadcaster);
+    let broadcaster: std::sync::Arc<dyn LiveStatusBroadcaster> = std::sync::Arc::new(NopBroadcaster);
     let resolver: std::sync::Arc<dyn TranscriptPathResolver> = std::sync::Arc::new(NopResolver);
     server_state.live_status_manager.start_slot(
         slot_id,
@@ -823,19 +783,13 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
     for _ in 0..50 {
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        let snap = server_state
-            .live_status_manager
-            .debug_store()
-            .snapshot_for(slot_id);
+        let snap = server_state.live_status_manager.debug_store().snapshot_for(slot_id);
         if snap.last_real_trigger_kind.is_some() {
             break;
         }
     }
 
-    let snap = server_state
-        .live_status_manager
-        .debug_store()
-        .snapshot_for(slot_id);
+    let snap = server_state.live_status_manager.debug_store().snapshot_for(slot_id);
     assert!(
         snap.last_real_trigger_kind.is_some(),
         "real hook arrival must update last_real_trigger_kind; got {snap:?}",
@@ -902,11 +856,7 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let (execution, run) = server_state
         .work_db
@@ -935,13 +885,9 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
     server_state
         .worker_registry
         .register_run_slot(execution.id.clone(), slot_id);
-    server_state.live_worker_states.register_spawn(
-        slot_id,
-        execution.id.clone(),
-        "claude-opus-4-7",
-        0,
-        None,
-    );
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, execution.id.clone(), "claude-opus-4-7", 0, None);
 
     let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
     let event = crate::events_socket::IncomingHookEvent {
@@ -1030,11 +976,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let (execution, run) = server_state
         .work_db
@@ -1071,9 +1013,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
     };
     dispatch_live_worker_state(&server_state, &event).await;
 
-    let resolved =
-        <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &execution.id)
-            .await;
+    let resolved = <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &execution.id).await;
     assert_eq!(
         resolved.as_deref().map(|p| p.to_string_lossy().to_string()),
         Some(path.to_owned()),
@@ -1087,8 +1027,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
     // namespace for this trait method; the resolver's job is to
     // refuse the wrong-namespace identifier rather than
     // accidentally satisfy it.
-    let wrong =
-        <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &run.id).await;
+    let wrong = <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &run.id).await;
     assert!(
         wrong.is_none(),
         "resolver must not satisfy a work_runs.id lookup as if it were an execution id; got {wrong:?}",
@@ -1147,11 +1086,7 @@ async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() 
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let (execution, _run) = server_state
         .work_db
@@ -1170,13 +1105,9 @@ async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() 
     // No hook events have fired yet, so transcript_path is NULL
     // on the work_runs row and absent from the cache.
     let slot_id = 6u8;
-    server_state.live_worker_states.register_spawn(
-        slot_id,
-        execution.id.clone(),
-        "claude-opus-4-7",
-        0,
-        None,
-    );
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, execution.id.clone(), "claude-opus-4-7", 0, None);
 
     // Pre-fix this returned `Unknown` (the `get_run(exec_*)`
     // call bailed) — the post-fix resolver must surface
@@ -1237,11 +1168,7 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let (execution, run) = server_state
         .work_db
@@ -1386,13 +1313,8 @@ async fn shutdown_workers_releases_each_live_worker_via_release_worker_pane() {
                 .await
                 .expect("ReleaseWorkerPane EngineRequest should be enqueued");
             let (request_id, slot_id) = match &envelope.payload {
-                FrontendEvent::EngineRequest {
-                    request_id,
-                    request,
-                } => match request {
-                    EngineToAppRequest::ReleaseWorkerPane(input) => {
-                        (request_id.clone(), input.slot_id)
-                    }
+                FrontendEvent::EngineRequest { request_id, request } => match request {
+                    EngineToAppRequest::ReleaseWorkerPane(input) => (request_id.clone(), input.slot_id),
                     other => panic!("expected ReleaseWorkerPane, got {other:?}"),
                 },
                 other => panic!("expected EngineRequest, got {other:?}"),
@@ -1792,8 +1714,8 @@ fn live_execution_for_deleted_item_returns_execution_id_when_running() {
 
 #[test]
 fn live_execution_for_deleted_item_returns_none_when_terminal() {
-    use boss_protocol::ExecutionStatus;
     use crate::work::CreateExecutionInput;
+    use boss_protocol::ExecutionStatus;
     for status in [
         ExecutionStatus::Completed,
         ExecutionStatus::Failed,
@@ -1846,16 +1768,12 @@ fn live_execution_for_deleted_item_returns_none_for_product() {
 
 #[test]
 fn build_chore_update_message_returns_none_when_nothing_changed() {
-    assert!(
-        build_chore_update_message("Same name", "Same name", "Same desc", "Same desc")
-            .is_none()
-    );
+    assert!(build_chore_update_message("Same name", "Same name", "Same desc", "Same desc").is_none());
 }
 
 #[test]
 fn build_chore_update_message_includes_name_diff() {
-    let msg = build_chore_update_message("old name", "new name", "desc", "desc")
-        .expect("should produce a message");
+    let msg = build_chore_update_message("old name", "new name", "desc", "desc").expect("should produce a message");
     assert!(msg.contains("[chore-update]"), "must contain the tag");
     assert!(msg.contains("old name"), "must contain the old name");
     assert!(msg.contains("new name"), "must contain the new name");
@@ -1995,9 +1913,8 @@ async fn chore_update_notify_sends_message_to_live_worker() {
         WorkItem::Task(t) | WorkItem::Chore(t) => (t.name.clone(), t.description.clone()),
         _ => panic!("expected task/chore"),
     };
-    let msg =
-        build_chore_update_message(&old_name, &new_name, &old_description, &new_description)
-            .expect("name changed — message should be produced");
+    let msg = build_chore_update_message(&old_name, &new_name, &old_description, &new_description)
+        .expect("name changed — message should be produced");
 
     let resolved_run = active_chore_run_id(&server_state, &updated_item)
         .expect("active chore with live worker should resolve a run_id");
@@ -2005,11 +1922,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     let server_clone = server_state.clone();
     let msg_clone = msg.clone();
     let run_clone = resolved_run.clone();
-    let send = tokio::spawn(async move {
-        server_clone
-            .send_input_to_worker(&run_clone, msg_clone)
-            .await
-    });
+    let send = tokio::spawn(async move { server_clone.send_input_to_worker(&run_clone, msg_clone).await });
 
     // Drain the app session: expect a SendToPane EngineRequest.
     let envelope = app_sink
@@ -2017,10 +1930,7 @@ async fn chore_update_notify_sends_message_to_live_worker() {
         .await
         .expect("SendToPane should be enqueued on the app sink");
     let (request_id, request) = match envelope.payload {
-        FrontendEvent::EngineRequest {
-            request_id,
-            request,
-        } => (request_id, request),
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
         other => panic!("expected EngineRequest, got {other:?}"),
     };
     match &request {
@@ -2084,11 +1994,7 @@ fn make_execution_for_test(server_state: &Arc<ServerState>) -> boss_protocol::Wo
         .unwrap();
     server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap()
 }
 
@@ -2128,10 +2034,7 @@ fn segment_to_wire_all_roles() {
     use crate::transcript_markdown::SegmentRole;
     let roles = [
         (SegmentRole::User, boss_protocol::SegmentRole::User),
-        (
-            SegmentRole::Assistant,
-            boss_protocol::SegmentRole::Assistant,
-        ),
+        (SegmentRole::Assistant, boss_protocol::SegmentRole::Assistant),
         (SegmentRole::Thinking, boss_protocol::SegmentRole::Thinking),
         (SegmentRole::Tool, boss_protocol::SegmentRole::Tool),
         (SegmentRole::System, boss_protocol::SegmentRole::System),
@@ -2157,10 +2060,7 @@ async fn execution_transcript_no_path_returns_unavailable() {
         .work_db
         .transcript_path_for_execution(&execution.id)
         .unwrap();
-    assert!(
-        path.is_none(),
-        "precondition: fresh execution has no transcript path"
-    );
+    assert!(path.is_none(), "precondition: fresh execution has no transcript path");
     // The handler would return ExecutionTranscriptUnavailable.
     // Verify the DB layer returns None and is_live is false.
     let is_live = execution.finished_at.is_none() && execution.status.is_live();
@@ -2246,16 +2146,13 @@ async fn execution_transcript_normal_case() {
     let segments = crate::transcript_markdown::events_to_segments(&events, &Default::default());
     assert!(!segments.is_empty(), "must produce at least one segment");
 
-    let wire: Vec<boss_protocol::TranscriptSegment> =
-        segments.into_iter().map(segment_to_wire).collect();
+    let wire: Vec<boss_protocol::TranscriptSegment> = segments.into_iter().map(segment_to_wire).collect();
     assert!(
-        wire.iter()
-            .any(|s| s.role == boss_protocol::SegmentRole::User),
+        wire.iter().any(|s| s.role == boss_protocol::SegmentRole::User),
         "must have a User segment"
     );
     assert!(
-        wire.iter()
-            .any(|s| s.role == boss_protocol::SegmentRole::Assistant),
+        wire.iter().any(|s| s.role == boss_protocol::SegmentRole::Assistant),
         "must have an Assistant segment"
     );
 }
@@ -2311,10 +2208,7 @@ fn executions_list_returns_empty_for_task_with_no_executions() {
             force_duplicate: false,
         })
         .unwrap();
-    let executions = server_state
-        .work_db
-        .list_executions(Some(&task.id))
-        .unwrap();
+    let executions = server_state.work_db.list_executions(Some(&task.id)).unwrap();
     assert!(
         executions.is_empty(),
         "a task with no executions must return an empty list"

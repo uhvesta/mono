@@ -13,8 +13,8 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CommentAnchor, CreateCommentInput, FrontendEvent, FrontendRequest, ResolvedComment,
-    TopicEventPayload, WorkComment, comment_topic,
+    CommentAnchor, CreateCommentInput, FrontendEvent, FrontendRequest, ResolvedComment, TopicEventPayload, WorkComment,
+    comment_topic,
 };
 
 mod watcher_support;
@@ -32,11 +32,13 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(PathBuf::from(":memory:")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(PathBuf::from(":memory:"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
         let socket_for_serve = socket_path.clone();
-        let join =
-            tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
+        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
             return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
@@ -67,10 +69,7 @@ fn anchor(exact: &str, prefix: &str, suffix: &str) -> CommentAnchor {
 }
 
 async fn create_comment(client: &mut BossClient, input: CreateCommentInput) -> Result<WorkComment> {
-    match client
-        .send_request(&FrontendRequest::CommentsCreate { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CommentsCreate { input }).await? {
         FrontendEvent::CommentResult { comment } => Ok(comment),
         other => Err(unexpected("comments_create", other)),
     }
@@ -193,10 +192,7 @@ async fn comments_create_list_resolve_dismiss_round_trip() -> Result<()> {
     // Resolve against a doc where the first span is gone → orphan.
     let edited = "Alpha beta gamma. Delta epsilon. Nothing else remains in this body.";
     let reresolved = resolve_comments(&mut client, kind, id, edited).await?;
-    let first_again = reresolved
-        .iter()
-        .find(|r| r.comment.id == c1.id)
-        .expect("c1 present");
+    let first_again = reresolved.iter().find(|r| r.comment.id == c1.id).expect("c1 present");
     assert_eq!(first_again.resolution.kind, "orphan");
 
     // Soft-dismiss the first comment: hidden by default, revealed with the
@@ -238,9 +234,7 @@ async fn comment_topic_invalidation_reaches_subscriber() -> Result<()> {
     let invalidation = watcher.next_invalidation(Duration::from_secs(2)).await?;
     assert_eq!(invalidation.topic, topic);
     match invalidation.event {
-        TopicEventPayload::WorkInvalidated {
-            reason, item_ids, ..
-        } => {
+        TopicEventPayload::WorkInvalidated { reason, item_ids, .. } => {
             assert_eq!(reason, "comment_created");
             assert_eq!(item_ids, vec![id.to_owned()]);
         }

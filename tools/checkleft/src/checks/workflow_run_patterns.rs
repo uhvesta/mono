@@ -54,18 +54,13 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                 Err(error) => {
                     findings.push(Finding {
                         severity: Severity::Error,
-                        message: format!(
-                            "failed to parse workflow YAML while checking run patterns: {error}"
-                        ),
+                        message: format!("failed to parse workflow YAML while checking run patterns: {error}"),
                         location: Some(Location {
                             path: changed_file.path.clone(),
                             line: None,
                             column: None,
                         }),
-                        remediations: vec![
-                            "Fix YAML syntax so checks can validate workflow `run:` blocks."
-                                .to_owned(),
-                        ],
+                        remediations: vec!["Fix YAML syntax so checks can validate workflow `run:` blocks.".to_owned()],
                         suggested_fix: None,
                     });
                     continue;
@@ -154,24 +149,20 @@ fn parse_config(config: &toml::Value) -> Result<CompiledWorkflowRunPatternsConfi
         bail!("workflow-run-patterns check config must contain at least one `rules` entry");
     }
 
-    let default_severity =
-        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
-    let default_remediation = parsed.remediation.unwrap_or_else(|| {
-        "Update the workflow run script to satisfy repository CI conventions.".to_owned()
-    });
+    let default_severity = Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_remediation = parsed
+        .remediation
+        .unwrap_or_else(|| "Update the workflow run script to satisfy repository CI conventions.".to_owned());
 
     let mut rules = Vec::with_capacity(parsed.rules.len());
     for rule in parsed.rules {
-        let pattern = Regex::new(&rule.pattern)
-            .with_context(|| format!("invalid rule regex: {}", rule.pattern))?;
+        let pattern = Regex::new(&rule.pattern).with_context(|| format!("invalid rule regex: {}", rule.pattern))?;
         rules.push(WorkflowRunPatternRule {
             pattern,
             message: rule.message,
             must_include: rule.must_include,
             severity: Severity::parse_with_default(rule.severity.as_deref(), default_severity),
-            remediation: rule
-                .remediation
-                .unwrap_or_else(|| default_remediation.clone()),
+            remediation: rule.remediation.unwrap_or_else(|| default_remediation.clone()),
         });
     }
 

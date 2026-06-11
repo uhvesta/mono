@@ -131,11 +131,7 @@ pub fn record_start(ctx: StartContext) {
         fields.insert("engine_version".into(), Value::String(version));
     }
     if !ctx.socket_paths.is_empty() {
-        let strs: Vec<String> = ctx
-            .socket_paths
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
+        let strs: Vec<String> = ctx.socket_paths.iter().map(|p| p.display().to_string()).collect();
         fields.insert("socket_paths".into(), json!(strs));
     }
     if let Some(db) = ctx.state_db_path {
@@ -289,14 +285,15 @@ fn resolve_path() -> Option<PathBuf> {
 
 fn append_to(path: &Path, value: &Value) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
 
     rotate_if_needed(path).ok();
 
-    let mut line = serde_json::to_string(value)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let mut line =
+        serde_json::to_string(value).map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     line.push('\n');
 
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -328,11 +325,7 @@ fn rotate_if_needed(path: &Path) -> std::io::Result<()> {
     // Cut on the first newline so the surviving prefix starts with a
     // complete JSON record. If the second half has no newline at all,
     // we just keep what we have (better than truncating mid-line).
-    let start = buf
-        .iter()
-        .position(|b| *b == b'\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let start = buf.iter().position(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
 
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
@@ -492,11 +485,7 @@ mod tests {
         let bytes_per_line = line.len() as u64;
         let target_lines = (MAX_LOG_BYTES + MAX_LOG_BYTES / 2) / bytes_per_line;
         {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .unwrap();
+            let mut f = OpenOptions::new().create(true).append(true).open(&path).unwrap();
             for _ in 0..target_lines {
                 f.write_all(line.as_bytes()).unwrap();
             }
@@ -517,10 +506,7 @@ mod tests {
         .unwrap();
 
         let after = fs::metadata(&path).unwrap().len();
-        assert!(
-            after < MAX_LOG_BYTES,
-            "expected rotated file under cap, got {after}"
-        );
+        assert!(after < MAX_LOG_BYTES, "expected rotated file under cap, got {after}");
     }
 
     #[test]
@@ -600,10 +586,7 @@ mod tests {
                 let mut m = Map::new();
                 m.insert("pid".into(), json!(1));
                 m.insert("socket_kind".into(), Value::String("frontend".into()));
-                m.insert(
-                    "socket_path".into(),
-                    Value::String("/tmp/boss-engine.sock".into()),
-                );
+                m.insert("socket_path".into(), Value::String("/tmp/boss-engine.sock".into()));
                 m
             }),
         )

@@ -125,17 +125,8 @@ impl SpawnConfig {
     ///
     /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
     /// need to construct a driver instance directly.
-    pub fn claude_invocation(
-        &self,
-        non_opus_auto_mode: bool,
-        settings_path: Option<&Path>,
-    ) -> String {
-        crate::driver::ClaudeDriver.spawn_invocation(
-            &self.model,
-            self.claude_effort,
-            settings_path,
-            non_opus_auto_mode,
-        )
+    pub fn claude_invocation(&self, non_opus_auto_mode: bool, settings_path: Option<&Path>) -> String {
+        crate::driver::ClaudeDriver.spawn_invocation(&self.model, self.claude_effort, settings_path, non_opus_auto_mode)
     }
 }
 
@@ -182,22 +173,13 @@ pub fn resolve_spawn_config(
     pool_model_override: Option<&str>,
     product_default_model: Option<&str>,
 ) -> SpawnConfig {
-    let model = if let Some(m) = model_override
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    let model = if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
-    } else if let Some(m) = pool_model_override
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    } else if let Some(m) = pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
     } else if let Some(level) = effort_level {
         default_model_for_level(level).to_owned()
-    } else if let Some(pd) = product_default_model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
+    } else if let Some(pd) = product_default_model.map(str::trim).filter(|s| !s.is_empty()) {
         pd.to_owned()
     } else {
         ENGINE_DEFAULT_MODEL.to_owned()
@@ -465,8 +447,7 @@ mod tests {
         // Row: effort = medium, model_override = opus. Design §Q3 says
         // the override changes the model only; effort + addendum still
         // follow `effort_level`.
-        let cfg =
-            resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, Some("claude-sonnet-4-6"));
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, Some("claude-sonnet-4-6"));
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
@@ -474,8 +455,7 @@ mod tests {
 
     #[test]
     fn model_override_beats_product_default_when_effort_is_unset() {
-        let cfg =
-            resolve_spawn_config(None, Some("claude-haiku-4-5-20251001"), None, Some("claude-opus-4-7"));
+        let cfg = resolve_spawn_config(None, Some("claude-haiku-4-5-20251001"), None, Some("claude-opus-4-7"));
         assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
         assert_eq!(cfg.claude_effort, None);
         assert_eq!(cfg.prompt_addendum, None);
@@ -513,9 +493,7 @@ mod tests {
         let path = Path::new("/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json");
         let inv = cfg.claude_invocation(false, Some(path));
         assert!(
-            inv.contains(
-                "--settings '/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json'"
-            ),
+            inv.contains("--settings '/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json'"),
             "expected single-quoted --settings flag, got: {inv:?}",
         );
         let settings_at = inv.find("--settings").expect("--settings present");
@@ -576,11 +554,7 @@ mod tests {
     #[test]
     fn non_opus_model_skip_mode_gets_dangerously_skip_permissions() {
         // non_opus_auto_mode=false (default/personal laptop): --dangerously-skip-permissions.
-        for model in [
-            "claude-haiku-4-5-20251001",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-        ] {
+        for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
             let cfg = SpawnConfig {
                 effort_level: None,
                 claude_effort: None,
@@ -602,11 +576,7 @@ mod tests {
     #[test]
     fn non_opus_model_auto_mode_gets_permission_mode_auto() {
         // non_opus_auto_mode=true (corp laptop): --permission-mode auto for Sonnet/Haiku too.
-        for model in [
-            "claude-haiku-4-5-20251001",
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-        ] {
+        for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
             let cfg = SpawnConfig {
                 effort_level: None,
                 claude_effort: None,
@@ -688,10 +658,7 @@ mod tests {
         assert_eq!(cfg.model, "fable");
         assert_eq!(cfg.claude_effort, Some("max"));
         let inv = cfg.claude_invocation(false, None);
-        assert!(
-            inv.contains("--model fable"),
-            "Max effort must use fable, got: {inv:?}",
-        );
+        assert!(inv.contains("--model fable"), "Max effort must use fable, got: {inv:?}",);
         assert!(
             inv.contains("--permission-mode auto"),
             "Fable (max effort) must use --permission-mode auto, got: {inv:?}",
@@ -720,31 +687,17 @@ mod tests {
 
     #[test]
     fn original_level_for_marker_partitions_q4_corpus() {
-        assert_eq!(
-            original_level_for_marker("investigate"),
-            Some(EffortLevel::Large)
-        );
-        assert_eq!(
-            original_level_for_marker("end-to-end"),
-            Some(EffortLevel::Large)
-        );
-        assert_eq!(
-            original_level_for_marker("engine"),
-            Some(EffortLevel::Medium)
-        );
-        assert_eq!(
-            original_level_for_marker("RENAME"),
-            Some(EffortLevel::Trivial)
-        );
+        assert_eq!(original_level_for_marker("investigate"), Some(EffortLevel::Large));
+        assert_eq!(original_level_for_marker("end-to-end"), Some(EffortLevel::Large));
+        assert_eq!(original_level_for_marker("engine"), Some(EffortLevel::Medium));
+        assert_eq!(original_level_for_marker("RENAME"), Some(EffortLevel::Trivial));
         // Stale-marker safety net.
         assert_eq!(original_level_for_marker("not-a-marker"), None);
     }
 
     #[test]
     fn all_markers_covers_every_q4_rule() {
-        let total = INVESTIGATE_MARKERS.len()
-            + MULTI_SUBSYSTEM_HINTS.len()
-            + MECHANICAL_EDIT_MARKERS.len();
+        let total = INVESTIGATE_MARKERS.len() + MULTI_SUBSYSTEM_HINTS.len() + MECHANICAL_EDIT_MARKERS.len();
         assert_eq!(all_markers().count(), total);
     }
 
@@ -762,8 +715,7 @@ mod tests {
         assert_eq!(cfg.claude_effort, Some("medium"));
 
         // Task model_override beats pool override.
-        let cfg =
-            resolve_spawn_config(Some(EffortLevel::Small), Some("sonnet"), Some("opus"), None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), Some("sonnet"), Some("opus"), None);
         assert_eq!(cfg.model, "sonnet");
         assert_eq!(cfg.claude_effort, Some("medium"));
     }
@@ -796,5 +748,4 @@ mod tests {
         assert_eq!(cfg.claude_effort, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
     }
-
 }

@@ -29,8 +29,7 @@ impl Check for FrontendNoLegacyApiCheck {
 #[async_trait]
 impl ConfiguredCheck for CompiledFrontendNoLegacyApiConfig {
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        let import_re =
-            Regex::new(r#"^\s*import\b[^;]*\bfrom\s*["']([^"']+)["']"#).expect("valid regex");
+        let import_re = Regex::new(r#"^\s*import\b[^;]*\bfrom\s*["']([^"']+)["']"#).expect("valid regex");
         let mut findings = Vec::new();
 
         for changed_file in &changeset.changed_files {
@@ -119,9 +118,9 @@ fn parse_config(config: &toml::Value) -> Result<CompiledFrontendNoLegacyApiConfi
             .map(|module| module.trim_matches('/').to_owned())
             .collect(),
         severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error),
-        remediation: parsed.remediation.unwrap_or_else(|| {
-            "Import from supported modules under `frontend/src/api/` instead.".to_owned()
-        }),
+        remediation: parsed
+            .remediation
+            .unwrap_or_else(|| "Import from supported modules under `frontend/src/api/` instead.".to_owned()),
     })
 }
 
@@ -129,10 +128,7 @@ fn is_frontend_source_file(path: &std::path::Path) -> bool {
     if !path.starts_with(std::path::Path::new("frontend/src")) {
         return false;
     }
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("ts") | Some("tsx")
-    )
+    matches!(path.extension().and_then(|ext| ext.to_str()), Some("ts") | Some("tsx"))
 }
 
 fn normalize_import_module(module: &str) -> String {

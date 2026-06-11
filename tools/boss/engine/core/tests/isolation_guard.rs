@@ -43,15 +43,16 @@ impl TestEngine {
         let pid_path = temp.path().join(format!("{stem}.pid"));
         let events_path = temp.path().join(format!("{stem}.events.sock"));
 
-        let work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path).build();
+        let work = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(db_path)
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work, None));
 
         let sock = socket_path.clone();
         let pid = pid_path.clone();
         let ev = events_path.clone();
-        let join = tokio::spawn(async move {
-            serve(cfg, sock, Some(pid), Some(ev), None, None).await
-        });
+        let join = tokio::spawn(async move { serve(cfg, sock, Some(pid), Some(ev), None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
             return Err(anyhow!("engine never bound socket {}", socket_path.display()));
@@ -146,8 +147,7 @@ async fn isolated_engine_binds_events_socket_at_derived_path() -> Result<()> {
     // resolves to /tmp/Library/Application Support/Boss/events.sock — a
     // completely different directory from our derived /tmp/boss-test-*.events.sock.
     let home = std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into());
-    let prod_events = std::path::PathBuf::from(home)
-        .join("Library/Application Support/Boss/events.sock");
+    let prod_events = std::path::PathBuf::from(home).join("Library/Application Support/Boss/events.sock");
     assert_ne!(
         engine.events_path, prod_events,
         "derived events socket path must differ from production path"
@@ -172,14 +172,16 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
     let prod_db = temp.path().join("prod-state.db");
     let prod_pid = temp.path().join("boss-engine.pid");
 
-    let prod_work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(prod_db).build();
+    let prod_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(prod_db)
+        .build();
     let prod_cfg = Arc::new(RuntimeConfig::from_parts(prod_work, None));
     let prod_sock_c = prod_socket.clone();
     let prod_pid_c = prod_pid.clone();
     let prod_ev_c = prod_events.clone();
-    let prod_join = tokio::spawn(async move {
-        serve(prod_cfg, prod_sock_c, Some(prod_pid_c), Some(prod_ev_c), None, None).await
-    });
+    let prod_join =
+        tokio::spawn(async move { serve(prod_cfg, prod_sock_c, Some(prod_pid_c), Some(prod_ev_c), None, None).await });
     if !wait_for_socket(prod_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
         prod_join.abort();
         return Err(anyhow!("production engine never bound socket"));
@@ -191,14 +193,16 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
     let test_db = temp.path().join("boss-test-uuid.db");
     let test_pid = temp.path().join("boss-test-uuid.pid");
 
-    let test_work = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(test_db).build();
+    let test_work = WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(test_db)
+        .build();
     let test_cfg = Arc::new(RuntimeConfig::from_parts(test_work, None));
     let test_sock_c = test_socket.clone();
     let test_pid_c = test_pid.clone();
     let test_ev_c = test_events.clone();
-    let test_join = tokio::spawn(async move {
-        serve(test_cfg, test_sock_c, Some(test_pid_c), Some(test_ev_c), None, None).await
-    });
+    let test_join =
+        tokio::spawn(async move { serve(test_cfg, test_sock_c, Some(test_pid_c), Some(test_ev_c), None, None).await });
     if !wait_for_socket(test_socket.to_str().unwrap(), STARTUP_TIMEOUT).await {
         prod_join.abort();
         test_join.abort();
@@ -209,7 +213,10 @@ async fn production_and_test_fixture_engines_use_distinct_paths() -> Result<()> 
     let prod_pid_val: i32 = std::fs::read_to_string(&prod_pid)?.trim().parse()?;
     let test_pid_val: i32 = std::fs::read_to_string(&test_pid)?.trim().parse()?;
     assert!(process_is_alive(prod_pid_val), "production engine must still be alive");
-    assert!(process_is_alive(test_pid_val), "test-fixture engine must still be alive");
+    assert!(
+        process_is_alive(test_pid_val),
+        "test-fixture engine must still be alive"
+    );
 
     // Their paths must differ — the key invariant violated in the 2026-05-24 incident.
     assert_ne!(prod_events, test_events, "events sockets must be at distinct paths");

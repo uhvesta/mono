@@ -64,11 +64,7 @@ checks:
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].check_id, "checks-config");
     assert_eq!(diagnostics[0].location.path, Path::new("CHECKS.yaml"));
-    assert!(
-        diagnostics[0]
-            .message
-            .contains("failed to parse checks config")
-    );
+    assert!(diagnostics[0].message.contains("failed to parse checks config"));
 }
 
 #[tokio::test]
@@ -205,10 +201,7 @@ checks:
     assert!(checks.get("external-only").is_some());
     assert!(checks.get("local-only").is_some());
     assert_eq!(
-        checks
-            .get("external-only")
-            .expect("external-only present")
-            .origin,
+        checks.get("external-only").expect("external-only present").origin,
         CheckConfigOrigin::ExternalFile
     );
     assert_eq!(
@@ -372,8 +365,7 @@ checks:
         .expect_err("resolution must fail");
 
     assert!(
-        format!("{error:#}")
-            .contains("exec_paths` is not allowed in an external checks config"),
+        format!("{error:#}").contains("exec_paths` is not allowed in an external checks config"),
         "unexpected error: {error:#}"
     );
 }
@@ -399,11 +391,7 @@ async fn fails_when_external_checks_url_returns_404() {
     .await
     .expect_err("resolver must fail");
 
-    assert!(
-        error
-            .to_string()
-            .contains("returned 404 Not Found after 5 attempts")
-    );
+    assert!(error.to_string().contains("returned 404 Not Found after 5 attempts"));
 }
 
 #[test]
@@ -452,11 +440,7 @@ checks:
             .expect("remediation str"),
         "Remove the artifact."
     );
-    let when = rule
-        .get("when")
-        .expect("when")
-        .as_array()
-        .expect("when array");
+    let when = rule.get("when").expect("when").as_array().expect("when array");
     assert_eq!(when.len(), 2);
     assert_eq!(when[0].as_str(), Some("added"));
     assert_eq!(when[1].as_str(), Some("modified"));

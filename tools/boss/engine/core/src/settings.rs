@@ -108,12 +108,11 @@ impl SettingsStore {
                 return Ok(());
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("read settings file: {}", self.path.display()));
+                return Err(err).with_context(|| format!("read settings file: {}", self.path.display()));
             }
         };
-        let parsed: FileShape = toml::from_str(&contents)
-            .with_context(|| format!("parse settings file: {}", self.path.display()))?;
+        let parsed: FileShape =
+            toml::from_str(&contents).with_context(|| format!("parse settings file: {}", self.path.display()))?;
         let mut guard = self.state.lock().expect("settings lock poisoned");
         guard.clear();
         for (key, value) in parsed.settings {
@@ -169,10 +168,7 @@ impl SettingsStore {
                 key: spec.key.to_owned(),
                 description: spec.description.to_owned(),
                 default_enabled: spec.default_enabled,
-                enabled: guard
-                    .get(spec.key)
-                    .copied()
-                    .unwrap_or(spec.default_enabled),
+                enabled: guard.get(spec.key).copied().unwrap_or(spec.default_enabled),
             })
             .collect()
     }
@@ -189,21 +185,14 @@ impl SettingsStore {
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create settings parent dir: {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create settings parent dir: {}", parent.display()))?;
         }
 
         let tmp = self.path.with_extension("toml.tmp");
-        std::fs::write(&tmp, serialized)
-            .with_context(|| format!("write settings temp file: {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).with_context(|| {
-            format!(
-                "rename {} → {}",
-                tmp.display(),
-                self.path.display()
-            )
-        })?;
+        std::fs::write(&tmp, serialized).with_context(|| format!("write settings temp file: {}", tmp.display()))?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), self.path.display()))?;
         Ok(())
     }
 }
@@ -260,10 +249,7 @@ mod tests {
         store.load().unwrap();
         let snap = store.snapshot_all();
         assert_eq!(snap.len(), REGISTRY.len());
-        let draft = snap
-            .iter()
-            .find(|s| s.key == "default_pr_draft_mode")
-            .unwrap();
+        let draft = snap.iter().find(|s| s.key == "default_pr_draft_mode").unwrap();
         assert!(!draft.default_enabled);
         assert!(!draft.enabled);
     }

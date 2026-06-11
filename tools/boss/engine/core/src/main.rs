@@ -35,22 +35,23 @@ impl Write for DualLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.stderr.write_all(buf)?;
         if let Some(file) = &self.file
-            && let Ok(mut file) = file.lock() {
-                let _ = file.write_all(buf);
-            }
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = file.write_all(buf);
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.stderr.flush()?;
         if let Some(file) = &self.file
-            && let Ok(mut file) = file.lock() {
-                let _ = file.flush();
-            }
+            && let Ok(mut file) = file.lock()
+        {
+            let _ = file.flush();
+        }
         Ok(())
     }
 }
-
 
 /// Path for the structured-JSON engine trace file consumed by the Activity
 /// Log viewer in the macOS app. Lives alongside other Boss state files.
@@ -74,10 +75,11 @@ fn resolve_log_path() -> PathBuf {
 
 fn open_log_file(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create log directory {}", parent.display()))?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
 
     OpenOptions::new()
         .create(true)
@@ -93,9 +95,7 @@ async fn main() -> Result<()> {
     // without initialising logging or touching the audit log.
     // Q-Risk-3 from the design doc: this flag did not exist before this change.
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(|s| s.as_str()) == Some("--version")
-        || argv.get(1).map(|s| s.as_str()) == Some("-V")
-    {
+    if argv.get(1).map(|s| s.as_str()) == Some("--version") || argv.get(1).map(|s| s.as_str()) == Some("-V") {
         println!("{}", build_info::version_string("boss-engine"));
         return Ok(());
     }

@@ -107,10 +107,7 @@ pub fn bundled_check_names() -> impl Iterator<Item = &'static str> {
 pub struct BundledExternalCheckPackageProvider;
 
 impl ExternalCheckPackageProvider for BundledExternalCheckPackageProvider {
-    fn resolve(
-        &self,
-        implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>> {
+    fn resolve(&self, implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>> {
         let ExternalCheckImplementationRef::Bundled(name) = implementation_ref else {
             return Ok(None);
         };
@@ -120,10 +117,7 @@ impl ExternalCheckPackageProvider for BundledExternalCheckPackageProvider {
 }
 
 /// Look up a check by name across `defs`, returning the appropriate package.
-fn resolve_from_defs(
-    defs: &[BundledCheckDef],
-    name: &str,
-) -> Result<Option<ExternalCheckPackage>> {
+fn resolve_from_defs(defs: &[BundledCheckDef], name: &str) -> Result<Option<ExternalCheckPackage>> {
     for def in defs {
         if !def.check_names.contains(&name) {
             continue;
@@ -159,17 +153,15 @@ fn build_bundled_component_package(
         id: check_name.to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
-        implementation: ExternalCheckPackageImplementation::Component(
-            ExternalCheckComponentPackage {
-                artifact_path: String::new(),
-                artifact_sha256: sha256,
-                artifact_bytes: Some(bytes),
-                check_name: check_name.to_owned(),
-                limits,
-                checks: None,
-                provenance: None,
-            },
-        ),
+        implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+            artifact_path: String::new(),
+            artifact_sha256: sha256,
+            artifact_bytes: Some(bytes),
+            check_name: check_name.to_owned(),
+            limits,
+            checks: None,
+            provenance: None,
+        }),
     }
 }
 
@@ -204,9 +196,7 @@ mod tests {
     fn returns_none_for_unknown_bundled_name() {
         let provider = BundledExternalCheckPackageProvider;
         let resolved = provider
-            .resolve(&ExternalCheckImplementationRef::Bundled(
-                "does-not-exist".to_owned(),
-            ))
+            .resolve(&ExternalCheckImplementationRef::Bundled("does-not-exist".to_owned()))
             .expect("resolve");
         assert!(resolved.is_none());
     }
@@ -215,9 +205,7 @@ mod tests {
     fn ignores_non_bundled_refs() {
         let provider = BundledExternalCheckPackageProvider;
         let resolved = provider
-            .resolve(&ExternalCheckImplementationRef::Generated(
-                "buildifier".to_owned(),
-            ))
+            .resolve(&ExternalCheckImplementationRef::Generated("buildifier".to_owned()))
             .expect("resolve");
         assert!(resolved.is_none());
     }
@@ -320,8 +308,7 @@ mod tests {
         };
         // limits == None means the runtime uses the proportional formula.
         assert!(
-            comp.limits.is_none()
-                || comp.limits.as_ref().is_some_and(|l| l.timeout_ms.is_none()),
+            comp.limits.is_none() || comp.limits.as_ref().is_some_and(|l| l.timeout_ms.is_none()),
             "bundled check must not set an explicit timeout_ms; got: {:?}",
             comp.limits,
         );

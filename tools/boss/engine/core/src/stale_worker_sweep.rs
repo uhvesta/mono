@@ -214,10 +214,7 @@ pub async fn run_one_pass(
 
         // Grace-period guard: skip executions whose `started_at` is
         // within STALE_GRACE_SECS or not yet recorded.
-        let started_epoch = execution
-            .started_at
-            .as_deref()
-            .and_then(|s| s.parse::<i64>().ok());
+        let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
         match started_epoch {
             None => {
                 outcome.grace_skipped += 1;
@@ -270,13 +267,14 @@ pub async fn run_one_pass(
                 now_epoch_secs,
                 stale_threshold_secs,
                 recovery_patch.as_deref(),
-            ) {
-                tracing::warn!(
-                    work_item_id,
-                    ?err,
-                    "stale-worker sweep: failed to append audit line to description (non-fatal)",
-                );
-            }
+            )
+        {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "stale-worker sweep: failed to append audit line to description (non-fatal)",
+            );
+        }
 
         // Release the worker pool slot so the orphan sweep detects the
         // chore and creates a fresh ready execution for redispatch.
@@ -285,9 +283,7 @@ pub async fn run_one_pass(
         // "auto-worker-N" prefix and release_worker_and_kick routes to the
         // correct pool via pool_for_worker_id.
         let worker_id = worker_id_for_slot(state.slot_id);
-        coordinator
-            .release_worker_and_kick(&worker_id, None)
-            .await;
+        coordinator.release_worker_and_kick(&worker_id, None).await;
 
         // Structured event for bossctl dispatch tail.
         dispatch_events
@@ -325,9 +321,7 @@ fn append_reconcile_audit(
     let current_desc = match &item {
         boss_protocol::WorkItem::Product(p) => p.description.as_str(),
         boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => {
-            t.description.as_str()
-        }
+        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
     };
     let recovery_note = match recovery_patch {
         Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
@@ -359,8 +353,8 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionCoordinator, WorkerPool,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionCoordinator, WorkerPool,
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -396,11 +390,7 @@ mod tests {
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
-        async fn create_change(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
             unimplemented!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {
@@ -491,17 +481,14 @@ mod tests {
     fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id)
-                .build())
+            .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
             .unwrap();
         let old_started_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             .saturating_sub(300) as i64; // 5 minutes ago
-        db.force_started_at_for_test(&execution.id, old_started_at)
-            .unwrap();
+        db.force_started_at_for_test(&execution.id, old_started_at).unwrap();
         execution.id
     }
 
@@ -514,12 +501,7 @@ mod tests {
         ))
     }
 
-    fn register_slot(
-        live_states: &LiveWorkerStateRegistry,
-        slot_id: u8,
-        execution_id: &str,
-        work_item_id: &str,
-    ) {
+    fn register_slot(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str, work_item_id: &str) {
         live_states.register_spawn(
             slot_id,
             execution_id,
@@ -586,10 +568,7 @@ mod tests {
         drive_to_working_idle(&live_states, 1);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
         let claimed_before = coordinator.worker_pool().claimed_execution_ids().await;
         assert!(claimed_before.contains(&execution_id));
 
@@ -622,9 +601,7 @@ mod tests {
 
         let item = db.get_work_item(&work_item_id).unwrap();
         let desc = match &item {
-            boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => {
-                t.description.clone()
-            }
+            boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
             _ => panic!("expected chore"),
         };
         assert!(desc.contains("[engine-reconcile]"), "got: {desc:?}");
@@ -645,10 +622,7 @@ mod tests {
         drive_to_working_idle(&live_states, 1);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(
@@ -681,10 +655,7 @@ mod tests {
         drive_to_working_tool_in_flight(&live_states, 1);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(
@@ -719,10 +690,7 @@ mod tests {
         // Left at Spawning — no events applied.
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(
@@ -749,14 +717,13 @@ mod tests {
 
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
             .unwrap();
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
@@ -764,10 +731,7 @@ mod tests {
         drive_to_working_idle(&live_states, 1);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution.id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(

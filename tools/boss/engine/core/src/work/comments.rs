@@ -86,12 +86,7 @@ impl WorkDb {
     /// Transition a comment's status. Accepts `active` / `resolved` /
     /// `orphaned` / `dismissed`; stamps `dismissed_at` when entering
     /// `resolved` / `dismissed` and clears it otherwise (re-activation).
-    pub fn set_comment_status(
-        &self,
-        comment_id: &str,
-        status: &str,
-        actor: Option<&str>,
-    ) -> Result<WorkComment> {
+    pub fn set_comment_status(&self, comment_id: &str, status: &str, actor: Option<&str>) -> Result<WorkComment> {
         match status {
             COMMENT_STATUS_ACTIVE
             | COMMENT_STATUS_RESOLVED
@@ -114,8 +109,7 @@ impl WorkDb {
         if n == 0 {
             bail!("unknown comment: {comment_id}");
         }
-        query_comment(&conn, comment_id)?
-            .with_context(|| format!("missing comment after status update: {comment_id}"))
+        query_comment(&conn, comment_id)?.with_context(|| format!("missing comment after status update: {comment_id}"))
     }
 
     /// Soft-dismiss: transition a comment to `resolved`. Recoverable via
@@ -157,8 +151,7 @@ impl WorkDb {
         if n == 0 {
             bail!("unknown comment: {comment_id}");
         }
-        query_comment(&conn, comment_id)?
-            .with_context(|| format!("missing comment after anchor update: {comment_id}"))
+        query_comment(&conn, comment_id)?.with_context(|| format!("missing comment after anchor update: {comment_id}"))
     }
 
     /// Resolve every active (or previously orphaned) comment on an artifact
@@ -211,11 +204,7 @@ impl WorkDb {
                         score: None,
                     }
                 }
-                AnchorResolution::Fuzzy {
-                    start,
-                    length,
-                    score,
-                } => {
+                AnchorResolution::Fuzzy { start, length, score } => {
                     let new_anchor = extract_anchor(plain_text, start, length);
                     let anchor_json = serde_json::to_string(&new_anchor)?;
                     tx.execute(
@@ -292,11 +281,10 @@ impl WorkDb {
     ) -> Result<usize> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let originals: Vec<WorkComment> =
-            query_comments(&tx, "work_item", task_id, false)?
-                .into_iter()
-                .filter(|c| c.status == COMMENT_STATUS_ACTIVE)
-                .collect();
+        let originals: Vec<WorkComment> = query_comments(&tx, "work_item", task_id, false)?
+            .into_iter()
+            .filter(|c| c.status == COMMENT_STATUS_ACTIVE)
+            .collect();
         let now = now_string();
         let actor = crate::work::AUDIT_ACTOR_DESIGN_DETECTOR;
         let mut migrated = 0usize;
@@ -390,8 +378,7 @@ impl WorkDb {
         )?;
         let cols = Self::magic_wand_columns();
         let sql = format!("SELECT {cols} FROM magic_wand_dispatches WHERE id = ?1");
-        conn.query_row(&sql, [&id], map_magic_wand_dispatch)
-            .map_err(Into::into)
+        conn.query_row(&sql, [&id], map_magic_wand_dispatch).map_err(Into::into)
     }
 
     /// Insert a `chore_created` dispatch row for a Phase-4 PR-backed doc
@@ -430,8 +417,7 @@ impl WorkDb {
         )?;
         let cols = Self::magic_wand_columns();
         let sql = format!("SELECT {cols} FROM magic_wand_dispatches WHERE id = ?1");
-        conn.query_row(&sql, [&id], map_magic_wand_dispatch)
-            .map_err(Into::into)
+        conn.query_row(&sql, [&id], map_magic_wand_dispatch).map_err(Into::into)
     }
 
     /// Transition a dispatch from `in_flight` to `returned` (success) or
@@ -479,10 +465,7 @@ impl WorkDb {
     }
 
     /// Fetch a dispatch row by id.
-    pub fn get_magic_wand_dispatch(
-        &self,
-        dispatch_id: &str,
-    ) -> Result<Option<MagicWandDispatch>> {
+    pub fn get_magic_wand_dispatch(&self, dispatch_id: &str) -> Result<Option<MagicWandDispatch>> {
         let conn = self.connect()?;
         let cols = Self::magic_wand_columns();
         let sql = format!("SELECT {cols} FROM magic_wand_dispatches WHERE id = ?1");
@@ -565,10 +548,7 @@ impl WorkDb {
 
     /// Discard the magic-wand result without modifying the description.
     /// Transitions the dispatch to `discarded`; the comment stays `active`.
-    pub fn discard_magic_wand_dispatch(
-        &self,
-        dispatch_id: &str,
-    ) -> Result<MagicWandDispatch> {
+    pub fn discard_magic_wand_dispatch(&self, dispatch_id: &str) -> Result<MagicWandDispatch> {
         let conn = self.connect()?;
         let now = now_string();
         let n = conn.execute(
@@ -604,9 +584,7 @@ fn extract_anchor(plain_text: &str, start: usize, length: usize) -> CommentAncho
 
 pub(crate) fn query_comment(conn: &Connection, id: &str) -> Result<Option<WorkComment>> {
     let sql = format!("SELECT {COMMENT_COLUMNS} FROM work_comments WHERE id = ?1");
-    conn.query_row(&sql, [id], map_comment)
-        .optional()
-        .map_err(Into::into)
+    conn.query_row(&sql, [id], map_comment).optional().map_err(Into::into)
 }
 
 pub(crate) fn query_comments(
@@ -794,9 +772,7 @@ mod tests {
             prefix: "new-prefix".to_owned(),
             suffix: "new-suffix".to_owned(),
         };
-        let updated = db
-            .update_comment_anchor(&c.id, &new_anchor, "v2", 5)
-            .unwrap();
+        let updated = db.update_comment_anchor(&c.id, &new_anchor, "v2", 5).unwrap();
         assert_eq!(updated.anchor.exact, "alpha-v2");
         assert_eq!(updated.doc_version, "v2");
         assert_eq!(updated.last_resolved_with.as_deref(), Some("fuzzy"));
@@ -854,10 +830,7 @@ mod tests {
         assert_eq!(present.status, "active");
         assert_eq!(present.last_resolved_with.as_deref(), Some("exact"));
 
-        let absent = pr
-            .iter()
-            .find(|c| c.anchor.exact == "absent span zzqq")
-            .unwrap();
+        let absent = pr.iter().find(|c| c.anchor.exact == "absent span zzqq").unwrap();
         assert_eq!(absent.status, "orphaned");
         assert_eq!(absent.last_resolved_with.as_deref(), Some("orphan"));
     }
@@ -928,15 +901,7 @@ mod tests {
             .create_magic_wand_dispatch(&comment.id, "work_item", "t1", "v0")
             .unwrap();
         let updated = db
-            .complete_magic_wand_dispatch(
-                &dispatch.id,
-                "failed",
-                None,
-                Some("length_sanity"),
-                None,
-                None,
-                false,
-            )
+            .complete_magic_wand_dispatch(&dispatch.id, "failed", None, Some("length_sanity"), None, None, false)
             .unwrap();
         assert_eq!(updated.status, "failed");
         assert!(updated.result_md.is_none());
@@ -950,20 +915,13 @@ mod tests {
         let dispatch = db
             .create_magic_wand_dispatch(&comment.id, "work_item", "t1", "v0")
             .unwrap();
-        db.complete_magic_wand_dispatch(
-            &dispatch.id,
-            "returned",
-            Some("result"),
-            None,
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        db.complete_magic_wand_dispatch(&dispatch.id, "returned", Some("result"), None, None, None, false)
+            .unwrap();
         // A second complete call must fail because status is no longer 'in_flight'.
-        assert!(db
-            .complete_magic_wand_dispatch(&dispatch.id, "failed", None, None, None, None, false)
-            .is_err());
+        assert!(
+            db.complete_magic_wand_dispatch(&dispatch.id, "failed", None, None, None, None, false)
+                .is_err()
+        );
     }
 
     #[test]
@@ -973,16 +931,8 @@ mod tests {
         let dispatch = db
             .create_magic_wand_dispatch(&comment.id, "work_item", "t1", "v0")
             .unwrap();
-        db.complete_magic_wand_dispatch(
-            &dispatch.id,
-            "returned",
-            Some("result"),
-            None,
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        db.complete_magic_wand_dispatch(&dispatch.id, "returned", Some("result"), None, None, None, false)
+            .unwrap();
         let discarded = db.discard_magic_wand_dispatch(&dispatch.id).unwrap();
         assert_eq!(discarded.status, "discarded");
         // Comment stays active.
@@ -997,16 +947,8 @@ mod tests {
         let dispatch = db
             .create_magic_wand_dispatch(&comment.id, "work_item", "t1", "v0")
             .unwrap();
-        db.complete_magic_wand_dispatch(
-            &dispatch.id,
-            "returned",
-            Some("# Updated"),
-            None,
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        db.complete_magic_wand_dispatch(&dispatch.id, "returned", Some("# Updated"), None, None, None, false)
+            .unwrap();
         // Pass a different current_doc_version to trigger a conflict.
         let (updated, conflict) = db
             .apply_magic_wand_dispatch(&dispatch.id, "v_different", "user:me")

@@ -38,16 +38,10 @@ use crate::protocol::WorkerEvent;
 /// worker run id the engine has correlated this hook to; included in
 /// the audit record so triage can pivot from an audit line back to the
 /// offending worker.
-pub fn record_if_sandbox_attempt(
-    boss_state_dir: &Path,
-    run_id: Option<&str>,
-    event: &WorkerEvent,
-) {
+pub fn record_if_sandbox_attempt(boss_state_dir: &Path, run_id: Option<&str>, event: &WorkerEvent) {
     let (tool_name, tool_input) = match event {
         WorkerEvent::PreToolUse {
-            tool_name,
-            tool_input,
-            ..
+            tool_name, tool_input, ..
         } => (tool_name.as_str(), tool_input),
         _ => return,
     };
@@ -60,25 +54,13 @@ pub fn record_if_sandbox_attempt(
     let detail = reason.detail();
 
     let mut payload = serde_json::Map::new();
-    payload.insert(
-        "tool".to_owned(),
-        serde_json::Value::String(tool_name.to_owned()),
-    );
-    payload.insert(
-        "reason".to_owned(),
-        serde_json::Value::String(label.to_owned()),
-    );
+    payload.insert("tool".to_owned(), serde_json::Value::String(tool_name.to_owned()));
+    payload.insert("reason".to_owned(), serde_json::Value::String(label.to_owned()));
     if let Some(detail) = detail {
-        payload.insert(
-            "detail".to_owned(),
-            serde_json::Value::String(detail),
-        );
+        payload.insert("detail".to_owned(), serde_json::Value::String(detail));
     }
     if let Some(run_id) = run_id {
-        payload.insert(
-            "run_id".to_owned(),
-            serde_json::Value::String(run_id.to_owned()),
-        );
+        payload.insert("run_id".to_owned(), serde_json::Value::String(run_id.to_owned()));
     }
 
     audit::record_event("worker_sandbox_attempt", &serde_json::Value::Object(payload));
@@ -116,11 +98,7 @@ impl Reason {
     }
 }
 
-fn classify(
-    boss_state_dir: &Path,
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-) -> Option<Reason> {
+fn classify(boss_state_dir: &Path, tool_name: &str, tool_input: &serde_json::Value) -> Option<Reason> {
     match tool_name {
         "Read" | "Edit" | "Write" | "NotebookEdit" => {
             let path = tool_input.get("file_path").and_then(|v| v.as_str())?;
@@ -146,12 +124,8 @@ fn classify_bash(boss_state_dir: &Path, command: &str) -> Option<Reason> {
     // shlex returns None on unclosed quotes; in that case we fall
     // back to whitespace splitting (best-effort — the literal-path
     // scan below still catches the obvious shapes).
-    let tokens: Vec<String> = shlex::split(command).unwrap_or_else(|| {
-        command
-            .split_whitespace()
-            .map(|s| s.to_owned())
-            .collect()
-    });
+    let tokens: Vec<String> =
+        shlex::split(command).unwrap_or_else(|| command.split_whitespace().map(|s| s.to_owned()).collect());
 
     // Detect bossctl invocations even when the path has embedded
     // spaces and shlex tokenization shredded the basename across
@@ -197,9 +171,7 @@ fn classify_bash(boss_state_dir: &Path, command: &str) -> Option<Reason> {
     let state_dir_str = boss_state_dir.to_string_lossy();
     if !state_dir_str.is_empty() {
         for token in &tokens {
-            if path_is_inside(boss_state_dir, token)
-                || token.contains(state_dir_str.as_ref())
-            {
+            if path_is_inside(boss_state_dir, token) || token.contains(state_dir_str.as_ref()) {
                 return Some(Reason::BossStatePath(command.to_owned()));
             }
         }
@@ -340,11 +312,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_skipped() {
-        let reason = classify(
-            &boss_dir(),
-            "Grep",
-            &serde_json::json!({ "pattern": "state.db" }),
-        );
+        let reason = classify(&boss_dir(), "Grep", &serde_json::json!({ "pattern": "state.db" }));
         assert!(reason.is_none());
     }
 

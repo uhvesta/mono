@@ -23,8 +23,7 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, EffortLevel, FrontendEvent, FrontendRequest, Product,
-    Task, WorkItem,
+    CreateChoreInput, CreateProductInput, EffortLevel, FrontendEvent, FrontendRequest, Product, Task, WorkItem,
 };
 use serde_json::Value;
 
@@ -40,15 +39,15 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
         Ok(Self {
             socket_path,
@@ -89,12 +88,7 @@ async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> 
     }
 }
 
-async fn create_chore(
-    client: &mut BossClient,
-    product_id: &str,
-    name: &str,
-    description: &str,
-) -> Result<Task> {
+async fn create_chore(client: &mut BossClient, product_id: &str, name: &str, description: &str) -> Result<Task> {
     match client
         .send_request(&FrontendRequest::CreateChore {
             input: CreateChoreInput {
@@ -202,13 +196,7 @@ async fn three_escalation_events_match_recorded_rates() -> Result<()> {
     let product = create_product(&mut client, "Boss").await?;
 
     // Three chores, one per marker — denominators all = 1.
-    let rename_chore = create_chore(
-        &mut client,
-        &product.id,
-        "Rename auth middleware",
-        "Renames the module",
-    )
-    .await?;
+    let rename_chore = create_chore(&mut client, &product.id, "Rename auth middleware", "Renames the module").await?;
     let cursor_chore = create_chore(
         &mut client,
         &product.id,
@@ -256,10 +244,7 @@ async fn three_escalation_events_match_recorded_rates() -> Result<()> {
     )
     .await?;
 
-    let report = run_boss(
-        engine.socket_str(),
-        &["product", "audit-effort", &product.id],
-    )?;
+    let report = run_boss(engine.socket_str(), &["product", "audit-effort", &product.id])?;
     let r = &report["report"];
     assert_eq!(r["product_id"].as_str(), Some(product.id.as_str()));
     assert_eq!(r["total_chores"].as_u64(), Some(3));
@@ -306,20 +291,14 @@ async fn empty_data_does_not_divide_by_zero() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(&mut client, "Boss").await?;
 
-    let report = run_boss(
-        engine.socket_str(),
-        &["product", "audit-effort", &product.id],
-    )?;
+    let report = run_boss(engine.socket_str(), &["product", "audit-effort", &product.id])?;
     let r = &report["report"];
     assert_eq!(r["total_chores"].as_u64(), Some(0));
     assert_eq!(r["total_escalations"].as_u64(), Some(0));
     assert!(r["rows"].as_array().unwrap().is_empty());
 
     // Human output should not panic / divide by zero either.
-    let human = run_boss_human(
-        engine.socket_str(),
-        &["product", "audit-effort", &product.id],
-    )?;
+    let human = run_boss_human(engine.socket_str(), &["product", "audit-effort", &product.id])?;
     assert!(
         human.contains("0 escalations across 0 chores"),
         "human header missing zero counts: {human}",
@@ -353,10 +332,7 @@ async fn multi_marker_event_counts_against_each_marker() -> Result<()> {
         &["apply", "cursor"],
     )
     .await?;
-    let report = run_boss(
-        engine.socket_str(),
-        &["product", "audit-effort", &product.id],
-    )?;
+    let report = run_boss(engine.socket_str(), &["product", "audit-effort", &product.id])?;
     let rows = report["report"]["rows"].as_array().unwrap();
     let by_marker = |m: &str| {
         rows.iter()

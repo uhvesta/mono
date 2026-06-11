@@ -35,15 +35,12 @@ where
 /// chain shared by the `map_*` mappers and a few ad-hoc row readers.
 /// Note `serde_json::Value::default()` is `Value::Null`, so this covers
 /// the `Value` call sites that previously wrote `unwrap_or(Value::Null)`.
-pub(crate) fn deserialize_json_or_default<T: serde::de::DeserializeOwned + Default>(
-    json: Option<&str>,
-) -> T {
+pub(crate) fn deserialize_json_or_default<T: serde::de::DeserializeOwned + Default>(json: Option<&str>) -> T {
     json.and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default()
 }
 
 pub(crate) fn map_product(row: &Row<'_>) -> rusqlite::Result<Product> {
-    let external_tracker_kind: Option<String> =
-        row.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty());
+    let external_tracker_kind: Option<String> = row.get::<_, Option<String>>(10)?.filter(|s| !s.is_empty());
     let external_tracker_config: Option<serde_json::Value> = row
         .get::<_, Option<String>>(11)?
         .and_then(|s| serde_json::from_str(&s).ok());
@@ -249,9 +246,10 @@ pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// string for unknown trackers so callers can still surface the ref.
 pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> String {
     if kind == "github"
-        && let Some((repo, number)) = canonical_id.rsplit_once('#') {
-            return format!("https://github.com/{repo}/issues/{number}");
-        }
+        && let Some((repo, number)) = canonical_id.rsplit_once('#')
+    {
+        return format!("https://github.com/{repo}/issues/{number}");
+    }
     String::new()
 }
 
@@ -281,9 +279,7 @@ pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task
 /// Like [`map_task_with_external_ref`] but also reads column 35 carrying
 /// `parent_task_id`. Used in `get_work_tree` where the SELECT explicitly
 /// includes the external-ref columns (30–34) followed by `parent_task_id`.
-pub(crate) fn map_task_with_external_ref_and_parent(
-    row: &Row<'_>,
-) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
     Ok(task)
@@ -293,17 +289,14 @@ pub(crate) fn map_task_with_external_ref_and_parent(
 /// carrying `source_automation_id`. Used in `get_work_tree` so automation-
 /// produced tasks carry their provenance to the client (icon display + kanban
 /// filtering both key off this field).
-pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(
-    row: &Row<'_>,
-) -> rusqlite::Result<Task> {
+pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_and_parent(row)?;
     task.source_automation_id = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
-    let branch_naming: BranchNaming =
-        deserialize_json_or_default(row.get::<_, Option<String>>(22)?.as_deref());
+    let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(22)?.as_deref());
     let kind_raw: String = row.get(2)?;
     let kind = parse_text_column::<ExecutionKind>(2, &kind_raw)?;
     let status_raw: String = row.get(3)?;
@@ -365,9 +358,7 @@ pub(crate) fn map_attention_item(row: &Row<'_>) -> rusqlite::Result<WorkAttentio
     })
 }
 
-pub(crate) fn map_effort_escalation(
-    row: &Row<'_>,
-) -> rusqlite::Result<boss_protocol::EffortEscalation> {
+pub(crate) fn map_effort_escalation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::EffortEscalation> {
     let id: String = row.get(0)?;
     let product_id: String = row.get(1)?;
     let work_item_id: String = row.get(2)?;
@@ -382,9 +373,8 @@ pub(crate) fn map_effort_escalation(
     // poison the audit.
     let original_level = parse_text_column::<boss_protocol::EffortLevel>(3, &original_level_str)?;
     let new_level = parse_text_column::<boss_protocol::EffortLevel>(4, &new_level_str)?;
-    let markers: Vec<String> = serde_json::from_str(&markers_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
-    })?;
+    let markers: Vec<String> = serde_json::from_str(&markers_json)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into()))?;
     Ok(boss_protocol::EffortEscalation {
         id,
         product_id,
@@ -422,10 +412,7 @@ pub(crate) fn map_conflict_resolution(row: &Row<'_>) -> rusqlite::Result<Conflic
     })
 }
 
-pub(crate) fn query_conflict_resolution(
-    conn: &Connection,
-    id: &str,
-) -> Result<Option<ConflictResolution>> {
+pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<Option<ConflictResolution>> {
     let mut stmt = conn.prepare(
         "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
                 base_sha_at_trigger, head_sha_before, head_sha_after, status, failure_reason,
@@ -631,17 +618,10 @@ pub(crate) fn automation_trigger_from_db(
     kind: &str,
     config_json: &str,
 ) -> anyhow::Result<boss_protocol::AutomationTrigger> {
-    let mut config: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(config_json)
-            .with_context(|| format!("failed to parse trigger_config JSON: {config_json}"))?;
-    config.insert(
-        "kind".to_owned(),
-        serde_json::Value::String(kind.to_owned()),
-    );
-    let trigger =
-        serde_json::from_value::<boss_protocol::AutomationTrigger>(serde_json::Value::Object(
-            config,
-        ))
+    let mut config: serde_json::Map<String, serde_json::Value> = serde_json::from_str(config_json)
+        .with_context(|| format!("failed to parse trigger_config JSON: {config_json}"))?;
+    config.insert("kind".to_owned(), serde_json::Value::String(kind.to_owned()));
+    let trigger = serde_json::from_value::<boss_protocol::AutomationTrigger>(serde_json::Value::Object(config))
         .with_context(|| format!("failed to deserialise AutomationTrigger with kind={kind}"))?;
     Ok(trigger)
 }
@@ -649,11 +629,8 @@ pub(crate) fn automation_trigger_from_db(
 /// Split an [`AutomationTrigger`] into `(trigger_kind, trigger_config_json)`
 /// for DB storage. The `"kind"` field is removed from the config body so the
 /// discriminator can be stored separately without duplication.
-pub(crate) fn automation_trigger_to_db(
-    trigger: &boss_protocol::AutomationTrigger,
-) -> anyhow::Result<(String, String)> {
-    let tagged = serde_json::to_value(trigger)
-        .context("failed to serialise AutomationTrigger")?;
+pub(crate) fn automation_trigger_to_db(trigger: &boss_protocol::AutomationTrigger) -> anyhow::Result<(String, String)> {
+    let tagged = serde_json::to_value(trigger).context("failed to serialise AutomationTrigger")?;
     let mut map = match tagged {
         serde_json::Value::Object(m) => m,
         other => anyhow::bail!("unexpected AutomationTrigger JSON shape: {other}"),
@@ -672,19 +649,16 @@ pub(crate) fn automation_trigger_to_db(
 /// 8  open_task_limit, 9 catch_up_window_secs, 10 enabled,
 /// 11 created_via, 12 created_at, 13 updated_at,
 /// 14 last_fired_at, 15 last_outcome, 16 next_due_at
-pub(crate) fn map_automation(
-    row: &Row<'_>,
-) -> rusqlite::Result<boss_protocol::Automation> {
+pub(crate) fn map_automation(row: &Row<'_>) -> rusqlite::Result<boss_protocol::Automation> {
     let trigger_kind: String = row.get(5)?;
     let trigger_config: String = row.get(6)?;
-    let trigger =
-        automation_trigger_from_db(&trigger_kind, &trigger_config).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                5,
-                rusqlite::types::Type::Text,
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-            )
-        })?;
+    let trigger = automation_trigger_from_db(&trigger_kind, &trigger_config).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+        )
+    })?;
     Ok(boss_protocol::Automation {
         id: row.get(0)?,
         short_id: row.get(1)?,
@@ -708,9 +682,7 @@ pub(crate) fn map_automation(
 /// Map a row from the canonical `automation_runs` SELECT column order:
 /// 0 id, 1 automation_id, 2 scheduled_for, 3 started_at, 4 finished_at,
 /// 5 triage_execution_id, 6 outcome, 7 produced_task_id, 8 detail
-pub(crate) fn map_automation_run(
-    row: &Row<'_>,
-) -> rusqlite::Result<boss_protocol::AutomationRun> {
+pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protocol::AutomationRun> {
     Ok(boss_protocol::AutomationRun {
         id: row.get(0)?,
         automation_id: row.get(1)?,

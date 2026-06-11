@@ -31,19 +31,14 @@ pub(crate) fn starlark_file_kind(path: &Path) -> Option<StarlarkFileKind> {
     match path.file_name().and_then(|name| name.to_str()) {
         Some("BUILD") | Some("BUILD.bazel") => Some(StarlarkFileKind::Build),
         Some("MODULE.bazel") => Some(StarlarkFileKind::Module),
-        _ if matches!(path.extension().and_then(|ext| ext.to_str()), Some("bzl")) => {
-            Some(StarlarkFileKind::Bzl)
-        }
+        _ if matches!(path.extension().and_then(|ext| ext.to_str()), Some("bzl")) => Some(StarlarkFileKind::Bzl),
         _ => None,
     }
 }
 
 pub(crate) fn parse_starlark_file(contents: &str) -> Option<ParsedStarlarkFile<'_>> {
     let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_starlark::LANGUAGE.into())
-        .is_err()
-    {
+    if parser.set_language(&tree_sitter_starlark::LANGUAGE.into()).is_err() {
         return None;
     }
     let tree = parser.parse(contents, None)?;
@@ -109,9 +104,7 @@ pub(crate) fn source_location(node: Node<'_>) -> SourceLocation {
 }
 
 fn unquote_starlark_string(raw: &str) -> Option<&str> {
-    for prefix in [
-        "r", "R", "rb", "rB", "Rb", "RB", "br", "bR", "Br", "BR", "b", "B",
-    ] {
+    for prefix in ["r", "R", "rb", "rB", "Rb", "RB", "br", "bR", "Br", "BR", "b", "B"] {
         if let Some(rest) = raw.strip_prefix(prefix) {
             return unquote_starlark_string(rest);
         }

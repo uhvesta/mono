@@ -90,9 +90,7 @@ impl BuildkiteLogReader {
     /// Override the `bk` binary path. Used in tests to inject a fake
     /// script that returns canned responses.
     pub fn with_binary(binary: impl Into<String>) -> Self {
-        Self {
-            binary: binary.into(),
-        }
+        Self { binary: binary.into() }
     }
 }
 
@@ -140,9 +138,7 @@ impl GithubActionsLogReader {
     }
 
     pub fn with_binary(binary: impl Into<String>) -> Self {
-        Self {
-            binary: binary.into(),
-        }
+        Self { binary: binary.into() }
     }
 }
 
@@ -154,11 +150,7 @@ impl CiLogReader for GithubActionsLogReader {
     }
 
     async fn read_log_full(&self, job_id: &str) -> Result<String> {
-        run_capture(
-            &self.binary,
-            &["run", "view", "--log-failed", "--job", job_id],
-        )
-        .await
+        run_capture(&self.binary, &["run", "view", "--log-failed", "--job", job_id]).await
     }
 
     async fn retrigger(&self, id: &str) -> Result<String> {
@@ -219,10 +211,7 @@ pub fn reader_for(provider: CiProvider) -> Box<dyn CiLogReader> {
 pub fn parse_buildkite_build_id(url: &str) -> Option<String> {
     let after_builds = url.split_once("/builds/")?.1;
     // Strip query/fragment and any trailing path segments.
-    let id = after_builds
-        .split(['#', '?', '/'])
-        .next()
-        .unwrap_or(after_builds);
+    let id = after_builds.split(['#', '?', '/']).next().unwrap_or(after_builds);
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
@@ -258,10 +247,7 @@ pub fn parse_buildkite_job_id(url: &str) -> Option<String> {
 /// the path segment after `/runs/`.
 pub fn parse_gha_run_id(url: &str) -> Option<String> {
     let after_runs = url.split_once("/runs/")?.1;
-    let id = after_runs
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_runs);
+    let id = after_runs.split(['/', '?', '#']).next().unwrap_or(after_runs);
     if id.is_empty() { None } else { Some(id.to_owned()) }
 }
 
@@ -323,10 +309,7 @@ mod tests {
     #[test]
     fn buildkite_build_id_parses_from_canonical_url() {
         let url = "https://buildkite.com/myorg/mypipe/builds/12345#abc-def-ghi";
-        assert_eq!(
-            parse_buildkite_build_id(url).as_deref(),
-            Some("12345")
-        );
+        assert_eq!(parse_buildkite_build_id(url).as_deref(), Some("12345"));
     }
 
     #[test]
@@ -344,19 +327,13 @@ mod tests {
     #[test]
     fn buildkite_pipeline_slug_parses_from_canonical_url() {
         let url = "https://buildkite.com/myorg/mypipeline/builds/1329#job-uuid";
-        assert_eq!(
-            parse_buildkite_pipeline_slug(url).as_deref(),
-            Some("mypipeline"),
-        );
+        assert_eq!(parse_buildkite_pipeline_slug(url).as_deref(), Some("mypipeline"),);
     }
 
     #[test]
     fn buildkite_pipeline_slug_parses_without_fragment() {
         let url = "https://buildkite.com/myorg/mypipeline/builds/1329";
-        assert_eq!(
-            parse_buildkite_pipeline_slug(url).as_deref(),
-            Some("mypipeline"),
-        );
+        assert_eq!(parse_buildkite_pipeline_slug(url).as_deref(), Some("mypipeline"),);
     }
 
     #[test]
@@ -369,10 +346,7 @@ mod tests {
     #[test]
     fn buildkite_job_id_parses_from_fragment() {
         let url = "https://buildkite.com/o/p/builds/42#018f-1234-uuid";
-        assert_eq!(
-            parse_buildkite_job_id(url).as_deref(),
-            Some("018f-1234-uuid")
-        );
+        assert_eq!(parse_buildkite_job_id(url).as_deref(), Some("018f-1234-uuid"));
     }
 
     #[test]
@@ -448,10 +422,7 @@ mod tests {
     #[test]
     fn gha_invocation_hint_embeds_job_id() {
         let r = GithubActionsLogReader::new();
-        assert_eq!(
-            r.worker_cli_invocation_hint("99"),
-            "gh run view --log-failed --job 99"
-        );
+        assert_eq!(r.worker_cli_invocation_hint("99"), "gh run view --log-failed --job 99");
     }
 
     #[test]
@@ -536,10 +507,7 @@ exit 2
             let bk = write_script(dir.path(), "bk", FAKE_BK);
             let reader = BuildkiteLogReader::with_binary(bk.to_str().unwrap());
             let tail = reader.read_log_tail("any-job-uuid", 2).await.unwrap();
-            assert_eq!(
-                tail,
-                "TEST FAILED at frob_bar_test.rs:42\nlast meaningful line"
-            );
+            assert_eq!(tail, "TEST FAILED at frob_bar_test.rs:42\nlast meaningful line");
         }
 
         #[tokio::test]

@@ -21,9 +21,7 @@ use anyhow::{Result, anyhow};
 use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
-use boss_protocol::{
-    CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem,
-};
+use boss_protocol::{CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem};
 use serde_json::Value;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -38,17 +36,17 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
         Ok(Self {
             socket_path,
@@ -73,9 +71,7 @@ async fn create_product(client: &mut BossClient, input: CreateProductInput) -> R
         FrontendEvent::WorkItemCreated {
             item: WorkItem::Product(p),
         } => Ok(p),
-        other => Err(anyhow!(
-            "unexpected engine event for product create: {other:?}"
-        )),
+        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
     }
 }
 
@@ -178,17 +174,11 @@ async fn chore_create_with_effort_and_model_round_trips_through_show() -> Result
         .ok_or_else(|| anyhow!("chore create did not return an id: {created}"))?
         .to_owned();
     assert_eq!(created["chore"]["effort_level"].as_str(), Some("large"));
-    assert_eq!(
-        created["chore"]["model_override"].as_str(),
-        Some("claude-opus-4-7"),
-    );
+    assert_eq!(created["chore"]["model_override"].as_str(), Some("claude-opus-4-7"),);
 
     let shown = run_boss(engine.socket_str(), &["chore", "show", &chore_id])?;
     assert_eq!(shown["chore"]["effort_level"].as_str(), Some("large"));
-    assert_eq!(
-        shown["chore"]["model_override"].as_str(),
-        Some("claude-opus-4-7"),
-    );
+    assert_eq!(shown["chore"]["model_override"].as_str(), Some("claude-opus-4-7"),);
     Ok(())
 }
 
@@ -270,10 +260,7 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
             "",
         ],
     )?;
-    let chore_id = created["chore"]["id"]
-        .as_str()
-        .expect("chore id")
-        .to_owned();
+    let chore_id = created["chore"]["id"].as_str().expect("chore id").to_owned();
     // Fresh row: NULL on both fields.
     assert!(created["chore"]["effort_level"].is_null());
     assert!(created["chore"]["model_override"].is_null());
@@ -281,15 +268,7 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
     // Set via update.
     let updated = run_boss(
         engine.socket_str(),
-        &[
-            "chore",
-            "update",
-            &chore_id,
-            "--effort",
-            "medium",
-            "--model",
-            "sonnet",
-        ],
+        &["chore", "update", &chore_id, "--effort", "medium", "--model", "sonnet"],
     )?;
     assert_eq!(updated["chore"]["effort_level"].as_str(), Some("medium"));
     assert_eq!(updated["chore"]["model_override"].as_str(), Some("sonnet"));
@@ -297,13 +276,7 @@ async fn chore_update_sets_clears_effort_and_model_round_trip() -> Result<()> {
     // Clear via --unset-effort / --unset-model.
     let cleared = run_boss(
         engine.socket_str(),
-        &[
-            "chore",
-            "update",
-            &chore_id,
-            "--unset-effort",
-            "--unset-model",
-        ],
+        &["chore", "update", &chore_id, "--unset-effort", "--unset-model"],
     )?;
     assert!(cleared["chore"]["effort_level"].is_null());
     assert!(cleared["chore"]["model_override"].is_null());
@@ -338,18 +311,9 @@ async fn product_set_default_model_lifecycle_round_trips() -> Result<()> {
     // Set.
     let set_resp = run_boss(
         engine.socket_str(),
-        &[
-            "product",
-            "set-default-model",
-            &product.id,
-            "--model",
-            "sonnet",
-        ],
+        &["product", "set-default-model", &product.id, "--model", "sonnet"],
     )?;
-    assert_eq!(
-        set_resp["product"]["default_model"].as_str(),
-        Some("sonnet"),
-    );
+    assert_eq!(set_resp["product"]["default_model"].as_str(), Some("sonnet"),);
 
     // Show reflects it.
     let shown = run_boss(engine.socket_str(), &["product", "show", &product.id])?;

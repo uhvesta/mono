@@ -156,10 +156,7 @@ mod tests {
         let json = r#"{"repository": {"default_branch": "master"}}"#;
         let env = env_with_event_path(json);
         let payload = env.read_github_event_payload().unwrap();
-        assert_eq!(
-            payload.repository.unwrap().default_branch.as_deref(),
-            Some("master")
-        );
+        assert_eq!(payload.repository.unwrap().default_branch.as_deref(), Some("master"));
     }
 
     #[test]
@@ -167,10 +164,7 @@ mod tests {
         let json = r#"{"unknown_top_level": true, "merge_group": {"base_sha": "aa", "future_field": 42}}"#;
         let env = env_with_event_path(json);
         let payload = env.read_github_event_payload().unwrap();
-        assert_eq!(
-            payload.merge_group.unwrap().base_sha.as_deref(),
-            Some("aa")
-        );
+        assert_eq!(payload.merge_group.unwrap().base_sha.as_deref(), Some("aa"));
     }
 
     #[test]

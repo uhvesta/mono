@@ -202,10 +202,7 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
 /// on the `task` / `skip` keyword having a word boundary, so prose that merely
 /// *mentions* the protocol does not trip it.
 pub fn parse_triage_decision(final_message: &str) -> TriageDecision {
-    let markers: Vec<TriageDecision> = final_message
-        .lines()
-        .filter_map(parse_marker_line)
-        .collect();
+    let markers: Vec<TriageDecision> = final_message.lines().filter_map(parse_marker_line).collect();
     match markers.len() {
         0 => TriageDecision::NoDecision,
         1 => markers.into_iter().next().unwrap(),
@@ -300,10 +297,7 @@ impl EngineTriageDispatcher {
                 ),
             };
         };
-        match self
-            .work_db
-            .create_automation_triage_execution(&automation.id, &repo)
-        {
+        match self.work_db.create_automation_triage_execution(&automation.id, &repo) {
             Ok(execution) => {
                 (self.kick)();
                 TriageDispatch::Dispatched {
@@ -319,11 +313,7 @@ impl EngineTriageDispatcher {
 
 #[async_trait]
 impl TriageDispatcher for EngineTriageDispatcher {
-    async fn dispatch_triage(
-        &self,
-        automation: &Automation,
-        _scheduled_for_epoch: i64,
-    ) -> TriageDispatch {
+    async fn dispatch_triage(&self, automation: &Automation, _scheduled_for_epoch: i64) -> TriageDispatch {
         self.fire(automation)
     }
 }
@@ -407,10 +397,7 @@ mod tests {
 
     #[test]
     fn empty_task_id_is_not_a_marker() {
-        assert_eq!(
-            parse_triage_decision("automation: task   "),
-            TriageDecision::NoDecision
-        );
+        assert_eq!(parse_triage_decision("automation: task   "), TriageDecision::NoDecision);
     }
 
     #[test]

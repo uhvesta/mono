@@ -7,9 +7,8 @@ impl WorkDb {
         }
 
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create work db directory {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create work db directory {}", parent.display()))?;
         }
 
         let db = Self { path, memory: None };
@@ -88,17 +87,12 @@ impl WorkDb {
             params![id, input.name, slug, description, repo_remote_url, now, design_repo, docs_repo, worker_branch_prefix],
         )?;
 
-        let product = query_product(&tx, &id)?
-            .with_context(|| format!("missing product after insert: {id}"))?;
+        let product = query_product(&tx, &id)?.with_context(|| format!("missing product after insert: {id}"))?;
         tx.commit()?;
         Ok(product)
     }
 
-    pub fn list_projects(
-        &self,
-        product_id: &str,
-        dep_filter: Option<&DependencyFilter>,
-    ) -> Result<Vec<Project>> {
+    pub fn list_projects(&self, product_id: &str, dep_filter: Option<&DependencyFilter>) -> Result<Vec<Project>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
@@ -148,17 +142,10 @@ impl WorkDb {
         // Non-design-shaped projects (postmortems, checklists, etc.)
         // pass `no_design_task = true` and land here with zero tasks.
         if !input.no_design_task {
-            insert_design_task_for_project_in_tx(
-                &tx,
-                &input.product_id,
-                &id,
-                &input.name,
-                input.autostart,
-            )?;
+            insert_design_task_for_project_in_tx(&tx, &input.product_id, &id, &input.name, input.autostart)?;
         }
 
-        let project = query_project(&tx, &id)?
-            .with_context(|| format!("missing project after insert: {id}"))?;
+        let project = query_project(&tx, &id)?.with_context(|| format!("missing project after insert: {id}"))?;
         tx.commit()?;
         Ok(project)
     }
@@ -181,10 +168,7 @@ impl WorkDb {
 
     /// Create a `kind = 'investigation'` task. Parallel to `create_chore`
     /// but uses the `investigation` kind and supports an optional `project_id`.
-    pub fn create_investigation(
-        &self,
-        input: boss_protocol::CreateInvestigationInput,
-    ) -> Result<Task> {
+    pub fn create_investigation(&self, input: boss_protocol::CreateInvestigationInput) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let task = insert_investigation_in_tx(&tx, input)?;
@@ -199,11 +183,7 @@ impl WorkDb {
     /// `pr_checker` supplies the live PR state for chains where the cached
     /// DB state alone cannot distinguish open from closed-unmerged. Pass
     /// `&GhPrStateChecker` in production; pass `&FakePrStateChecker` in tests.
-    pub fn create_revision(
-        &self,
-        input: CreateRevisionInput,
-        pr_checker: &dyn PrStateChecker,
-    ) -> Result<Task> {
+    pub fn create_revision(&self, input: CreateRevisionInput, pr_checker: &dyn PrStateChecker) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let task = assert_parent_revisable_and_insert(&tx, input, pr_checker)?;
@@ -257,7 +237,15 @@ impl WorkDb {
                  external_ref_boss_checksum         = ?7,
                  updated_at                         = ?5
              WHERE id = ?1 AND deleted_at IS NULL",
-            params![chore.id, kind, canonical_id, raw_json, now, upstream_checksum, boss_checksum],
+            params![
+                chore.id,
+                kind,
+                canonical_id,
+                raw_json,
+                now,
+                upstream_checksum,
+                boss_checksum
+            ],
         )?;
         tx.commit()?;
         Ok(chore)

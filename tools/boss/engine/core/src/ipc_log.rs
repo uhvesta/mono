@@ -135,11 +135,7 @@ async fn writer_task(root: PathBuf, mut rx: mpsc::UnboundedReceiver<IpcLogEntry>
                 continue;
             }
             let path = ipc_dir.join(format!("ipc-{date_str}.jsonl"));
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
+            match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(f) => {
                     file = Some(f);
                     current_date = date_str;
@@ -184,12 +180,11 @@ fn prune_old_files(dir: &Path, keep_days: u64) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(date_part) = name
-            .strip_prefix("ipc-")
-            .and_then(|s| s.strip_suffix(".jsonl"))
-            && date_part < cutoff_date.as_str() {
-                let _ = std::fs::remove_file(entry.path());
-            }
+        if let Some(date_part) = name.strip_prefix("ipc-").and_then(|s| s.strip_suffix(".jsonl"))
+            && date_part < cutoff_date.as_str()
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -218,9 +213,7 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{
-        EngineToAppResponse, ReleaseWorkerPaneInput, ReleaseWorkerPaneResult,
-    };
+    use crate::protocol::{EngineToAppResponse, ReleaseWorkerPaneInput, ReleaseWorkerPaneResult};
 
     #[test]
     fn epoch_ms_to_date_known_values() {

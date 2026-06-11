@@ -67,10 +67,7 @@ pub async fn gh_merge_when_ready(pr_url: &str) -> Result<MergeAction> {
     }
 
     // Re-probe concurrently to determine which outcome occurred.
-    let (is_merged, is_in_queue) = tokio::join!(
-        probe_is_merged(pr_url),
-        probe_in_merge_queue(pr_url),
-    );
+    let (is_merged, is_in_queue) = tokio::join!(probe_is_merged(pr_url), probe_in_merge_queue(pr_url),);
 
     Ok(derive_action(is_in_queue, is_merged))
 }

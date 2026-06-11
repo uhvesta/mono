@@ -24,8 +24,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::external::{
-    ExternalCheckDeclarativePackage, ExternalCheckPackageImplementation,
-    parse_declarative_check_manifest, run_declarative_check,
+    ExternalCheckDeclarativePackage, ExternalCheckPackageImplementation, parse_declarative_check_manifest,
+    run_declarative_check,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Finding;
@@ -35,12 +35,10 @@ const MANIFEST: &str = include_str!("../../../checks/buildifier/check.yaml");
 
 /// Format-clean but carries three lint warnings (module-docstring,
 /// unused-variable, no-effect). Exercises the per-file lint invocation.
-const MALFORMED_FIXTURE: &str =
-    include_str!("../../../tests/fixtures/buildifier/malformed.bzl.fixture");
+const MALFORMED_FIXTURE: &str = include_str!("../../../tests/fixtures/buildifier/malformed.bzl.fixture");
 
 /// Lint-clean but needs reformatting. Exercises the batch format invocation.
-const UNFORMATTED_FIXTURE: &str =
-    include_str!("../../../tests/fixtures/buildifier/unformatted.bzl.fixture");
+const UNFORMATTED_FIXTURE: &str = include_str!("../../../tests/fixtures/buildifier/unformatted.bzl.fixture");
 
 /// Resolve the real buildifier binary from the test's runfiles, or `None` when it
 /// was not staged (e.g. running under plain `cargo test`).
@@ -54,16 +52,11 @@ const UNFORMATTED_FIXTURE: &str =
 fn buildifier_from_runfiles() -> Option<PathBuf> {
     match std::env::var("CHECKLEFT_E2E_BUILDIFIER") {
         Ok(rlocationpath) => {
-            let runfiles =
-                runfiles::Runfiles::create().expect("runfiles must initialize under `bazel test`");
+            let runfiles = runfiles::Runfiles::create().expect("runfiles must initialize under `bazel test`");
             let path = runfiles
                 .rlocation(&rlocationpath)
                 .expect("buildifier rlocation must resolve");
-            assert!(
-                path.exists(),
-                "staged buildifier must exist at {}",
-                path.display()
-            );
+            assert!(path.exists(), "staged buildifier must exist at {}", path.display());
             Some(path)
         }
         Err(_) => {

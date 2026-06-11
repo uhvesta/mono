@@ -191,9 +191,7 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// the worker's env). Every production event connection should carry
 /// this field. If missing, a warning is logged but the event is
 /// returned with `run_id: None`.
-pub async fn handle_connection(
-    stream: UnixStream,
-) -> Result<IncomingHookEvent, SocketError> {
+pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
@@ -341,8 +339,7 @@ mod tests {
         // None depending on scheduling. We assert only on the event
         // payload here; the explicit pid-matching test below holds the
         // client alive for the duration of the lookup.
-        let payload =
-            br#"{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false}"#;
+        let payload = br#"{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false}"#;
         let path_owned = path.clone();
         let client_task = tokio::task::spawn_blocking(move || {
             use std::io::Write;
@@ -434,9 +431,11 @@ mod tests {
         let client = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(
-                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":""}"#,
-            ).unwrap();
+            stream
+                .write_all(
+                    br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":""}"#,
+                )
+                .unwrap();
             stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
 

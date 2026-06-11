@@ -12,9 +12,8 @@ use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 use super::starlark::{
-    ParsedStarlarkFile, SourceLocation, StarlarkFileKind, call_function_name,
-    find_matching_string_literal, normalize_callee, parse_starlark_file, source_location,
-    starlark_file_kind,
+    ParsedStarlarkFile, SourceLocation, StarlarkFileKind, call_function_name, find_matching_string_literal,
+    normalize_callee, parse_starlark_file, source_location, starlark_file_kind,
 };
 
 #[derive(Debug, Default)]
@@ -134,12 +133,7 @@ struct CompiledForbiddenPackageDefaultVisibilityRule {
 }
 
 impl CompiledRule {
-    fn evaluate(
-        &self,
-        path: &Path,
-        file_kind: StarlarkFileKind,
-        parsed: &ParsedStarlarkFile<'_>,
-    ) -> Vec<Finding> {
+    fn evaluate(&self, path: &Path, file_kind: StarlarkFileKind, parsed: &ParsedStarlarkFile<'_>) -> Vec<Finding> {
         match self {
             Self::ForbiddenRuleCall(rule) => rule.evaluate(path, parsed),
             Self::ForbiddenPackageDefaultVisibility(rule) => rule.evaluate(path, file_kind, parsed),
@@ -150,36 +144,19 @@ impl CompiledRule {
 impl CompiledForbiddenRuleCallRule {
     fn evaluate(&self, path: &Path, parsed: &ParsedStarlarkFile<'_>) -> Vec<Finding> {
         let mut findings = Vec::new();
-        collect_findings_forbidden_rule_calls(
-            parsed.root(),
-            parsed.source,
-            self,
-            path,
-            &mut findings,
-        );
+        collect_findings_forbidden_rule_calls(parsed.root(), parsed.source, self, path, &mut findings);
         findings
     }
 }
 
 impl CompiledForbiddenPackageDefaultVisibilityRule {
-    fn evaluate(
-        &self,
-        path: &Path,
-        file_kind: StarlarkFileKind,
-        parsed: &ParsedStarlarkFile<'_>,
-    ) -> Vec<Finding> {
+    fn evaluate(&self, path: &Path, file_kind: StarlarkFileKind, parsed: &ParsedStarlarkFile<'_>) -> Vec<Finding> {
         if file_kind != StarlarkFileKind::Build {
             return Vec::new();
         }
 
         let mut findings = Vec::new();
-        collect_findings_forbidden_default_visibility(
-            parsed.root(),
-            parsed.source,
-            self,
-            path,
-            &mut findings,
-        );
+        collect_findings_forbidden_default_visibility(parsed.root(), parsed.source, self, path, &mut findings);
         findings
     }
 }
@@ -193,8 +170,7 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelPoliciesConfig> {
         bail!("bazel-policies check config must contain at least one `rules` entry");
     }
 
-    let default_severity =
-        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_severity = Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
     let default_remediation = normalize_optional_string(parsed.remediation, "remediation")?;
 
     let mut rules = Vec::with_capacity(parsed.rules.len());
@@ -207,16 +183,10 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelPoliciesConfig> {
                 remediation,
                 severity,
             } => CompiledRule::ForbiddenRuleCall(CompiledForbiddenRuleCallRule {
-                symbols: normalize_non_empty_unique_strings(
-                    symbols,
-                    &format!("{field_prefix}.symbols"),
-                )?,
+                symbols: normalize_non_empty_unique_strings(symbols, &format!("{field_prefix}.symbols"))?,
                 message: normalize_optional_string(message, &format!("{field_prefix}.message"))?,
-                remediation: normalize_optional_string(
-                    remediation,
-                    &format!("{field_prefix}.remediation"),
-                )?
-                .or_else(|| default_remediation.clone()),
+                remediation: normalize_optional_string(remediation, &format!("{field_prefix}.remediation"))?
+                    .or_else(|| default_remediation.clone()),
                 severity: Severity::parse_with_default(severity.as_deref(), default_severity),
             }),
             BazelPolicyRuleConfig::ForbiddenPackageDefaultVisibility {
@@ -224,24 +194,13 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelPoliciesConfig> {
                 message,
                 remediation,
                 severity,
-            } => CompiledRule::ForbiddenPackageDefaultVisibility(
-                CompiledForbiddenPackageDefaultVisibilityRule {
-                    values: normalize_non_empty_unique_strings(
-                        values,
-                        &format!("{field_prefix}.values"),
-                    )?,
-                    message: normalize_optional_string(
-                        message,
-                        &format!("{field_prefix}.message"),
-                    )?,
-                    remediation: normalize_optional_string(
-                        remediation,
-                        &format!("{field_prefix}.remediation"),
-                    )?
+            } => CompiledRule::ForbiddenPackageDefaultVisibility(CompiledForbiddenPackageDefaultVisibilityRule {
+                values: normalize_non_empty_unique_strings(values, &format!("{field_prefix}.values"))?,
+                message: normalize_optional_string(message, &format!("{field_prefix}.message"))?,
+                remediation: normalize_optional_string(remediation, &format!("{field_prefix}.remediation"))?
                     .or_else(|| default_remediation.clone()),
-                    severity: Severity::parse_with_default(severity.as_deref(), default_severity),
-                },
-            ),
+                severity: Severity::parse_with_default(severity.as_deref(), default_severity),
+            }),
         });
     }
 
@@ -259,10 +218,7 @@ fn normalize_optional_string(value: Option<String>, field_name: &str) -> Result<
     Ok(Some(trimmed.to_owned()))
 }
 
-fn normalize_non_empty_unique_strings(
-    values: Vec<String>,
-    field_name: &str,
-) -> Result<Vec<String>> {
+fn normalize_non_empty_unique_strings(values: Vec<String>, field_name: &str) -> Result<Vec<String>> {
     if values.is_empty() {
         bail!("bazel-policies check config `{field_name}` must contain at least one value");
     }
@@ -288,8 +244,7 @@ fn collect_findings_forbidden_rule_calls(
     path: &Path,
     findings: &mut Vec<Finding>,
 ) {
-    if let Some((matched_symbol, location)) = forbidden_rule_call_match(node, source, &rule.symbols)
-    {
+    if let Some((matched_symbol, location)) = forbidden_rule_call_match(node, source, &rule.symbols) {
         findings.push(Finding {
             severity: rule.severity,
             message: rule
@@ -302,8 +257,7 @@ fn collect_findings_forbidden_rule_calls(
                 column: Some(location.column),
             }),
             remediations: vec![rule.remediation.clone().unwrap_or_else(|| {
-                "Replace the forbidden Bazel rule or macro call with an approved alternative."
-                    .to_owned()
+                "Replace the forbidden Bazel rule or macro call with an approved alternative.".to_owned()
             })],
             suggested_fix: None,
         });
@@ -337,22 +291,20 @@ fn collect_findings_forbidden_default_visibility(
     path: &Path,
     findings: &mut Vec<Finding>,
 ) {
-    if let Some((matched_value, location)) =
-        forbidden_default_visibility_match(node, source, &rule.values)
-    {
+    if let Some((matched_value, location)) = forbidden_default_visibility_match(node, source, &rule.values) {
         findings.push(Finding {
             severity: rule.severity,
-            message: rule.message.clone().unwrap_or_else(|| {
-                format!("package default_visibility must not include `{matched_value}`")
-            }),
+            message: rule
+                .message
+                .clone()
+                .unwrap_or_else(|| format!("package default_visibility must not include `{matched_value}`")),
             location: Some(Location {
                 path: path.to_path_buf(),
                 line: Some(location.line),
                 column: Some(location.column),
             }),
             remediations: vec![rule.remediation.clone().unwrap_or_else(|| {
-                "Remove the package default visibility or narrow visibility on individual targets."
-                    .to_owned()
+                "Remove the package default visibility or narrow visibility on individual targets.".to_owned()
             })],
             suggested_fix: None,
         });
@@ -390,8 +342,7 @@ fn forbidden_default_visibility_match<'a>(
         }
 
         let value = argument.child_by_field_name("value")?;
-        if let Some((matched_value, location)) = find_matching_string_literal(value, source, values)
-        {
+        if let Some((matched_value, location)) = find_matching_string_literal(value, source, values) {
             return Some((matched_value, location));
         }
     }
@@ -444,13 +395,7 @@ genrule(
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(
-            result.findings[0]
-                .location
-                .as_ref()
-                .and_then(|loc| loc.line),
-            Some(2)
-        );
+        assert_eq!(result.findings[0].location.as_ref().and_then(|loc| loc.line), Some(2));
         assert!(result.findings[0].message.contains("genrule"));
     }
 
@@ -489,13 +434,7 @@ def make_demo(name):
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(
-            result.findings[0]
-                .location
-                .as_ref()
-                .and_then(|loc| loc.line),
-            Some(3)
-        );
+        assert_eq!(result.findings[0].location.as_ref().and_then(|loc| loc.line), Some(3));
         assert_eq!(
             result.findings[0].remediations,
             vec!["Replace the forbidden Bazel rule or macro call with an approved alternative."]
@@ -535,13 +474,7 @@ package(
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(
-            result.findings[0]
-                .location
-                .as_ref()
-                .and_then(|loc| loc.line),
-            Some(4)
-        );
+        assert_eq!(result.findings[0].location.as_ref().and_then(|loc| loc.line), Some(4));
         assert!(result.findings[0].message.contains("//visibility:public"));
     }
 

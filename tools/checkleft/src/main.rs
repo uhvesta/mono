@@ -8,15 +8,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use checkleft::change_detection::environment::CiEnvironment;
 use checkleft::change_detection::scenario::Scenario;
-use checkleft::change_detection::{ChangePlan, ChangeOverrides, base_revision_from_plan, resolve_change_plan};
+use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
 use checkleft::external::{
-    BundledExternalCheckPackageProvider, CompositeExternalCheckPackageProvider,
-    ConfiguredExternalCheckPackageProvider, DefaultExternalCheckExecutor, ExternalCheckExecutor,
-    ExternalCheckPackageProvider, FileExternalCheckPackageProvider,
-    GeneratedExternalCheckPackageProvider, NoopExternalCheckExecutor,
+    BundledExternalCheckPackageProvider, CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
+    DefaultExternalCheckExecutor, ExternalCheckExecutor, ExternalCheckPackageProvider,
+    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider, NoopExternalCheckExecutor,
     NoopExternalCheckPackageProvider,
 };
 use checkleft::input::ChangeSet;
@@ -133,22 +132,26 @@ async fn run_cli() -> Result<ExitCode> {
     info!(kind = ?vcs.kind(), "detected repository");
     let env = CiEnvironment::from_env();
 
-    let Cli { verbose: _, run_args: default_run_args, command } = cli;
+    let Cli {
+        verbose: _,
+        run_args: default_run_args,
+        command,
+    } = cli;
 
     match command {
-        None => {
-            dispatch_run(default_run_args, &root, &vcs, &env).await
-        }
-        Some(Commands::Run(args)) => {
-            dispatch_run(args, &root, &vcs, &env).await
-        }
+        None => dispatch_run(default_run_args, &root, &vcs, &env).await,
+        Some(Commands::Run(args)) => dispatch_run(args, &root, &vcs, &env).await,
         Some(Commands::List {
             config,
             all,
             base_ref,
             default_branch,
         }) => {
-            let overrides = ChangeOverrides { all, base_ref, default_branch };
+            let overrides = ChangeOverrides {
+                all,
+                base_ref,
+                default_branch,
+            };
             info!("resolving change plan");
             let plan = resolve_change_plan(&env, &vcs, &overrides)?;
             info!("building runner for list");
@@ -177,8 +180,15 @@ async fn run_cli() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         // TEMPORARY: bake-period parity check (P844 migration step 2). Remove once checks.sh is retired.
-        Some(Commands::ShowPlan { base_ref, default_branch }) => {
-            let overrides = ChangeOverrides { all: false, base_ref, default_branch };
+        Some(Commands::ShowPlan {
+            base_ref,
+            default_branch,
+        }) => {
+            let overrides = ChangeOverrides {
+                all: false,
+                base_ref,
+                default_branch,
+            };
             let plan = resolve_change_plan(&env, &vcs, &overrides)?;
             match &plan {
                 ChangePlan::All => println!("plan=all"),
@@ -207,12 +217,22 @@ async fn run_cli() -> Result<ExitCode> {
 }
 
 async fn dispatch_run(
-    RunArgs { config, all, base_ref, default_branch, format }: RunArgs,
+    RunArgs {
+        config,
+        all,
+        base_ref,
+        default_branch,
+        format,
+    }: RunArgs,
     root: &Path,
     vcs: &Vcs,
     env: &CiEnvironment,
 ) -> Result<ExitCode> {
-    let overrides = ChangeOverrides { all, base_ref, default_branch };
+    let overrides = ChangeOverrides {
+        all,
+        base_ref,
+        default_branch,
+    };
     info!("resolving change plan");
     let plan = resolve_change_plan(env, vcs, &overrides)?;
     info!("building runner for run");
@@ -243,7 +263,11 @@ async fn dispatch_run(
     let has_error = results
         .iter()
         .any(|result| result.findings.iter().any(|f| f.severity == Severity::Error));
-    Ok(if has_error { ExitCode::from(1) } else { ExitCode::SUCCESS })
+    Ok(if has_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 async fn build_runner(
@@ -313,32 +337,27 @@ fn build_external_package_provider(root: &Path) -> Result<Arc<dyn ExternalCheckP
         ));
     }
 
-    let index_path =
-        normalize_optional_description(std::env::var(CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV).ok());
+    let index_path = normalize_optional_description(std::env::var(CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV).ok());
     if mode == ExternalProviderMode::GeneratedOnly && index_path.is_none() {
         anyhow::bail!(
             "`{CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV}=generated-only` requires `{CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV}` to be set"
         );
     }
     if mode != ExternalProviderMode::FileOnly
-        && let Some(index_path) = index_path {
-            info!(index_path = %index_path, "loading generated external package index");
-            let generated_provider = GeneratedExternalCheckPackageProvider::from_index_path(
-                root,
-                Path::new(&index_path),
-            )?;
-            providers.push(ConfiguredExternalCheckPackageProvider::new(
-                "generated-index",
-                Arc::new(generated_provider),
-            ));
-        }
+        && let Some(index_path) = index_path
+    {
+        info!(index_path = %index_path, "loading generated external package index");
+        let generated_provider = GeneratedExternalCheckPackageProvider::from_index_path(root, Path::new(&index_path))?;
+        providers.push(ConfiguredExternalCheckPackageProvider::new(
+            "generated-index",
+            Arc::new(generated_provider),
+        ));
+    }
 
     if providers.is_empty() {
         return Ok(Arc::new(NoopExternalCheckPackageProvider));
     }
-    Ok(Arc::new(CompositeExternalCheckPackageProvider::new(
-        providers,
-    )))
+    Ok(Arc::new(CompositeExternalCheckPackageProvider::new(providers)))
 }
 
 fn build_external_check_executor(root: &Path) -> Result<Arc<dyn ExternalCheckExecutor>> {
@@ -371,9 +390,8 @@ async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs) -> ChangeSe
     let commit_description = normalize_optional_description(vcs.current_commit_description().ok());
     let change_id = resolve_change_id();
     let repository = resolve_repository(vcs);
-    let pr_description = normalize_optional_description(
-        resolve_pr_description(repository.as_deref(), change_id.as_deref()).await,
-    );
+    let pr_description =
+        normalize_optional_description(resolve_pr_description(repository.as_deref(), change_id.as_deref()).await);
     changeset
         .with_commit_description(commit_description)
         .with_change_id(change_id)
@@ -382,12 +400,9 @@ async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs) -> ChangeSe
 }
 
 fn resolve_change_id() -> Option<String> {
-    [
-        std::env::var(CHECKS_CHANGE_ID_ENV),
-        std::env::var(CHECKS_PR_NUMBER_ENV),
-    ]
-    .into_iter()
-    .find_map(|value| normalize_optional_description(value.ok()))
+    [std::env::var(CHECKS_CHANGE_ID_ENV), std::env::var(CHECKS_PR_NUMBER_ENV)]
+        .into_iter()
+        .find_map(|value| normalize_optional_description(value.ok()))
 }
 
 fn resolve_repository(vcs: &Vcs) -> Option<String> {
@@ -395,14 +410,12 @@ fn resolve_repository(vcs: &Vcs) -> Option<String> {
         .or_else(|| normalize_optional_description(vcs.remote_repo_slug()))
 }
 
-async fn resolve_pr_description(
-    repository: Option<&str>,
-    change_id: Option<&str>,
-) -> Option<String> {
+async fn resolve_pr_description(repository: Option<&str>, change_id: Option<&str>) -> Option<String> {
     if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV)
-        && !raw.trim().is_empty() {
-            return Some(raw);
-        }
+        && !raw.trim().is_empty()
+    {
+        return Some(raw);
+    }
 
     let repository = repository?;
     let change_id = change_id?;
@@ -418,11 +431,7 @@ async fn resolve_pr_description(
 
 fn init_tracing(verbose: bool) -> Result<()> {
     tracing_subscriber::fmt()
-        .with_max_level(if verbose {
-            LevelFilter::INFO
-        } else {
-            LevelFilter::OFF
-        })
+        .with_max_level(if verbose { LevelFilter::INFO } else { LevelFilter::OFF })
         .with_writer(stderr)
         .try_init()
         .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
@@ -586,11 +595,7 @@ fn format_fix_summary(suggested_fix: &SuggestedFix) -> String {
         "{} ({} edit{})",
         suggested_fix.description,
         suggested_fix.edits.len(),
-        if suggested_fix.edits.len() == 1 {
-            ""
-        } else {
-            "s"
-        }
+        if suggested_fix.edits.len() == 1 { "" } else { "s" }
     )
 }
 
@@ -611,22 +616,31 @@ impl OutputStyle {
     fn detect_for_stdout() -> Self {
         let no_color = std::env::var_os("NO_COLOR").is_some();
         if !std::io::stdout().is_terminal() || no_color {
-            return Self { level: ColorLevel::None };
+            return Self {
+                level: ColorLevel::None,
+            };
         }
 
         if let Ok(colorterm) = std::env::var("COLORTERM") {
             let ct = colorterm.to_ascii_lowercase();
             if ct == "truecolor" || ct == "24bit" {
-                return Self { level: ColorLevel::TrueColor };
+                return Self {
+                    level: ColorLevel::TrueColor,
+                };
             }
         }
 
         if let Ok(term) = std::env::var("TERM")
-            && term.contains("256color") {
-                return Self { level: ColorLevel::Color256 };
-            }
+            && term.contains("256color")
+        {
+            return Self {
+                level: ColorLevel::Color256,
+            };
+        }
 
-        Self { level: ColorLevel::Basic }
+        Self {
+            level: ColorLevel::Basic,
+        }
     }
 
     fn paint_bold(self, text: &str) -> String {

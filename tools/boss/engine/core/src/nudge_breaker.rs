@@ -87,12 +87,10 @@ impl NudgeBreaker {
     /// — three nudges fire, then the breaker trips and stays tripped.
     pub fn record(&self, execution_id: &str, fingerprint: &str, max: u32) -> NudgeDecision {
         let mut guard = self.inner.lock().expect("NudgeBreaker mutex poisoned");
-        let entry = guard
-            .entry(execution_id.to_owned())
-            .or_insert_with(|| NudgeRecord {
-                fingerprint: fingerprint.to_owned(),
-                count: 0,
-            });
+        let entry = guard.entry(execution_id.to_owned()).or_insert_with(|| NudgeRecord {
+            fingerprint: fingerprint.to_owned(),
+            count: 0,
+        });
         if entry.fingerprint != fingerprint {
             // Progress since the last nudge — reset to a fresh cycle.
             entry.fingerprint = fingerprint.to_owned();
@@ -161,7 +159,10 @@ mod tests {
     #[test]
     fn cap_of_one_trips_after_a_single_nudge() {
         let breaker = NudgeBreaker::new();
-        assert_eq!(breaker.record("exec_c", "no_pr", 1), NudgeDecision::Proceed { count: 1 });
+        assert_eq!(
+            breaker.record("exec_c", "no_pr", 1),
+            NudgeDecision::Proceed { count: 1 }
+        );
         assert_eq!(breaker.record("exec_c", "no_pr", 1), NudgeDecision::Trip { count: 1 });
     }
 

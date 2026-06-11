@@ -111,8 +111,7 @@ macro_rules! register_counter {
 macro_rules! register_gauge {
     ($static_name:ident, $name:literal, $description:literal $(,)?) => {
         #[allow(dead_code)]
-        pub static $static_name: $crate::metrics::GaugeHandle =
-            $crate::metrics::GaugeHandle::new($name, $description);
+        pub static $static_name: $crate::metrics::GaugeHandle = $crate::metrics::GaugeHandle::new($name, $description);
     };
 }
 
@@ -211,10 +210,7 @@ impl Registry {
                 );
             }
             Some(_existing) => {
-                panic!(
-                    "duplicate counter registration: {} already registered",
-                    handle.name
-                );
+                panic!("duplicate counter registration: {} already registered", handle.name);
             }
             None => {
                 counters.insert(
@@ -252,10 +248,7 @@ impl Registry {
                 );
             }
             Some(_existing) => {
-                panic!(
-                    "duplicate gauge registration: {} already registered",
-                    handle.name
-                );
+                panic!("duplicate gauge registration: {} already registered", handle.name);
             }
             None => {
                 gauges.insert(
@@ -277,13 +270,7 @@ impl Registry {
     /// "stale: not registered by current engine" so the operator can
     /// still see historical values. If a handle later registers
     /// against this name, [`Self::register_counter`] adopts the row.
-    pub(crate) fn insert_stale_counter(
-        &self,
-        name: &str,
-        description: &str,
-        value: u64,
-        updated_at_ms: i64,
-    ) {
+    pub(crate) fn insert_stale_counter(&self, name: &str, description: &str, value: u64, updated_at_ms: i64) {
         let mut counters = self.counters.write().expect("metrics counters lock poisoned");
         counters.insert(
             name.to_owned(),
@@ -297,13 +284,7 @@ impl Registry {
         );
     }
 
-    pub(crate) fn insert_stale_gauge(
-        &self,
-        name: &str,
-        description: &str,
-        value: i64,
-        observed_at_ms: i64,
-    ) {
+    pub(crate) fn insert_stale_gauge(&self, name: &str, description: &str, value: i64, observed_at_ms: i64) {
         let mut gauges = self.gauges.write().expect("metrics gauges lock poisoned");
         gauges.insert(
             name.to_owned(),
@@ -514,9 +495,7 @@ fn validate_name(name: &str) {
     for c in name.chars() {
         let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_';
         if !ok {
-            panic!(
-                "metric name {name} contains invalid character {c:?}; allowed: a-z 0-9 . _"
-            );
+            panic!("metric name {name} contains invalid character {c:?}; allowed: a-z 0-9 . _");
         }
     }
 }
@@ -532,21 +511,9 @@ pub(crate) fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    register_counter!(
-        TEST_COUNTER_A,
-        "test.counter_a",
-        "Phase 1 unit-test counter A."
-    );
-    register_counter!(
-        TEST_COUNTER_B,
-        "test.counter_b",
-        "Phase 1 unit-test counter B."
-    );
-    register_gauge!(
-        TEST_GAUGE_A,
-        "test.gauge_a",
-        "Phase 1 unit-test gauge A."
-    );
+    register_counter!(TEST_COUNTER_A, "test.counter_a", "Phase 1 unit-test counter A.");
+    register_counter!(TEST_COUNTER_B, "test.counter_b", "Phase 1 unit-test counter B.");
+    register_gauge!(TEST_GAUGE_A, "test.gauge_a", "Phase 1 unit-test gauge A.");
 
     #[test]
     fn register_and_increment_counter() {
@@ -614,9 +581,7 @@ mod tests {
     fn name_validation_rejects_uppercase() {
         let registry = Registry::new();
         static BAD: CounterHandle = CounterHandle::new("Bad.Name", "uppercase rejected");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            registry.register_counter(&BAD)
-        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.register_counter(&BAD)));
         assert!(result.is_err(), "expected register to panic for uppercase name");
     }
 
@@ -628,9 +593,7 @@ mod tests {
             // because the lifetime is dynamic in this loop.
             let leaked: &'static str = Box::leak(bad.to_owned().into_boxed_str());
             let handle = CounterHandle::new(leaked, "rejected");
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                registry.register_counter(&handle)
-            }));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| registry.register_counter(&handle)));
             assert!(result.is_err(), "expected register to panic for {bad:?}");
         }
     }
@@ -658,11 +621,7 @@ mod tests {
     fn init_all_registers_all_declared_counters() {
         let registry = Registry::new();
         crate::metrics::init_all(&registry);
-        let names: Vec<_> = registry
-            .counter_snapshots()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let names: Vec<_> = registry.counter_snapshots().into_iter().map(|s| s.name).collect();
         // Phase 3: PR URL capture counters.
         for expected in [
             "pr_url_capture.primary_path.hit",
@@ -730,13 +689,13 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        assert_eq!(names.len(), 43, "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 9 merge_poller + 18 external_tracker counters");
+        assert_eq!(
+            names.len(),
+            43,
+            "expected 4 pr_url_capture + 3 cube_workspace_lease + 9 dispatcher + 9 merge_poller + 18 external_tracker counters"
+        );
         // Phase 3: dep_unblock gauge.
-        let gauge_names: Vec<_> = registry
-            .gauge_snapshots()
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+        let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
         assert_eq!(
             gauge_names,
             vec!["dependency_unblock.longest_stale_seconds"],

@@ -13,16 +13,9 @@ struct SourceLocation {
     column: u32,
 }
 
-pub(super) fn analyze_java_file(
-    path: &Path,
-    contents: &str,
-    rules: &[CompiledNoCallRule],
-) -> Vec<Finding> {
+pub(super) fn analyze_java_file(path: &Path, contents: &str, rules: &[CompiledNoCallRule]) -> Vec<Finding> {
     let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_java::LANGUAGE.into())
-        .is_err()
-    {
+    if parser.set_language(&tree_sitter_java::LANGUAGE.into()).is_err() {
         return Vec::new();
     }
 
@@ -41,9 +34,11 @@ pub(super) fn analyze_java_file(
         .into_iter()
         .map(|matched| Finding {
             severity: matched.rule.severity,
-            message: matched.rule.message.clone().unwrap_or_else(|| {
-                format!("Disallowed call to {}.", matched.rule.pattern.render())
-            }),
+            message: matched
+                .rule
+                .message
+                .clone()
+                .unwrap_or_else(|| format!("Disallowed call to {}.", matched.rule.pattern.render())),
             location: Some(Location {
                 path: path.to_path_buf(),
                 line: Some(matched.location.line),
@@ -132,11 +127,7 @@ fn find_imports(root: Node<'_>, source: &[u8]) -> HashMap<String, String> {
         if child.kind() != "import_declaration" {
             continue;
         }
-        let text = child
-            .utf8_text(source)
-            .ok()
-            .map(str::trim)
-            .unwrap_or_default();
+        let text = child.utf8_text(source).ok().map(str::trim).unwrap_or_default();
         if text.contains(" static ") {
             continue;
         }
@@ -155,12 +146,7 @@ fn find_imports(root: Node<'_>, source: &[u8]) -> HashMap<String, String> {
     imports
 }
 
-fn collect_type_declarations(
-    node: Node<'_>,
-    source: &[u8],
-    model: &mut JavaFileModel,
-    enclosing_type: Option<&str>,
-) {
+fn collect_type_declarations(node: Node<'_>, source: &[u8], model: &mut JavaFileModel, enclosing_type: Option<&str>) {
     if matches!(node.kind(), "class_declaration" | "interface_declaration") {
         let Some(name_node) = node.child_by_field_name("name") else {
             return;
@@ -208,11 +194,7 @@ fn collect_type_declarations(
     }
 }
 
-fn collect_declared_supertypes(
-    type_node: Node<'_>,
-    source: &[u8],
-    model: &JavaFileModel,
-) -> Vec<String> {
+fn collect_declared_supertypes(type_node: Node<'_>, source: &[u8], model: &JavaFileModel) -> Vec<String> {
     let mut output = Vec::new();
     if let Some(superclass) = type_node.child_by_field_name("superclass") {
         let mut cursor = superclass.walk();
@@ -259,11 +241,7 @@ fn collect_declared_supertypes(
     output
 }
 
-fn collect_declared_fields(
-    type_node: Node<'_>,
-    source: &[u8],
-    model: &JavaFileModel,
-) -> HashMap<String, String> {
+fn collect_declared_fields(type_node: Node<'_>, source: &[u8], model: &JavaFileModel) -> HashMap<String, String> {
     let mut fields = HashMap::new();
     let Some(body) = type_node.child_by_field_name("body") else {
         return fields;
@@ -297,11 +275,7 @@ fn collect_declared_fields(
     fields
 }
 
-fn collect_declared_methods(
-    type_node: Node<'_>,
-    source: &[u8],
-    model: &JavaFileModel,
-) -> Vec<JavaMethodDecl> {
+fn collect_declared_methods(type_node: Node<'_>, source: &[u8], model: &JavaFileModel) -> Vec<JavaMethodDecl> {
     let mut methods = Vec::new();
     let Some(body) = type_node.child_by_field_name("body") else {
         return methods;
@@ -358,11 +332,7 @@ fn normalize_type_text(raw: &str) -> Option<String> {
             _ => result.push(ch),
         }
     }
-    if result.is_empty() {
-        None
-    } else {
-        Some(result)
-    }
+    if result.is_empty() { None } else { Some(result) }
 }
 
 fn known_lang_type(simple: &str) -> Option<&'static str> {
@@ -504,12 +474,7 @@ impl<'a> JavaTraversalContext<'a> {
         None
     }
 
-    fn lookup_method_return_type(
-        &self,
-        owner_type: &str,
-        method_name: &str,
-        arity: usize,
-    ) -> Option<String> {
+    fn lookup_method_return_type(&self, owner_type: &str, method_name: &str, arity: usize) -> Option<String> {
         let mut queue = vec![owner_type.to_owned()];
         let mut seen = HashSet::new();
         while let Some(current) = queue.pop() {
@@ -535,28 +500,25 @@ impl<'a> JavaTraversalContext<'a> {
     }
 }
 
-fn walk_java<'a>(
-    node: Node<'_>,
-    ctx: &mut JavaTraversalContext<'a>,
-    rules: &'a [CompiledNoCallRule],
-) {
+fn walk_java<'a>(node: Node<'_>, ctx: &mut JavaTraversalContext<'a>, rules: &'a [CompiledNoCallRule]) {
     match node.kind() {
         "class_declaration" | "interface_declaration" => {
             let previous_type = ctx.current_type.clone();
             if let Some(name_node) = node.child_by_field_name("name")
-                && let Ok(simple_name) = name_node.utf8_text(ctx.source) {
-                    let next_type = previous_type
-                        .as_ref()
-                        .map(|parent| format!("{parent}.{simple_name}"))
-                        .or_else(|| {
-                            ctx.model
-                                .package_name
-                                .as_ref()
-                                .map(|package| format!("{package}.{simple_name}"))
-                        })
-                        .unwrap_or_else(|| simple_name.to_owned());
-                    ctx.current_type = Some(next_type);
-                }
+                && let Ok(simple_name) = name_node.utf8_text(ctx.source)
+            {
+                let next_type = previous_type
+                    .as_ref()
+                    .map(|parent| format!("{parent}.{simple_name}"))
+                    .or_else(|| {
+                        ctx.model
+                            .package_name
+                            .as_ref()
+                            .map(|package| format!("{package}.{simple_name}"))
+                    })
+                    .unwrap_or_else(|| simple_name.to_owned());
+                ctx.current_type = Some(next_type);
+            }
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 walk_java(child, ctx, rules);
@@ -646,8 +608,7 @@ fn bind_parameters(node: Node<'_>, ctx: &mut JavaTraversalContext<'_>) {
                 let Some(type_node) = pieces.next() else {
                     continue;
                 };
-                let Some(declarator) = pieces.find(|node| node.kind() == "variable_declarator")
-                else {
+                let Some(declarator) = pieces.find(|node| node.kind() == "variable_declarator") else {
                     continue;
                 };
                 let Some(name_node) = declarator.child_by_field_name("name") else {
@@ -671,8 +632,8 @@ fn bind_local_variables(node: Node<'_>, ctx: &mut JavaTraversalContext<'_>) {
     let declared_type_raw = declared_type_node
         .and_then(|type_node| type_node.utf8_text(ctx.source).ok())
         .and_then(normalize_type_text);
-    let declared_type = declared_type_node
-        .and_then(|type_node| resolve_type_node_text(type_node, ctx.source, ctx.model));
+    let declared_type =
+        declared_type_node.and_then(|type_node| resolve_type_node_text(type_node, ctx.source, ctx.model));
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -723,11 +684,7 @@ fn bind_assignment(node: Node<'_>, ctx: &mut JavaTraversalContext<'_>) {
     }
 }
 
-fn inspect_method_invocation<'a>(
-    node: Node<'_>,
-    ctx: &mut JavaTraversalContext<'a>,
-    rules: &'a [CompiledNoCallRule],
-) {
+fn inspect_method_invocation<'a>(node: Node<'_>, ctx: &mut JavaTraversalContext<'a>, rules: &'a [CompiledNoCallRule]) {
     let Some(name_node) = node.child_by_field_name("name") else {
         return;
     };
@@ -792,10 +749,7 @@ fn resolve_expression_type(node: Node<'_>, ctx: &JavaTraversalContext<'_>) -> Op
             ctx.lookup_field_type(&owner_type, field_name)
         }
         "method_invocation" => {
-            let method_name = node
-                .child_by_field_name("name")?
-                .utf8_text(ctx.source)
-                .ok()?;
+            let method_name = node.child_by_field_name("name")?.utf8_text(ctx.source).ok()?;
             let arguments = node.child_by_field_name("arguments")?;
             let arity = argument_count(arguments);
             let owner_type = resolve_method_owner_type(node, ctx)?;
@@ -864,11 +818,7 @@ fn direct_super_types(actual: &str, model: &JavaFileModel) -> Vec<String> {
     if let Some(decl) = model.declared_types.get(actual) {
         direct.extend(decl.super_types.iter().cloned());
     }
-    direct.extend(
-        known_direct_supertypes(actual)
-            .iter()
-            .map(|value| (*value).to_owned()),
-    );
+    direct.extend(known_direct_supertypes(actual).iter().map(|value| (*value).to_owned()));
     direct
 }
 
@@ -884,14 +834,10 @@ fn known_direct_supertypes(actual: &str) -> &'static [&'static str] {
             "java.util.concurrent.Future",
             "java.lang.Object",
         ],
-        "java.util.concurrent.RunnableFuture" => &[
-            "java.util.concurrent.Future",
-            "java.lang.Runnable",
-            "java.lang.Object",
-        ],
-        "java.util.concurrent.ScheduledFuture" => {
-            &["java.util.concurrent.Future", "java.lang.Object"]
+        "java.util.concurrent.RunnableFuture" => {
+            &["java.util.concurrent.Future", "java.lang.Runnable", "java.lang.Object"]
         }
+        "java.util.concurrent.ScheduledFuture" => &["java.util.concurrent.Future", "java.lang.Object"],
         _ => &[],
     }
 }

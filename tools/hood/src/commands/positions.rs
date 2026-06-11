@@ -3,9 +3,7 @@ use std::collections::{HashMap, HashSet};
 use broker_robinhood::RobinhoodClient;
 use broker_robinhood::RobinhoodClientError;
 use broker_robinhood::client::RobinhoodAccount;
-use comfy_table::{
-    Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_BORDERS_ONLY,
-};
+use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table, presets::UTF8_BORDERS_ONLY};
 use console::set_colors_enabled;
 use serde_json::Value;
 use thiserror::Error;
@@ -94,9 +92,7 @@ async fn build_position_rows(
 ) -> Result<Vec<PositionRow>> {
     let mut rows = Vec::new();
     for account in selected_accounts {
-        let mut positions = client
-            .fetch_positions(&access_token, &account.account_number)
-            .await?;
+        let mut positions = client.fetch_positions(&access_token, &account.account_number).await?;
         positions.sort_by(|left, right| left.symbol.cmp(&right.symbol));
 
         for position in positions {
@@ -115,16 +111,12 @@ async fn build_position_rows(
         return Ok(rows);
     }
 
-    let symbols = rows
-        .iter()
-        .map(|row| row.symbol.clone())
-        .collect::<Vec<String>>();
+    let symbols = rows.iter().map(|row| row.symbol.clone()).collect::<Vec<String>>();
     let quotes = fetch_quote_snapshots(&client, &access_token, &symbols).await?;
 
     for row in &mut rows {
         let quote = quotes.get(&row.symbol);
-        let (equity, percentage_change, todays_return) =
-            calculate_position_metrics(row.quantity, quote);
+        let (equity, percentage_change, todays_return) = calculate_position_metrics(row.quantity, quote);
         row.equity = equity;
         row.percentage_change = percentage_change;
         row.todays_return = todays_return;
@@ -139,10 +131,7 @@ async fn build_position_rows(
     Ok(rows)
 }
 
-fn select_accounts(
-    accounts: Vec<RobinhoodAccount>,
-    account: &str,
-) -> Result<Vec<RobinhoodAccount>> {
+fn select_accounts(accounts: Vec<RobinhoodAccount>, account: &str) -> Result<Vec<RobinhoodAccount>> {
     if account == "default" {
         let default = accounts
             .into_iter()
@@ -173,12 +162,8 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
         > 1;
     let total_equity = sum_optional_values(rows.iter().map(|row| row.equity));
     let total_todays_return = sum_optional_values(rows.iter().map(|row| row.todays_return));
-    let total_percentage_change =
-        calculate_total_percentage_change(total_equity, total_todays_return);
-    let quantity_values = rows
-        .iter()
-        .map(|row| format_quantity(row.quantity))
-        .collect::<Vec<_>>();
+    let total_percentage_change = calculate_total_percentage_change(total_equity, total_todays_return);
+    let quantity_values = rows.iter().map(|row| format_quantity(row.quantity)).collect::<Vec<_>>();
     let aligned_quantities = align_decimal_column(&quantity_values);
 
     let mut table = Table::new();
@@ -236,9 +221,7 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
     }
     total_row.extend([
         Cell::new("Total").add_attribute(Attribute::Bold),
-        Cell::new("")
-            .fg(Color::White)
-            .set_alignment(CellAlignment::Right),
+        Cell::new("").fg(Color::White).set_alignment(CellAlignment::Right),
         Cell::new(format_optional_currency(total_equity))
             .fg(Color::White)
             .add_attribute(Attribute::Bold)
@@ -258,8 +241,7 @@ fn render_positions_table(rows: &[PositionRow]) -> String {
 }
 
 fn render_positions_csv(rows: &[PositionRow]) -> String {
-    let mut output =
-        String::from("account,symbol,quantity,equity,percentage_change,todays_return\n");
+    let mut output = String::from("account,symbol,quantity,equity,percentage_change,todays_return\n");
     for row in rows {
         let fields = [
             csv_escape(&row.account_number),
@@ -302,9 +284,7 @@ async fn fetch_quote_snapshots(
         let mut url = client
             .base_url()
             .join("marketdata/quotes/")
-            .map_err(|error| {
-                PositionsError::RobinhoodClient(RobinhoodClientError::InvalidEndpointUrl(error))
-            })?;
+            .map_err(|error| PositionsError::RobinhoodClient(RobinhoodClientError::InvalidEndpointUrl(error)))?;
         url.set_query(Some(&format!("symbols={}", chunk.join(","))));
 
         let response = client
@@ -313,22 +293,20 @@ async fn fetch_quote_snapshots(
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|error| {
-                PositionsError::RobinhoodClient(RobinhoodClientError::HttpClient(error))
-            })?;
+            .map_err(|error| PositionsError::RobinhoodClient(RobinhoodClientError::HttpClient(error)))?;
 
         if !response.status().is_success() {
-            return Err(PositionsError::RobinhoodClient(
-                RobinhoodClientError::UnexpectedStatus(response.status()),
-            ));
+            return Err(PositionsError::RobinhoodClient(RobinhoodClientError::UnexpectedStatus(
+                response.status(),
+            )));
         }
 
-        let body = response.bytes().await.map_err(|error| {
-            PositionsError::RobinhoodClient(RobinhoodClientError::HttpClient(error))
-        })?;
-        let payload: Value = serde_json::from_slice(&body).map_err(|error| {
-            PositionsError::RobinhoodClient(RobinhoodClientError::ResponseBodyParse(error))
-        })?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| PositionsError::RobinhoodClient(RobinhoodClientError::HttpClient(error)))?;
+        let payload: Value = serde_json::from_slice(&body)
+            .map_err(|error| PositionsError::RobinhoodClient(RobinhoodClientError::ResponseBodyParse(error)))?;
 
         let Some(results) = payload.get("results").and_then(Value::as_array) else {
             continue;
@@ -364,30 +342,23 @@ fn parse_quote_number(value: Option<&Value>) -> Option<f64> {
     }
 }
 
-fn calculate_position_metrics(
-    quantity: f64,
-    quote: Option<&QuoteSnapshot>,
-) -> (Option<f64>, Option<f64>, Option<f64>) {
+fn calculate_position_metrics(quantity: f64, quote: Option<&QuoteSnapshot>) -> (Option<f64>, Option<f64>, Option<f64>) {
     let Some(quote) = quote else {
         return (None, None, None);
     };
 
     let equity = quote.last_trade_price.map(|price| price * quantity);
-    let (percentage_change, todays_return) = if let (Some(last_trade_price), Some(previous_close)) =
-        (quote.last_trade_price, quote.previous_close)
-    {
-        if previous_close.abs() > f64::EPSILON {
-            let change = last_trade_price - previous_close;
-            (
-                Some((change / previous_close) * 100.0),
-                Some(change * quantity),
-            )
+    let (percentage_change, todays_return) =
+        if let (Some(last_trade_price), Some(previous_close)) = (quote.last_trade_price, quote.previous_close) {
+            if previous_close.abs() > f64::EPSILON {
+                let change = last_trade_price - previous_close;
+                (Some((change / previous_close) * 100.0), Some(change * quantity))
+            } else {
+                (None, None)
+            }
         } else {
             (None, None)
-        }
-    } else {
-        (None, None)
-    };
+        };
 
     (equity, percentage_change, todays_return)
 }
@@ -464,21 +435,15 @@ fn align_decimal_column(values: &[String]) -> Vec<String> {
 }
 
 fn format_optional_currency(value: Option<f64>) -> String {
-    value
-        .map(format_currency)
-        .unwrap_or_else(|| "N/A".to_string())
+    value.map(format_currency).unwrap_or_else(|| "N/A".to_string())
 }
 
 fn format_optional_percentage(value: Option<f64>) -> String {
-    value
-        .map(format_percentage_change)
-        .unwrap_or_else(|| "N/A".to_string())
+    value.map(format_percentage_change).unwrap_or_else(|| "N/A".to_string())
 }
 
 fn format_optional_signed_currency(value: Option<f64>) -> String {
-    value
-        .map(format_signed_currency)
-        .unwrap_or_else(|| "N/A".to_string())
+    value.map(format_signed_currency).unwrap_or_else(|| "N/A".to_string())
 }
 
 fn format_optional_raw_number(value: Option<f64>) -> String {
@@ -497,12 +462,8 @@ fn sum_optional_values(values: impl Iterator<Item = Option<f64>>) -> Option<f64>
     has_value.then_some(total)
 }
 
-fn calculate_total_percentage_change(
-    total_equity: Option<f64>,
-    total_todays_return: Option<f64>,
-) -> Option<f64> {
-    let (Some(total_equity), Some(total_todays_return)) = (total_equity, total_todays_return)
-    else {
+fn calculate_total_percentage_change(total_equity: Option<f64>, total_todays_return: Option<f64>) -> Option<f64> {
+    let (Some(total_equity), Some(total_todays_return)) = (total_equity, total_todays_return) else {
         return None;
     };
 
@@ -570,9 +531,8 @@ mod tests {
 
     use super::{
         PositionRow, QuoteSnapshot, align_decimal_column, calculate_position_metrics,
-        calculate_total_percentage_change, format_currency, format_percentage_change,
-        format_quantity, format_signed_currency, render_positions_csv, render_positions_table,
-        select_accounts,
+        calculate_total_percentage_change, format_currency, format_percentage_change, format_quantity,
+        format_signed_currency, render_positions_csv, render_positions_table, select_accounts,
     };
 
     #[test]
@@ -589,11 +549,7 @@ mod tests {
 
     #[test]
     fn align_decimal_column_aligns_quantities_for_readability() {
-        let aligned = align_decimal_column(&[
-            "1,500".to_string(),
-            "12.5".to_string(),
-            "1,618.57743".to_string(),
-        ]);
+        let aligned = align_decimal_column(&["1,500".to_string(), "12.5".to_string(), "1,618.57743".to_string()]);
 
         assert_eq!(aligned[0], "1,500      ");
         assert_eq!(aligned[1], "   12.5    ");
@@ -607,8 +563,7 @@ mod tests {
             previous_close: Some(100.0),
         };
 
-        let (equity, percentage_change, todays_return) =
-            calculate_position_metrics(2.0, Some(&quote));
+        let (equity, percentage_change, todays_return) = calculate_position_metrics(2.0, Some(&quote));
 
         assert_eq!(equity, Some(220.0));
         assert_eq!(percentage_change, Some(10.0));
@@ -617,8 +572,7 @@ mod tests {
 
     #[test]
     fn calculate_total_percentage_change_uses_total_return_and_previous_close_equity() {
-        let total_percentage_change =
-            calculate_total_percentage_change(Some(3_500.0), Some(5.0)).expect("has totals");
+        let total_percentage_change = calculate_total_percentage_change(Some(3_500.0), Some(5.0)).expect("has totals");
 
         assert!((total_percentage_change - 0.1430615164520744).abs() < 1e-12);
     }
@@ -727,10 +681,7 @@ mod tests {
             lines[0],
             "account,symbol,quantity,equity,percentage_change,todays_return"
         );
-        assert_eq!(
-            lines[1],
-            "116748102690,AMZN,1618.57743,300000.12,2.5,120.45"
-        );
+        assert_eq!(lines[1], "116748102690,AMZN,1618.57743,300000.12,2.5,120.45");
         assert_eq!(lines[2], "5QT29231,V,1500,150000,-1.2,-30");
     }
 
@@ -758,8 +709,7 @@ mod tests {
             },
         ];
 
-        let selected =
-            select_accounts(accounts, "default").expect("default account should resolve");
+        let selected = select_accounts(accounts, "default").expect("default account should resolve");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].account_number, "5678");
     }

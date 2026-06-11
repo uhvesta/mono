@@ -47,8 +47,8 @@ use tokio::sync::Notify;
 
 use async_trait::async_trait;
 use boss_protocol::{
-    AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED,
-    AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT, Automation, AutomationTrigger,
+    AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED, AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT,
+    Automation, AutomationTrigger,
 };
 
 use crate::automation_schedule::{next_occurrence_after, parse_cron, parse_timezone};
@@ -99,11 +99,7 @@ pub enum TriageDispatch {
 /// [`LoggingTriageDispatcher`].
 #[async_trait]
 pub trait TriageDispatcher: Send + Sync {
-    async fn dispatch_triage(
-        &self,
-        automation: &Automation,
-        scheduled_for_epoch: i64,
-    ) -> TriageDispatch;
+    async fn dispatch_triage(&self, automation: &Automation, scheduled_for_epoch: i64) -> TriageDispatch;
 }
 
 /// Task-5 placeholder dispatcher: the triage execution kind, preamble, and
@@ -118,11 +114,7 @@ pub struct LoggingTriageDispatcher;
 
 #[async_trait]
 impl TriageDispatcher for LoggingTriageDispatcher {
-    async fn dispatch_triage(
-        &self,
-        automation: &Automation,
-        scheduled_for_epoch: i64,
-    ) -> TriageDispatch {
+    async fn dispatch_triage(&self, automation: &Automation, scheduled_for_epoch: i64) -> TriageDispatch {
         tracing::warn!(
             automation_id = %automation.id,
             scheduled_for = scheduled_for_epoch,
@@ -140,8 +132,7 @@ impl TriageDispatcher for LoggingTriageDispatcher {
 /// satisfy the repo's giant-struct convention (`checkleft`'s
 /// rust-giant-structs-use-builder, which flags 6+ named fields) — the
 /// scheduler never builds one.
-#[derive(Debug, Default, PartialEq, Eq)]
-#[derive(bon::Builder)]
+#[derive(Debug, Default, PartialEq, Eq, bon::Builder)]
 pub struct AutomationSchedulerPass {
     /// Due automations evaluated this pass.
     pub evaluated: usize,
@@ -248,15 +239,17 @@ pub async fn run_one_pass(
     let due = match work_db.list_due_automations(now_epoch) {
         Ok(due) => due,
         Err(err) => {
-            tracing::warn!(?err, "automation scheduler: failed to list due automations; skipping pass");
+            tracing::warn!(
+                ?err,
+                "automation scheduler: failed to list due automations; skipping pass"
+            );
             return pass;
         }
     };
 
     for automation in due {
         pass.evaluated += 1;
-        if let Err(err) = evaluate_one(work_db, now_epoch, dispatcher, &automation, &mut pass).await
-        {
+        if let Err(err) = evaluate_one(work_db, now_epoch, dispatcher, &automation, &mut pass).await {
             tracing::warn!(
                 automation_id = %automation.id,
                 ?err,
@@ -332,9 +325,7 @@ async fn evaluate_one(
         }
     }
 
-    let catch_up_window = automation
-        .catch_up_window_secs
-        .unwrap_or(DEFAULT_CATCH_UP_WINDOW_SECS);
+    let catch_up_window = automation.catch_up_window_secs.unwrap_or(DEFAULT_CATCH_UP_WINDOW_SECS);
     let staleness = now - most_recent;
 
     // 4. Skip-if-stale.
@@ -458,9 +449,8 @@ mod tests {
     use crate::automation_schedule::next_occurrence_after_str;
     use crate::work::{CreateChoreInput, CreateProductInput, WorkDb};
     use boss_protocol::{
-        AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED,
-        AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT, AutomationPatch, AutomationTrigger,
-        CreateAutomationInput,
+        AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED, AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT,
+        AutomationPatch, AutomationTrigger, CreateAutomationInput,
     };
 
     /// A dispatcher with a fixed verdict, recording every call.
@@ -472,13 +462,17 @@ mod tests {
     impl FakeDispatcher {
         fn dispatched() -> Self {
             Self {
-                verdict: TriageDispatch::Dispatched { execution_id: "exec_test".to_owned() },
+                verdict: TriageDispatch::Dispatched {
+                    execution_id: "exec_test".to_owned(),
+                },
                 calls: Mutex::new(Vec::new()),
             }
         }
         fn transient() -> Self {
             Self {
-                verdict: TriageDispatch::TransientFailure { detail: "vpn down".to_owned() },
+                verdict: TriageDispatch::TransientFailure {
+                    detail: "vpn down".to_owned(),
+                },
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -609,7 +603,10 @@ mod tests {
             reloaded.next_due_at.unwrap().parse::<i64>().unwrap(),
             utc_epoch(2026, 5, 29, 14, 0)
         );
-        assert_eq!(reloaded.last_outcome.as_deref(), Some(AUTOMATION_OUTCOME_FAILED_WILL_RETRY));
+        assert_eq!(
+            reloaded.last_outcome.as_deref(),
+            Some(AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+        );
     }
 
     #[tokio::test]
@@ -807,7 +804,10 @@ mod tests {
 
         let expected_following = next_occurrence_after_str("0 14 * * *", "UTC", occ).unwrap().unwrap();
         let reloaded = db.get_automation(&automation.id).unwrap().unwrap();
-        assert_eq!(reloaded.next_due_at.unwrap().parse::<i64>().unwrap(), expected_following);
+        assert_eq!(
+            reloaded.next_due_at.unwrap().parse::<i64>().unwrap(),
+            expected_following
+        );
     }
 
     /// next_sleep_secs targets the earliest automation's next_due_at, not a
@@ -849,11 +849,7 @@ mod tests {
             .unwrap();
         let t2pm_plus_5 = t2pm + 5;
         let sleep2 = next_sleep_secs(&db, t2pm_plus_5);
-        assert_eq!(
-            sleep2 as i64,
-            t3pm - t2pm_plus_5,
-            "should target 3pm after 2pm fires"
-        );
+        assert_eq!(sleep2 as i64, t3pm - t2pm_plus_5, "should target 3pm after 2pm fires");
     }
 
     /// With no enabled automations, next_sleep_secs falls back to the maximum.

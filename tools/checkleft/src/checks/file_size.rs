@@ -15,11 +15,7 @@ const DEFAULT_MAX_LINES: usize = 500;
 pub struct FileSizeCheck;
 
 impl FileSizeCheck {
-    fn configure_with_dir(
-        &self,
-        config: &toml::Value,
-        config_dir: &Path,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_with_dir(&self, config: &toml::Value, config_dir: &Path) -> Result<Arc<dyn ConfiguredCheck>> {
         Ok(Arc::new(parse_config(config, config_dir)?))
     }
 }
@@ -38,11 +34,7 @@ impl Check for FileSizeCheck {
         self.configure_with_dir(config, Path::new(""))
     }
 
-    fn configure_scoped(
-        &self,
-        config: &toml::Value,
-        config_dir: Option<&Path>,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_scoped(&self, config: &toml::Value, config_dir: Option<&Path>) -> Result<Arc<dyn ConfiguredCheck>> {
         self.configure_with_dir(config, config_dir.unwrap_or_else(|| Path::new("")))
     }
 }
@@ -57,9 +49,10 @@ impl ConfiguredCheck for ParsedFileSizeConfig {
                 continue;
             }
             if let Some(exclude_files) = &self.exclude_files
-                && is_excluded(&changed_file.path, exclude_files, &self.config_dir) {
-                    continue;
-                }
+                && is_excluded(&changed_file.path, exclude_files, &self.config_dir)
+            {
+                continue;
+            }
 
             let Ok(contents) = tree.read_file(&changed_file.path) else {
                 continue;
@@ -99,10 +92,7 @@ impl ConfiguredCheck for ParsedFileSizeConfig {
                     line: Some((self.max_lines.saturating_add(1)) as u32),
                     column: Some(1),
                 }),
-                remediations: vec![
-                    "Split the file or refactor into smaller modules to reduce line count."
-                        .to_owned(),
-                ],
+                remediations: vec!["Split the file or refactor into smaller modules to reduce line count.".to_owned()],
                 suggested_fix: None,
             });
         }
@@ -141,15 +131,10 @@ struct ParsedFileSizeConfig {
 }
 
 fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<ParsedFileSizeConfig> {
-    let parsed: FileSizeConfig = config
-        .clone()
-        .try_into()
-        .context("invalid file-size check config")?;
+    let parsed: FileSizeConfig = config.clone().try_into().context("invalid file-size check config")?;
 
     let max_lines = match parsed.max_lines {
-        Some(value) => {
-            usize::try_from(value).context("`max_lines` must be a non-negative integer")?
-        }
+        Some(value) => usize::try_from(value).context("`max_lines` must be a non-negative integer")?,
         None => DEFAULT_MAX_LINES,
     };
 
@@ -170,14 +155,11 @@ fn parse_exclude_files(patterns: Option<&[String]>) -> Result<Option<GlobSet>> {
 
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
+        let glob = Glob::new(pattern).with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
         builder.add(glob);
     }
 
-    let globset = builder
-        .build()
-        .context("failed to compile `exclude_files` patterns")?;
+    let globset = builder.build().context("failed to compile `exclude_files` patterns")?;
     Ok(Some(globset))
 }
 
@@ -378,7 +360,11 @@ mod tests {
             .expect("run check");
 
         // Pattern "oversized.rs" from sub/dir context does NOT match root-level "oversized.rs".
-        assert_eq!(result.findings.len(), 1, "file outside config_dir should not be excluded");
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "file outside config_dir should not be excluded"
+        );
     }
 
     #[tokio::test]

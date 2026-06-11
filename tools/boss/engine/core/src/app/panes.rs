@@ -48,11 +48,7 @@ pub(super) async fn handle_focus_worker_pane(ctx: Dispatch, req: FrontendRequest
                     slot_id,
                     "focus_worker_pane: pane raised",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkerPaneFocused { run_id, slot_id },
-                );
+                send_response(&sink, &request_id, FrontendEvent::WorkerPaneFocused { run_id, slot_id });
             }
             Err(err) => {
                 tracing::warn!(?err, run_id = %run_id, "focus_worker_pane failed");
@@ -109,11 +105,7 @@ pub(super) async fn handle_send_input_to_worker(ctx: Dispatch, req: FrontendRequ
                     slot_id,
                     "send_input_to_worker: text injected",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::WorkerInputSent { run_id, slot_id },
-                );
+                send_response(&sink, &request_id, FrontendEvent::WorkerInputSent { run_id, slot_id });
             }
             Err(err) => {
                 tracing::warn!(?err, run_id = %run_id, "send_input_to_worker failed");
@@ -201,10 +193,6 @@ pub(super) async fn handle_list_worker_live_states(ctx: Dispatch, req: FrontendR
     };
     {
         let states = server_state.live_worker_states_snapshot();
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::WorkerLiveStatesList { states },
-        );
+        send_response(&sink, &request_id, FrontendEvent::WorkerLiveStatesList { states });
     }
 }

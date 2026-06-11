@@ -91,10 +91,7 @@ class Foo {
 
     assert_eq!(result.findings.len(), 1);
     assert_eq!(
-        result.findings[0]
-            .location
-            .as_ref()
-            .and_then(|location| location.line),
+        result.findings[0].location.as_ref().and_then(|location| location.line),
         Some(9)
     );
 }
@@ -252,11 +249,7 @@ async fn rejects_unsupported_language() {
         .await
         .expect_err("must fail");
 
-    assert!(
-        error
-            .to_string()
-            .contains("unsupported code-patterns `lang`")
-    );
+    assert!(error.to_string().contains("unsupported code-patterns `lang`"));
 }
 
 #[tokio::test]

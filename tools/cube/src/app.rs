@@ -7,8 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use console::{Style, style};
 use git_utils::pr_bookmark;
 use git_utils::repo_slug::{
-    is_owner_name_slug, origin_path_matches_slug, origin_urls_equivalent, parse_github_remote,
-    parse_org_name_shape,
+    is_owner_name_slug, origin_path_matches_slug, origin_urls_equivalent, parse_github_remote, parse_org_name_shape,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -17,8 +16,8 @@ use uuid::Uuid;
 
 use crate::audit;
 use crate::cli::{
-    ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, PrEnsureArgs, PrPushArgs,
-    RepoCommand, StackCommand, WorkspaceCommand,
+    ChangeCommand, Cli, Command, DoctorArgs, GraphArgs, PrCommand, PrEnsureArgs, PrPushArgs, RepoCommand, StackCommand,
+    WorkspaceCommand,
 };
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::config;
@@ -123,10 +122,7 @@ pub enum CubeError {
     #[error("failed to serialize output: {0}")]
     Json(#[from] serde_json::Error),
     #[error("workspace `{workspace_path}` is stale and could not be auto-recovered: {cause}")]
-    StaleRecoveryFailed {
-        workspace_path: PathBuf,
-        cause: String,
-    },
+    StaleRecoveryFailed { workspace_path: PathBuf, cause: String },
     /// The lease handler tried to reclaim a workspace whose previous
     /// lease had expired (so cube flipped it back to `free`), but the
     /// workspace's `@` still has the prior holder's uncommitted /
@@ -184,9 +180,7 @@ impl CubeError {
             Self::InvalidArgument(_) | Self::NotImplemented(_) => ExitCode::from(2),
             Self::RepoNotFound(_) => ExitCode::from(3),
             Self::NoAvailableWorkspace(_) => ExitCode::from(4),
-            Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) | Self::ChangeNotFound(_) => {
-                ExitCode::from(5)
-            }
+            Self::WorkspaceNotFound(_) | Self::LeaseNotFound(_) | Self::ChangeNotFound(_) => ExitCode::from(5),
             Self::SetupStepFailed { .. } => ExitCode::from(6),
             Self::Storage(_)
             | Self::Io(_)
@@ -214,11 +208,7 @@ pub fn run(cli: Cli) -> Result<RunResult> {
     run_with_dependencies(cli, None, &runner)
 }
 
-fn run_with_dependencies(
-    cli: Cli,
-    database_path: Option<&Path>,
-    runner: &dyn CommandRunner,
-) -> Result<RunResult> {
+fn run_with_dependencies(cli: Cli, database_path: Option<&Path>, runner: &dyn CommandRunner) -> Result<RunResult> {
     run_with_context(cli, database_path, runner, None, None)
 }
 
@@ -230,9 +220,7 @@ fn run_with_context(
     cube_config: Option<config::CubeConfig>,
 ) -> Result<RunResult> {
     match cli.command {
-        Command::Repo { command } => {
-            run_repo(command, database_path, runner, repo_ensure_defaults, cube_config)
-        }
+        Command::Repo { command } => run_repo(command, database_path, runner, repo_ensure_defaults, cube_config),
         Command::Workspace { command } => run_workspace(command, database_path, runner),
         Command::Change { command } => run_change(command, database_path, runner),
         Command::Stack { command } => run_stack(command),
@@ -274,9 +262,7 @@ fn run_repo(
                     let repo_id = repo_id_from_origin(&origin)?;
                     ensure_repo_core(&store, runner, &repo_id, &origin, None, &defaults)?
                 }
-                (Some(name), None) => {
-                    ensure_repo_by_name(&store, runner, &name, &defaults, &cfg)?
-                }
+                (Some(name), None) => ensure_repo_by_name(&store, runner, &name, &defaults, &cfg)?,
                 (None, None) => {
                     // clap enforces that exactly one of the two is present.
                     return Err(CubeError::InvalidArgument(
@@ -348,8 +334,7 @@ fn run_repo(
                 )));
             }
 
-            let workspace_paths: Vec<PathBuf> =
-                workspaces.iter().map(|w| w.workspace_path.clone()).collect();
+            let workspace_paths: Vec<PathBuf> = workspaces.iter().map(|w| w.workspace_path.clone()).collect();
             let workspace_count = workspaces.len();
 
             // Delete the repo row; FK cascades remove workspaces, workspace_setup,
@@ -364,10 +349,7 @@ fn run_repo(
                         Ok(()) => purged_dirs.push(path.display().to_string()),
                         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                         Err(err) => {
-                            eprintln!(
-                                "warning: failed to remove workspace dir {}: {err}",
-                                path.display()
-                            );
+                            eprintln!("warning: failed to remove workspace dir {}: {err}", path.display());
                         }
                     }
                 }
@@ -429,19 +411,15 @@ fn ensure_repo_by_name(
 ) -> Result<RepoRecord> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(CubeError::InvalidArgument(
-            "repo name must not be empty".to_string(),
-        ));
+        return Err(CubeError::InvalidArgument("repo name must not be empty".to_string()));
     }
 
     // Step 1: the reponame already names a registered slug.
     if let Some(existing) = store.get_repo(name)? {
         let existing = heal_source_if_missing(store, &existing, defaults)?;
-        fs::create_dir_all(&existing.workspace_root).map_err(|e| {
-            CubeError::WorkspaceDirCreate {
-                path: existing.workspace_root.clone(),
-                source: e,
-            }
+        fs::create_dir_all(&existing.workspace_root).map_err(|e| CubeError::WorkspaceDirCreate {
+            path: existing.workspace_root.clone(),
+            source: e,
         })?;
         materialize_repo_source_if_missing(runner, &existing)?;
         return Ok(existing);
@@ -493,11 +471,7 @@ fn ensure_repo_by_name(
 /// record and call `materialize_repo_source_if_missing`, which early-returns
 /// when `source` is `None` — so the clone was silently skipped.
 /// Now `ensure` heals the record first so the clone always runs.
-fn heal_source_if_missing(
-    store: &Store,
-    record: &RepoRecord,
-    defaults: &RepoEnsureDefaults,
-) -> Result<RepoRecord> {
+fn heal_source_if_missing(store: &Store, record: &RepoRecord, defaults: &RepoEnsureDefaults) -> Result<RepoRecord> {
     if record.source.is_none() {
         let derived = defaults.repo_root.join(&record.repo);
         eprintln!(
@@ -588,10 +562,7 @@ fn ensure_repo_core(
     let mut record = record;
     if let Some(branch) = detected_branch {
         if branch != record.main_branch {
-            eprintln!(
-                "cube: detected default branch `{branch}` for repo `{}`",
-                record.repo
-            );
+            eprintln!("cube: detected default branch `{branch}` for repo `{}`", record.repo);
         }
         record.main_branch = branch;
     }
@@ -624,9 +595,7 @@ fn github_fallback_error(err: CubeError, org: &str, repo: &str) -> CubeError {
 fn normalize_origin(origin: &str) -> Result<String> {
     let trimmed = origin.trim();
     if trimmed.is_empty() {
-        return Err(CubeError::InvalidArgument(
-            "origin must not be empty".to_string(),
-        ));
+        return Err(CubeError::InvalidArgument("origin must not be empty".to_string()));
     }
     // Expand a bare `owner/repo` shorthand to a canonical GitHub SSH URL so
     // `cube repo ensure --origin brianduff/flunge` Just Works.
@@ -652,10 +621,7 @@ fn default_repo_ensure_defaults() -> Result<RepoEnsureDefaults> {
 /// `jj git clone` — it's expected to leave the working tree under
 /// `<pool-root>/<reponame>`, after which cube colocates jj over it. Otherwise
 /// cube runs `jj git clone <origin> <source>` and promotes the default branch.
-fn materialize_repo_source_if_missing(
-    runner: &dyn CommandRunner,
-    record: &RepoRecord,
-) -> Result<Option<String>> {
+fn materialize_repo_source_if_missing(runner: &dyn CommandRunner, record: &RepoRecord) -> Result<Option<String>> {
     let Some(source) = &record.source else {
         return Ok(None);
     };
@@ -673,11 +639,7 @@ fn materialize_repo_source_if_missing(
                 runner.run(&CommandInvocation {
                     cwd: source.to_path_buf(),
                     program: "jj".to_string(),
-                    args: vec![
-                        "git".to_string(),
-                        "init".to_string(),
-                        "--colocate".to_string(),
-                    ],
+                    args: vec!["git".to_string(), "init".to_string(), "--colocate".to_string()],
                 })?;
             }
             return Ok(None);
@@ -706,11 +668,9 @@ fn materialize_repo_source_if_missing(
             ))
         })?;
         let mut iter = parts.into_iter();
-        let program = iter.next().ok_or_else(|| {
-            CubeError::InvalidArgument(format!(
-                "resolver clone_command `{clone_command}` is empty"
-            ))
-        })?;
+        let program = iter
+            .next()
+            .ok_or_else(|| CubeError::InvalidArgument(format!("resolver clone_command `{clone_command}` is empty")))?;
         let args: Vec<String> = iter.collect();
         if which::which(&program).is_err() {
             return Err(CubeError::InvalidArgument(format!(
@@ -718,10 +678,7 @@ fn materialize_repo_source_if_missing(
                  install it or fix the resolver in your cube config"
             )));
         }
-        eprintln!(
-            "cube: using `{clone_command}` to clone repo `{}`",
-            record.repo
-        );
+        eprintln!("cube: using `{clone_command}` to clone repo `{}`", record.repo);
         runner
             .run(&CommandInvocation {
                 cwd: parent.to_path_buf(),
@@ -729,23 +686,16 @@ fn materialize_repo_source_if_missing(
                 args,
             })
             .map_err(|err| match err {
-                CubeError::CommandFailed { stderr, .. } => CubeError::InvalidArgument(format!(
-                    "resolver clone_command `{clone_command}` failed: {stderr}"
-                )),
+                CubeError::CommandFailed { stderr, .. } => {
+                    CubeError::InvalidArgument(format!("resolver clone_command `{clone_command}` failed: {stderr}"))
+                }
                 other => other,
             })?;
-        eprintln!(
-            "cube: running `jj git init --colocate` in {}",
-            source.display()
-        );
+        eprintln!("cube: running `jj git init --colocate` in {}", source.display());
         runner.run(&CommandInvocation {
             cwd: source.to_path_buf(),
             program: "jj".to_string(),
-            args: vec![
-                "git".to_string(),
-                "init".to_string(),
-                "--colocate".to_string(),
-            ],
+            args: vec!["git".to_string(), "init".to_string(), "--colocate".to_string()],
         })?;
         // The colocated clone already exposes the remote's branches as local
         // jj bookmarks, so there is nothing to promote here; we only need the
@@ -780,11 +730,7 @@ fn materialize_repo_source_if_missing(
 /// output — so callers fall back to the historical `main` default rather than
 /// hard-failing materialization. SSH-prefixed origins (`org-N@github.com:...`)
 /// authenticate via SSH key here, so corporate SSO does not block detection.
-fn detect_remote_default_branch(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    origin: &str,
-) -> Option<String> {
+fn detect_remote_default_branch(runner: &dyn CommandRunner, cwd: &Path, origin: &str) -> Option<String> {
     let output = runner
         .run(&CommandInvocation {
             cwd: cwd.to_path_buf(),
@@ -830,11 +776,7 @@ fn parse_symref_default_branch(output: &str) -> Option<String> {
 /// surface a hard error rather than letting the caller stumble into
 /// `jj new <missing>` later. Idempotent: re-tracking an already-tracked
 /// bookmark is a no-op.
-fn track_remote_bookmarks(
-    runner: &dyn CommandRunner,
-    repo_path: &Path,
-    default_branch: Option<&str>,
-) -> Result<()> {
+fn track_remote_bookmarks(runner: &dyn CommandRunner, repo_path: &Path, default_branch: Option<&str>) -> Result<()> {
     // Always attempt the two conventional defaults; additionally attempt the
     // detected default branch when it is something else (e.g. `develop`,
     // `trunk`) so the lease's later `jj new <main_branch>` has a local bookmark
@@ -842,19 +784,16 @@ fn track_remote_bookmarks(
     // tracking order for the common cases.
     let mut candidates: Vec<String> = vec!["main".to_string(), "master".to_string()];
     if let Some(branch) = default_branch
-        && !candidates.iter().any(|c| c == branch) {
-            candidates.push(branch.to_string());
-        }
+        && !candidates.iter().any(|c| c == branch)
+    {
+        candidates.push(branch.to_string());
+    }
     let mut tracked_any = false;
     for branch in &candidates {
         let result = runner.run(&CommandInvocation {
             cwd: repo_path.to_path_buf(),
             program: "jj".to_string(),
-            args: vec![
-                "bookmark".to_string(),
-                "track".to_string(),
-                format!("{branch}@origin"),
-            ],
+            args: vec!["bookmark".to_string(), "track".to_string(), format!("{branch}@origin")],
         });
         match result {
             Ok(_) => tracked_any = true,
@@ -978,9 +917,7 @@ fn is_no_such_remote_bookmark(err: &CubeError) -> bool {
     if program != "jj" {
         return false;
     }
-    stderr
-        .to_lowercase()
-        .contains(JJ_NO_REMOTE_BOOKMARK_SIGNATURE)
+    stderr.to_lowercase().contains(JJ_NO_REMOTE_BOOKMARK_SIGNATURE)
 }
 
 /// Returns `true` when `err` is jj reporting that the on-lease
@@ -998,16 +935,12 @@ fn is_unresolved_remote_target(err: &CubeError) -> bool {
         return false;
     }
     let lower = stderr.to_lowercase();
-    lower.contains(JJ_NO_REMOTE_BOOKMARK_SIGNATURE)
-        || lower.contains(JJ_REVISION_DOESNT_EXIST_SIGNATURE)
+    lower.contains(JJ_NO_REMOTE_BOOKMARK_SIGNATURE) || lower.contains(JJ_REVISION_DOESNT_EXIST_SIGNATURE)
 }
 
 fn repo_id_from_origin(origin: &str) -> Result<String> {
     let trimmed = origin.trim().trim_end_matches('/');
-    let tail = trimmed
-        .rsplit(|ch| ['/', ':'].contains(&ch))
-        .next()
-        .unwrap_or("");
+    let tail = trimmed.rsplit(|ch| ['/', ':'].contains(&ch)).next().unwrap_or("");
     let tail = tail.strip_suffix(".git").unwrap_or(tail);
     let repo = sanitize_repo_id(tail);
     if repo.is_empty() {
@@ -1087,22 +1020,14 @@ fn run_workspace(
                 );
             }
             let expired_by_workspace_id: std::collections::HashMap<&str, &crate::store::ExpiredLease> =
-                expired
-                    .iter()
-                    .map(|e| (e.workspace_id.as_str(), e))
-                    .collect();
+                expired.iter().map(|e| (e.workspace_id.as_str(), e)).collect();
             // Self-heal any rows whose on-disk directory has been deleted
             // out from under cube. The repo lock is already held by this
             // lease call, so use the `_in_repo` variant that skips its own
             // locking. After expire_stale_leases above, any leased rows
             // whose lease has aged out are now `free`, and reconcile will
             // forget them too if their directory is also missing.
-            reconcile_missing_workspaces_in_repo(
-                &mut store,
-                database_path,
-                &repo,
-                leased_at_epoch_s,
-            )?;
+            reconcile_missing_workspaces_in_repo(&mut store, database_path, &repo, leased_at_epoch_s)?;
 
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
@@ -1153,9 +1078,7 @@ fn run_workspace(
                 }
                 // A directory with neither .jj/ nor .git/ holds no
                 // recoverable work — there is nothing dirty to reclaim.
-                if !target.workspace_path.join(".jj").is_dir()
-                    && !target.workspace_path.join(".git").is_dir()
-                {
+                if !target.workspace_path.join(".jj").is_dir() && !target.workspace_path.join(".git").is_dir() {
                     return Err(CubeError::InvalidArgument(format!(
                         "workspace `{pref}` has neither a .jj nor a .git directory; \
                          there is no in-flight work to reclaim with --allow-dirty."
@@ -1177,8 +1100,7 @@ fn run_workspace(
                 // No reset: the working copy is handed over exactly as the
                 // prior holder left it. Record whatever `@` currently is so
                 // the registry's head_commit reflects the recovered state.
-                let head_commit =
-                    current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
+                let head_commit = current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
                 store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
                 workspace.head_commit = Some(head_commit);
 
@@ -1247,9 +1169,10 @@ fn run_workspace(
             let ordered_ids: Vec<String> = {
                 let mut v = Vec::new();
                 if let Some(pref) = prefer.as_deref()
-                    && free_workspaces.iter().any(|w| w.workspace_id == pref) {
-                        v.push(pref.to_string());
-                    }
+                    && free_workspaces.iter().any(|w| w.workspace_id == pref)
+                {
+                    v.push(pref.to_string());
+                }
                 for w in &free_workspaces {
                     if !v.contains(&w.workspace_id) {
                         v.push(w.workspace_id.clone());
@@ -1303,14 +1226,9 @@ fn run_workspace(
                             "bookmarks": bookmarks,
                             "skipped": conflicted_candidate.is_some(),
                         }));
-                        store.update_workspace_health(
-                            &repo,
-                            ws_id,
-                            WorkspaceHealth::Conflicted,
-                        )?;
+                        store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Conflicted)?;
                         if conflicted_candidate.is_none() {
-                            conflicted_candidate =
-                                Some((ws_id.clone(), bookmarks.clone()));
+                            conflicted_candidate = Some((ws_id.clone(), bookmarks.clone()));
                         }
                         // Keep looking for a clean one before falling back
                         // to repairing the conflicted one.
@@ -1322,11 +1240,7 @@ fn run_workspace(
                             "skipped": true,
                             "reason": "dirty_working_copy",
                         }));
-                        store.update_workspace_health(
-                            &repo,
-                            ws_id,
-                            WorkspaceHealth::Dirty,
-                        )?;
+                        store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Dirty)?;
                         audit!(
                             database_path,
                             "workspace.health_check_skipped",
@@ -1362,13 +1276,9 @@ fn run_workspace(
             // first repairable conflicted workspace, otherwise auto-create a
             // fresh one. No pool state (dirty, husk, occupied) is ever a hard
             // stop — cube always provisions new capacity for a reachable repo.
-            let chosen_id = clean_candidate.or_else(|| {
-                conflicted_candidate.as_ref().map(|(id, _)| id.clone())
-            });
+            let chosen_id = clean_candidate.or_else(|| conflicted_candidate.as_ref().map(|(id, _)| id.clone()));
 
-            let (mut workspace, was_auto_created, repair_bookmarks) = if let Some(ws_id) =
-                chosen_id
-            {
+            let (mut workspace, was_auto_created, repair_bookmarks) = if let Some(ws_id) = chosen_id {
                 // Claim the specific workspace we health-checked.
                 let ws = store
                     .claim_specific_workspace(
@@ -1456,15 +1366,12 @@ fn run_workspace(
             // new worker — better to clean them up now so the workspace is
             // truly pristine.
             if !repair_bookmarks.is_empty()
-                && let Err(error) = repair_conflicted_bookmarks(
-                    runner,
-                    database_path,
-                    &workspace.workspace_path,
-                    &repair_bookmarks,
-                ) {
-                    let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
-                    return Err(error);
-                }
+                && let Err(error) =
+                    repair_conflicted_bookmarks(runner, database_path, &workspace.workspace_path, &repair_bookmarks)
+            {
+                let _ = store.release_workspace(&lease_id, Some("lease_setup_failed"));
+                return Err(error);
+            }
 
             // If the workspace we just claimed was reclaimed-from-expired
             // in this lease call, guard the reset: a destructive
@@ -1511,8 +1418,7 @@ fn run_workspace(
                 None
             };
 
-            let head_commit =
-                current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
+            let head_commit = current_workspace_commit(runner, database_path, &workspace.workspace_path)?;
             store.update_workspace_head_commit(&lease_id, Some(&head_commit))?;
             workspace.head_commit = Some(head_commit);
 
@@ -1617,13 +1523,7 @@ fn run_workspace(
                 // Opportunistically forget consumed boss/exec_* bookmarks.
                 // The fetch above already updated main, so do_fetch = false.
                 // Best-effort: log a warning but never block the release.
-                match gc_workspace_bookmarks(
-                    runner,
-                    database_path,
-                    &workspace.workspace_path,
-                    false,
-                    false,
-                ) {
+                match gc_workspace_bookmarks(runner, database_path, &workspace.workspace_path, false, false) {
                     Ok(forgotten) if !forgotten.is_empty() => {
                         eprintln!(
                             "cube: release gc: {} consumed bookmark(s) forgotten in {}",
@@ -1668,9 +1568,7 @@ fn run_workspace(
         }
         WorkspaceCommand::Heartbeat { lease, ttl_seconds } => {
             let now = current_epoch_s()?;
-            let ttl = ttl_seconds
-                .map(|s| s as i64)
-                .unwrap_or(DEFAULT_LEASE_TTL_SECS);
+            let ttl = ttl_seconds.map(|s| s as i64).unwrap_or(DEFAULT_LEASE_TTL_SECS);
             let new_expires_at = now + ttl;
             let updated = store
                 .heartbeat_lease(&lease, Some(new_expires_at))?
@@ -1712,10 +1610,7 @@ fn run_workspace(
             );
 
             RunResult::new(
-                format!(
-                    "Force-released {} (workspace not reset).",
-                    released.workspace_id
-                ),
+                format!("Force-released {} (workspace not reset).", released.workspace_id),
                 json!({
                     "workspace": released,
                 }),
@@ -1760,11 +1655,7 @@ fn run_workspace(
             let message = format_setup_message(&record.workspace_id, &report);
             RunResult::new(message, payload)
         }
-        WorkspaceCommand::List {
-            repo,
-            state,
-            holder,
-        } => {
+        WorkspaceCommand::List { repo, state, holder } => {
             let parsed_effective_state = match state.as_deref() {
                 Some(raw) => Some(EffectiveState::from_str(raw).ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
@@ -1777,12 +1668,8 @@ fn run_workspace(
             // we materialize the listing — otherwise `list` would surface
             // a row that the next `lease` is going to fail on. Scope the
             // reconcile to the same repo filter the user asked for.
-            let reconciled = reconcile_missing_workspaces(
-                &mut store,
-                database_path,
-                repo.as_deref(),
-                current_epoch_s()?,
-            )?;
+            let reconciled =
+                reconcile_missing_workspaces(&mut store, database_path, repo.as_deref(), current_epoch_s()?)?;
             let filter = WorkspaceListFilter {
                 repo: repo.as_deref(),
                 effective_state: parsed_effective_state,
@@ -1814,11 +1701,7 @@ fn run_workspace(
                 [] => return Err(CubeError::WorkspaceNotFound(workspace)),
                 [single] => single.clone(),
                 many => {
-                    let repos = many
-                        .iter()
-                        .map(|r| r.repo.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                    let repos = many.iter().map(|r| r.repo.as_str()).collect::<Vec<_>>().join(", ");
                     return Err(CubeError::InvalidArgument(format!(
                         "workspace id `{workspace}` matches multiple repos ({repos}); disambiguate with --repo"
                     )));
@@ -1844,7 +1727,7 @@ fn run_workspace(
                         return Err(CubeError::WorkspaceDirRemove {
                             path: record.workspace_path.clone(),
                             source: err,
-                        })
+                        });
                     }
                 }
             }
@@ -1929,13 +1812,7 @@ fn run_workspace(
                     });
                     continue;
                 }
-                match gc_workspace_bookmarks(
-                    runner,
-                    database_path,
-                    &record.workspace_path,
-                    true,
-                    dry_run,
-                ) {
+                match gc_workspace_bookmarks(runner, database_path, &record.workspace_path, true, dry_run) {
                     Ok(bookmarks) => {
                         results.push(WorkspaceGcResult {
                             workspace_id: record.workspace_id.clone(),
@@ -1957,8 +1834,7 @@ fn run_workspace(
                 }
             }
 
-            let total_forgotten: usize =
-                results.iter().map(|r| r.bookmarks_forgotten.len()).sum();
+            let total_forgotten: usize = results.iter().map(|r| r.bookmarks_forgotten.len()).sum();
             let message = if dry_run {
                 format!(
                     "{} workspace(s): {} bookmark(s) would be forgotten (dry-run).",
@@ -1974,17 +1850,11 @@ fn run_workspace(
             };
             RunResult::new(message, json!({ "results": results }))
         }
-        WorkspaceCommand::Rebase => {
-            workspace_rebase(&mut store, database_path, runner)
-        }
+        WorkspaceCommand::Rebase => workspace_rebase(&mut store, database_path, runner),
     }
 }
 
-fn run_change(
-    command: ChangeCommand,
-    database_path: Option<&Path>,
-    runner: &dyn CommandRunner,
-) -> Result<RunResult> {
+fn run_change(command: ChangeCommand, database_path: Option<&Path>, runner: &dyn CommandRunner) -> Result<RunResult> {
     let mut store = if let Some(path) = database_path {
         Store::open_at(path)?
     } else {
@@ -2142,9 +2012,7 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
         // Slurp eagerly before any subprocess can race on the fd.
         let mut content = String::new();
         if is_stdin_like {
-            std::io::stdin()
-                .read_to_string(&mut content)
-                .map_err(CubeError::Io)?;
+            std::io::stdin().read_to_string(&mut content).map_err(CubeError::Io)?;
         } else {
             std::fs::File::open(path)
                 .and_then(|mut f| f.read_to_string(&mut content))
@@ -2160,16 +2028,14 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
 
         // Write to a uniquely-named temp file so gh pr create can open it as
         // a regular file (no race, no /dev/stdin weirdness in the subprocess).
-        let tmp_path = std::env::temp_dir()
-            .join(format!("cube-pr-body-{}.md", Uuid::new_v4()));
+        let tmp_path = std::env::temp_dir().join(format!("cube-pr-body-{}.md", Uuid::new_v4()));
         std::fs::write(&tmp_path, content.as_bytes()).map_err(CubeError::Io)?;
         let tmp_path_str = tmp_path.display().to_string();
         Ok((tmp_path_str, Some(tmp_path)))
     } else {
         // Regular file path — validate it exists and is non-empty.
-        let meta = std::fs::metadata(path).map_err(|e| {
-            CubeError::InvalidArgument(format!("--body-file `{path}`: {e}"))
-        })?;
+        let meta =
+            std::fs::metadata(path).map_err(|e| CubeError::InvalidArgument(format!("--body-file `{path}`: {e}")))?;
         if meta.len() == 0 {
             return Err(CubeError::InvalidArgument(format!(
                 "--body-file `{path}` is empty; \
@@ -2187,11 +2053,7 @@ fn resolve_body_file(path: &str) -> Result<(String, Option<PathBuf>)> {
 /// `--ignore-immutable` gotchas. The target branch is read from the repo pool
 /// configuration (`main_branch` field) — not hardcoded. Safe to call multiple
 /// times (idempotent when already up-to-date).
-fn workspace_rebase(
-    store: &mut Store,
-    database_path: Option<&Path>,
-    runner: &dyn CommandRunner,
-) -> Result<RunResult> {
+fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dyn CommandRunner) -> Result<RunResult> {
     let cwd = std::env::current_dir().map_err(CubeError::Io)?;
 
     // Look up this workspace in the registry to get the repo and main_branch.
@@ -2208,18 +2070,13 @@ fn workspace_rebase(
     let main_branch = repo_record.main_branch.clone();
 
     // Resolve the GitHub remote name (the real upstream, not the local mirror).
-    let (github_remote, _owner_repo) =
-        resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
+    let (github_remote, _owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
 
     // Fetch latest state — needed for both `main` and the boss branch.
     run_jj(
         runner,
         database_path,
-        &RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["git", "fetch", "--remote", &github_remote],
-        ),
+        &RealCommandRunner::invocation(&cwd, "jj", &["git", "fetch", "--remote", &github_remote]),
     )?;
 
     // Detect the boss/exec_* branch from the ancestry of the current @.
@@ -2316,11 +2173,7 @@ fn workspace_rebase(
         // Ignore errors — the list is informational; the agent can always
         // run `jj resolve --list` or `jj st` directly.
         let conflicted_files: Vec<String> = runner
-            .run(&RealCommandRunner::invocation(
-                &cwd,
-                "jj",
-                &["resolve", "--list"],
-            ))
+            .run(&RealCommandRunner::invocation(&cwd, "jj", &["resolve", "--list"]))
             .map(|out| {
                 out.lines()
                     .map(str::trim)
@@ -2354,9 +2207,7 @@ fn workspace_rebase(
             }),
         )
     } else {
-        eprintln!(
-            "cube: workspace rebase: {boss_branch_name} rebased onto {main_branch} cleanly"
-        );
+        eprintln!("cube: workspace rebase: {boss_branch_name} rebased onto {main_branch} cleanly");
         RunResult::new(
             format!(
                 "REBASED_CLEAN: branch `{boss_branch_name}` rebased onto `{main_branch}` \
@@ -2383,16 +2234,8 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
 
     // Resolve owner/repo from jj remote list.
     let remote_output = runner
-        .run(&RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["git", "remote", "list"],
-        ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to list jj remotes (is this a jj workspace?): {e}"
-            ))
-        })?;
+        .run(&RealCommandRunner::invocation(&cwd, "jj", &["git", "remote", "list"]))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to list jj remotes (is this a jj workspace?): {e}")))?;
     // Resolve BOTH the remote *name* and the owner/repo slug. The name
     // matters: in a cube workspace `origin` is a local on-disk mirror and
     // the real GitHub upstream is a differently-named remote (commonly
@@ -2414,8 +2257,7 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
 
     // Refuse to push a `pr/<n>` bookmark — those are local-only cube
     // bookkeeping and must never reach a remote.
-    pr_bookmark::assert_not_pr_bookmark(&branch)
-        .map_err(CubeError::InvalidArgument)?;
+    pr_bookmark::assert_not_pr_bookmark(&branch).map_err(CubeError::InvalidArgument)?;
 
     // Push the branch to the GitHub remote by name (--allow-new is
     // idempotent: fine when the remote bookmark already exists).
@@ -2423,13 +2265,9 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         .run(&RealCommandRunner::invocation(
             &cwd,
             "jj",
-            &[
-                "git", "push", "-b", &branch, "--remote", &github_remote, "--allow-new",
-            ],
+            &["git", "push", "-b", &branch, "--remote", &github_remote, "--allow-new"],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!("failed to push branch `{branch}`: {e}"))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to push branch `{branch}`: {e}")))?;
 
     // Verify the push actually reached GitHub. Confirming against the same
     // remote we pushed to (e.g. `git ls-remote origin`) is circular — if
@@ -2457,9 +2295,7 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
                 "url",
             ],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!("failed to check for existing PR: {e}"))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to check for existing PR: {e}")))?;
 
     let prs = serde_json::from_str::<Vec<serde_json::Value>>(&list_json).unwrap_or_default();
 
@@ -2471,11 +2307,7 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
         )));
     }
 
-    if let Some(url) = prs
-        .first()
-        .and_then(|pr| pr.get("url"))
-        .and_then(|v| v.as_str())
-    {
+    if let Some(url) = prs.first().and_then(|pr| pr.get("url")).and_then(|v| v.as_str()) {
         let url = url.to_string();
         let number = pr_number_from_url(&url);
         let pr_bookmark_name = set_pr_bookmark(runner, &cwd, number, &branch)?;
@@ -2486,9 +2318,7 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     }
 
     // No existing PR — create one.
-    let mut create_args: Vec<&str> = vec![
-        "pr", "create", "-R", &owner_repo, "--head", &branch, "--base", "main",
-    ];
+    let mut create_args: Vec<&str> = vec!["pr", "create", "-R", &owner_repo, "--head", &branch, "--base", "main"];
     let title_ref;
     let body_ref;
     // Materialised path for --body-file (may differ from the original when
@@ -2562,11 +2392,7 @@ fn set_pr_bookmark(
             "jj",
             &["bookmark", "set", &bookmark_name, "-r", branch],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to set local bookmark `{bookmark_name}`: {e}"
-            ))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to set local bookmark `{bookmark_name}`: {e}")))?;
     Ok(Some(bookmark_name))
 }
 
@@ -2577,12 +2403,7 @@ fn set_pr_bookmark(
 /// the "false confirmation" hole where a push lands on a local mirror
 /// remote and a same-remote check (`git ls-remote <that remote>`) reports
 /// success even though GitHub — and therefore any open PR — never advanced.
-fn verify_push_reached_github(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    owner_repo: &str,
-    branch: &str,
-) -> Result<()> {
+fn verify_push_reached_github(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, branch: &str) -> Result<()> {
     let local_sha = runner
         .run(&RealCommandRunner::invocation(
             cwd,
@@ -2649,11 +2470,7 @@ fn detect_jj_bookmark(runner: &dyn CommandRunner, cwd: &Path) -> Result<String> 
                 r#"bookmarks.map(|b| b.name()).join("\n")"#,
             ],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to detect current jj bookmark: {e}"
-            ))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to detect current jj bookmark: {e}")))?;
 
     output
         .lines()
@@ -2661,8 +2478,7 @@ fn detect_jj_bookmark(runner: &dyn CommandRunner, cwd: &Path) -> Result<String> 
         .find(|s| !s.is_empty())
         .ok_or_else(|| {
             CubeError::InvalidArgument(
-                "no bookmark on current jj commit — run `jj bookmark create <name> -r @` first"
-                    .to_string(),
+                "no bookmark on current jj commit — run `jj bookmark create <name> -r @` first".to_string(),
             )
         })
         .map(str::to_string)
@@ -2678,16 +2494,8 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
 
     // Resolve owner/repo and the github remote name.
     let remote_output = runner
-        .run(&RealCommandRunner::invocation(
-            &cwd,
-            "jj",
-            &["git", "remote", "list"],
-        ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to list jj remotes (is this a jj workspace?): {e}"
-            ))
-        })?;
+        .run(&RealCommandRunner::invocation(&cwd, "jj", &["git", "remote", "list"]))
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to list jj remotes (is this a jj workspace?): {e}")))?;
     let (github_remote, owner_repo) = parse_github_remote(&remote_output).ok_or_else(|| {
         CubeError::InvalidArgument(format!(
             "could not detect a github.com remote from `jj git remote list` output:\n{remote_output}"
@@ -2695,12 +2503,10 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
     })?;
 
     // Resolve (pr_number, head_branch) from args or by inference.
-    let (pr_number, head_branch) =
-        resolve_pr_push_target(&args, runner, &cwd, &github_remote, &owner_repo)?;
+    let (pr_number, head_branch) = resolve_pr_push_target(&args, runner, &cwd, &github_remote, &owner_repo)?;
 
     // Guard: the head branch must not be a reserved pr/* bookmark.
-    pr_bookmark::assert_not_pr_bookmark(&head_branch)
-        .map_err(CubeError::InvalidArgument)?;
+    pr_bookmark::assert_not_pr_bookmark(&head_branch).map_err(CubeError::InvalidArgument)?;
 
     let pr_bm = pr_bookmark::pr_bookmark_name(pr_number);
 
@@ -2714,9 +2520,7 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
             "jj",
             &["log", "-r", "@", "--no-graph", "-T", "empty"],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!("failed to inspect working copy: {e}"))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to inspect working copy: {e}")))?;
     let at_is_empty = empty_out.trim() == "true";
 
     if at_is_empty {
@@ -2739,8 +2543,7 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
             }
             _ => {
                 return Err(CubeError::InvalidArgument(
-                    "@ is empty — nothing to land; create a commit before running `cube pr push`"
-                        .to_string(),
+                    "@ is empty — nothing to land; create a commit before running `cube pr push`".to_string(),
                 ));
             }
         }
@@ -2785,11 +2588,7 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
                 "git",
                 &["push", "--force-with-lease", &github_remote, &head_branch],
             ))
-            .map_err(|e| {
-                CubeError::InvalidArgument(format!(
-                    "force-with-lease push of `{head_branch}` failed: {e}"
-                ))
-            })?;
+            .map_err(|e| CubeError::InvalidArgument(format!("force-with-lease push of `{head_branch}` failed: {e}")))?;
     } else {
         // Normal fast-forward push: @ must be a descendant of pr/<n>.
         let ancestor_rev = format!("{pr_bm} & ancestors(@)");
@@ -2799,11 +2598,7 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
                 "jj",
                 &["log", "-r", &ancestor_rev, "--no-graph", "-T", "commit_id"],
             ))
-            .map_err(|e| {
-                CubeError::InvalidArgument(format!(
-                    "failed to check ancestry of `{pr_bm}`: {e}"
-                ))
-            })?;
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to check ancestry of `{pr_bm}`: {e}")))?;
         if ancestor_out.trim().is_empty() {
             return Err(CubeError::InvalidArgument(format!(
                 "@ is not a descendant of `{pr_bm}` — refusing to push (this would not be a \
@@ -2820,18 +2615,9 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
             .run(&RealCommandRunner::invocation(
                 &cwd,
                 "jj",
-                &[
-                    "git",
-                    "push",
-                    "-b",
-                    &head_branch,
-                    "--remote",
-                    &github_remote,
-                ],
+                &["git", "push", "-b", &head_branch, "--remote", &github_remote],
             ))
-            .map_err(|e| {
-                CubeError::InvalidArgument(format!("failed to push `{head_branch}`: {e}"))
-            })?;
+            .map_err(|e| CubeError::InvalidArgument(format!("failed to push `{head_branch}`: {e}")))?;
     }
 
     // Verify the push reached GitHub.
@@ -2898,37 +2684,18 @@ fn resolve_pr_push_target(
                     cwd,
                     "gh",
                     &[
-                        "pr",
-                        "list",
-                        "-R",
-                        owner_repo,
-                        "--head",
-                        b,
-                        "--state",
-                        "open",
-                        "--json",
-                        "number",
+                        "pr", "list", "-R", owner_repo, "--head", b, "--state", "open", "--json", "number",
                     ],
                 ))
-                .map_err(|e| {
-                    CubeError::InvalidArgument(format!(
-                        "failed to look up open PR for branch `{b}`: {e}"
-                    ))
-                })?;
-            let prs: Vec<serde_json::Value> =
-                serde_json::from_str(&list_json).map_err(|e| {
-                    CubeError::InvalidArgument(format!(
-                        "unexpected response from `gh pr list` for branch `{b}`: {e}"
-                    ))
-                })?;
-            let number = prs
-                .first()
-                .and_then(|pr| pr["number"].as_u64())
-                .ok_or_else(|| {
-                    CubeError::InvalidArgument(format!(
-                        "no open PR found for branch `{b}`; create a PR with `cube pr ensure` first"
-                    ))
-                })?;
+                .map_err(|e| CubeError::InvalidArgument(format!("failed to look up open PR for branch `{b}`: {e}")))?;
+            let prs: Vec<serde_json::Value> = serde_json::from_str(&list_json).map_err(|e| {
+                CubeError::InvalidArgument(format!("unexpected response from `gh pr list` for branch `{b}`: {e}"))
+            })?;
+            let number = prs.first().and_then(|pr| pr["number"].as_u64()).ok_or_else(|| {
+                CubeError::InvalidArgument(format!(
+                    "no open PR found for branch `{b}`; create a PR with `cube pr ensure` first"
+                ))
+            })?;
             Ok((number, b.to_string()))
         }
 
@@ -2947,9 +2714,7 @@ fn resolve_pr_push_target(
                         r#"bookmarks.map(|b| b.name()).join("\n")"#,
                     ],
                 ))
-                .map_err(|e| {
-                    CubeError::InvalidArgument(format!("failed to infer PR from ancestry: {e}"))
-                })?;
+                .map_err(|e| CubeError::InvalidArgument(format!("failed to infer PR from ancestry: {e}")))?;
 
             if infer_out.trim().is_empty() {
                 return Err(CubeError::InvalidArgument(
@@ -2991,12 +2756,7 @@ fn resolve_pr_push_target(
 }
 
 /// Verify the PR identified by `pr_number` is open on GitHub; error if merged/closed.
-fn check_pr_open(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    owner_repo: &str,
-    pr_number: u64,
-) -> Result<()> {
+fn check_pr_open(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, pr_number: u64) -> Result<()> {
     let state_json = runner
         .run(&RealCommandRunner::invocation(
             cwd,
@@ -3011,16 +2771,9 @@ fn check_pr_open(
                 "state",
             ],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to check state of PR #{pr_number}: {e}"
-            ))
-        })?;
-    let state: serde_json::Value = serde_json::from_str(&state_json).map_err(|e| {
-        CubeError::InvalidArgument(format!(
-            "unexpected response from `gh pr view {pr_number}`: {e}"
-        ))
-    })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to check state of PR #{pr_number}: {e}")))?;
+    let state: serde_json::Value = serde_json::from_str(&state_json)
+        .map_err(|e| CubeError::InvalidArgument(format!("unexpected response from `gh pr view {pr_number}`: {e}")))?;
     let state_str = state["state"].as_str().unwrap_or("UNKNOWN");
     if state_str != "OPEN" {
         return Err(CubeError::InvalidArgument(format!(
@@ -3032,12 +2785,7 @@ fn check_pr_open(
 }
 
 /// Fetch the current head SHA of `branch` from GitHub (authoritative source).
-fn fetch_github_sha(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    owner_repo: &str,
-    branch: &str,
-) -> Result<String> {
+fn fetch_github_sha(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, branch: &str) -> Result<String> {
     let api_path = format!("repos/{owner_repo}/branches/{branch}");
     runner
         .run(&RealCommandRunner::invocation(
@@ -3045,42 +2793,25 @@ fn fetch_github_sha(
             "gh",
             &["api", &api_path, "--jq", ".commit.sha"],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to fetch GitHub head sha for `{branch}`: {e}"
-            ))
-        })
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to fetch GitHub head sha for `{branch}`: {e}")))
 }
 
 /// Advance `head_branch` and `pr_bm` bookmarks to `@`.
-fn advance_pr_bookmarks(
-    runner: &dyn CommandRunner,
-    cwd: &Path,
-    head_branch: &str,
-    pr_bm: &str,
-) -> Result<()> {
+fn advance_pr_bookmarks(runner: &dyn CommandRunner, cwd: &Path, head_branch: &str, pr_bm: &str) -> Result<()> {
     runner
         .run(&RealCommandRunner::invocation(
             cwd,
             "jj",
             &["bookmark", "set", head_branch, "-r", "@"],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to advance `{head_branch}` bookmark to @: {e}"
-            ))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{head_branch}` bookmark to @: {e}")))?;
     runner
         .run(&RealCommandRunner::invocation(
             cwd,
             "jj",
             &["bookmark", "set", pr_bm, "-r", "@"],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to advance `{pr_bm}` bookmark to @: {e}"
-            ))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to advance `{pr_bm}` bookmark to @: {e}")))?;
     Ok(())
 }
 
@@ -3101,12 +2832,13 @@ fn next_workspace_id(prefix: &str, existing: &[String]) -> String {
     let mut found_any = false;
     for id in existing {
         if let Some(suffix) = id.strip_prefix(prefix)
-            && let Ok(n) = suffix.parse::<u32>() {
-                found_any = true;
-                if n > max_n {
-                    max_n = n;
-                }
+            && let Ok(n) = suffix.parse::<u32>()
+        {
+            found_any = true;
+            if n > max_n {
+                max_n = n;
             }
+        }
     }
     let next = if found_any { max_n + 1 } else { 1 };
     format!("{prefix}{next:03}")
@@ -3134,9 +2866,7 @@ fn auto_create_workspace(
     // become a "broken-empty" husk (issue #845 part 2a). The repo lock is held
     // across the whole lease, so the staging name can't race a concurrent
     // create for this repo; clear any leftover from a prior interrupted run.
-    let staging_path = repo_record
-        .workspace_root
-        .join(format!(".incoming-{workspace_id}"));
+    let staging_path = repo_record.workspace_root.join(format!(".incoming-{workspace_id}"));
     if staging_path.exists() {
         fs::remove_dir_all(&staging_path).map_err(|source| CubeError::WorkspaceDirRemove {
             path: staging_path.clone(),
@@ -3173,12 +2903,7 @@ fn auto_create_workspace(
         // source rather than GitHub. Add the real upstream as the `github` remote
         // and track the integration branch there so workers always branch from the
         // current GitHub head, not the mirror snapshot.
-        add_github_remote_and_track(
-            runner,
-            &staging_path,
-            &repo_record.origin,
-            &repo_record.main_branch,
-        )?;
+        add_github_remote_and_track(runner, &staging_path, &repo_record.origin, &repo_record.main_branch)?;
     } else {
         // Cloned directly from GitHub: `origin` IS the upstream — track the
         // integration branch on it as usual.
@@ -3305,10 +3030,7 @@ fn discover_workspaces(repo: &RepoRecord) -> Result<Vec<crate::metadata::Workspa
     Ok(candidates)
 }
 
-fn find_workspace_record(
-    store: &mut Store,
-    workspace_path: &Path,
-) -> Result<Option<crate::metadata::WorkspaceRecord>> {
+fn find_workspace_record(store: &mut Store, workspace_path: &Path) -> Result<Option<crate::metadata::WorkspaceRecord>> {
     if let Some(record) = store.get_workspace_by_path(workspace_path)? {
         if workspace_path_exists(&record) {
             return Ok(Some(record));
@@ -3479,8 +3201,15 @@ fn gc_collect_closed_pr_bookmarks(
                 workspace_path,
                 "gh",
                 &[
-                    "pr", "view", pr_num, "-R", &owner_repo,
-                    "--json", "state", "--jq", ".state",
+                    "pr",
+                    "view",
+                    pr_num,
+                    "-R",
+                    &owner_repo,
+                    "--json",
+                    "state",
+                    "--jq",
+                    ".state",
                 ],
             )) {
                 Ok(out) => out,
@@ -3495,11 +3224,7 @@ fn gc_collect_closed_pr_bookmarks(
 /// bookmarks across all free workspaces, at most once per 24 hours.
 /// The timestamp is written BEFORE the thread is spawned so concurrent lease
 /// calls within the same window skip redundant gc triggers.
-fn maybe_trigger_pool_gc(
-    store: &mut Store,
-    database_path: Option<&Path>,
-    now_epoch_s: i64,
-) -> Result<()> {
+fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
     let last_gc = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)?;
     let should_trigger = match last_gc {
         None => true,
@@ -3540,23 +3265,12 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
         if !workspace_path_exists(record) {
             continue;
         }
-        if let Err(e) = gc_workspace_bookmarks(
-            &runner,
-            database_path.as_deref(),
-            &record.workspace_path,
-            true,
-            false,
-        ) {
-            eprintln!(
-                "cube: auto gc: {}: {e}",
-                record.workspace_id,
-            );
+        if let Err(e) = gc_workspace_bookmarks(&runner, database_path.as_deref(), &record.workspace_path, true, false) {
+            eprintln!("cube: auto gc: {}: {e}", record.workspace_id,);
         }
     }
 
-    let gc_config = config::load_config()
-        .unwrap_or_default()
-        .unhealthy_gc;
+    let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
         gc_aged_unhealthy_workspaces(&runner, &store, database_path.as_deref(), now, max_age_secs);
@@ -3637,22 +3351,11 @@ fn gc_aged_unhealthy_workspaces(
             }
         };
 
-        let prior_health = record
-            .health_status
-            .map(|h| h.as_str())
-            .unwrap_or("unknown");
+        let prior_health = record.health_status.map(|h| h.as_str()).unwrap_or("unknown");
         let age_secs = now_epoch_s.saturating_sub(unhealthy_since);
 
-        if let Err(e) = reset_workspace(
-            runner,
-            database_path,
-            &record.workspace_path,
-            &main_branch,
-        ) {
-            eprintln!(
-                "cube: unhealthy gc: {}: reset failed: {e}",
-                record.workspace_id,
-            );
+        if let Err(e) = reset_workspace(runner, database_path, &record.workspace_path, &main_branch) {
+            eprintln!("cube: unhealthy gc: {}: reset failed: {e}", record.workspace_id,);
             continue;
         }
 
@@ -3710,11 +3413,10 @@ fn gc_stale_workspace_logs(store: &Store) {
         }
     };
     let active_workspaces = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
-        Ok(w) => {
-            w.iter()
-                .map(|r| r.workspace_id.clone())
-                .collect::<std::collections::HashSet<_>>()
-        }
+        Ok(w) => w
+            .iter()
+            .map(|r| r.workspace_id.clone())
+            .collect::<std::collections::HashSet<_>>(),
         Err(e) => {
             eprintln!("cube: workspace logs gc: failed to list workspaces: {e}");
             return;
@@ -3730,12 +3432,10 @@ fn gc_stale_workspace_logs(store: &Store) {
             None => continue,
         };
         if !active_workspaces.contains(&workspace_id)
-            && let Err(e) = fs::remove_dir_all(&path) {
-                eprintln!(
-                    "cube: workspace logs gc: failed to remove {}: {e}",
-                    path.display()
-                );
-            }
+            && let Err(e) = fs::remove_dir_all(&path)
+        {
+            eprintln!("cube: workspace logs gc: failed to remove {}: {e}", path.display());
+        }
     }
 }
 
@@ -3892,19 +3592,14 @@ fn resume_workspace_on_pr(
     prior_expired: Option<&crate::store::ExpiredLease>,
     main_branch: &str,
 ) -> Result<PrResumeInfo> {
-    let (github_remote, owner_repo) =
-        resolve_github_remote_for_workspace(runner, database_path, workspace_path)?;
+    let (github_remote, owner_repo) = resolve_github_remote_for_workspace(runner, database_path, workspace_path)?;
 
     // Fetch from the GitHub remote — load-bearing for the cold path where the
     // PR branch has never been fetched into this workspace.
     run_jj(
         runner,
         database_path,
-        &RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &["git", "fetch", "--remote", &github_remote],
-        ),
+        &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch", "--remote", &github_remote]),
     )?;
 
     // Guard: if this workspace was reclaimed from an expired lease, refuse to
@@ -3930,10 +3625,7 @@ fn resume_workspace_on_pr(
             return Err(CubeError::LeaseExpiredWorkspaceDirty {
                 workspace_path: workspace_path.to_path_buf(),
                 prior_lease_id: prior.lease_id.clone(),
-                prior_holder: prior
-                    .holder
-                    .clone()
-                    .unwrap_or_else(|| "<unknown>".to_string()),
+                prior_holder: prior.holder.clone().unwrap_or_else(|| "<unknown>".to_string()),
             });
         }
     }
@@ -3954,18 +3646,11 @@ fn resume_workspace_on_pr(
                 "headRefName,headRefOid,state",
             ],
         ))
-        .map_err(|e| {
-            CubeError::InvalidArgument(format!(
-                "failed to resolve PR {pr_number} in {owner_repo}: {e}"
-            ))
-        })?;
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {pr_number} in {owner_repo}: {e}")))?;
 
     let pr_info: serde_json::Value = serde_json::from_str(&pr_json)?;
 
-    let state = pr_info
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or("UNKNOWN");
+    let state = pr_info.get("state").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
     if state == "MERGED" || state == "CLOSED" {
         return Err(CubeError::InvalidArgument(format!(
             "PR {pr_number} ({owner_repo}) is {state} — cannot resume on a non-open PR. \
@@ -3993,11 +3678,7 @@ fn resume_workspace_on_pr(
     run_jj(
         runner,
         database_path,
-        &RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &["bookmark", "set", &pr_bm, "-r", &remote_ref],
-        ),
+        &RealCommandRunner::invocation(workspace_path, "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref]),
     )?;
 
     // Re-establish the local head-branch bookmark pointing at the fetched ref
@@ -4008,14 +3689,7 @@ fn resume_workspace_on_pr(
         &RealCommandRunner::invocation(
             workspace_path,
             "jj",
-            &[
-                "bookmark",
-                "set",
-                &head_branch,
-                "-r",
-                &remote_ref,
-                "--allow-backwards",
-            ],
+            &["bookmark", "set", &head_branch, "-r", &remote_ref, "--allow-backwards"],
         ),
     )?;
 
@@ -4026,10 +3700,7 @@ fn resume_workspace_on_pr(
         &RealCommandRunner::invocation(workspace_path, "jj", &["new", &pr_bm]),
     )?;
 
-    Ok(PrResumeInfo {
-        pr_number,
-        head_branch,
-    })
+    Ok(PrResumeInfo { pr_number, head_branch })
 }
 
 /// Variant of [`reset_workspace`] that refuses to run the destructive
@@ -4079,10 +3750,7 @@ fn reset_workspace_guarded(
             return Err(CubeError::LeaseExpiredWorkspaceDirty {
                 workspace_path: workspace_path.to_path_buf(),
                 prior_lease_id: prior.lease_id.clone(),
-                prior_holder: prior
-                    .holder
-                    .clone()
-                    .unwrap_or_else(|| "<unknown>".to_string()),
+                prior_holder: prior.holder.clone().unwrap_or_else(|| "<unknown>".to_string()),
             });
         }
     }
@@ -4093,7 +3761,14 @@ fn reset_workspace_guarded(
     // detection (rather than a `has_source` proxy) means the correct remote is
     // found even when the source mirror is later GC'd after provisioning.
     let upstream_remote = detect_upstream_tracking_remote(runner, database_path, workspace_path);
-    fast_forward_default_branch_to_origin(runner, database_path, workspace_path, main_branch, prior_expired, &upstream_remote)?;
+    fast_forward_default_branch_to_origin(
+        runner,
+        database_path,
+        workspace_path,
+        main_branch,
+        prior_expired,
+        &upstream_remote,
+    )?;
 
     audit_jj_op(database_path, workspace_path, "new", &[main_branch], prior_expired);
     run_jj(
@@ -4116,8 +3791,7 @@ fn detect_upstream_tracking_remote(
     database_path: Option<&Path>,
     workspace_path: &Path,
 ) -> String {
-    let invocation =
-        RealCommandRunner::invocation(workspace_path, "jj", &["git", "remote", "list"]);
+    let invocation = RealCommandRunner::invocation(workspace_path, "jj", &["git", "remote", "list"]);
     let remote_output = run_jj(runner, database_path, &invocation).unwrap_or_default();
     if let Some((name, _)) = parse_github_remote(&remote_output) {
         return name;
@@ -4429,11 +4103,7 @@ fn read_head_status(
 /// surfaces a clear `NoAvailableWorkspace` error naming the broken
 /// workspace path instead of the raw jj message. Other failures and
 /// non-`jj` invocations pass through untouched.
-fn run_jj(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    invocation: &CommandInvocation,
-) -> Result<String> {
+fn run_jj(runner: &dyn CommandRunner, database_path: Option<&Path>, invocation: &CommandInvocation) -> Result<String> {
     match runner.run(invocation) {
         Ok(out) => Ok(out),
         Err(err) => {
@@ -4443,11 +4113,7 @@ fn run_jj(
                     "cube: initialised jj on existing git workspace {}",
                     invocation.cwd.display()
                 );
-                let init = RealCommandRunner::invocation(
-                    &invocation.cwd,
-                    "jj",
-                    &["git", "init", "--colocate"],
-                );
+                let init = RealCommandRunner::invocation(&invocation.cwd, "jj", &["git", "init", "--colocate"]);
                 if runner.run(&init).is_err() {
                     return Err(err);
                 }
@@ -4486,11 +4152,7 @@ fn run_jj(
                     invocation.cwd.display()
                 );
             }
-            let update_stale = RealCommandRunner::invocation(
-                &invocation.cwd,
-                "jj",
-                &["workspace", "update-stale"],
-            );
+            let update_stale = RealCommandRunner::invocation(&invocation.cwd, "jj", &["workspace", "update-stale"]);
             if let Err(update_err) = runner.run(&update_stale) {
                 return Err(CubeError::StaleRecoveryFailed {
                     workspace_path: invocation.cwd.clone(),
@@ -4544,9 +4206,7 @@ fn jj_workspace_broken_empty(err: &CubeError, cwd: &Path) -> bool {
         return false;
     }
     let lower = stderr.to_lowercase();
-    lower.contains(JJ_NO_JJ_REPO_SIGNATURE)
-        && !cwd.join(".jj").is_dir()
-        && !cwd.join(".git").is_dir()
+    lower.contains(JJ_NO_JJ_REPO_SIGNATURE) && !cwd.join(".jj").is_dir() && !cwd.join(".git").is_dir()
 }
 
 /// Returns the audit event name if the error is one that `jj workspace
@@ -4567,7 +4227,6 @@ fn jj_update_stale_recovery_kind(err: &CubeError) -> Option<&'static str> {
     }
     None
 }
-
 
 fn current_workspace_commit(
     runner: &dyn CommandRunner,
@@ -4613,21 +4272,14 @@ fn current_change_identity(
             ],
         },
     )?;
-    let mut lines = output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
+    let mut lines = output.lines().map(str::trim).filter(|line| !line.is_empty());
     let jj_change_id = lines
         .next()
-        .ok_or_else(|| {
-            CubeError::InvalidArgument("jj change query did not return a change id".to_string())
-        })?
+        .ok_or_else(|| CubeError::InvalidArgument("jj change query did not return a change id".to_string()))?
         .to_string();
     let head_commit = lines
         .next()
-        .ok_or_else(|| {
-            CubeError::InvalidArgument("jj change query did not return a head commit".to_string())
-        })?
+        .ok_or_else(|| CubeError::InvalidArgument("jj change query did not return a head commit".to_string()))?
         .to_string();
     Ok(ChangeIdentity {
         jj_change_id,
@@ -4868,24 +4520,15 @@ fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
         .iter()
         .map(|r| format!("{}/{}", r.repo, r.workspace_id))
         .collect();
-    let paths: Vec<String> = records
-        .iter()
-        .map(|r| abbreviate_path(&r.workspace_path))
-        .collect();
+    let paths: Vec<String> = records.iter().map(|r| abbreviate_path(&r.workspace_path)).collect();
     let effective_states: Vec<String> = records.iter().map(effective_state_display).collect();
     let name_w = names.iter().map(|s| s.len()).max().unwrap_or(0);
-    let state_w = effective_states
-        .iter()
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(0);
+    let state_w = effective_states.iter().map(|s| s.len()).max().unwrap_or(0);
 
     let label_w = "holder".len();
     let dim = Style::new().dim();
     let mut lines = Vec::with_capacity(records.len());
-    for (((record, name), path), eff_state) in
-        records.iter().zip(&names).zip(&paths).zip(&effective_states)
-    {
+    for (((record, name), path), eff_state) in records.iter().zip(&names).zip(&paths).zip(&effective_states) {
         let name_pad = format!("{name:<name_w$}");
         let state_pad = format!("{eff_state:<state_w$}");
         let state_styled = match record.state {
@@ -4943,11 +4586,7 @@ fn human_workspace_detail(record: &crate::metadata::WorkspaceRecord, jj_status: 
         format!("{} {}", dim.apply_to("state:"), style_state(record.state),),
     ];
     if let Some(lease_id) = &record.lease_id {
-        lines.push(format!(
-            "{} {}",
-            dim.apply_to("lease_id:"),
-            dim.apply_to(lease_id),
-        ));
+        lines.push(format!("{} {}", dim.apply_to("lease_id:"), dim.apply_to(lease_id),));
     }
     if let Some(holder) = &record.holder {
         lines.push(format!("{} {holder}", dim.apply_to("holder:")));
@@ -5008,9 +4647,7 @@ fn resolve_release_lease(
         return Ok(lease);
     }
     let workspace_id = workspace.ok_or_else(|| {
-        CubeError::InvalidArgument(
-            "release requires a workspace id positional or --lease".to_string(),
-        )
+        CubeError::InvalidArgument("release requires a workspace id positional or --lease".to_string())
     })?;
     let matches = store.list_workspaces_filtered(&WorkspaceListFilter {
         repo: repo.as_deref(),
@@ -5026,11 +4663,7 @@ fn resolve_release_lease(
             ))
         }),
         many => {
-            let repos = many
-                .iter()
-                .map(|r| r.repo.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let repos = many.iter().map(|r| r.repo.as_str()).collect::<Vec<_>>().join(", ");
             Err(CubeError::InvalidArgument(format!(
                 "workspace id `{workspace_id}` matches multiple repos ({repos}); disambiguate with --repo"
             )))
@@ -5101,11 +4734,7 @@ fn format_repo_list(records: &[RepoRecord]) -> String {
 fn human_repo_detail(record: &RepoRecord) -> String {
     let dim = Style::new().dim();
     let mut lines = vec![
-        format!(
-            "{} {}",
-            dim.apply_to("repo:"),
-            style(&record.repo).cyan().bold(),
-        ),
+        format!("{} {}", dim.apply_to("repo:"), style(&record.repo).cyan().bold(),),
         format!("{} {}", dim.apply_to("origin:"), record.origin),
         format!("{} {}", dim.apply_to("main_branch:"), record.main_branch),
         format!(
@@ -5113,18 +4742,10 @@ fn human_repo_detail(record: &RepoRecord) -> String {
             dim.apply_to("workspace_root:"),
             abbreviate_path(&record.workspace_root),
         ),
-        format!(
-            "{} {}",
-            dim.apply_to("workspace_prefix:"),
-            record.workspace_prefix,
-        ),
+        format!("{} {}", dim.apply_to("workspace_prefix:"), record.workspace_prefix,),
     ];
     if let Some(source) = &record.source {
-        lines.push(format!(
-            "{} {}",
-            dim.apply_to("source:"),
-            abbreviate_path(source),
-        ));
+        lines.push(format!("{} {}", dim.apply_to("source:"), abbreviate_path(source),));
     }
     lines.join("\n")
 }
@@ -5149,18 +4770,10 @@ fn human_change_detail(record: &ChangeRecord) -> String {
             dim.apply_to("jj_change_id:"),
             dim.apply_to(&record.jj_change_id),
         ),
-        format!(
-            "{} {}",
-            dim.apply_to("head_commit:"),
-            dim.apply_to(&record.head_commit),
-        ),
+        format!("{} {}", dim.apply_to("head_commit:"), dim.apply_to(&record.head_commit),),
     ];
     if let Some(parent_change_id) = &record.parent_change_id {
-        lines.push(format!(
-            "{} {}",
-            dim.apply_to("parent_change_id:"),
-            parent_change_id,
-        ));
+        lines.push(format!("{} {}", dim.apply_to("parent_change_id:"), parent_change_id,));
     }
     lines.push(format!(
         "{} {}",
@@ -5186,10 +4799,10 @@ mod tests {
     use crate::command_runner::{CommandInvocation, CommandRunner};
 
     use super::{
-        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY,
-        RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded,
-        gc_aged_unhealthy_workspaces, is_stdin_path, render_boss_infra_exclude_block,
-        resolve_body_file, run_with_context, run_with_dependencies, upsert_managed_exclude,
+        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
+        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_stdin_path,
+        render_boss_infra_exclude_block, resolve_body_file, run_with_context, run_with_dependencies,
+        upsert_managed_exclude,
     };
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
@@ -5210,8 +4823,8 @@ mod tests {
         let (_tempdir, database_path) = with_database_path();
 
         let cli = Cli::parse_from(["cube", "repo", "list"]);
-        let result = run_with_dependencies(cli, Some(&database_path), &FakeRunner::default())
-            .expect("repo list should succeed");
+        let result =
+            run_with_dependencies(cli, Some(&database_path), &FakeRunner::default()).expect("repo list should succeed");
 
         assert_eq!(result.message, "No repos configured.");
         assert_eq!(result.payload["repos"], json!([]));
@@ -5239,24 +4852,20 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@github.com:spinyfin/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: Some(defaults.repo_root.join("mono")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@github.com:spinyfin/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("mono")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
         let result = run_with_context(
             ensure,
             Some(&database_path),
@@ -5288,23 +4897,21 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@github.com:spinyfin/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: Some(source_path.clone()),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@github.com:spinyfin/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: Some(source_path.clone()),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ls_remote_symref(
-                defaults.repo_root.clone(),
-                "git@github.com:spinyfin/mono.git",
-                "main",
-            ),
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), "git@github.com:spinyfin/mono.git", "main"),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -5318,12 +4925,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5331,21 +4933,11 @@ mod tests {
             ),
         ]);
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
-        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
-            .expect("ensure");
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None).expect("ensure");
 
         assert_eq!(result.message, "Ensured repo `mono`.");
-        assert_eq!(
-            result.payload["repo"]["source"],
-            source_path.display().to_string()
-        );
+        assert_eq!(result.payload["repo"]["source"], source_path.display().to_string());
         runner.assert_exhausted();
     }
 
@@ -5355,11 +4947,7 @@ mod tests {
         let defaults = repo_ensure_defaults(&tempdir);
         let source_path = defaults.repo_root.join("mono");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ls_remote_symref(
-                defaults.repo_root.clone(),
-                "git@github.com:spinyfin/mono.git",
-                "main",
-            ),
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), "git@github.com:spinyfin/mono.git", "main"),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -5373,12 +4961,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5386,15 +4969,8 @@ mod tests {
             ),
         ]);
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
-        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
-            .expect("ensure");
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None).expect("ensure");
 
         assert_eq!(result.message, "Ensured repo `mono`.");
         assert_eq!(result.payload["repo_id"], "mono");
@@ -5403,19 +4979,12 @@ mod tests {
             result.payload["repo"]["workspace_root"],
             defaults.workspace_root.display().to_string()
         );
-        assert_eq!(
-            result.payload["repo"]["source"],
-            source_path.display().to_string()
-        );
+        assert_eq!(result.payload["repo"]["source"], source_path.display().to_string());
         assert!(defaults.workspace_root.is_dir());
         runner.assert_exhausted();
     }
 
-    fn resolver_config(
-        name: &str,
-        origin_pattern: &str,
-        clone_command: Option<&str>,
-    ) -> crate::config::CubeConfig {
+    fn resolver_config(name: &str, origin_pattern: &str, clone_command: Option<&str>) -> crate::config::CubeConfig {
         crate::config::CubeConfig {
             repo_resolvers: vec![crate::config::RepoResolver {
                 name: name.to_string(),
@@ -5435,19 +5004,9 @@ mod tests {
         // "true" stands in for `mint` — it exists on PATH so the which-check
         // passes. The clone command is the {name}-substituted resolver string.
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                defaults.repo_root.clone(),
-                "true",
-                &["clone", "frontend-api"],
-                "",
-            )
-            .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["git", "init", "--colocate"],
-                "",
-            ),
+            ExpectedCommand::ok(defaults.repo_root.clone(), "true", &["clone", "frontend-api"], "")
+                .creating_dir(source_path.clone()),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["git", "init", "--colocate"], ""),
             // This LinkedIn repo's default branch is `master`, so detection
             // must record `main_branch = "master"` rather than the old default.
             ExpectedCommand::ls_remote_symref(
@@ -5477,10 +5036,7 @@ mod tests {
             result.payload["repo"]["origin"],
             "org-127256988@github.com:linkedin-multiproduct/frontend-api.git"
         );
-        assert_eq!(
-            result.payload["repo"]["clone_command"],
-            "true clone frontend-api"
-        );
+        assert_eq!(result.payload["repo"]["clone_command"], "true clone frontend-api");
         assert_eq!(result.payload["repo"]["main_branch"], "master");
         runner.assert_exhausted();
     }
@@ -5501,12 +5057,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5543,15 +5094,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@github.com:spinyfin/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: Some(defaults.repo_root.join("mono")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@github.com:spinyfin/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("mono")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         // A resolver is configured, but the slug match (step 1) wins first, so
@@ -5571,10 +5124,7 @@ mod tests {
         .expect("ensure");
 
         assert_eq!(result.message, "Ensured repo `mono`.");
-        assert_eq!(
-            result.payload["repo"]["origin"],
-            "git@github.com:spinyfin/mono.git"
-        );
+        assert_eq!(result.payload["repo"]["origin"], "git@github.com:spinyfin/mono.git");
     }
 
     #[test]
@@ -5593,12 +5143,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5645,17 +5190,8 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::no_such_remote_bookmark(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-            ),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-                "",
-            ),
+            ExpectedCommand::no_such_remote_bookmark(source_path.clone(), "jj", &["bookmark", "track", "main@origin"]),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "master@origin"], ""),
         ]);
 
         let ensure = Cli::parse_from(["cube", "repo", "ensure", "spinyfin/legacy"]);
@@ -5693,22 +5229,13 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::no_such_remote_bookmark(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-            ),
+            ExpectedCommand::no_such_remote_bookmark(source_path.clone(), "jj", &["bookmark", "track", "main@origin"]),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
                 &["bookmark", "track", "master@origin"],
             ),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "develop@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "develop@origin"], ""),
         ]);
 
         let ensure = Cli::parse_from(["cube", "repo", "ensure", "spinyfin/trunkish"]);
@@ -5761,12 +5288,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5792,19 +5314,13 @@ mod tests {
     fn parse_symref_default_branch_reads_head_symref() {
         let out = "ref: refs/heads/master\tHEAD\n\
                    0123456789abcdef0123456789abcdef01234567\tHEAD";
-        assert_eq!(
-            super::parse_symref_default_branch(out),
-            Some("master".to_string())
-        );
+        assert_eq!(super::parse_symref_default_branch(out), Some("master".to_string()));
     }
 
     #[test]
     fn parse_symref_default_branch_handles_nonconventional_name() {
         let out = "ref: refs/heads/develop\tHEAD\ndeadbeef\tHEAD";
-        assert_eq!(
-            super::parse_symref_default_branch(out),
-            Some("develop".to_string())
-        );
+        assert_eq!(super::parse_symref_default_branch(out), Some("develop".to_string()));
     }
 
     #[test]
@@ -5836,10 +5352,7 @@ mod tests {
             "https://github.com/spinyfin/mono"
         );
         // Bare single-segment names are not slugs, pass through.
-        assert_eq!(
-            super::normalize_origin("mono").unwrap(),
-            "mono"
-        );
+        assert_eq!(super::normalize_origin("mono").unwrap(), "mono");
     }
 
     #[test]
@@ -5852,11 +5365,7 @@ mod tests {
         let expanded_origin = "git@github.com:brianduff/flunge.git";
 
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ls_remote_symref(
-                defaults.repo_root.clone(),
-                expanded_origin,
-                "main",
-            ),
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), expanded_origin, "main"),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -5870,12 +5379,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5883,16 +5387,9 @@ mod tests {
             ),
         ]);
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "brianduff/flunge",
-        ]);
-        let result =
-            run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
-                .expect("ensure with owner/repo shorthand");
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "brianduff/flunge"]);
+        let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
+            .expect("ensure with owner/repo shorthand");
 
         assert_eq!(result.message, "Ensured repo `flunge`.");
         assert_eq!(result.payload["repo"]["origin"], expanded_origin);
@@ -5913,33 +5410,28 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@github.com:spinyfin/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: Some(source_path.clone()),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@github.com:spinyfin/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: Some(source_path.clone()),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         // Patch the stored record to set source=null, simulating the degenerate state.
         {
             let conn = rusqlite::Connection::open(&database_path).expect("db conn");
-            conn.execute(
-                "UPDATE repos SET source_path = NULL WHERE repo = 'mono'",
-                [],
-            )
-            .expect("patch source to null");
+            conn.execute("UPDATE repos SET source_path = NULL WHERE repo = 'mono'", [])
+                .expect("patch source to null");
         }
 
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ls_remote_symref(
-                defaults.repo_root.clone(),
-                "git@github.com:spinyfin/mono.git",
-                "main",
-            ),
+            ExpectedCommand::ls_remote_symref(defaults.repo_root.clone(), "git@github.com:spinyfin/mono.git", "main"),
             ExpectedCommand::ok(
                 defaults.repo_root.clone(),
                 "jj",
@@ -5953,12 +5445,7 @@ mod tests {
                 "",
             )
             .creating_dir(source_path.clone()),
-            ExpectedCommand::ok(
-                source_path.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-                "",
-            ),
+            ExpectedCommand::ok(source_path.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
             ExpectedCommand::no_such_remote_bookmark(
                 source_path.clone(),
                 "jj",
@@ -5966,21 +5453,12 @@ mod tests {
             ),
         ]);
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
         let result = run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
             .expect("ensure must heal source=null and clone");
 
         assert_eq!(result.message, "Ensured repo `mono`.");
-        assert_eq!(
-            result.payload["repo"]["source"],
-            source_path.display().to_string()
-        );
+        assert_eq!(result.payload["repo"]["source"], source_path.display().to_string());
         runner.assert_exhausted();
     }
 
@@ -6000,15 +5478,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@github.com:spinyfin/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: Some(source_path.clone()),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@github.com:spinyfin/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: Some(source_path.clone()),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         // The runner must see a `jj git init --colocate` call.
@@ -6019,13 +5499,7 @@ mod tests {
             "",
         )]);
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
         run_with_context(ensure, Some(&database_path), &runner, Some(&defaults), None)
             .expect("ensure must colocate-init an existing git repo");
 
@@ -6097,15 +5571,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "bduff".to_string(),
-                origin: "git@github.com:linkedin-sandbox/bduff.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "bduff-agent-".to_string(),
-                source: Some(defaults.repo_root.join("bduff")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "bduff".to_string(),
+                    origin: "git@github.com:linkedin-sandbox/bduff.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "bduff-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("bduff")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let ensure = Cli::parse_from([
@@ -6137,15 +5613,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "bduff".to_string(),
-                origin: "org-132020694@github.com:linkedin-sandbox/bduff.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "bduff-agent-".to_string(),
-                source: Some(defaults.repo_root.join("bduff")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "bduff".to_string(),
+                    origin: "org-132020694@github.com:linkedin-sandbox/bduff.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "bduff-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("bduff")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let ensure = Cli::parse_from([
@@ -6178,15 +5656,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "ci-infra".to_string(),
-                origin: "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "ci-infra-agent-".to_string(),
-                source: Some(defaults.repo_root.join("ci-infra")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "ci-infra".to_string(),
+                    origin: "ssh://org-132020694@github.com/linkedin-eng/ci-infra.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "ci-infra-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("ci-infra")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let ensure = Cli::parse_from([
@@ -6219,15 +5699,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "ci-infra".to_string(),
-                origin: "git@github.com:linkedin-eng/ci-infra.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "ci-infra-agent-".to_string(),
-                source: Some(defaults.repo_root.join("ci-infra")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "ci-infra".to_string(),
+                    origin: "git@github.com:linkedin-eng/ci-infra.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "ci-infra-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("ci-infra")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let ensure = Cli::parse_from([
@@ -6259,15 +5741,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "bduff".to_string(),
-                origin: "git@github.com:linkedin-sandbox/bduff.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "bduff-agent-".to_string(),
-                source: Some(defaults.repo_root.join("bduff")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "bduff".to_string(),
+                    origin: "git@github.com:linkedin-sandbox/bduff.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "bduff-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("bduff")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let ensure = Cli::parse_from([
@@ -6306,24 +5790,20 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "dev-infra".to_string(),
-                origin: "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "dev-infra-agent-".to_string(),
-                source: Some(defaults.repo_root.join("dev-infra")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "dev-infra".to_string(),
+                    origin: "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "dev-infra-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("dev-infra")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "linkedin-multiproduct/dev-infra",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "linkedin-multiproduct/dev-infra"]);
         let result = run_with_context(
             ensure,
             Some(&database_path),
@@ -6353,24 +5833,20 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "dev-infra".to_string(),
-                origin: "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: defaults.workspace_root.clone(),
-                workspace_prefix: "dev-infra-agent-".to_string(),
-                source: Some(defaults.repo_root.join("dev-infra")),
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "dev-infra".to_string(),
+                    origin: "ssh://org-127256988@github.com/linkedin-multiproduct/dev-infra.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: defaults.workspace_root.clone(),
+                    workspace_prefix: "dev-infra-agent-".to_string(),
+                    source: Some(defaults.repo_root.join("dev-infra")),
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "some-other-org/dev-infra",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "some-other-org/dev-infra"]);
         let err = run_with_context(
             ensure,
             Some(&database_path),
@@ -6407,10 +5883,25 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 first_path.clone(),
@@ -6420,20 +5911,10 @@ mod tests {
             ),
         ]);
 
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         assert_eq!(
             result.payload["workspace"]["workspace_path"],
             first_path.display().to_string()
@@ -6482,9 +5963,19 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
             ExpectedCommand::revision_doesnt_exist(
                 first_path.clone(),
                 "jj",
@@ -6533,20 +6024,21 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6556,20 +6048,10 @@ mod tests {
             ),
         ]);
 
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "auto-create demo",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "auto-create demo"]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-001"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
         assert_eq!(result.payload["workspace"]["state"], "leased");
         assert_eq!(result.payload["workspace"]["task"], "auto-create demo");
         assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
@@ -6596,15 +6078,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "legacy".to_string(),
-                origin: "git@github.com:spinyfin/legacy.git".to_string(),
-                main_branch: "master".to_string(),
-                workspace_root: workspace_root.clone(),
-                workspace_prefix: "legacy-agent-".to_string(),
-                source: None,
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "legacy".to_string(),
+                    origin: "git@github.com:spinyfin/legacy.git".to_string(),
+                    main_branch: "master".to_string(),
+                    workspace_root: workspace_root.clone(),
+                    workspace_prefix: "legacy-agent-".to_string(),
+                    source: None,
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let new_path = workspace_root.join("legacy-agent-001");
@@ -6623,20 +6107,21 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "main@origin"]),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "master@origin"], ""),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/legacy.git\n",
             ),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "master@origin"],
+                &["bookmark", "set", "master", "-r", "master@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/legacy.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "master", "-r", "master@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "master"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6656,10 +6141,7 @@ mod tests {
         ]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "legacy-agent-001"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "legacy-agent-001");
         assert_eq!(result.payload["workspace"]["state"], "leased");
         runner.assert_exhausted();
     }
@@ -6693,20 +6175,21 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6726,10 +6209,7 @@ mod tests {
         ]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-001"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-001");
         assert_eq!(result.payload["workspace"]["state"], "leased");
         runner.assert_exhausted();
     }
@@ -6772,20 +6252,21 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -6821,15 +6302,17 @@ mod tests {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "weird".to_string(),
-                origin: "git@github.com:spinyfin/weird.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: workspace_root.clone(),
-                workspace_prefix: "weird-agent-".to_string(),
-                source: None,
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "weird".to_string(),
+                    origin: "git@github.com:spinyfin/weird.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: workspace_root.clone(),
+                    workspace_prefix: "weird-agent-".to_string(),
+                    source: None,
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         let staging = workspace_root.join(".incoming-weird-agent-001");
@@ -6847,26 +6330,11 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "main@origin"],
-            ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "main@origin"]),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
         ]);
 
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "weird",
-            "--task",
-            "no default branch",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "weird", "--task", "no default branch"]);
         let err = run_with_dependencies(lease, Some(&database_path), &runner)
             .expect_err("lease should fail when neither default branch is present");
         match err {
@@ -6912,18 +6380,10 @@ mod tests {
             ExpectedCommand {
                 cwd: staging.clone(),
                 program: "jj".to_string(),
-                args: vec![
-                    "bookmark".to_string(),
-                    "track".to_string(),
-                    "main@origin".to_string(),
-                ],
+                args: vec!["bookmark".to_string(), "track".to_string(), "main@origin".to_string()],
                 result: Err(CubeError::CommandFailed {
                     program: "jj".to_string(),
-                    args: vec![
-                        "bookmark".to_string(),
-                        "track".to_string(),
-                        "main@origin".to_string(),
-                    ],
+                    args: vec!["bookmark".to_string(), "track".to_string(), "main@origin".to_string()],
                     status: Some(2),
                     stderr: "Error: Failed to load repo: some unrelated jj failure".to_string(),
                 }),
@@ -6966,10 +6426,25 @@ mod tests {
             (workspace_root.join("mono-agent-007"), "second"),
         ] {
             let runner = FakeRunner::new(vec![
-                ExpectedCommand::ok(path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+                ExpectedCommand::ok(
+                    path.clone(),
+                    "jj",
+                    &["status", "--no-pager"],
+                    "The working copy is clean",
+                ),
                 ExpectedCommand::ok(path.clone(), "jj", &["git", "fetch"], ""),
-                ExpectedCommand::ok(path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-                ExpectedCommand::ok(path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+                ExpectedCommand::ok(
+                    path.clone(),
+                    "jj",
+                    &["git", "remote", "list"],
+                    "origin\tgit@github.com:spinyfin/mono.git\n",
+                ),
+                ExpectedCommand::ok(
+                    path.clone(),
+                    "jj",
+                    &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                    "",
+                ),
                 ExpectedCommand::ok(path.clone(), "jj", &["new", "main"], ""),
                 ExpectedCommand::ok(
                     path.clone(),
@@ -6999,20 +6474,21 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -7024,19 +6500,13 @@ mod tests {
         let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "third"]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-008"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-008");
         runner.assert_exhausted();
     }
 
     #[test]
     fn next_workspace_id_picks_max_plus_one() {
-        assert_eq!(
-            super::next_workspace_id("mono-agent-", &[]),
-            "mono-agent-001"
-        );
+        assert_eq!(super::next_workspace_id("mono-agent-", &[]), "mono-agent-001");
         assert_eq!(
             super::next_workspace_id(
                 "mono-agent-",
@@ -7077,10 +6547,25 @@ mod tests {
 
         let preferred_path = workspace_root.join("mono-agent-005");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(preferred_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(preferred_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 preferred_path.clone(),
@@ -7102,10 +6587,7 @@ mod tests {
         ]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-005"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-005");
         assert_eq!(
             result.payload["workspace"]["workspace_path"],
             preferred_path.display().to_string()
@@ -7125,10 +6607,25 @@ mod tests {
         // First lease takes mono-agent-005 (the preferred one).
         let preferred_path = workspace_root.join("mono-agent-005");
         let first_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(preferred_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(preferred_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                preferred_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 preferred_path.clone(),
@@ -7147,17 +6644,31 @@ mod tests {
             "--prefer",
             "mono-agent-005",
         ]);
-        run_with_dependencies(first_lease, Some(&database_path), &first_runner)
-            .expect("first lease");
+        run_with_dependencies(first_lease, Some(&database_path), &first_runner).expect("first lease");
         first_runner.assert_exhausted();
 
         // Second lease prefers mono-agent-005 (leased), should fall back to mono-agent-004.
         let fallback_path = workspace_root.join("mono-agent-004");
         let second_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(fallback_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                fallback_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(fallback_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(fallback_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                fallback_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                fallback_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(fallback_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 fallback_path.clone(),
@@ -7176,13 +6687,9 @@ mod tests {
             "--prefer",
             "mono-agent-005",
         ]);
-        let result = run_with_dependencies(second_lease, Some(&database_path), &second_runner)
-            .expect("second lease");
+        let result = run_with_dependencies(second_lease, Some(&database_path), &second_runner).expect("second lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         second_runner.assert_exhausted();
     }
 
@@ -7197,10 +6704,25 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-004");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 first_path.clone(),
@@ -7222,10 +6744,7 @@ mod tests {
         ]);
         let result = run_with_dependencies(lease, Some(&database_path), &runner).expect("lease");
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         runner.assert_exhausted();
     }
 
@@ -7258,8 +6777,18 @@ mod tests {
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(first.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(first.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(first.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(first.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                first.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                first.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(first.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 first.clone(),
@@ -7304,8 +6833,18 @@ mod tests {
             // health-check 007 → clean → use
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 clean_path.clone(),
@@ -7336,10 +6875,7 @@ mod tests {
         // mono-agent-003 must be marked dirty in the store
         use crate::store::Store;
         let store = Store::open_at(&database_path).unwrap();
-        let ws = store
-            .get_workspace_by_path(&dirty_path)
-            .unwrap()
-            .unwrap();
+        let ws = store.get_workspace_by_path(&dirty_path).unwrap().unwrap();
         assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
     }
 
@@ -7351,8 +6887,7 @@ mod tests {
         // call is the head-commit read.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
         let dirty_path = workspace_root.join("mono-agent-005");
         std::fs::create_dir_all(dirty_path.join(".jj")).expect("dirty dir");
 
@@ -7436,8 +6971,7 @@ mod tests {
         // recovering worker is not routed away from the dirty tree.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7477,8 +7011,18 @@ mod tests {
         let first_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(busy_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(busy_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(busy_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(busy_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                busy_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                busy_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(busy_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 busy_path.clone(),
@@ -7531,32 +7075,69 @@ mod tests {
     ) -> FakeRunner {
         let github_remote = "github";
         let remote_list = format!("origin\t/local/mirror\n{github_remote}\tgit@github.com:spinyfin/mono.git\n");
-        let pr_json = format!(
-            r#"{{"headRefName":"{head_branch}","headRefOid":"deadbeef1234567890","state":"OPEN"}}"#
-        );
+        let pr_json = format!(r#"{{"headRefName":"{head_branch}","headRefOid":"deadbeef1234567890","state":"OPEN"}}"#);
         let remote_ref = format!("{head_branch}@{github_remote}");
         let pr_bm = format!("pr/{pr_number}");
         FakeRunner::new(vec![
             // Health check
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             // Resolve github remote
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], &remote_list),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["git", "remote", "list"],
+                &remote_list,
+            ),
             // Fetch from GitHub remote (--remote <github_remote>)
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch", "--remote", github_remote], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["git", "fetch", "--remote", github_remote],
+                "",
+            ),
             // Resolve PR head from gh
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "gh", &[
-                "pr", "view", &pr_number.to_string(),
-                "-R", "spinyfin/mono",
-                "--json", "headRefName,headRefOid,state",
-            ], &pr_json),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    &pr_number.to_string(),
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "headRefName,headRefOid,state",
+                ],
+                &pr_json,
+            ),
             // Set pr/<n> bookmark
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["bookmark", "set", &pr_bm, "-r", &remote_ref],
+                "",
+            ),
             // Set head-branch bookmark
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", head_branch, "-r", &remote_ref, "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["bookmark", "set", head_branch, "-r", &remote_ref, "--allow-backwards"],
+                "",
+            ),
             // Land on PR head
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", &pr_bm], ""),
             // Record head_commit
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"], head_commit),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                head_commit,
+            ),
         ])
     }
 
@@ -7567,8 +7148,7 @@ mod tests {
         // the same commands regardless (gh always consulted for reconciliation).
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7577,9 +7157,14 @@ mod tests {
 
         let result = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "resume PR 1364",
-                "--resume-pr", "1364",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "resume PR 1364",
+                "--resume-pr",
+                "1364",
             ]),
             Some(&database_path),
             &runner,
@@ -7600,8 +7185,7 @@ mod tests {
         // view` and creates the bookmark on the fetched ref.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7610,9 +7194,14 @@ mod tests {
 
         let result = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "resume cold PR 42",
-                "--resume-pr", "42",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "resume cold PR 42",
+                "--resume-pr",
+                "42",
             ]),
             Some(&database_path),
             &runner,
@@ -7631,10 +7220,8 @@ mod tests {
         // leased, then positioned on the PR head.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("ws-004 dir");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj"))
-            .expect("ws-007 dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("ws-004 dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-007").join(".jj")).expect("ws-007 dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7645,10 +7232,16 @@ mod tests {
 
         let result = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "resume PR 99 on preferred workspace",
-                "--prefer", "mono-agent-007",
-                "--resume-pr", "99",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "resume PR 99 on preferred workspace",
+                "--prefer",
+                "mono-agent-007",
+                "--resume-pr",
+                "99",
             ]),
             Some(&database_path),
             &runner,
@@ -7668,8 +7261,7 @@ mod tests {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         // Only mono-agent-004 exists; the preferred mono-agent-999 does not.
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7678,10 +7270,16 @@ mod tests {
 
         let result = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "resume with fallback",
-                "--prefer", "mono-agent-999",
-                "--resume-pr", "77",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "resume with fallback",
+                "--prefer",
+                "mono-agent-999",
+                "--resume-pr",
+                "77",
             ]),
             Some(&database_path),
             &runner,
@@ -7697,8 +7295,7 @@ mod tests {
     fn workspace_lease_resume_pr_hard_errors_on_merged_pr() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7706,21 +7303,40 @@ mod tests {
         let pr_json = r#"{"headRefName":"boss/exec_merged","headRefOid":"deadbeef","state":"MERGED"}"#;
         let remote_list = "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n";
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], remote_list),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
-            ExpectedCommand::ok(ws_path.clone(), "gh", &[
-                "pr", "view", "5",
-                "-R", "spinyfin/mono",
-                "--json", "headRefName,headRefOid,state",
-            ], pr_json),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    "5",
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "headRefName,headRefOid,state",
+                ],
+                pr_json,
+            ),
         ]);
 
         let err = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "attempt to resume merged PR",
-                "--resume-pr", "5",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "attempt to resume merged PR",
+                "--resume-pr",
+                "5",
             ]),
             Some(&database_path),
             &runner,
@@ -7737,8 +7353,7 @@ mod tests {
     fn workspace_lease_resume_pr_hard_errors_on_closed_pr() {
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7746,21 +7361,40 @@ mod tests {
         let pr_json = r#"{"headRefName":"boss/exec_closed","headRefOid":"cafebabe","state":"CLOSED"}"#;
         let remote_list = "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n";
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], remote_list),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
-            ExpectedCommand::ok(ws_path.clone(), "gh", &[
-                "pr", "view", "10",
-                "-R", "spinyfin/mono",
-                "--json", "headRefName,headRefOid,state",
-            ], pr_json),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    "10",
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "headRefName,headRefOid,state",
+                ],
+                pr_json,
+            ),
         ]);
 
         let err = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "attempt to resume closed PR",
-                "--resume-pr", "10",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "attempt to resume closed PR",
+                "--resume-pr",
+                "10",
             ]),
             Some(&database_path),
             &runner,
@@ -7777,8 +7411,7 @@ mod tests {
         // Normal lease without --resume_pr must not include "resume_pr" in JSON.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
-        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj"))
-            .expect("workspace dir");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
 
         seed_mono_repo(&workspace_root, &database_path);
 
@@ -7822,8 +7455,18 @@ mod tests {
             // health-check 007 → clean → use
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 clean_path.clone(),
@@ -7879,16 +7522,21 @@ mod tests {
                 &jj_status_conflicted("fix-burst"),
             ),
             // repair 003: forget the conflicted bookmark
+            ExpectedCommand::ok(path_003.clone(), "jj", &["bookmark", "forget", "fix-burst"], ""),
+            // reset 003
+            ExpectedCommand::ok(path_003.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 path_003.clone(),
                 "jj",
-                &["bookmark", "forget", "fix-burst"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                path_003.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            // reset 003
-            ExpectedCommand::ok(path_003.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(path_003.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(path_003.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(path_003.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 path_003.clone(),
@@ -7952,14 +7600,20 @@ mod tests {
             )
             .creating_dir(staging.clone()),
             ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -7979,8 +7633,7 @@ mod tests {
 
         // The leased workspace is the newly created one.
         assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-008",
+            result.payload["workspace"]["workspace_id"], "mono-agent-008",
             "expected newly created workspace"
         );
         assert_eq!(result.payload["workspace"]["state"], "leased");
@@ -8017,8 +7670,18 @@ mod tests {
             ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 clean_path.clone(),
@@ -8043,9 +7706,7 @@ mod tests {
         )
         .expect("list");
 
-        let workspaces = list_result.payload["workspaces"]
-            .as_array()
-            .expect("workspaces array");
+        let workspaces = list_result.payload["workspaces"].as_array().expect("workspaces array");
         // 003 is free-dirty, 007 is leased
         let ws_003 = workspaces
             .iter()
@@ -8076,8 +7737,18 @@ mod tests {
             ExpectedCommand::ok(dirty_path.clone(), "jj", &["status", "--no-pager"], jj_status_dirty()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 clean_path.clone(),
@@ -8101,9 +7772,7 @@ mod tests {
         )
         .expect("list dirty");
 
-        let workspaces = dirty_list.payload["workspaces"]
-            .as_array()
-            .expect("workspaces");
+        let workspaces = dirty_list.payload["workspaces"].as_array().expect("workspaces");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0]["workspace_id"], "mono-agent-003");
 
@@ -8147,8 +7816,18 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(ws_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&ws_path),
             gc_pr_remote_noop_command(&ws_path),
@@ -8190,8 +7869,18 @@ mod tests {
             ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(clean_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 clean_path.clone(),
@@ -8233,10 +7922,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8245,16 +7949,8 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
-        let lease_result =
-            run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
+        let lease_result = run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         let lease_id = lease_result.payload["workspace"]["lease_id"]
             .as_str()
             .expect("lease id")
@@ -8263,21 +7959,27 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
             gc_pr_remote_noop_command(&workspace_path),
         ]);
         let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]);
-        let release_result =
-            run_with_dependencies(release, Some(&database_path), &release_runner).expect("release");
+        let release_result = run_with_dependencies(release, Some(&database_path), &release_runner).expect("release");
 
         assert_eq!(release_result.payload["workspace"]["state"], "free");
-        assert_eq!(
-            release_result.payload["workspace"]["lease_id"],
-            serde_json::Value::Null
-        );
+        assert_eq!(release_result.payload["workspace"]["lease_id"], serde_json::Value::Null);
         release_runner.assert_exhausted();
     }
 
@@ -8291,10 +7993,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8303,16 +8020,8 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "audit smoke",
-        ]);
-        let lease_result =
-            run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "audit smoke"]);
+        let lease_result = run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         let lease_id = lease_result.payload["workspace"]["lease_id"]
             .as_str()
             .expect("lease id")
@@ -8321,21 +8030,23 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
             gc_pr_remote_noop_command(&workspace_path),
         ]);
-        let release = Cli::parse_from([
-            "cube",
-            "workspace",
-            "release",
-            "--lease",
-            &lease_id,
-            "--reason",
-            "done",
-        ]);
+        let release = Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id, "--reason", "done"]);
         run_with_dependencies(release, Some(&database_path), &release_runner).expect("release");
         release_runner.assert_exhausted();
 
@@ -8359,7 +8070,11 @@ mod tests {
                 name == "lease.acquired" || name == "lease.released"
             })
             .collect();
-        assert_eq!(by_event.len(), 2, "expected one lease.acquired + one lease.released event");
+        assert_eq!(
+            by_event.len(),
+            2,
+            "expected one lease.acquired + one lease.released event"
+        );
 
         let acquired = by_event[0];
         assert_eq!(acquired["event"], "lease.acquired");
@@ -8382,10 +8097,7 @@ mod tests {
         // Each reset emits a fetch + bookmark-set + new triple, and we
         // have a lease and a release: so six `workspace.jj_op` entries on
         // the timeline.
-        let jj_ops: Vec<&serde_json::Value> = events
-            .iter()
-            .filter(|e| e["event"] == "workspace.jj_op")
-            .collect();
+        let jj_ops: Vec<&serde_json::Value> = events.iter().filter(|e| e["event"] == "workspace.jj_op").collect();
         assert_eq!(
             jj_ops.len(),
             6,
@@ -8407,10 +8119,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8425,21 +8152,27 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
             gc_pr_remote_noop_command(&workspace_path),
         ]);
         let release = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
-        let result = run_with_dependencies(release, Some(&database_path), &release_runner)
-            .expect("release by id");
+        let result = run_with_dependencies(release, Some(&database_path), &release_runner).expect("release by id");
 
         assert_eq!(result.payload["workspace"]["state"], "free");
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         release_runner.assert_exhausted();
     }
 
@@ -8474,10 +8207,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8533,10 +8281,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8566,10 +8329,7 @@ mod tests {
         .expect("force-release");
 
         assert_eq!(result.payload["workspace"]["state"], "free");
-        assert_eq!(
-            result.payload["workspace"]["last_release_reason"],
-            "force-released"
-        );
+        assert_eq!(result.payload["workspace"]["last_release_reason"], "force-released");
         release_runner.assert_exhausted();
     }
 
@@ -8634,10 +8394,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8663,10 +8438,7 @@ mod tests {
 
         match error {
             CubeError::InvalidArgument(msg) => {
-                assert!(
-                    msg.contains("currently leased"),
-                    "unexpected message: {msg}"
-                );
+                assert!(msg.contains("currently leased"), "unexpected message: {msg}");
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
@@ -8693,10 +8465,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -8873,13 +8660,7 @@ mod tests {
         }
 
         let result = run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "workspace",
-                "remove",
-                "mono-agent-007",
-                "--expunge",
-            ]),
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007", "--expunge"]),
             Some(&database_path),
             &FakeRunner::default(),
         )
@@ -8887,10 +8668,7 @@ mod tests {
 
         assert_eq!(result.payload["expunged"], true);
         assert!(result.message.contains("deleted workspace directory"));
-        assert!(
-            !workspace_path.exists(),
-            "expected on-disk directory to be removed"
-        );
+        assert!(!workspace_path.exists(), "expected on-disk directory to be removed");
 
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
@@ -8932,13 +8710,7 @@ mod tests {
         std::fs::remove_dir_all(&workspace_path).unwrap();
 
         let result = run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "workspace",
-                "remove",
-                "mono-agent-007",
-                "--expunge",
-            ]),
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007", "--expunge"]),
             Some(&database_path),
             &FakeRunner::default(),
         )
@@ -9021,13 +8793,7 @@ mod tests {
         }
 
         run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "workspace",
-                "remove",
-                "mono-agent-007",
-                "--expunge",
-            ]),
+            Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007", "--expunge"]),
             Some(&database_path),
             &FakeRunner::default(),
         )
@@ -9054,20 +8820,21 @@ mod tests {
                 "",
             )
             .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -9078,22 +8845,14 @@ mod tests {
         ]);
 
         let lease_result = run_with_dependencies(
-            Cli::parse_from([
-                "cube",
-                "workspace",
-                "lease",
-                "mono",
-                "--task",
-                "after-expunge",
-            ]),
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "after-expunge"]),
             Some(&database_path),
             &lease_runner,
         )
         .expect("lease after expunge");
 
         assert_eq!(
-            lease_result.payload["workspace"]["workspace_id"],
-            "mono-agent-001",
+            lease_result.payload["workspace"]["workspace_id"], "mono-agent-001",
             "lease should auto-create a fresh slot, not resurrect the expunged one"
         );
 
@@ -9150,10 +8909,25 @@ mod tests {
         // Without --expunge the dir is still there, so the next lease
         // discovers it and re-syncs the row.
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9170,8 +8944,7 @@ mod tests {
         .expect("lease re-syncs row");
 
         assert_eq!(
-            lease_result.payload["workspace"]["workspace_id"],
-            "mono-agent-007",
+            lease_result.payload["workspace"]["workspace_id"], "mono-agent-007",
             "without --expunge the discovered directory resurrects the row"
         );
     }
@@ -9186,10 +8959,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-001");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9272,10 +9060,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9284,14 +9087,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
         run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         lease_runner.assert_exhausted();
 
@@ -9308,13 +9104,9 @@ mod tests {
             "--workspace",
             &workspace_path.display().to_string(),
         ]);
-        let status_result =
-            run_with_dependencies(status, Some(&database_path), &status_runner).expect("status");
+        let status_result = run_with_dependencies(status, Some(&database_path), &status_runner).expect("status");
 
-        assert_eq!(
-            status_result.payload["jj_status"],
-            "The working copy is clean"
-        );
+        assert_eq!(status_result.payload["jj_status"], "The working copy is clean");
         assert!(status_result.message.contains("jj_status:"));
         status_runner.assert_exhausted();
     }
@@ -9329,10 +9121,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9341,14 +9148,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
         run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         lease_runner.assert_exhausted();
 
@@ -9378,10 +9178,25 @@ mod tests {
 
         let first_path = workspace_root.join("mono-agent-001");
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(first_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(first_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                first_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(first_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 first_path.clone(),
@@ -9395,20 +9210,15 @@ mod tests {
 
         // global list returns both rows
         let list_all = Cli::parse_from(["cube", "workspace", "list"]);
-        let result_all =
-            run_with_dependencies(list_all, Some(&database_path), &FakeRunner::default())
-                .expect("list");
+        let result_all = run_with_dependencies(list_all, Some(&database_path), &FakeRunner::default()).expect("list");
         let rows = result_all.payload["workspaces"].as_array().expect("array");
         assert_eq!(rows.len(), 2);
 
         // state filter narrows to leased only
         let list_leased = Cli::parse_from(["cube", "workspace", "list", "--state", "leased"]);
         let result_leased =
-            run_with_dependencies(list_leased, Some(&database_path), &FakeRunner::default())
-                .expect("list leased");
-        let leased = result_leased.payload["workspaces"]
-            .as_array()
-            .expect("array");
+            run_with_dependencies(list_leased, Some(&database_path), &FakeRunner::default()).expect("list leased");
+        let leased = result_leased.payload["workspaces"].as_array().expect("array");
         assert_eq!(leased.len(), 1);
         assert_eq!(leased[0]["workspace_id"], "mono-agent-001");
         assert_eq!(leased[0]["state"], "leased");
@@ -9416,8 +9226,8 @@ mod tests {
 
         // invalid state returns argument error
         let list_bad = Cli::parse_from(["cube", "workspace", "list", "--state", "bogus"]);
-        let error = run_with_dependencies(list_bad, Some(&database_path), &FakeRunner::default())
-            .expect_err("invalid state");
+        let error =
+            run_with_dependencies(list_bad, Some(&database_path), &FakeRunner::default()).expect_err("invalid state");
         assert!(matches!(error, CubeError::InvalidArgument(_)));
     }
 
@@ -9431,10 +9241,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9443,14 +9268,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
         run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         lease_runner.assert_exhausted();
 
@@ -9484,8 +9302,7 @@ mod tests {
             "--title",
             "Implement parser",
         ]);
-        let result =
-            run_with_dependencies(create, Some(&database_path), &change_runner).expect("change");
+        let result = run_with_dependencies(create, Some(&database_path), &change_runner).expect("change");
 
         assert_eq!(result.payload["change"]["repo"], "mono");
         assert_eq!(
@@ -9508,10 +9325,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9520,14 +9352,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
         run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         lease_runner.assert_exhausted();
 
@@ -9561,8 +9386,7 @@ mod tests {
             "--title",
             "Implement parser",
         ]);
-        let root_result =
-            run_with_dependencies(root, Some(&database_path), &root_runner).expect("root change");
+        let root_result = run_with_dependencies(root, Some(&database_path), &root_runner).expect("root change");
         root_runner.assert_exhausted();
         let parent_change_id = root_result.payload["change"]["change_id"]
             .as_str()
@@ -9570,12 +9394,7 @@ mod tests {
             .to_string();
 
         let child_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(
-                workspace_path.clone(),
-                "jj",
-                &["new", "root123", "-m", "Add tests"],
-                "",
-            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "root123", "-m", "Add tests"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -9599,13 +9418,9 @@ mod tests {
             "--title",
             "Add tests",
         ]);
-        let child_result =
-            run_with_dependencies(child, Some(&database_path), &child_runner).expect("child");
+        let child_result = run_with_dependencies(child, Some(&database_path), &child_runner).expect("child");
 
-        assert_eq!(
-            child_result.payload["change"]["parent_change_id"],
-            parent_change_id
-        );
+        assert_eq!(child_result.payload["change"]["parent_change_id"], parent_change_id);
         assert_eq!(child_result.payload["change"]["jj_change_id"], "child456");
         child_runner.assert_exhausted();
     }
@@ -9620,10 +9435,25 @@ mod tests {
 
         let workspace_path = workspace_root.join("mono-agent-004");
         let lease_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9632,14 +9462,7 @@ mod tests {
                 "abc1234",
             ),
         ]);
-        let lease = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement cube",
-        ]);
+        let lease = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement cube"]);
         run_with_dependencies(lease, Some(&database_path), &lease_runner).expect("lease");
         lease_runner.assert_exhausted();
 
@@ -9673,8 +9496,7 @@ mod tests {
             "--title",
             "Implement parser",
         ]);
-        let create_result =
-            run_with_dependencies(create, Some(&database_path), &change_runner).expect("change");
+        let create_result = run_with_dependencies(create, Some(&database_path), &change_runner).expect("change");
         change_runner.assert_exhausted();
 
         let change_id = create_result.payload["change"]["change_id"]
@@ -9682,8 +9504,7 @@ mod tests {
             .expect("change id")
             .to_string();
         let info = Cli::parse_from(["cube", "change", "info", "--change", &change_id]);
-        let info_result = run_with_dependencies(info, Some(&database_path), &FakeRunner::default())
-            .expect("info");
+        let info_result = run_with_dependencies(info, Some(&database_path), &FakeRunner::default()).expect("info");
 
         assert_eq!(info_result.payload["change"]["change_id"], change_id);
         assert_eq!(info_result.payload["change"]["title"], "Implement parser");
@@ -9697,10 +9518,25 @@ mod tests {
 
     fn lease_runner_for(workspace_path: &std::path::Path, head: &str) -> FakeRunner {
         FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.to_path_buf(),
@@ -9744,8 +9580,18 @@ mod tests {
     fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner {
         FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             gc_noop_command(workspace_path),
             gc_pr_remote_noop_command(workspace_path),
@@ -9758,10 +9604,25 @@ mod tests {
         setup_steps: Vec<ExpectedCommand>,
     ) -> FakeRunner {
         let mut commands = vec![
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.to_path_buf(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.to_path_buf(),
@@ -9776,15 +9637,17 @@ mod tests {
 
     fn seed_mono_repo(workspace_root: &std::path::Path, database_path: &std::path::Path) {
         let store = crate::store::Store::open_at(database_path).expect("store");
-        store.upsert_repo(&crate::metadata::RepoRecord {
-            repo: "mono".to_string(),
-            origin: "git@github.com:spinyfin/mono.git".to_string(),
-            main_branch: "main".to_string(),
-            workspace_root: workspace_root.to_path_buf(),
-            workspace_prefix: "mono-agent-".to_string(),
-            source: None,
-            clone_command: None,
-        }).expect("seed repo");
+        store
+            .upsert_repo(&crate::metadata::RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.to_path_buf(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("seed repo");
     }
 
     #[test]
@@ -9813,13 +9676,9 @@ mod tests {
             "--workspace",
             &workspace_path.display().to_string(),
         ]);
-        let result =
-            run_with_dependencies(setup, Some(&database_path), &setup_runner).expect("setup");
+        let result = run_with_dependencies(setup, Some(&database_path), &setup_runner).expect("setup");
         setup_runner.assert_exhausted();
-        assert_eq!(
-            result.message,
-            "No setup steps are configured for mono-agent-001."
-        );
+        assert_eq!(result.message, "No setup steps are configured for mono-agent-001.");
         assert_eq!(result.payload["setup"]["steps"], json!([]));
     }
 
@@ -9850,8 +9709,18 @@ mod tests {
         // Release runner returns a consumed bookmark from the gc log query.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -9923,12 +9792,7 @@ mod tests {
                 "boss/exec_dead_01",
             ),
             gc_pr_remote_noop_command(&ws2_path),
-            ExpectedCommand::ok(
-                ws2_path.clone(),
-                "jj",
-                &["bookmark", "forget", "boss/exec_dead_01"],
-                "",
-            ),
+            ExpectedCommand::ok(ws2_path.clone(), "jj", &["bookmark", "forget", "boss/exec_dead_01"], ""),
         ]);
         let gc_result = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "gc"]),
@@ -9941,17 +9805,11 @@ mod tests {
         let results = gc_result.payload["results"].as_array().unwrap();
         assert_eq!(results.len(), 2);
 
-        let ws1_r = results
-            .iter()
-            .find(|r| r["workspace_id"] == "mono-agent-001")
-            .unwrap();
+        let ws1_r = results.iter().find(|r| r["workspace_id"] == "mono-agent-001").unwrap();
         assert_eq!(ws1_r["skipped"], true);
         assert_eq!(ws1_r["skipped_reason"], "leased");
 
-        let ws2_r = results
-            .iter()
-            .find(|r| r["workspace_id"] == "mono-agent-002")
-            .unwrap();
+        let ws2_r = results.iter().find(|r| r["workspace_id"] == "mono-agent-002").unwrap();
         assert_eq!(ws2_r["skipped"], false);
         assert_eq!(ws2_r["bookmarks_forgotten"].as_array().unwrap().len(), 1);
         assert_eq!(ws2_r["bookmarks_forgotten"][0], "boss/exec_dead_01");
@@ -10047,22 +9905,55 @@ mod tests {
         // Release runner: gc finds a closed pr/42 bookmark and forgets it.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             // exec sweep: no consumed exec bookmarks.
             gc_noop_command(&workspace_path),
             // pr sweep: GitHub remote resolved, pr/42 found, state = CLOSED.
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"],
-                "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n"),
             ExpectedCommand::ok(
-                workspace_path.clone(), "jj",
-                &["log", "-r", "bookmarks(glob:\"pr/*\")", "--no-graph", "-T", "bookmarks ++ \"\\n\""],
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"pr/*\")",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
                 "pr/42\n",
             ),
             ExpectedCommand::ok(
-                workspace_path.clone(), "gh",
-                &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state", "--jq", ".state"],
+                workspace_path.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    "42",
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "state",
+                    "--jq",
+                    ".state",
+                ],
                 "CLOSED",
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/42"], ""),
@@ -10101,20 +9992,53 @@ mod tests {
 
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"],
-                "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n"),
             ExpectedCommand::ok(
-                workspace_path.clone(), "jj",
-                &["log", "-r", "bookmarks(glob:\"pr/*\")", "--no-graph", "-T", "bookmarks ++ \"\\n\""],
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"pr/*\")",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
                 "pr/99\n",
             ),
             ExpectedCommand::ok(
-                workspace_path.clone(), "gh",
-                &["pr", "view", "99", "-R", "spinyfin/mono", "--json", "state", "--jq", ".state"],
+                workspace_path.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    "99",
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "state",
+                    "--jq",
+                    ".state",
+                ],
                 "MERGED",
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/99"], ""),
@@ -10154,20 +10078,53 @@ mod tests {
         // Release runner: gc finds pr/7 but state is OPEN — no forget call.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"],
-                "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n"),
             ExpectedCommand::ok(
-                workspace_path.clone(), "jj",
-                &["log", "-r", "bookmarks(glob:\"pr/*\")", "--no-graph", "-T", "bookmarks ++ \"\\n\""],
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"pr/*\")",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
                 "pr/7\n",
             ),
             ExpectedCommand::ok(
-                workspace_path.clone(), "gh",
-                &["pr", "view", "7", "-R", "spinyfin/mono", "--json", "state", "--jq", ".state"],
+                workspace_path.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    "7",
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "state",
+                    "--jq",
+                    ".state",
+                ],
                 "OPEN",
             ),
             // No bookmark forget — pr/7 is still open.
@@ -10207,8 +10164,18 @@ mod tests {
         // Release runner: remote list fails → pr sweep skipped, no extra commands.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
             ExpectedCommand {
@@ -10347,9 +10314,7 @@ steps:
         )
         .expect("first lease");
         lease_runner.assert_exhausted();
-        let setup_steps = lease_result.payload["setup"]["steps"]
-            .as_array()
-            .expect("steps array");
+        let setup_steps = lease_result.payload["setup"]["steps"].as_array().expect("steps array");
         assert_eq!(setup_steps.len(), 1);
         assert_eq!(setup_steps[0]["id"], "deps");
         assert_eq!(setup_steps[0]["status"], "ran");
@@ -10361,8 +10326,18 @@ steps:
         // Release so we can re-lease cleanly.
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
             gc_pr_remote_noop_command(&workspace_path),
@@ -10385,9 +10360,7 @@ steps:
         )
         .expect("second lease");
         second_lease_runner.assert_exhausted();
-        let second_steps = second_result.payload["setup"]["steps"]
-            .as_array()
-            .expect("steps array");
+        let second_steps = second_result.payload["setup"]["steps"].as_array().expect("steps array");
         assert_eq!(second_steps.len(), 1);
         assert_eq!(second_steps[0]["status"], "skipped");
         assert_eq!(second_steps[0]["reason"], "fingerprint_unchanged");
@@ -10416,12 +10389,7 @@ steps:
         let lease_runner = lease_runner_with_setup(
             &workspace_path,
             "abc1234",
-            vec![ExpectedCommand::ok(
-                workspace_path.clone(),
-                "pnpm",
-                &["install"],
-                "",
-            )],
+            vec![ExpectedCommand::ok(workspace_path.clone(), "pnpm", &["install"], "")],
         );
         run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
@@ -10499,15 +10467,22 @@ steps:
         let workspace_record = {
             use crate::store::Store;
             let store = Store::open_at(&database_path).unwrap();
-            store
-                .get_workspace_by_path(&workspace_path)
-                .unwrap()
-                .unwrap()
+            store.get_workspace_by_path(&workspace_path).unwrap().unwrap()
         };
         let release_runner = FakeRunner::new(vec![
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             gc_noop_command(&workspace_path),
             gc_pr_remote_noop_command(&workspace_path),
@@ -10591,10 +10566,7 @@ steps:
         // can rerun `cube workspace setup` to repair it.
         use crate::store::Store;
         let store = Store::open_at(&database_path).unwrap();
-        let record = store
-            .get_workspace_by_path(&workspace_path)
-            .unwrap()
-            .unwrap();
+        let record = store.get_workspace_by_path(&workspace_path).unwrap().unwrap();
         assert_eq!(record.state, crate::metadata::WorkspaceState::Leased);
         assert!(record.lease_id.is_some());
     }
@@ -10613,7 +10585,12 @@ steps:
         // retry the original command. The remainder of the lease then
         // proceeds normally.
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::stale(workspace_path.clone(), "jj", &["git", "fetch"]),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -10622,8 +10599,18 @@ steps:
                 "Working copy now at: abc1234",
             ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -10641,10 +10628,7 @@ steps:
         .expect("lease should auto-recover from stale");
         runner.assert_exhausted();
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
 
         // The recovery is observable in the audit log.
@@ -10678,7 +10662,12 @@ steps:
         // itself fails. The lease must not pretend success — surface a
         // distinct StaleRecoveryFailed error.
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::stale(workspace_path.clone(), "jj", &["git", "fetch"]),
             ExpectedCommand {
                 cwd: workspace_path.clone(),
@@ -10738,10 +10727,25 @@ steps:
                 &["workspace", "update-stale"],
                 "Working copy now at: abc1234",
             ),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -10759,10 +10763,7 @@ steps:
         .expect("lease should auto-recover from op-log divergence");
         runner.assert_exhausted();
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
 
         let audit_dir = database_path.parent().unwrap().join("audit");
@@ -10849,16 +10850,26 @@ steps:
         // remainder of the lease proceeds normally.
         let runner = FakeRunner::new(vec![
             ExpectedCommand::no_jj_repo(workspace_path.clone(), "jj", &["status", "--no-pager"]),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "init", "--colocate"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
-                &["git", "init", "--colocate"],
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
+            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -10876,10 +10887,7 @@ steps:
         .expect("lease should auto-recover by running jj git init --colocate");
         runner.assert_exhausted();
 
-        assert_eq!(
-            result.payload["workspace"]["workspace_id"],
-            "mono-agent-004"
-        );
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
         assert_eq!(result.payload["workspace"]["head_commit"], "abc1234");
 
         let audit_dir = database_path.parent().unwrap().join("audit");
@@ -10935,14 +10943,20 @@ steps:
             )
             .creating_dir(staging.clone()),
             ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -10967,12 +10981,16 @@ steps:
         assert!(!husk_path.exists(), "broken-empty husk should be removed");
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let rows = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
+        let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
         let ids: Vec<_> = rows.iter().map(|r| r.workspace_id.as_str()).collect();
-        assert!(!ids.contains(&"mono-agent-004"), "husk row should be forgotten; saw {ids:?}");
-        assert!(ids.contains(&"mono-agent-001"), "fresh workspace should exist; saw {ids:?}");
+        assert!(
+            !ids.contains(&"mono-agent-004"),
+            "husk row should be forgotten; saw {ids:?}"
+        );
+        assert!(
+            ids.contains(&"mono-agent-001"),
+            "fresh workspace should exist; saw {ids:?}"
+        );
 
         // Audit log records both the detection and the GC of the husk.
         let events = audit_events(&tempdir);
@@ -10981,8 +10999,9 @@ steps:
             "expected workspace.broken_empty audit event; got: {events:?}"
         );
         assert!(
-            events.iter().any(|e| e["event"] == "workspace.broken_empty_gc"
-                && e["workspace_id"] == "mono-agent-004"),
+            events
+                .iter()
+                .any(|e| e["event"] == "workspace.broken_empty_gc" && e["workspace_id"] == "mono-agent-004"),
             "expected workspace.broken_empty_gc audit event for the husk; got: {events:?}"
         );
     }
@@ -11021,14 +11040,20 @@ steps:
             )
             .creating_dir(staging.clone()),
             ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -11088,14 +11113,20 @@ steps:
             )
             .creating_dir(staging.clone()),
             ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -11197,18 +11228,13 @@ steps:
             result.payload["reconciled"]["removed"][0]["workspace_id"],
             "mono-agent-007"
         );
-        assert_eq!(
-            result.payload["reconciled"]["removed"][0]["prior_state"],
-            "free"
-        );
+        assert_eq!(result.payload["reconciled"]["removed"][0]["prior_state"], "free");
         assert_eq!(result.payload["reconciled"]["held"], json!([]));
         assert_eq!(result.payload["workspaces"], json!([]));
 
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let remaining = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
+        let remaining = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
         assert!(remaining.is_empty(), "row must be deleted by reconcile");
 
         let events = audit_events(&tempdir);
@@ -11262,17 +11288,12 @@ steps:
             result.payload["reconciled"]["removed"][0]["workspace_id"],
             "mono-agent-001"
         );
-        assert_eq!(
-            result.payload["reconciled"]["removed"][0]["prior_state"],
-            "leased"
-        );
+        assert_eq!(result.payload["reconciled"]["removed"][0]["prior_state"], "leased");
         assert_eq!(result.payload["reconciled"]["held"], json!([]));
 
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let remaining = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
+        let remaining = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
         assert!(
             remaining.is_empty(),
             "expired+missing row must be force-released and deleted"
@@ -11331,21 +11352,12 @@ steps:
             result.payload["reconciled"]["held"][0]["workspace_id"],
             "mono-agent-001"
         );
-        assert_eq!(
-            result.payload["reconciled"]["held"][0]["prior_state"],
-            "leased"
-        );
+        assert_eq!(result.payload["reconciled"]["held"][0]["prior_state"], "leased");
 
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let remaining = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
-        assert_eq!(
-            remaining.len(),
-            1,
-            "active-lease+missing row must be left in place"
-        );
+        let remaining = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
+        assert_eq!(remaining.len(), 1, "active-lease+missing row must be left in place");
         assert_eq!(remaining[0].state, crate::metadata::WorkspaceState::Leased);
 
         let events = audit_events(&tempdir);
@@ -11404,33 +11416,35 @@ steps:
         let (tempdir, database_path) = with_database_path();
         let workspace_root_a = tempdir.path().join("repos-a/workspaces");
         let workspace_root_b = tempdir.path().join("repos-b/workspaces");
-        std::fs::create_dir_all(workspace_root_a.join("mono-agent-001").join(".jj"))
-            .expect("workspace dir a");
-        std::fs::create_dir_all(workspace_root_b.join("other-agent-001").join(".jj"))
-            .expect("workspace dir b");
+        std::fs::create_dir_all(workspace_root_a.join("mono-agent-001").join(".jj")).expect("workspace dir a");
+        std::fs::create_dir_all(workspace_root_b.join("other-agent-001").join(".jj")).expect("workspace dir b");
 
         {
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@github.com:spinyfin/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: workspace_root_a.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: None,
-                clone_command: None,
-            }).expect("seed repo a");
-            store.upsert_repo(&RepoRecord {
-                repo: "other".to_string(),
-                origin: "git@github.com:spinyfin/other.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: workspace_root_b.clone(),
-                workspace_prefix: "other-agent-".to_string(),
-                source: None,
-                clone_command: None,
-            }).expect("seed repo b");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@github.com:spinyfin/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: workspace_root_a.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: None,
+                    clone_command: None,
+                })
+                .expect("seed repo a");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "other".to_string(),
+                    origin: "git@github.com:spinyfin/other.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: workspace_root_b.clone(),
+                    workspace_prefix: "other-agent-".to_string(),
+                    source: None,
+                    clone_command: None,
+                })
+                .expect("seed repo b");
         }
 
         // Seed both repos with one free row each, then wipe both dirs.
@@ -11457,10 +11471,8 @@ steps:
                 )
                 .unwrap();
         }
-        std::fs::remove_dir_all(workspace_root_a.join("mono-agent-001"))
-            .expect("wipe a");
-        std::fs::remove_dir_all(workspace_root_b.join("other-agent-001"))
-            .expect("wipe b");
+        std::fs::remove_dir_all(workspace_root_a.join("mono-agent-001")).expect("wipe a");
+        std::fs::remove_dir_all(workspace_root_b.join("other-agent-001")).expect("wipe b");
 
         let result = run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "list", "--repo", "mono"]),
@@ -11470,9 +11482,7 @@ steps:
         .expect("list");
 
         // Only the `mono` row should appear in the reconcile report.
-        let removed = result.payload["reconciled"]["removed"]
-            .as_array()
-            .unwrap();
+        let removed = result.payload["reconciled"]["removed"].as_array().unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0]["repo"], "mono");
 
@@ -11539,20 +11549,21 @@ steps:
                 "",
             )
             .creating_dir(staging.clone()),
+            ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "track", "main@origin"], ""),
+            ExpectedCommand::no_such_remote_bookmark(staging.clone(), "jj", &["bookmark", "track", "master@origin"]),
+            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
-                staging.clone(),
+                new_path.clone(),
                 "jj",
-                &["bookmark", "track", "main@origin"],
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
                 "",
             ),
-            ExpectedCommand::no_such_remote_bookmark(
-                staging.clone(),
-                "jj",
-                &["bookmark", "track", "master@origin"],
-            ),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -11570,19 +11581,14 @@ steps:
         .expect("second lease");
         runner.assert_exhausted();
 
-        assert_eq!(
-            second.payload["workspace"]["workspace_id"],
-            "mono-agent-001"
-        );
+        assert_eq!(second.payload["workspace"]["workspace_id"], "mono-agent-001");
 
         // Only the freshly-claimed (re-provisioned) row remains; the
         // phantom row was forgotten before the new clone created the
         // replacement.
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let rows = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
+        let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].workspace_id, "mono-agent-001");
         assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Leased);
@@ -11590,10 +11596,7 @@ steps:
         let events = audit_events(&tempdir);
         let reconciled: Vec<_> = events
             .iter()
-            .filter(|e| {
-                e["event"] == "workspace.dir_missing_reconciled"
-                    && e["workspace_id"] == "mono-agent-001"
-            })
+            .filter(|e| e["event"] == "workspace.dir_missing_reconciled" && e["workspace_id"] == "mono-agent-001")
             .collect();
         assert_eq!(reconciled.len(), 1);
     }
@@ -11649,7 +11652,12 @@ steps:
         // isn't `main` — exactly the shape a still-active worker's WIP looks like.
         let probe_output = "abcd1234\tfalse\tfeature-bookmark";
         let second_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -11716,9 +11724,7 @@ steps:
         // the refused claim.
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let rows = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
+        let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Free);
         assert_eq!(rows[0].last_release_reason.as_deref(), Some("lease_setup_failed"));
@@ -11754,7 +11760,12 @@ steps:
         // Clean @: empty, parent on main → safe to reset.
         let probe_output = "abcd1234\ttrue\tmain";
         let second_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -11769,8 +11780,18 @@ steps:
                 ],
                 probe_output,
             ),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),
@@ -11827,11 +11848,22 @@ steps:
         let github_remote = "github";
         let remote_list = format!("origin\t/local/mirror\n{github_remote}\tgit@github.com:spinyfin/mono.git\n");
         let probe_output = "abcd1234\tfalse\tfeature-bookmark";
-        let head_status_template = "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")";
+        let head_status_template =
+            "change_id ++ \"\\t\" ++ empty ++ \"\\t\" ++ parents.map(|p| p.bookmarks().join(\",\")).join(\";\")";
         let second_runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], &remote_list),
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch", "--remote", github_remote], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "fetch", "--remote", github_remote],
+                "",
+            ),
             ExpectedCommand::ok(
                 workspace_path.clone(),
                 "jj",
@@ -11842,9 +11874,14 @@ steps:
 
         let err = run_with_dependencies(
             Cli::parse_from([
-                "cube", "workspace", "lease", "mono",
-                "--task", "resume dirty PR",
-                "--resume-pr", "42",
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "resume dirty PR",
+                "--resume-pr",
+                "42",
             ]),
             Some(&database_path),
             &second_runner,
@@ -11867,9 +11904,7 @@ steps:
         // The workspace is back to `free` — the new lease was rolled back.
         use crate::store::{Store, WorkspaceListFilter};
         let store = Store::open_at(&database_path).unwrap();
-        let rows = store
-            .list_workspaces_filtered(&WorkspaceListFilter::default())
-            .unwrap();
+        let rows = store.list_workspaces_filtered(&WorkspaceListFilter::default()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, crate::metadata::WorkspaceState::Free);
         assert_eq!(rows[0].last_release_reason.as_deref(), Some("lease_setup_failed"));
@@ -11898,8 +11933,7 @@ steps:
             program: "jj".to_string(),
             args: vec!["status".to_string()],
         };
-        let err = super::run_jj(&runner, None, &invocation)
-            .expect_err("non-stale failure should propagate");
+        let err = super::run_jj(&runner, None, &invocation).expect_err("non-stale failure should propagate");
         runner.assert_exhausted();
         assert!(
             matches!(err, CubeError::CommandFailed { .. }),
@@ -12150,16 +12184,9 @@ steps:
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         // File is created empty by default.
         let result = resolve_body_file(&tmp.path().display().to_string());
-        assert!(
-            result.is_err(),
-            "should error on empty file, got {:?}",
-            result
-        );
+        assert!(result.is_err(), "should error on empty file, got {:?}", result);
         let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("empty"),
-            "error should mention 'empty': {msg}"
-        );
+        assert!(msg.contains("empty"), "error should mention 'empty': {msg}");
     }
 
     #[test]
@@ -12209,10 +12236,7 @@ steps:
         writer.join().expect("writer thread");
 
         // resolved path must differ from the FIFO (temp file was created).
-        assert_ne!(
-            resolved, path_str,
-            "resolved path should be a temp file, not the FIFO"
-        );
+        assert_ne!(resolved, path_str, "resolved path should be a temp file, not the FIFO");
         let materialized = std::fs::read_to_string(&resolved).expect("read materialized");
         assert_eq!(materialized, expected_body);
 
@@ -12262,8 +12286,7 @@ steps:
         // via --body "..." lets the shell evaluate backticks and $(...) before
         // cube ever sees the argument, corrupting PR bodies that contain
         // inline code.
-        let body_content =
-            "Use `rustc --help` or `$(cargo --version)` or ${CARGO_HOME}.\n\nMore `code`.";
+        let body_content = "Use `rustc --help` or `$(cargo --version)` or ${CARGO_HOME}.\n\nMore `code`.";
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), body_content).expect("write body");
         let body_path = tmp.path().display().to_string();
@@ -12279,9 +12302,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             // Push verification: local commit vs GitHub branch head sha.
@@ -12294,20 +12315,23 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 "[]",
             ),
@@ -12331,12 +12355,7 @@ steps:
                 ],
                 "https://github.com/spinyfin/mono/pull/99",
             ),
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "jj",
-                &["bookmark", "set", "pr/99", "-r", "my-feature"],
-                "",
-            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/99", "-r", "my-feature"], ""),
         ]);
 
         let cli = Cli::parse_from([
@@ -12350,8 +12369,7 @@ steps:
             "--body-file",
             &body_path,
         ]);
-        let result =
-            run_with_dependencies(cli, None, &runner).expect("ensure_pr with --body-file");
+        let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr with --body-file");
         runner.assert_exhausted();
 
         assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/99");
@@ -12375,9 +12393,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12389,20 +12405,23 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 "[]",
             ),
@@ -12410,22 +12429,23 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "create", "-R", "spinyfin/mono", "--head", "my-feature", "--base",
-                    "main", "--title", "New PR",
+                    "pr",
+                    "create",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--base",
+                    "main",
+                    "--title",
+                    "New PR",
                 ],
                 "https://github.com/spinyfin/mono/pull/42",
             ),
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "jj",
-                &["bookmark", "set", "pr/42", "-r", "my-feature"],
-                "",
-            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "my-feature"], ""),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr created");
         runner.assert_exhausted();
 
@@ -12449,9 +12469,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12463,33 +12481,37 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 r#"[{"url":"https://github.com/spinyfin/mono/pull/7"}]"#,
             ),
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "jj",
-                &["bookmark", "set", "pr/7", "-r", "my-feature"],
-                "",
-            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/7", "-r", "my-feature"], ""),
         ]);
 
         let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "Existing PR",
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "my-feature",
+            "--title",
+            "Existing PR",
         ]);
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists");
         runner.assert_exhausted();
@@ -12520,9 +12542,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "github", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "github", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12534,20 +12554,23 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "deadbeef\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 "[]",
             ),
@@ -12555,22 +12578,23 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "create", "-R", "spinyfin/mono", "--head", "my-feature", "--base",
-                    "main", "--title", "New PR",
+                    "pr",
+                    "create",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--base",
+                    "main",
+                    "--title",
+                    "New PR",
                 ],
                 "https://github.com/spinyfin/mono/pull/77",
             ),
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "jj",
-                &["bookmark", "set", "pr/77", "-r", "my-feature"],
-                "",
-            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/77", "-r", "my-feature"], ""),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr created");
         runner.assert_exhausted();
         assert_eq!(result.payload["url"], "https://github.com/spinyfin/mono/pull/77");
@@ -12592,9 +12616,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12607,19 +12629,12 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "2f8dd09\n",
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
         let err = run_with_dependencies(cli, None, &runner)
             .expect_err("ensure_pr should fail when push did not reach GitHub");
         runner.assert_exhausted();
@@ -12646,8 +12661,7 @@ steps:
         ]);
 
         let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "pr/42"]);
-        let err = run_with_dependencies(cli, None, &runner)
-            .expect_err("ensure_pr should refuse a pr/* branch");
+        let err = run_with_dependencies(cli, None, &runner).expect_err("ensure_pr should refuse a pr/* branch");
         runner.assert_exhausted();
         let msg = err.to_string();
         assert!(
@@ -12671,9 +12685,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12685,20 +12697,23 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 "[]",
             ),
@@ -12706,22 +12721,31 @@ steps:
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "create", "-R", "spinyfin/mono", "--head", "my-feature", "--base",
-                    "main", "--title", "My Feature",
+                    "pr",
+                    "create",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--base",
+                    "main",
+                    "--title",
+                    "My Feature",
                 ],
                 "https://github.com/spinyfin/mono/pull/55",
             ),
             // Must call `jj bookmark set pr/55 -r my-feature` after creation.
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "jj",
-                &["bookmark", "set", "pr/55", "-r", "my-feature"],
-                "",
-            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/55", "-r", "my-feature"], ""),
         ]);
 
         let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "My Feature",
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "my-feature",
+            "--title",
+            "My Feature",
         ]);
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr create+bookmark");
         runner.assert_exhausted();
@@ -12744,9 +12768,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12758,37 +12780,40 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 r#"[{"url":"https://github.com/spinyfin/mono/pull/33"}]"#,
             ),
             // Bookmark set must happen even on the reuse/backfill path.
-            ExpectedCommand::ok(
-                cwd.clone(),
-                "jj",
-                &["bookmark", "set", "pr/33", "-r", "my-feature"],
-                "",
-            ),
+            ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/33", "-r", "my-feature"], ""),
         ]);
 
         let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "My Feature",
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "my-feature",
+            "--title",
+            "My Feature",
         ]);
-        let result =
-            run_with_dependencies(cli, None, &runner).expect("ensure_pr exists+bookmark");
+        let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists+bookmark");
         runner.assert_exhausted();
 
         assert_eq!(result.payload["action"], "exists");
@@ -12811,9 +12836,7 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "jj",
-                &[
-                    "git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new",
-                ],
+                &["git", "push", "-b", "my-feature", "--remote", "origin", "--allow-new"],
                 "",
             ),
             ExpectedCommand::ok(
@@ -12825,30 +12848,38 @@ steps:
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
-                &[
-                    "api",
-                    "repos/spinyfin/mono/branches/my-feature",
-                    "--jq",
-                    ".commit.sha",
-                ],
+                &["api", "repos/spinyfin/mono/branches/my-feature", "--jq", ".commit.sha"],
                 "abc123\n",
             ),
             ExpectedCommand::ok(
                 cwd.clone(),
                 "gh",
                 &[
-                    "pr", "list", "-R", "spinyfin/mono", "--head", "my-feature", "--state",
-                    "open", "--json", "url",
+                    "pr",
+                    "list",
+                    "-R",
+                    "spinyfin/mono",
+                    "--head",
+                    "my-feature",
+                    "--state",
+                    "open",
+                    "--json",
+                    "url",
                 ],
                 r#"[{"url":"https://github.com/spinyfin/mono/pull/10"},{"url":"https://github.com/spinyfin/mono/pull/11"}]"#,
             ),
         ]);
 
         let cli = Cli::parse_from([
-            "cube", "pr", "ensure", "--branch", "my-feature", "--title", "My Feature",
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "my-feature",
+            "--title",
+            "My Feature",
         ]);
-        let err = run_with_dependencies(cli, None, &runner)
-            .expect_err("ensure_pr should fail on >1 open PRs");
+        let err = run_with_dependencies(cli, None, &runner).expect_err("ensure_pr should fail on >1 open PRs");
         runner.assert_exhausted();
         let msg = err.to_string();
         assert!(
@@ -12872,15 +12903,22 @@ steps:
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             // check PR is open
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
             // @ is not empty
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "false",
+            ),
             // ancestor check: pr/42 is an ancestor of @
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
                 "aabbcc\n",
             ),
@@ -12890,27 +12928,33 @@ steps:
             ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
             // push (no --allow-new)
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["git", "push", "-b", "boss/exec_abc", "--remote", "github"],
                 "",
             ),
             // verify: local sha
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
                 "deadbeef\n",
             ),
             // verify: github sha
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "deadbeef\n",
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let result = run_with_dependencies(cli, None, &runner).expect("pr_push happy path");
         runner.assert_exhausted();
         assert_eq!(result.payload["action"], "pushed");
@@ -12925,29 +12969,40 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
             // @ is empty
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "true"),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "true",
+            ),
             // fetch github sha for head-branch
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "abc123\n",
             ),
             // fetch pr/42 sha — matches github
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "pr/42", "--no-graph", "-T", "commit_id"],
                 "abc123\n",
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let result = run_with_dependencies(cli, None, &runner).expect("pr_push noop");
         runner.assert_exhausted();
         assert_eq!(result.payload["action"], "noop");
@@ -12961,26 +13016,37 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "true"),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "true",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "github_sha\n",
             ),
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "pr/42", "--no-graph", "-T", "commit_id"],
                 "local_sha\n",
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should fail — nothing to land");
         runner.assert_exhausted();
         assert!(
@@ -12996,22 +13062,27 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "false",
+            ),
             // ancestor check returns empty → not a descendant
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
                 "",
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse detached @");
         runner.assert_exhausted();
         assert!(
@@ -13026,22 +13097,34 @@ steps:
         let cwd = std::env::current_dir().expect("cwd");
         let push_err = CubeError::CommandFailed {
             program: "jj".to_string(),
-            args: vec!["git".to_string(), "push".to_string(), "-b".to_string(),
-                       "boss/exec_abc".to_string(), "--remote".to_string(), "github".to_string()],
+            args: vec![
+                "git".to_string(),
+                "push".to_string(),
+                "-b".to_string(),
+                "boss/exec_abc".to_string(),
+                "--remote".to_string(),
+                "github".to_string(),
+            ],
             status: Some(1),
-            stderr: "Error: Remote bookmark boss/exec_abc@github is ahead of local bookmark"
-                .to_string(),
+            stderr: "Error: Remote bookmark boss/exec_abc@github is ahead of local bookmark".to_string(),
         };
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "false",
+            ),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
                 "aabbcc\n",
             ),
@@ -13052,15 +13135,15 @@ steps:
                 cwd: cwd.clone(),
                 program: "jj".to_string(),
                 args: ["git", "push", "-b", "boss/exec_abc", "--remote", "github"]
-                    .iter().map(|s| s.to_string()).collect(),
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 result: Err(push_err),
                 creates_dir: None,
             },
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should surface push error");
         runner.assert_exhausted();
         assert!(
@@ -13076,15 +13159,14 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"MERGED"}"#,
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should hard-error on merged PR");
         runner.assert_exhausted();
         assert!(
@@ -13100,15 +13182,14 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"CLOSED"}"#,
             ),
         ]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should hard-error on closed PR");
         runner.assert_exhausted();
         assert!(
@@ -13124,22 +13205,35 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
             // @ is not empty
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "false",
+            ),
             // lease check: jj's view of remote tracking bookmark
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "boss/exec_abc@github", "--no-graph", "-T", "commit_id"],
                 "remote_sha\n",
             ),
             // lease check: GitHub's actual head — matches jj's view
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "remote_sha\n",
             ),
             // advance bookmarks
@@ -13147,25 +13241,40 @@ steps:
             ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
             // force push via git
             ExpectedCommand::ok(
-                cwd.clone(), "git",
+                cwd.clone(),
+                "git",
                 &["push", "--force-with-lease", "github", "boss/exec_abc"],
                 "",
             ),
             // verify
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
                 "new_sha\n",
             ),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "new_sha\n",
             ),
         ]);
 
         let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc", "--force-with-lease",
+            "cube",
+            "pr",
+            "push",
+            "--pr",
+            "42",
+            "--branch",
+            "boss/exec_abc",
+            "--force-with-lease",
         ]);
         let result = run_with_dependencies(cli, None, &runner).expect("force-with-lease happy path");
         runner.assert_exhausted();
@@ -13180,33 +13289,52 @@ steps:
         let runner = FakeRunner::new(vec![
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "false",
+            ),
             // lease check: jj's view of remote
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "boss/exec_abc@github", "--no-graph", "-T", "commit_id"],
                 "old_sha\n",
             ),
             // lease check: GitHub advanced concurrently
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "new_sha_from_concurrent_push\n",
             ),
         ]);
 
         let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc", "--force-with-lease",
+            "cube",
+            "pr",
+            "push",
+            "--pr",
+            "42",
+            "--branch",
+            "boss/exec_abc",
+            "--force-with-lease",
         ]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse concurrent advance");
         runner.assert_exhausted();
         assert!(
-            err.to_string().contains("force-with-lease refused")
-                || err.to_string().contains("advanced"),
+            err.to_string().contains("force-with-lease refused") || err.to_string().contains("advanced"),
             "error should mention lease refusal: {err}"
         );
     }
@@ -13219,24 +13347,36 @@ steps:
             ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
             // Inference query
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &[
-                    "log", "-r", r#"latest(ancestors(@) & bookmarks(glob:"pr/*"))"#,
-                    "--no-graph", "-T", r#"bookmarks.map(|b| b.name()).join("\n")"#,
+                    "log",
+                    "-r",
+                    r#"latest(ancestors(@) & bookmarks(glob:"pr/*"))"#,
+                    "--no-graph",
+                    "-T",
+                    r#"bookmarks.map(|b| b.name()).join("\n")"#,
                 ],
                 "boss/exec_abc\npr/42\n",
             ),
             // check PR is open
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
+                cwd.clone(),
+                "gh",
                 &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
                 r#"{"state":"OPEN"}"#,
             ),
             // @ is not empty
-            ExpectedCommand::ok(cwd.clone(), "jj", &["log", "-r", "@", "--no-graph", "-T", "empty"], "false"),
+            ExpectedCommand::ok(
+                cwd.clone(),
+                "jj",
+                &["log", "-r", "@", "--no-graph", "-T", "empty"],
+                "false",
+            ),
             // ancestor check
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "pr/42 & ancestors(@)", "--no-graph", "-T", "commit_id"],
                 "aabbcc\n",
             ),
@@ -13245,19 +13385,27 @@ steps:
             ExpectedCommand::ok(cwd.clone(), "jj", &["bookmark", "set", "pr/42", "-r", "@"], ""),
             // push
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["git", "push", "-b", "boss/exec_abc", "--remote", "github"],
                 "",
             ),
             // verify
             ExpectedCommand::ok(
-                cwd.clone(), "jj",
+                cwd.clone(),
+                "jj",
                 &["log", "-r", "boss/exec_abc", "--no-graph", "-T", "commit_id"],
                 "deadbeef\n",
             ),
             ExpectedCommand::ok(
-                cwd.clone(), "gh",
-                &["api", "repos/spinyfin/mono/branches/boss/exec_abc", "--jq", ".commit.sha"],
+                cwd.clone(),
+                "gh",
+                &[
+                    "api",
+                    "repos/spinyfin/mono/branches/boss/exec_abc",
+                    "--jq",
+                    ".commit.sha",
+                ],
                 "deadbeef\n",
             ),
         ]);
@@ -13273,13 +13421,14 @@ steps:
     fn pr_push_guard_rejects_pr_bookmark_head_branch() {
         // If the resolved head-branch is a pr/* name (explicit --branch pr/42), refuse.
         let cwd = std::env::current_dir().expect("cwd");
-        let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(cwd.clone(), "jj", &["git", "remote", "list"], remote_list_github()),
-        ]);
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            cwd.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            remote_list_github(),
+        )]);
 
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "pr/42",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "pr/42"]);
         let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse pr/* branch");
         runner.assert_exhausted();
         assert!(
@@ -13308,10 +13457,7 @@ steps:
 
     #[test]
     fn pr_number_from_url_returns_none_for_non_numeric_suffix() {
-        assert_eq!(
-            super::pr_number_from_url("https://github.com/owner/repo/pull/"),
-            None
-        );
+        assert_eq!(super::pr_number_from_url("https://github.com/owner/repo/pull/"), None);
     }
 
     #[test]
@@ -13370,8 +13516,7 @@ steps:
 
         ensure_boss_infra_excluded(&workspace, "mono-agent-004");
 
-        let exclude = std::fs::read_to_string(workspace.join(".git/info/exclude"))
-            .expect("exclude written");
+        let exclude = std::fs::read_to_string(workspace.join(".git/info/exclude")).expect("exclude written");
         assert!(exclude.contains("/logs/mono-agent-004.log"));
         assert!(exclude.contains(".boss/"));
 
@@ -13435,7 +13580,12 @@ steps:
     fn reset_runner_for(ws_path: &std::path::Path) -> FakeRunner {
         FakeRunner::new(vec![
             ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "remote", "list"], "origin\tgit@github.com:spinyfin/mono.git\n"),
+            ExpectedCommand::ok(
+                ws_path.to_path_buf(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
             ExpectedCommand::ok(
                 ws_path.to_path_buf(),
                 "jj",
@@ -13586,15 +13736,17 @@ steps:
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@example.com:org/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: None,
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@example.com:org/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: None,
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         // Populate two workspace rows directly via the store.
@@ -13651,15 +13803,17 @@ steps:
             use crate::metadata::RepoRecord;
             use crate::store::Store;
             let store = Store::open_at(&database_path).expect("store");
-            store.upsert_repo(&RepoRecord {
-                repo: "mono".to_string(),
-                origin: "git@example.com:org/mono.git".to_string(),
-                main_branch: "main".to_string(),
-                workspace_root: workspace_root.clone(),
-                workspace_prefix: "mono-agent-".to_string(),
-                source: None,
-                clone_command: None,
-            }).expect("seed repo");
+            store
+                .upsert_repo(&RepoRecord {
+                    repo: "mono".to_string(),
+                    origin: "git@example.com:org/mono.git".to_string(),
+                    main_branch: "main".to_string(),
+                    workspace_root: workspace_root.clone(),
+                    workspace_prefix: "mono-agent-".to_string(),
+                    source: None,
+                    clone_command: None,
+                })
+                .expect("seed repo");
         }
 
         // Populate and lease one workspace.
@@ -13677,15 +13831,7 @@ steps:
                 )
                 .unwrap();
             store
-                .claim_workspace(
-                    "mono",
-                    "boss/worker-1",
-                    "demo task",
-                    "lease-001",
-                    100,
-                    Some(9999),
-                    None,
-                )
+                .claim_workspace("mono", "boss/worker-1", "demo task", "lease-001", 100, Some(9999), None)
                 .unwrap();
         }
 
@@ -13719,18 +13865,19 @@ steps:
         let source_dir = tempdir.path().join("source").join("mono");
         std::fs::create_dir_all(&source_dir).expect("source dir");
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
         let ensure_defaults = RepoEnsureDefaults {
             repo_root: source_dir.parent().unwrap().to_path_buf(),
             workspace_root: workspace_root.clone(),
         };
-        run_with_context(ensure, Some(&database_path), &FakeRunner::default(), Some(&ensure_defaults), None).expect("repo");
+        run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&ensure_defaults),
+            None,
+        )
+        .expect("repo");
 
         let new_path = workspace_root.join("mono-agent-001");
         let staging = workspace_root.join(".incoming-mono-agent-001");
@@ -13750,9 +13897,12 @@ steps:
             )
             .creating_dir(staging.clone()),
             // Add the real GitHub remote.
-            ExpectedCommand::ok(staging.clone(), "jj", &[
-                "git", "remote", "add", "github", "git@github.com:spinyfin/mono.git",
-            ], ""),
+            ExpectedCommand::ok(
+                staging.clone(),
+                "jj",
+                &["git", "remote", "add", "github", "git@github.com:spinyfin/mono.git"],
+                "",
+            ),
             // Fetch from GitHub.
             ExpectedCommand::ok(staging.clone(), "jj", &["git", "fetch", "--remote", "github"], ""),
             // Track main on the github remote.
@@ -13761,8 +13911,18 @@ steps:
             ExpectedCommand::ok(staging.clone(), "jj", &["bookmark", "untrack", "main@origin"], ""),
             // Reset sequence uses main@github for the fast-forward.
             ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["git", "remote", "list"], "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n"),
-            ExpectedCommand::ok(new_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@github", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                new_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@github", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 new_path.clone(),
@@ -13792,26 +13952,42 @@ steps:
         std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
         std::fs::create_dir_all(&source_dir).expect("source dir");
 
-        let ensure = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
+        let ensure = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
         let ensure_defaults = RepoEnsureDefaults {
             repo_root: source_dir.parent().unwrap().to_path_buf(),
             workspace_root: workspace_root.clone(),
         };
-        run_with_context(ensure, Some(&database_path), &FakeRunner::default(), Some(&ensure_defaults), None).expect("repo");
+        run_with_context(
+            ensure,
+            Some(&database_path),
+            &FakeRunner::default(),
+            Some(&ensure_defaults),
+            None,
+        )
+        .expect("repo");
 
         let runner = FakeRunner::new(vec![
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["status", "--no-pager"], "The working copy is clean"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
             // detect_upstream_tracking_remote() returns the github remote
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "remote", "list"], "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n"),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\t/local/mirror\ngithub\tgit@github.com:spinyfin/mono.git\n",
+            ),
             // fast-forward against github, not the stale origin
-            ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "set", "main", "-r", "main@github", "--allow-backwards"], ""),
+            ExpectedCommand::ok(
+                workspace_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@github", "--allow-backwards"],
+                "",
+            ),
             ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main"], ""),
             ExpectedCommand::ok(
                 workspace_path.clone(),

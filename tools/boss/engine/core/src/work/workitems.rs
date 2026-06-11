@@ -1,10 +1,7 @@
 use super::*;
 
 impl WorkDb {
-    pub fn create_attention_item(
-        &self,
-        input: CreateAttentionItemInput,
-    ) -> Result<WorkAttentionItem> {
+    pub fn create_attention_item(&self, input: CreateAttentionItemInput) -> Result<WorkAttentionItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let (execution_id, work_item_id) = attention_target_from_input(&tx, &input)?;
@@ -31,8 +28,8 @@ impl WorkDb {
             ],
         )?;
 
-        let item = query_attention_item(&tx, &id)?
-            .with_context(|| format!("missing attention item after insert: {id}"))?;
+        let item =
+            query_attention_item(&tx, &id)?.with_context(|| format!("missing attention item after insert: {id}"))?;
         tx.commit()?;
         Ok(item)
     }
@@ -56,10 +53,7 @@ impl WorkDb {
     /// `repo_unresolved` surface and any future work-item-scoped
     /// attention flows. Errors if the work item id is unknown so
     /// callers can't accidentally silently no-op on a typo.
-    pub fn list_attention_items_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Vec<WorkAttentionItem>> {
+    pub fn list_attention_items_for_work_item(&self, work_item_id: &str) -> Result<Vec<WorkAttentionItem>> {
         let conn = self.connect()?;
         let _ = product_id_for_work_item(&conn, work_item_id)?;
         let mut stmt = conn.prepare(
@@ -140,12 +134,7 @@ impl WorkDb {
     /// SQL with `last_status_actor = 'engine'`; this path is for peer RPCs
     /// where the caller tier has already been resolved to `"human"` or
     /// `"boss"`.
-    pub fn update_work_item_as_actor(
-        &self,
-        id: &str,
-        patch: WorkItemPatch,
-        actor: &str,
-    ) -> Result<WorkItem> {
+    pub fn update_work_item_as_actor(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         match classify_id(id)? {
             ItemKind::Product => self.update_product(id, patch),
             ItemKind::Project => self.update_project(id, patch, actor),
@@ -219,8 +208,7 @@ impl WorkDb {
     /// must re-add any that still matter.
     pub fn restore_work_item(&self, id: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
-        let canonical =
-            resolve_friendly_work_item_id_inner(&conn, id, true)?.unwrap_or_else(|| id.to_owned());
+        let canonical = resolve_friendly_work_item_id_inner(&conn, id, true)?.unwrap_or_else(|| id.to_owned());
         match classify_id(&canonical)? {
             ItemKind::Task => {
                 // The row must exist (live or tombstoned). A WHERE that
@@ -229,11 +217,7 @@ impl WorkDb {
                 // check existence separately before the conditional
                 // UPDATE.
                 let exists = conn
-                    .query_row(
-                        "SELECT 1 FROM tasks WHERE id = ?1",
-                        params![canonical],
-                        |_| Ok(()),
-                    )
+                    .query_row("SELECT 1 FROM tasks WHERE id = ?1", params![canonical], |_| Ok(()))
                     .optional()?
                     .is_some();
                 if !exists {
@@ -335,10 +319,7 @@ impl WorkDb {
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation', 'revision') AND deleted_at IS NULL
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             )?;
-            let rows = stmt.query_map(
-                [product_id],
-                map_task_with_external_ref_parent_and_source_automation_id,
-            )?;
+            let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_and_source_automation_id)?;
             collect_rows(rows)?
         };
 
@@ -349,10 +330,7 @@ impl WorkDb {
                  WHERE product_id = ?1 AND kind = 'chore' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
             )?;
-            let rows = stmt.query_map(
-                [product_id],
-                map_task_with_external_ref_parent_and_source_automation_id,
-            )?;
+            let rows = stmt.query_map([product_id], map_task_with_external_ref_parent_and_source_automation_id)?;
             collect_rows(rows)?
         };
 
@@ -479,8 +457,7 @@ impl WorkDb {
     /// ids before the query runs, matching `get_work_item`'s contract.
     pub fn get_task_runtime(&self, work_item_id: &str) -> Result<TaskRuntime> {
         let conn = self.connect()?;
-        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?
-            .unwrap_or_else(|| work_item_id.to_owned());
+        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
         query_task_runtime(&conn, &resolved)
     }
 
@@ -492,11 +469,7 @@ impl WorkDb {
     /// The per-product sequence is shared across tasks and projects
     /// (design Q1), so each short_id belongs to at most one row across
     /// both tables for a given product.
-    pub fn get_work_item_by_short_id(
-        &self,
-        product_id: &str,
-        short_id: i64,
-    ) -> Result<Option<WorkItem>> {
+    pub fn get_work_item_by_short_id(&self, product_id: &str, short_id: i64) -> Result<Option<WorkItem>> {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
@@ -558,12 +531,7 @@ impl WorkDb {
             let rows = stmt.query_map([], map_task_with_parent)?;
             collect_rows(rows)?
                 .into_iter()
-                .filter(|task| {
-                    task.pr_url
-                        .as_deref()
-                        .and_then(crate::merge_poller::parse_pr_number)
-                        == Some(pr_number)
-                })
+                .filter(|task| task.pr_url.as_deref().and_then(crate::merge_poller::parse_pr_number) == Some(pr_number))
                 .collect()
         };
 
@@ -576,9 +544,10 @@ impl WorkDb {
             let mut revisions = Vec::with_capacity(revision_ids.len());
             for rev_id in &revision_ids {
                 if let Some(task) = query_task(&conn, rev_id)?
-                    && task.deleted_at.is_none() {
-                        revisions.push(task);
-                    }
+                    && task.deleted_at.is_none()
+                {
+                    revisions.push(task);
+                }
             }
             let mut revisions = attach_revision_projections(revisions, std::slice::from_ref(&owner));
             revisions.sort_by_key(|rev| rev.revision_seq.unwrap_or(i64::MAX));
@@ -601,11 +570,7 @@ impl WorkDb {
         // negated) when the caller asks to include deleted rows, so the
         // default `--deleted` view shows live and tombstoned tasks
         // together. Restore acts on the tombstoned ones.
-        let deleted_clause = if include_deleted {
-            ""
-        } else {
-            " AND deleted_at IS NULL"
-        };
+        let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
 
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
@@ -651,11 +616,9 @@ impl WorkDb {
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         let row = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = ?1",
-                params![key],
-                |row| row.get::<_, String>(0),
-            )
+            .query_row("SELECT value FROM metadata WHERE key = ?1", params![key], |row| {
+                row.get::<_, String>(0)
+            })
             .optional()?;
         Ok(row)
     }
@@ -690,12 +653,7 @@ impl WorkDb {
     /// `basis_hash` should be derived from the inputs that, if
     /// changed, invalidate the cached summary (typically a hash of
     /// name + description).
-    pub fn set_pane_summary(
-        &self,
-        work_item_id: &str,
-        summary: &str,
-        basis_hash: &str,
-    ) -> Result<()> {
+    pub fn set_pane_summary(&self, work_item_id: &str, summary: &str, basis_hash: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "INSERT INTO pane_summaries (work_item_id, summary, basis_hash, created_at)
@@ -719,11 +677,7 @@ impl WorkDb {
         ensure_product_exists(&conn, product_id)?;
 
         // See `list_tasks` for the include-deleted contract.
-        let deleted_clause = if include_deleted {
-            ""
-        } else {
-            " AND deleted_at IS NULL"
-        };
+        let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let mut stmt = conn.prepare(&format!(
             "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state
              FROM tasks
@@ -770,9 +724,7 @@ impl WorkDb {
             .filter(|s| !s.is_empty())
             .unwrap_or(RELATION_BLOCKS);
         if relation != RELATION_BLOCKS {
-            bail!(
-                "unsupported dependency relation `{relation}`; only `blocks` is implemented in v1"
-            );
+            bail!("unsupported dependency relation `{relation}`; only `blocks` is implemented in v1");
         }
         let dependent_id = input.dependent.trim();
         let prerequisite_id = input.prerequisite.trim();
@@ -861,9 +813,7 @@ impl WorkDb {
                )
              ORDER BY updated_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -943,10 +893,7 @@ impl WorkDb {
     /// Return the prerequisites and/or dependents of a single work
     /// item. Empty lists when nothing matches; errors only when the
     /// work item id itself is unknown.
-    pub fn list_dependencies(
-        &self,
-        input: ListDependenciesInput,
-    ) -> Result<WorkItemDependencyView> {
+    pub fn list_dependencies(&self, input: ListDependenciesInput) -> Result<WorkItemDependencyView> {
         let work_item_id = input.work_item.trim();
         if work_item_id.is_empty() {
             bail!("work_item id is required");
@@ -981,10 +928,7 @@ impl WorkDb {
     /// is collapsed into the peer's id + status + name + kind so the
     /// CLI / app shows the gate context without a second lookup.
     /// Drives the `boss <kind> show` Dependencies section (Q6).
-    pub fn list_dependencies_detailed(
-        &self,
-        input: ListDependenciesInput,
-    ) -> Result<WorkItemDependencyDetail> {
+    pub fn list_dependencies_detailed(&self, input: ListDependenciesInput) -> Result<WorkItemDependencyDetail> {
         let work_item_id = input.work_item.trim();
         if work_item_id.is_empty() {
             bail!("work_item id is required");

@@ -50,29 +50,31 @@ impl LocalSourceTree {
                 current.push(part);
 
                 if let Ok(metadata) = fs::symlink_metadata(&current)
-                    && metadata.file_type().is_symlink() {
-                        let resolved = current.canonicalize().with_context(|| {
-                            format!("failed to resolve symlink {}", current.display())
-                        })?;
-                        if !resolved.starts_with(&self.root) {
-                            bail!(
-                                "symlink escapes source tree root: {} -> {}",
-                                current.display(),
-                                resolved.display()
-                            );
-                        }
+                    && metadata.file_type().is_symlink()
+                {
+                    let resolved = current
+                        .canonicalize()
+                        .with_context(|| format!("failed to resolve symlink {}", current.display()))?;
+                    if !resolved.starts_with(&self.root) {
+                        bail!(
+                            "symlink escapes source tree root: {} -> {}",
+                            current.display(),
+                            resolved.display()
+                        );
                     }
+                }
             }
         }
 
         if let Ok(canonical) = current.canonicalize()
-            && !canonical.starts_with(&self.root) {
-                bail!(
-                    "resolved path escapes source tree root: {} -> {}",
-                    relative_path.display(),
-                    canonical.display()
-                );
-            }
+            && !canonical.starts_with(&self.root)
+        {
+            bail!(
+                "resolved path escapes source tree root: {} -> {}",
+                relative_path.display(),
+                canonical.display()
+            );
+        }
 
         Ok(current)
     }
@@ -132,12 +134,8 @@ impl SourceTree for LocalSourceTree {
 
         let mut output = Vec::new();
         for entry in entries {
-            let entry = entry.with_context(|| {
-                format!(
-                    "failed to read directory entry under {}",
-                    directory_path.display()
-                )
-            })?;
+            let entry =
+                entry.with_context(|| format!("failed to read directory entry under {}", directory_path.display()))?;
             output.push(self.path_relative_to_root(&entry.path())?);
         }
 
@@ -152,18 +150,13 @@ impl SourceTree for LocalSourceTree {
         }
 
         let mut glob_builder = GlobSetBuilder::new();
-        glob_builder
-            .add(Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?);
+        glob_builder.add(Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?);
         let glob_set = glob_builder.build().context("failed to build glob set")?;
 
         let mut matches = Vec::new();
         for entry in WalkDir::new(&self.root).follow_links(false) {
-            let entry = entry.with_context(|| {
-                format!(
-                    "failed to walk source tree rooted at {}",
-                    self.root.display()
-                )
-            })?;
+            let entry =
+                entry.with_context(|| format!("failed to walk source tree rooted at {}", self.root.display()))?;
 
             if entry.file_type().is_dir() {
                 continue;
@@ -189,11 +182,7 @@ fn run_bytes_command(root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "command `{binary} {}` failed: {}",
-            args.join(" "),
-            stderr.trim()
-        );
+        bail!("command `{binary} {}` failed: {}", args.join(" "), stderr.trim());
     }
 
     Ok(output.stdout)
@@ -297,9 +286,7 @@ mod tests {
 
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");
         assert!(tree.exists(Path::new("link.txt")));
-        let content = tree
-            .read_file(Path::new("link.txt"))
-            .expect("read through symlink");
+        let content = tree.read_file(Path::new("link.txt")).expect("read through symlink");
         assert_eq!(content, b"safe");
     }
 
@@ -307,10 +294,7 @@ mod tests {
     fn reads_file_from_git_base_revision() {
         let temp = tempdir().expect("create temp dir");
         run_git(temp.path(), &["init"]);
-        run_git(
-            temp.path(),
-            &["config", "user.email", "checkleft@example.com"],
-        );
+        run_git(temp.path(), &["config", "user.email", "checkleft@example.com"]);
         run_git(temp.path(), &["config", "user.name", "Checkleft"]);
 
         fs::write(temp.path().join("tracked.txt"), "before\n").expect("write initial file");
@@ -319,11 +303,8 @@ mod tests {
 
         fs::write(temp.path().join("tracked.txt"), "after\n").expect("rewrite file");
 
-        let tree = LocalSourceTree::with_base_revision(
-            temp.path(),
-            Some(BaseRevision::Git("HEAD".to_owned())),
-        )
-        .expect("create tree");
+        let tree = LocalSourceTree::with_base_revision(temp.path(), Some(BaseRevision::Git("HEAD".to_owned())))
+            .expect("create tree");
         let current = tree
             .read_file_versioned(Path::new("tracked.txt"), TreeVersion::Current)
             .expect("read current file");

@@ -51,10 +51,8 @@ pub enum ResolutionSignal {
 /// GitHub PR issue-comment URL — the stdout shape of a successful
 /// `gh pr comment` call. Path ends in `#issuecomment-<digits>`.
 static ISSUECOMMENT_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+#issuecomment-\d+",
-    )
-    .expect("issuecomment URL regex compiles")
+    Regex::new(r"https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+#issuecomment-\d+")
+        .expect("issuecomment URL regex compiles")
 });
 
 /// Detect a force-push command in a Bash `tool_input`.
@@ -71,9 +69,9 @@ pub fn is_force_push_command(tool_input: &serde_json::Value) -> bool {
     if !command.contains("git push") {
         return false;
     }
-    command.split_whitespace().any(|token| {
-        token == "-f" || token == "--force" || token == "--force-with-lease"
-    })
+    command
+        .split_whitespace()
+        .any(|token| token == "-f" || token == "--force" || token == "--force-with-lease")
 }
 
 /// Scan `tool_response` for a GitHub PR issue-comment URL — the stdout
@@ -81,14 +79,10 @@ pub fn is_force_push_command(tool_input: &serde_json::Value) -> bool {
 ///
 /// Returns the first `#issuecomment-<N>` URL found in `stdout` (then
 /// `stderr` as fallback), or `None`.
-pub fn extract_resolution_comment_url(
-    tool_response: &serde_json::Value,
-) -> Option<String> {
+pub fn extract_resolution_comment_url(tool_response: &serde_json::Value) -> Option<String> {
     let scan = |field: &str| -> Option<String> {
         let text = tool_response.get(field)?.as_str()?;
-        ISSUECOMMENT_URL_RE
-            .find(text)
-            .map(|m| m.as_str().to_owned())
+        ISSUECOMMENT_URL_RE.find(text).map(|m| m.as_str().to_owned())
     };
     scan("stdout").or_else(|| scan("stderr"))
 }
@@ -117,14 +111,8 @@ impl StagedResolutionSignalCache {
     /// kind — recording the same signal twice is a no-op. Multiple
     /// distinct signals for one execution accumulate in the set.
     pub fn record_signal(&self, execution_id: &str, signal: ResolutionSignal) {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("StagedResolutionSignalCache mutex poisoned");
-        guard
-            .entry(execution_id.to_owned())
-            .or_default()
-            .insert(signal);
+        let mut guard = self.inner.lock().expect("StagedResolutionSignalCache mutex poisoned");
+        guard.entry(execution_id.to_owned()).or_default().insert(signal);
     }
 
     /// Return `true` if at least one signal has been recorded for

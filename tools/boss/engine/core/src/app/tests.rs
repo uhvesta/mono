@@ -1,5 +1,5 @@
-use super::*;
 use super::server::{current_parent_pid, pid_is_alive};
+use super::*;
 use crate::protocol::TopicEventPayload;
 
 fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {
@@ -20,10 +20,7 @@ fn topic_envelope(topic: &str, revision: u64) -> FrontendEventEnvelope {
 }
 
 fn response_envelope(request_id: &str) -> FrontendEventEnvelope {
-    FrontendEventEnvelope::response(
-        request_id.to_owned(),
-        FrontendEvent::ProductsList { products: vec![] },
-    )
+    FrontendEventEnvelope::response(request_id.to_owned(), FrontendEvent::ProductsList { products: vec![] })
 }
 
 fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
@@ -33,7 +30,10 @@ fn topic_of(env: &FrontendEventEnvelope) -> Option<String> {
 fn test_server_state() -> Arc<ServerState> {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
-        crate::config::WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build(),
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
         None,
     ));
     // Leak the temp dir for the lifetime of the test process; the

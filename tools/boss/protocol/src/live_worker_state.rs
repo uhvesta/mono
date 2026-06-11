@@ -176,11 +176,7 @@ impl LiveWorkerState {
         binding: Option<WorkItemBinding>,
     ) -> Self {
         let (work_item_id, work_item_name, execution_id) = match binding {
-            Some(b) => (
-                Some(b.work_item_id),
-                Some(b.work_item_name),
-                Some(b.execution_id),
-            ),
+            Some(b) => (Some(b.work_item_id), Some(b.work_item_name), Some(b.execution_id)),
             None => (None, None, None),
         };
         Self {

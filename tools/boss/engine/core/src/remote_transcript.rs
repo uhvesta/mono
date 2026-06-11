@@ -58,11 +58,7 @@ fn shell_single_quote(s: &str) -> String {
 /// empty string. Any other non-zero exit surfaces as an error so a real
 /// failure (permission denied, connection lost) is not silently read as
 /// an empty transcript.
-pub async fn pull_remote_transcript_tail(
-    exec: &dyn SshExec,
-    path: &str,
-    max_bytes: u64,
-) -> Result<String> {
+pub async fn pull_remote_transcript_tail(exec: &dyn SshExec, path: &str, max_bytes: u64) -> Result<String> {
     let command = remote_tail_command(path, max_bytes);
     let out = exec.run(&[command.as_str()]).await?;
     if out.success() {
@@ -161,9 +157,7 @@ mod tests {
     #[tokio::test]
     async fn pull_returns_stdout_on_success() {
         let exec = FakeExec::ok("{\"a\":1}\n{\"b\":2}\n");
-        let out = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096)
-            .await
-            .unwrap();
+        let out = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096).await.unwrap();
         assert_eq!(out, "{\"a\":1}\n{\"b\":2}\n");
         assert_eq!(
             exec.last_command.lock().unwrap().as_deref(),
@@ -174,18 +168,14 @@ mod tests {
     #[tokio::test]
     async fn pull_maps_missing_file_to_empty() {
         let exec = FakeExec::failing(1, "tail: /p.jsonl: No such file or directory");
-        let out = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096)
-            .await
-            .unwrap();
+        let out = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096).await.unwrap();
         assert!(out.is_empty());
     }
 
     #[tokio::test]
     async fn pull_surfaces_real_failures() {
         let exec = FakeExec::failing(255, "ssh: connect to host zakalwe port 22: Broken pipe");
-        let err = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096)
-            .await
-            .unwrap_err();
+        let err = pull_remote_transcript_tail(&exec, "/p.jsonl", 4096).await.unwrap_err();
         assert!(err.to_string().contains("zakalwe"));
         assert!(err.to_string().contains("Broken pipe"));
     }

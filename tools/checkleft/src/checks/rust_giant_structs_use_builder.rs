@@ -12,8 +12,8 @@ use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 use super::rust_giant_struct_common::{
-    BuilderKind, DEFAULT_MAX_FIELDS, collect_violations, find_struct_line, is_excluded,
-    is_literal_path, parse_exclude_files, struct_declaration_line,
+    BuilderKind, DEFAULT_MAX_FIELDS, collect_violations, find_struct_line, is_excluded, is_literal_path,
+    parse_exclude_files, struct_declaration_line,
 };
 
 const CHECK_ID: &str = "rust-giant-structs-use-builder";
@@ -100,7 +100,6 @@ enum AuditKind {
     File,
 }
 
-
 #[async_trait]
 impl Check for RustGiantStructsUseBuilderCheck {
     fn id(&self) -> &str {
@@ -115,11 +114,7 @@ impl Check for RustGiantStructsUseBuilderCheck {
         Ok(Arc::new(parse_config(config, None)?))
     }
 
-    fn configure_scoped(
-        &self,
-        config: &toml::Value,
-        config_dir: Option<&Path>,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_scoped(&self, config: &toml::Value, config_dir: Option<&Path>) -> Result<Arc<dyn ConfiguredCheck>> {
         Ok(Arc::new(parse_config(config, config_dir)?))
     }
 }
@@ -215,9 +210,7 @@ impl ConfiguredCheck for ParsedConfig {
     fn declared_exclusions(&self) -> Vec<DeclaredExclusion> {
         self.auditable_exclusions
             .iter()
-            .map(|exclusion| {
-                DeclaredExclusion::new(exclusion.entry.clone(), vec![exclusion.path.clone()])
-            })
+            .map(|exclusion| DeclaredExclusion::new(exclusion.entry.clone(), vec![exclusion.path.clone()]))
             .collect()
     }
 
@@ -242,10 +235,7 @@ impl ConfiguredCheck for ParsedConfig {
                     Ok(ExclusionStatus::LoadBearing)
                 } else {
                     Ok(ExclusionStatus::Stale {
-                        reason: format!(
-                            "the excluded file `{}` no longer exists",
-                            spec.path.display()
-                        ),
+                        reason: format!("the excluded file `{}` no longer exists", spec.path.display()),
                     })
                 }
             }
@@ -294,7 +284,6 @@ impl ConfiguredCheck for ParsedConfig {
     }
 }
 
-
 fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<ParsedConfig> {
     let raw: RawConfig = config
         .clone()
@@ -309,9 +298,7 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
     let builder = match raw.builder.as_deref() {
         Some("bon") | None => BuilderKind::Bon,
         Some("derive_builder") => BuilderKind::DeriveBuilder,
-        Some(other) => bail!(
-            "unknown `builder` value: {other:?}; expected \"bon\" or \"derive_builder\""
-        ),
+        Some(other) => bail!("unknown `builder` value: {other:?}; expected \"bon\" or \"derive_builder\""),
     };
 
     let mut exclude_structs: HashSet<String> = HashSet::new();
@@ -340,10 +327,7 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
                 path: resolved.clone(),
                 kind: AuditKind::Struct(name_part.clone()),
             });
-            exclude_structs_qualified
-                .entry(resolved)
-                .or_default()
-                .insert(name_part);
+            exclude_structs_qualified.entry(resolved).or_default().insert(name_part);
         } else {
             // Simple form: scoped to the config subtree at runtime. The struct could live
             // in any file in the subtree, so the dependency can't be pinned — not audited.
@@ -375,7 +359,6 @@ fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<Parse
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -401,11 +384,7 @@ mod tests {
             kind: ChangeKind::Modified,
             old_path: None,
         }]);
-        check
-            .run(&changeset, &tree, &config)
-            .await
-            .expect("run check")
-            .findings
+        check.run(&changeset, &tree, &config).await.expect("run check").findings
     }
 
     async fn run_check(source: &str, config: toml::Value) -> Vec<String> {
@@ -585,10 +564,7 @@ pub struct Big {
         let config = toml::Value::Table(toml::toml! {
             exclude_files = ["skipped.rs"]
         });
-        let result = check
-            .run(&changeset, &tree, &config)
-            .await
-            .expect("run check");
+        let result = check.run(&changeset, &tree, &config).await.expect("run check");
         assert!(result.findings.is_empty());
     }
 
@@ -615,10 +591,7 @@ pub struct Big {
         let config = toml::Value::Table(toml::toml! {
             exclude_globs = ["skipped.rs"]
         });
-        let result = check
-            .run(&changeset, &tree, &config)
-            .await
-            .expect("run check");
+        let result = check.run(&changeset, &tree, &config).await.expect("run check");
         assert!(result.findings.is_empty());
     }
 
@@ -759,11 +732,7 @@ pub(crate) struct Big {
 
     /// Helper that runs the check with an explicit config_dir scope.
     /// The changed file is always `test.rs` relative to a fresh temp dir.
-    async fn run_check_scoped(
-        source: &str,
-        config: toml::Value,
-        config_dir: Option<&Path>,
-    ) -> Vec<String> {
+    async fn run_check_scoped(source: &str, config: toml::Value, config_dir: Option<&Path>) -> Vec<String> {
         let temp = tempdir().expect("create temp dir");
         fs::write(temp.path().join("test.rs"), source).expect("write file");
         let check = RustGiantStructsUseBuilderCheck;
@@ -773,9 +742,7 @@ pub(crate) struct Big {
             kind: ChangeKind::Modified,
             old_path: None,
         }]);
-        let configured = check
-            .configure_scoped(&config, config_dir)
-            .expect("configure_scoped");
+        let configured = check.configure_scoped(&config, config_dir).expect("configure_scoped");
         configured
             .run(&changeset, &tree)
             .await
@@ -814,8 +781,7 @@ pub struct Grandfathered {
             exclude_structs = ["Grandfathered"]
         });
         // config_dir = "tools/other" → test.rs is outside that subtree.
-        let messages =
-            run_check_scoped(source, config, Some(Path::new("tools/other"))).await;
+        let messages = run_check_scoped(source, config, Some(Path::new("tools/other"))).await;
         assert_eq!(messages.len(), 1, "expected Grandfathered to be flagged");
         assert!(messages[0].contains("Grandfathered"));
     }
@@ -945,7 +911,11 @@ pub struct Big {
             .await
             .expect("run check");
 
-        assert_eq!(result.findings.len(), 1, "file outside config_dir should not be excluded");
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "file outside config_dir should not be excluded"
+        );
     }
 
     #[tokio::test]
@@ -1022,11 +992,7 @@ pub struct PlainBig {
 }
 "#;
         let messages = run_check(source, toml::Value::Table(toml::Table::new())).await;
-        assert_eq!(
-            messages.len(),
-            1,
-            "plain giant struct should still be flagged"
-        );
+        assert_eq!(messages.len(), 1, "plain giant struct should still be flagged");
         assert!(messages[0].contains("PlainBig"));
     }
 
@@ -1049,8 +1015,7 @@ pub struct FreshlyAdded {
 }
 "#;
         let temp = tempdir().expect("create temp dir");
-        std::fs::create_dir_all(temp.path().join("tools/boss/engine/src"))
-            .expect("mkdir tools/boss/engine/src");
+        std::fs::create_dir_all(temp.path().join("tools/boss/engine/src")).expect("mkdir tools/boss/engine/src");
         fs::write(temp.path().join("tools/boss/engine/src/app.rs"), source).expect("write file");
         let check = RustGiantStructsUseBuilderCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");
@@ -1075,7 +1040,11 @@ pub struct FreshlyAdded {
             .into_iter()
             .map(|f| f.message)
             .collect();
-        assert_eq!(messages.len(), 1, "expected only the new struct flagged, got {messages:?}");
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected only the new struct flagged, got {messages:?}"
+        );
         assert!(messages[0].contains("FreshlyAdded"));
         assert!(!messages[0].contains("ServerState"));
     }
@@ -1092,8 +1061,7 @@ pub struct ServerState {
 }
 "#;
         let temp = tempdir().expect("create temp dir");
-        std::fs::create_dir_all(temp.path().join("tools/boss/engine/src"))
-            .expect("mkdir tools/boss/engine/src");
+        std::fs::create_dir_all(temp.path().join("tools/boss/engine/src")).expect("mkdir tools/boss/engine/src");
         // Same struct name, but in a different file than the qualified entry points at.
         fs::write(temp.path().join("tools/boss/engine/src/other.rs"), source).expect("write file");
         let check = RustGiantStructsUseBuilderCheck;
@@ -1117,7 +1085,11 @@ pub struct ServerState {
             .into_iter()
             .map(|f| f.message)
             .collect();
-        assert_eq!(messages.len(), 1, "expected ServerState flagged in the wrong file, got {messages:?}");
+        assert_eq!(
+            messages.len(),
+            1,
+            "expected ServerState flagged in the wrong file, got {messages:?}"
+        );
         assert!(messages[0].contains("ServerState"));
     }
 
@@ -1136,10 +1108,7 @@ pub struct Big {
 }
 "#;
 
-    fn configured(
-        config: toml::Value,
-        config_dir: Option<&Path>,
-    ) -> std::sync::Arc<dyn ConfiguredCheck> {
+    fn configured(config: toml::Value, config_dir: Option<&Path>) -> std::sync::Arc<dyn ConfiguredCheck> {
         RustGiantStructsUseBuilderCheck
             .configure_scoped(&config, config_dir)
             .expect("configure_scoped")
@@ -1191,10 +1160,7 @@ pub struct Big {
             Some(Path::new("")),
         );
         let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         assert_eq!(status, ExclusionStatus::LoadBearing);
     }
 
@@ -1209,10 +1175,7 @@ pub struct Big {
             Some(Path::new("")),
         );
         let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         match status {
             ExclusionStatus::Stale { reason } => {
                 assert!(reason.contains("satisfies"), "unexpected reason: {reason}");
@@ -1232,10 +1195,7 @@ pub struct Big {
             Some(Path::new("")),
         );
         let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         match status {
             ExclusionStatus::Stale { reason } => {
                 assert!(reason.contains("no longer exists"), "unexpected reason: {reason}");
@@ -1255,10 +1215,7 @@ pub struct Big {
             Some(Path::new("")),
         );
         let exclusion = DeclaredExclusion::new("test.rs::Big", vec!["test.rs".into()]);
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         match status {
             ExclusionStatus::Stale { reason } => {
                 assert!(reason.contains("no longer defined"), "unexpected reason: {reason}");
@@ -1280,18 +1237,12 @@ pub struct Big {
         let exclusion = DeclaredExclusion::new("gen.rs", vec!["gen.rs".into()]);
 
         // Missing file => stale.
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         assert!(matches!(status, ExclusionStatus::Stale { .. }));
 
         // Present file => load-bearing.
         fs::write(temp.path().join("gen.rs"), "// generated\n").expect("write file");
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         assert_eq!(status, ExclusionStatus::LoadBearing);
     }
 
@@ -1305,10 +1256,7 @@ pub struct Big {
             Some(Path::new("")),
         );
         let exclusion = DeclaredExclusion::new("nope.rs::Ghost", vec!["nope.rs".into()]);
-        let status = check
-            .evaluate_exclusion(&exclusion, &tree)
-            .await
-            .expect("evaluate");
+        let status = check.evaluate_exclusion(&exclusion, &tree).await.expect("evaluate");
         assert_eq!(status, ExclusionStatus::Unknown);
     }
 }

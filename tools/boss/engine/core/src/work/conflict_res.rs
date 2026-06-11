@@ -87,16 +87,11 @@ impl WorkDb {
             |row| row.get(0),
         )?;
         let churn_tripped = recent_count >= CHURN_GUARD_THRESHOLD;
-        let (status, failure_reason, finished_at): (&str, Option<&str>, Option<&str>) =
-            if churn_tripped {
-                (
-                    "abandoned",
-                    Some("churn_threshold_exceeded"),
-                    Some(now.as_str()),
-                )
-            } else {
-                ("pending", None, None)
-            };
+        let (status, failure_reason, finished_at): (&str, Option<&str>, Option<&str>) = if churn_tripped {
+            ("abandoned", Some("churn_threshold_exceeded"), Some(now.as_str()))
+        } else {
+            ("pending", None, None)
+        };
 
         let rows = tx.execute(
             "INSERT OR IGNORE INTO conflict_resolutions
@@ -161,10 +156,7 @@ impl WorkDb {
     ///
     /// Returns `None` when no attempt has ever been recorded for this
     /// work item.
-    pub fn latest_conflict_resolution_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<ConflictResolution>> {
+    pub fn latest_conflict_resolution_for_work_item(&self, work_item_id: &str) -> Result<Option<ConflictResolution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
@@ -187,10 +179,7 @@ impl WorkDb {
     /// conflict-detection path to detect "an attempt is already in
     /// flight" and by the worker prompt composer to find the row to
     /// embed the diagnosis from.
-    pub fn active_conflict_resolution_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<ConflictResolution>> {
+    pub fn active_conflict_resolution_for_work_item(&self, work_item_id: &str) -> Result<Option<ConflictResolution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, product_id, work_item_id, pr_url, pr_number, head_branch, base_branch,
@@ -446,10 +435,7 @@ impl WorkDb {
             params_vec.push(Box::new(cap as i64));
         }
         let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-            .collect();
+        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
         let rows = stmt.query_map(refs.as_slice(), map_conflict_resolution)?;
         let mut out = Vec::new();
         for row in rows {
@@ -471,10 +457,7 @@ impl WorkDb {
     /// (if currently `in_review`) and its `blocked_attempt_id` is
     /// repointed at the reset row. Returns the reset row on success;
     /// `Ok(None)` when the id is unknown or the row is non-terminal.
-    pub fn retry_conflict_resolution(
-        &self,
-        attempt_id: &str,
-    ) -> Result<Option<ConflictResolution>> {
+    pub fn retry_conflict_resolution(&self, attempt_id: &str) -> Result<Option<ConflictResolution>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();

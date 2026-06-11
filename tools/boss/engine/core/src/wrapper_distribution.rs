@@ -26,8 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 use crate::remote_wrapper::{
-    REMOTE_WRAPPER_DIR, REMOTE_WRAPPER_NAME, expected_version, remote_wrapper_path,
-    rendered_wrapper,
+    REMOTE_WRAPPER_DIR, REMOTE_WRAPPER_NAME, expected_version, remote_wrapper_path, rendered_wrapper,
 };
 use crate::ssh_transport::{SshFailureKind, SshTransport, classify_stderr};
 
@@ -196,10 +195,7 @@ pub async fn verify_wrapper_version(transport: &SshTransport) -> Result<VersionC
 /// Acquires the per-host lock from `locks` before running
 /// verify-then-push so the pair is atomic against concurrent callers
 /// on the same host. Callers for different hosts run in parallel.
-pub async fn ensure_wrapper_current(
-    transport: &SshTransport,
-    locks: &WrapperPushLocks,
-) -> Result<WrapperPushOutcome> {
+pub async fn ensure_wrapper_current(transport: &SshTransport, locks: &WrapperPushLocks) -> Result<WrapperPushOutcome> {
     let host_lock = locks.lock_for(&transport.host_id);
     let _guard = host_lock.lock().await;
     match verify_wrapper_version(transport).await? {
@@ -242,8 +238,8 @@ pub fn materialize_wrapper_to_disk() -> Result<PathBuf> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path = dir.join(format!("boss-remote-run.{}.{}.sh", std::process::id(), suffix));
-    let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("creating wrapper staging file at {path:?}"))?;
+    let mut file =
+        std::fs::File::create(&path).with_context(|| format!("creating wrapper staging file at {path:?}"))?;
     file.write_all(rendered_wrapper().as_bytes())
         .with_context(|| format!("writing wrapper bytes to {path:?}"))?;
     file.flush().with_context(|| format!("flushing {path:?}"))?;
@@ -259,13 +255,14 @@ struct TempFileGuard(PathBuf);
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
         if let Err(err) = std::fs::remove_file(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(
-                    ?err,
-                    path = %self.0.display(),
-                    "wrapper_distribution: failed to unlink local staging file"
-                );
-            }
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                ?err,
+                path = %self.0.display(),
+                "wrapper_distribution: failed to unlink local staging file"
+            );
+        }
     }
 }
 
@@ -317,10 +314,7 @@ mod tests {
         let lock_b = locks.lock_for("host-b");
 
         let _guard_a = lock_a.lock().await;
-        assert!(
-            lock_b.try_lock().is_ok(),
-            "different-host locks should be independent"
-        );
+        assert!(lock_b.try_lock().is_ok(), "different-host locks should be independent");
     }
 
     #[test]
@@ -381,10 +375,7 @@ mod tests {
         // The design names the reason verbatim; this constant must
         // match so attention items / failure tables can be filtered
         // by string compare.
-        assert_eq!(
-            RUN_FAILURE_REASON_WRAPPER_PUSH_FAILED,
-            "host_wrapper_push_failed"
-        );
+        assert_eq!(RUN_FAILURE_REASON_WRAPPER_PUSH_FAILED, "host_wrapper_push_failed");
     }
 
     #[test]

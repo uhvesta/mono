@@ -18,10 +18,7 @@ use super::{
 pub struct NoopExternalCheckPackageProvider;
 
 impl ExternalCheckPackageProvider for NoopExternalCheckPackageProvider {
-    fn resolve(
-        &self,
-        _implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>> {
+    fn resolve(&self, _implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>> {
         Ok(None)
     }
 }
@@ -38,20 +35,14 @@ impl FileExternalCheckPackageProvider {
             .canonicalize()
             .with_context(|| format!("failed to canonicalize root {}", root.display()))?;
         if !root.is_dir() {
-            bail!(
-                "external package provider root is not a directory: {}",
-                root.display()
-            );
+            bail!("external package provider root is not a directory: {}", root.display());
         }
         Ok(Self { root })
     }
 }
 
 impl ExternalCheckPackageProvider for FileExternalCheckPackageProvider {
-    fn resolve(
-        &self,
-        implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>> {
+    fn resolve(&self, implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>> {
         let ExternalCheckImplementationRef::File(relative_path) = implementation_ref else {
             return Ok(None);
         };
@@ -82,20 +73,20 @@ impl GeneratedExternalCheckPackageProvider {
             )
         })?;
 
-        let raw_index: RawGeneratedExternalCheckPackageIndex = toml::from_str(&index_contents)
-            .with_context(|| {
-                format!(
-                    "failed to parse generated external package index TOML {}",
-                    full_index_path.display()
-                )
-            })?;
+        let raw_index: RawGeneratedExternalCheckPackageIndex = toml::from_str(&index_contents).with_context(|| {
+            format!(
+                "failed to parse generated external package index TOML {}",
+                full_index_path.display()
+            )
+        })?;
         if let Some(version) = raw_index.version
-            && version != 1 {
-                bail!(
-                    "unsupported generated external package index version `{version}` in {} (expected 1)",
-                    full_index_path.display()
-                );
-            }
+            && version != 1
+        {
+            bail!(
+                "unsupported generated external package index version `{version}` in {} (expected 1)",
+                full_index_path.display()
+            );
+        }
 
         let index_dir = full_index_path
             .parent()
@@ -104,12 +95,12 @@ impl GeneratedExternalCheckPackageProvider {
 
         let mut packages_by_generated_id = BTreeMap::new();
         for (entry_idx, raw_entry) in raw_index.packages.into_iter().enumerate() {
-            let generated_id = raw_entry.parse_generated_id().with_context(|| {
-                format!("index entry [{}] has invalid implementation", entry_idx)
-            })?;
-            let manifest_path = raw_entry.parse_manifest_path().with_context(|| {
-                format!("index entry [{}] has invalid manifest path", entry_idx)
-            })?;
+            let generated_id = raw_entry
+                .parse_generated_id()
+                .with_context(|| format!("index entry [{}] has invalid implementation", entry_idx))?;
+            let manifest_path = raw_entry
+                .parse_manifest_path()
+                .with_context(|| format!("index entry [{}] has invalid manifest path", entry_idx))?;
             let manifest_full_path = index_dir.join(manifest_path);
 
             let package = load_external_check_package_manifest(&manifest_full_path).with_context(|| {
@@ -119,10 +110,7 @@ impl GeneratedExternalCheckPackageProvider {
                 )
             })?;
 
-            if packages_by_generated_id
-                .insert(generated_id.clone(), package)
-                .is_some()
-            {
+            if packages_by_generated_id.insert(generated_id.clone(), package).is_some() {
                 bail!(
                     "duplicate generated implementation `{generated_id}` in index {}",
                     full_index_path.display()
@@ -137,10 +125,7 @@ impl GeneratedExternalCheckPackageProvider {
 }
 
 impl ExternalCheckPackageProvider for GeneratedExternalCheckPackageProvider {
-    fn resolve(
-        &self,
-        implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>> {
+    fn resolve(&self, implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>> {
         let ExternalCheckImplementationRef::Generated(generated_id) = implementation_ref else {
             return Ok(None);
         };
@@ -173,10 +158,7 @@ impl CompositeExternalCheckPackageProvider {
 }
 
 impl ExternalCheckPackageProvider for CompositeExternalCheckPackageProvider {
-    fn resolve(
-        &self,
-        implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>> {
+    fn resolve(&self, implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>> {
         info!(
             implementation_ref = %implementation_ref,
             providers = self.providers.len(),
@@ -185,29 +167,20 @@ impl ExternalCheckPackageProvider for CompositeExternalCheckPackageProvider {
         let mut matches = Vec::new();
 
         for configured in &self.providers {
-            let package = configured
-                .provider
-                .resolve(implementation_ref)
-                .with_context(|| {
-                    format!(
-                        "external package provider `{}` failed resolving `{implementation_ref}`",
-                        configured.name
-                    )
-                })?;
+            let package = configured.provider.resolve(implementation_ref).with_context(|| {
+                format!(
+                    "external package provider `{}` failed resolving `{implementation_ref}`",
+                    configured.name
+                )
+            })?;
             if let Some(package) = package {
                 matches.push((configured.name.as_str(), package));
             }
         }
 
         if matches.len() > 1 {
-            let provider_names = matches
-                .iter()
-                .map(|(name, _)| *name)
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "implementation reference `{implementation_ref}` resolved by multiple providers: {provider_names}"
-            );
+            let provider_names = matches.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ");
+            bail!("implementation reference `{implementation_ref}` resolved by multiple providers: {provider_names}");
         }
 
         Ok(matches.pop().map(|(_, package)| package))
@@ -255,8 +228,7 @@ fn parse_relative_path(field_name: &str, value: &str) -> Result<PathBuf> {
         bail!("field `{field_name}` must not be empty");
     }
     let path = PathBuf::from(value);
-    validate_relative_path(&path)
-        .with_context(|| format!("field `{field_name}` must be a safe relative path"))?;
+    validate_relative_path(&path).with_context(|| format!("field `{field_name}` must be a safe relative path"))?;
     Ok(path)
 }
 
@@ -265,7 +237,6 @@ fn resolve_rooted_path(root: &Path, path: &Path, field_name: &str) -> Result<Pat
         return Ok(path.to_path_buf());
     }
 
-    validate_relative_path(path)
-        .with_context(|| format!("field `{field_name}` must be a safe relative path"))?;
+    validate_relative_path(path).with_context(|| format!("field `{field_name}` must be a safe relative path"))?;
     Ok(root.join(path))
 }

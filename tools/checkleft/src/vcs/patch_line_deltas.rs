@@ -11,9 +11,7 @@ pub(super) struct ParsedPatchFileDiff {
     pub line_delta: FileLineDelta,
 }
 
-pub(super) fn parse_file_diffs_from_git_patch(
-    patch: &str,
-) -> HashMap<PathBuf, ParsedPatchFileDiff> {
+pub(super) fn parse_file_diffs_from_git_patch(patch: &str) -> HashMap<PathBuf, ParsedPatchFileDiff> {
     let mut output = HashMap::new();
 
     let mut current_old_path: Option<PathBuf> = None;
@@ -40,14 +38,9 @@ pub(super) fn parse_file_diffs_from_git_patch(
         output
             .entry(path.clone())
             .and_modify(|existing| {
-                existing.line_delta.added_lines = existing
-                    .line_delta
-                    .added_lines
-                    .saturating_add(delta.added_lines);
-                existing.line_delta.removed_lines = existing
-                    .line_delta
-                    .removed_lines
-                    .saturating_add(delta.removed_lines);
+                existing.line_delta.added_lines = existing.line_delta.added_lines.saturating_add(delta.added_lines);
+                existing.line_delta.removed_lines =
+                    existing.line_delta.removed_lines.saturating_add(delta.removed_lines);
                 existing.file_diff.hunks.extend(file_diff.hunks.clone());
             })
             .or_insert(ParsedPatchFileDiff {
@@ -150,8 +143,7 @@ fn parse_patch_path(raw: &str) -> Option<PathBuf> {
 }
 
 fn parse_hunk_header(line: &str) -> Option<DiffHunk> {
-    let pattern =
-        Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("valid hunk regex");
+    let pattern = Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("valid hunk regex");
     let captures = pattern.captures(line)?;
 
     Some(DiffHunk {
@@ -199,9 +191,7 @@ index 0000000..1111111
 "#,
         );
 
-        let existing = diffs
-            .get(&PathBuf::from("src/lib.rs"))
-            .expect("src/lib.rs delta");
+        let existing = diffs.get(&PathBuf::from("src/lib.rs")).expect("src/lib.rs delta");
         assert_eq!(existing.line_delta.added_lines, 2);
         assert_eq!(existing.line_delta.removed_lines, 1);
         assert_eq!(existing.file_diff.hunks.len(), 1);
@@ -210,9 +200,7 @@ index 0000000..1111111
         assert_eq!(existing.file_diff.hunks[0].new_start, 1);
         assert_eq!(existing.file_diff.hunks[0].new_lines, 3);
 
-        let new_file = diffs
-            .get(&PathBuf::from("src/new.rs"))
-            .expect("src/new.rs delta");
+        let new_file = diffs.get(&PathBuf::from("src/new.rs")).expect("src/new.rs delta");
         assert_eq!(new_file.line_delta.added_lines, 1);
         assert_eq!(new_file.line_delta.removed_lines, 0);
         assert_eq!(new_file.file_diff.hunks[0].old_start, 0);
@@ -233,9 +221,7 @@ index 1111111..0000000
 "#,
         );
 
-        let deleted = diffs
-            .get(&PathBuf::from("src/old.rs"))
-            .expect("deleted file diff");
+        let deleted = diffs.get(&PathBuf::from("src/old.rs")).expect("deleted file diff");
         assert_eq!(deleted.line_delta.added_lines, 0);
         assert_eq!(deleted.line_delta.removed_lines, 1);
         assert_eq!(deleted.file_diff.hunks[0].old_start, 1);

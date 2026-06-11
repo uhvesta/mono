@@ -109,29 +109,17 @@ pub fn normalize_hook_event(raw: &serde_json::Value) -> Result<WorkerEvent, Norm
         "PreToolUse" => WorkerEvent::PreToolUse {
             session_id,
             tool_name: string_or_empty(obj.get("tool_name")),
-            tool_input: obj
-                .get("tool_input")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
+            tool_input: obj.get("tool_input").cloned().unwrap_or(serde_json::Value::Null),
         },
         "PostToolUse" => WorkerEvent::PostToolUse {
             session_id,
             tool_name: string_or_empty(obj.get("tool_name")),
-            tool_input: obj
-                .get("tool_input")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-            tool_response: obj
-                .get("tool_response")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
+            tool_input: obj.get("tool_input").cloned().unwrap_or(serde_json::Value::Null),
+            tool_response: obj.get("tool_response").cloned().unwrap_or(serde_json::Value::Null),
         },
         "Stop" => WorkerEvent::Stop {
             session_id,
-            stop_hook_active: obj
-                .get("stop_hook_active")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            stop_hook_active: obj.get("stop_hook_active").and_then(|v| v.as_bool()).unwrap_or(false),
             stop_reason: StopReason::Completed,
         },
         "Notification" => WorkerEvent::Notification {
@@ -156,10 +144,7 @@ fn parse_session_start_source(source: Option<&str>) -> SessionStartSource {
 }
 
 fn string_or_empty(value: Option<&serde_json::Value>) -> String {
-    value
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .unwrap_or_default()
+    value.and_then(|v| v.as_str()).map(str::to_owned).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -234,9 +219,7 @@ mod tests {
             "tool_input": { "command": "ls", "timeout": 5000 },
         });
         let WorkerEvent::PreToolUse {
-            tool_name,
-            tool_input,
-            ..
+            tool_name, tool_input, ..
         } = normalize_hook_event(&raw).unwrap()
         else {
             panic!("expected PreToolUse");
@@ -293,10 +276,7 @@ mod tests {
             "hook_event_name": "Stop",
             "stop_hook_active": true,
         });
-        let WorkerEvent::Stop {
-            stop_hook_active, ..
-        } = normalize_hook_event(&raw).unwrap()
-        else {
+        let WorkerEvent::Stop { stop_hook_active, .. } = normalize_hook_event(&raw).unwrap() else {
             panic!("expected Stop");
         };
         assert!(stop_hook_active);
@@ -367,10 +347,7 @@ mod tests {
     #[test]
     fn non_object_payload_errors() {
         let raw = json!("not an object");
-        assert!(matches!(
-            normalize_hook_event(&raw),
-            Err(NormalizeError::Malformed(_))
-        ));
+        assert!(matches!(normalize_hook_event(&raw), Err(NormalizeError::Malformed(_))));
     }
 
     #[test]

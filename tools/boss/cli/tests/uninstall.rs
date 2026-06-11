@@ -74,10 +74,7 @@ fn sandbox_uninstall_does_not_kill_dummy_engine() {
     // Give SIGTERM time to propagate if stop_engine was (incorrectly) called.
     std::thread::sleep(Duration::from_millis(200));
 
-    let still_running = dummy
-        .try_wait()
-        .expect("try_wait on dummy process")
-        .is_none();
+    let still_running = dummy.try_wait().expect("try_wait on dummy process").is_none();
 
     // Cleanup before asserting so the dummy is always reaped.
     dummy.kill().ok();

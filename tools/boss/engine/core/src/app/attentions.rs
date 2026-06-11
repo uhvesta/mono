@@ -20,11 +20,7 @@ pub(super) async fn handle_create_attention_item(ctx: Dispatch, req: FrontendReq
     {
         match work_db.create_attention_item(input) {
             Ok(item) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AttentionItemCreated { item },
-                );
+                send_response(&sink, &request_id, FrontendEvent::AttentionItemCreated { item });
             }
             Err(err) => {
                 send_response(
@@ -55,10 +51,7 @@ pub(super) async fn handle_list_attention_items(ctx: Dispatch, req: FrontendRequ
                 send_response(
                     &sink,
                     &request_id,
-                    FrontendEvent::AttentionItemsList {
-                        execution_id,
-                        items,
-                    },
+                    FrontendEvent::AttentionItemsList { execution_id, items },
                 );
             }
             Err(err) => {
@@ -86,11 +79,7 @@ pub(super) async fn handle_get_attention_item(ctx: Dispatch, req: FrontendReques
     };
     match work_db.get_attention_item(&id) {
         Ok(item) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AttentionItemResult { item },
-            );
+            send_response(&sink, &request_id, FrontendEvent::AttentionItemResult { item });
         }
         Err(err) => {
             send_response(
@@ -120,10 +109,7 @@ pub(super) async fn handle_list_attention_items_for_work_item(ctx: Dispatch, req
                 send_response(
                     &sink,
                     &request_id,
-                    FrontendEvent::AttentionItemsForWorkItemList {
-                        work_item_id,
-                        items,
-                    },
+                    FrontendEvent::AttentionItemsForWorkItemList { work_item_id, items },
                 );
             }
             Err(err) => {
@@ -263,11 +249,7 @@ pub(super) async fn handle_create_attention(ctx: Dispatch, req: FrontendRequest)
                         },
                     )
                     .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AttentionCreated { attention, group },
-                );
+                send_response(&sink, &request_id, FrontendEvent::AttentionCreated { attention, group });
             }
             Err(err) => {
                 send_response(
@@ -302,9 +284,7 @@ pub(super) async fn handle_answer_attention(ctx: Dispatch, req: FrontendRequest)
     };
     match work_db.answer_attention(&id, answer, skip, dismiss) {
         Ok(group) => {
-            let members = work_db
-                .list_attentions_for_group(&group.id)
-                .unwrap_or_default();
+            let members = work_db.list_attentions_for_group(&group.id).unwrap_or_default();
 
             // For followup groups: when the last open member is resolved,
             // auto-action (if any accepted) or auto-dismiss (all rejected)
@@ -438,9 +418,7 @@ pub(super) async fn handle_dismiss_attention(ctx: Dispatch, req: FrontendRequest
     {
         match work_db.dismiss_attention(&id, reason) {
             Ok(group) => {
-                let members = work_db
-                    .list_attentions_for_group(&group.id)
-                    .unwrap_or_default();
+                let members = work_db.list_attentions_for_group(&group.id).unwrap_or_default();
                 server_state
                     .publisher
                     .publish_frontend_event_on_product(
@@ -479,11 +457,7 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ActionAttentionGroup {
-        id,
-        skip_unanswered,
-    } = req
-    else {
+    let FrontendRequest::ActionAttentionGroup { id, skip_unanswered } = req else {
         unreachable!()
     };
     match work_db.action_attention_group(&id, skip_unanswered, &GhPrStateChecker) {
@@ -491,9 +465,7 @@ pub(super) async fn handle_action_attention_group(ctx: Dispatch, req: FrontendRe
             group,
             produced_work_item_ids,
         }) => {
-            let members = work_db
-                .list_attentions_for_group(&group.id)
-                .unwrap_or_default();
+            let members = work_db.list_attentions_for_group(&group.id).unwrap_or_default();
             // Live-update the Notifications window + inline doc surface.
             server_state
                 .publisher

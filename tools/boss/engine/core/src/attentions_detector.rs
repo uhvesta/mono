@@ -208,9 +208,7 @@ pub async fn reconcile_design_doc_questions(
     let repo_remote_url = format!("https://github.com/{owner}/{repo}");
     let inputs: Vec<CreateAttentionInput> = entries
         .iter()
-        .filter_map(|entry| {
-            build_question_input(entry, project_id, task_id, &doc_path, &repo_remote_url, &branch)
-        })
+        .filter_map(|entry| build_question_input(entry, project_id, task_id, &doc_path, &repo_remote_url, &branch))
         .collect();
     if inputs.is_empty() {
         return None;
@@ -400,11 +398,7 @@ pub async fn reconcile_task_followups(
 /// Build a `followup` [`CreateAttentionInput`], or `None` when the entry has
 /// no name. An unknown `proposed_work_kind` is dropped (left to the store
 /// default) rather than rejected.
-fn build_followup_input(
-    entry: &FollowupEntry,
-    work_item_id: &str,
-    execution_id: &str,
-) -> Option<CreateAttentionInput> {
+fn build_followup_input(entry: &FollowupEntry, work_item_id: &str, execution_id: &str) -> Option<CreateAttentionInput> {
     let name = entry.proposed_name.trim();
     if name.is_empty() {
         return None;
@@ -462,10 +456,7 @@ fn build_followup_input(
 /// re-prompt. An explicit empty array (`[]`) parses to `Some(vec![])`, which
 /// the caller treats as "no followups" (and does NOT fall back to the
 /// transcript — the worker deliberately recorded none).
-fn read_followups_artifact(
-    structured_output_dir: Option<&Path>,
-    execution_id: &str,
-) -> Option<Vec<FollowupEntry>> {
+fn read_followups_artifact(structured_output_dir: Option<&Path>, execution_id: &str) -> Option<Vec<FollowupEntry>> {
     let dir = structured_output_dir?;
     let raw = crate::structured_output::read(dir, execution_id)?;
     match serde_json::from_str::<Vec<FollowupEntry>>(&raw) {
@@ -731,7 +722,10 @@ fn is_risks_heading(heading_lower: &str) -> bool {
     let normalised = normalised.trim();
     matches!(
         normalised,
-        "risks" | "open questions" | "open question" | "risks open questions"
+        "risks"
+            | "open questions"
+            | "open question"
+            | "risks open questions"
             | "risks   open questions"
             | "risks and open questions"
     ) || normalised.contains("open question")
@@ -763,9 +757,7 @@ fn strip_markdown_bold(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        let marker = if (c == '*' && chars.peek() == Some(&'*'))
-            || (c == '_' && chars.peek() == Some(&'_'))
-        {
+        let marker = if (c == '*' && chars.peek() == Some(&'*')) || (c == '_' && chars.peek() == Some(&'_')) {
             chars.next(); // consume second char
             Some(c)
         } else {
@@ -854,11 +846,7 @@ pub async fn extract_followups_backstop(
     {
         Ok(r) => r,
         Err(err) => {
-            tracing::warn!(
-                execution_id,
-                ?err,
-                "attentions backstop (followups): HTTP send failed"
-            );
+            tracing::warn!(execution_id, ?err, "attentions backstop (followups): HTTP send failed");
             return None;
         }
     };
@@ -1094,10 +1082,7 @@ mod tests {
         // Explicit empty array → Some(empty) (deliberately "no followups",
         // distinct from absent — the caller must not fall back to transcript).
         std::fs::write(crate::structured_output::path_in(&dir, "e3"), "[]").unwrap();
-        assert_eq!(
-            read_followups_artifact(Some(&dir), "e3").map(|v| v.len()),
-            Some(0)
-        );
+        assert_eq!(read_followups_artifact(Some(&dir), "e3").map(|v| v.len()), Some(0));
 
         // Malformed → None (caller falls back to the transcript sentinel).
         std::fs::write(crate::structured_output::path_in(&dir, "e2"), "{not json}").unwrap();

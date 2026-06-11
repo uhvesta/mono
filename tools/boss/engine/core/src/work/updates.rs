@@ -4,8 +4,7 @@ impl WorkDb {
     pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let mut product =
-            query_product(&tx, id).require("product", id)?;
+        let mut product = query_product(&tx, id).require("product", id)?;
 
         apply_text_patch(&mut product.name, patch.name);
         apply_text_patch(&mut product.description, patch.description);
@@ -15,15 +14,11 @@ impl WorkDb {
         apply_text_patch(&mut product.status, patch.status);
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
         apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
-        apply_optional_string_patch(
-            &mut product.worker_branch_prefix,
-            patch.worker_branch_prefix,
-        );
+        apply_optional_string_patch(&mut product.worker_branch_prefix, patch.worker_branch_prefix);
         // Re-canonicalise so a patched (or pre-existing) prefix always
         // carries its trailing `/`; idempotent on already-canonical
         // values and on `None`.
-        product.worker_branch_prefix =
-            canonicalize_worker_branch_prefix(product.worker_branch_prefix.take());
+        product.worker_branch_prefix = canonicalize_worker_branch_prefix(product.worker_branch_prefix.take());
         product.slug = unique_product_slug_for_update(&tx, id, &slugify(&product.name))?;
         product.updated_at = now_string();
 
@@ -52,16 +47,10 @@ impl WorkDb {
         Ok(WorkItem::Product(updated))
     }
 
-    pub(crate) fn update_project(
-        &self,
-        id: &str,
-        patch: WorkItemPatch,
-        actor: &str,
-    ) -> Result<WorkItem> {
+    pub(crate) fn update_project(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        let mut project =
-            query_project(&tx, id).require("project", id)?;
+        let mut project = query_project(&tx, id).require("project", id)?;
         let previous_status = project.status;
         let status_changed = patch.status.is_some();
 
@@ -69,12 +58,10 @@ impl WorkDb {
         apply_text_patch(&mut project.description, patch.description);
         apply_text_patch(&mut project.goal, patch.goal);
         if let Some(status_str) = patch.status {
-            project.status = status_str.parse::<ProjectStatus>()
-                .map_err(|e| anyhow::anyhow!(e))?;
+            project.status = status_str.parse::<ProjectStatus>().map_err(|e| anyhow::anyhow!(e))?;
         }
         apply_text_patch(&mut project.priority, patch.priority);
-        project.slug =
-            unique_project_slug_for_update(&tx, &project.product_id, id, &slugify(&project.name))?;
+        project.slug = unique_project_slug_for_update(&tx, &project.product_id, id, &slugify(&project.name))?;
         project.updated_at = now_string();
 
         if status_changed {
@@ -105,12 +92,7 @@ impl WorkDb {
         )?;
 
         if status_changed && previous_status != project.status {
-            cascade_dependents_after_prereq_status_change(
-                &tx,
-                id,
-                project.status.as_str(),
-                &project.updated_at,
-            )?;
+            cascade_dependents_after_prereq_status_change(&tx, id, project.status.as_str(), &project.updated_at)?;
         }
 
         let updated = query_project(&tx, id).require("project", id)?;
@@ -118,12 +100,7 @@ impl WorkDb {
         Ok(WorkItem::Project(updated))
     }
 
-    pub(crate) fn update_task(
-        &self,
-        id: &str,
-        patch: WorkItemPatch,
-        actor: &str,
-    ) -> Result<WorkItem> {
+    pub(crate) fn update_task(&self, id: &str, patch: WorkItemPatch, actor: &str) -> Result<WorkItem> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let mut task = query_task(&tx, id).require("task", id)?;
@@ -137,30 +114,25 @@ impl WorkDb {
         apply_text_patch(&mut task.name, patch.name);
         apply_text_patch(&mut task.description, patch.description);
         if let Some(status_str) = patch.status {
-            task.status = status_str
-                .parse::<TaskStatus>()
-                .map_err(|e| anyhow::anyhow!(e))?;
+            task.status = status_str.parse::<TaskStatus>().map_err(|e| anyhow::anyhow!(e))?;
         }
         apply_optional_patch(&mut task.pr_url, patch.pr_url);
         // Reject non-empty repo override when the product has its own repo.
         if let Some(ref repo_patch) = patch.repo_remote_url
-            && !repo_patch.trim().is_empty() {
-                let product = query_product(&tx, &task.product_id)?.with_context(|| {
-                    format!(
-                        "orphan task {id}: parent product {} missing",
-                        task.product_id
-                    )
-                })?;
-                if let Some(product_repo) = product.repo_remote_url.as_deref() {
-                    bail!(
-                        "cannot set per-task repo override on product `{}`: \
+            && !repo_patch.trim().is_empty()
+        {
+            let product = query_product(&tx, &task.product_id)?
+                .with_context(|| format!("orphan task {id}: parent product {} missing", task.product_id))?;
+            if let Some(product_repo) = product.repo_remote_url.as_deref() {
+                bail!(
+                    "cannot set per-task repo override on product `{}`: \
                          product has its own repo (`{}`). \
                          Clear the product's repo first, or omit --repo to inherit.",
-                        product.slug,
-                        product_repo,
-                    );
-                }
+                    product.slug,
+                    product_repo,
+                );
             }
+        }
         apply_repo_remote_url_patch(&mut task.repo_remote_url, patch.repo_remote_url);
         if let Some(priority_patch) = patch.priority {
             task.priority = normalize_priority(Some(&priority_patch))?;
@@ -173,11 +145,7 @@ impl WorkDb {
             task.effort_level = if trimmed.is_empty() {
                 None
             } else {
-                Some(
-                    trimmed
-                        .parse::<EffortLevel>()
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                )
+                Some(trimmed.parse::<EffortLevel>().map_err(|e| anyhow::anyhow!(e))?)
             };
         }
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
@@ -199,12 +167,7 @@ impl WorkDb {
         }
 
         if status_changed {
-            refuse_manual_move_off_blocked_while_gated(
-                &tx,
-                id,
-                previous_status.as_str(),
-                task.status.as_str(),
-            )?;
+            refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
         }
         let actor_stamp = if status_changed && previous_status != task.status {
             actor
@@ -242,12 +205,7 @@ impl WorkDb {
         )?;
 
         if status_changed && previous_status != task.status {
-            cascade_dependents_after_prereq_status_change(
-                &tx,
-                id,
-                task.status.as_str(),
-                &task.updated_at,
-            )?;
+            cascade_dependents_after_prereq_status_change(&tx, id, task.status.as_str(), &task.updated_at)?;
         }
 
         // Manual-override suppression for `blocked: ci_failure` /

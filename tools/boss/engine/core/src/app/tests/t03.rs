@@ -45,9 +45,7 @@ fn authorize_rpc_boss_only_rejects_non_boss_pid_even_when_worker_registered() {
     // Register a non-existent pid as a worker — it is outside the boss
     // subtree and will be used as the peer under test.
     let worker_pid: libc::pid_t = i32::MAX;
-    server_state
-        .worker_registry
-        .register(worker_pid, "exec-worker-test");
+    server_state.worker_registry.register(worker_pid, "exec-worker-test");
 
     assert!(
         !server_state.authorize_rpc(RpcTier::BossOnly, Some(worker_pid)),

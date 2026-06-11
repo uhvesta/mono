@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-use wasmtime::component::Component;
 use wasmtime::Engine;
+use wasmtime::component::Component;
 
 /// Wasmtime version injected by build.rs from the workspace Cargo.lock.
 /// Must change whenever wasmtime is bumped because `.cwasm` files are not
@@ -161,27 +161,23 @@ fn compute_cache_key(artifact_sha256: &str) -> String {
 /// If another writer races us, both files contain valid precompiled output and
 /// either winner is correct.
 fn write_atomically(dest: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = dest
-        .parent()
-        .context("cache path has no parent directory")?;
+    let dir = dest.parent().context("cache path has no parent directory")?;
     let tmp = tempfile::Builder::new()
         .suffix(".cwasm.tmp")
         .tempfile_in(dir)
         .context("failed to create temporary file for atomic .cwasm write")?;
     fs::write(tmp.path(), bytes)
         .with_context(|| format!("failed to write .cwasm bytes to {}", tmp.path().display()))?;
-    tmp.persist(dest)
-        .map(|_| ())
-        .or_else(|e| {
-            // On Windows, `persist` can fail if another writer raced us and
-            // already placed the file.  If the dest now exists, treat it as a
-            // concurrent write success.
-            if dest.exists() {
-                Ok(())
-            } else {
-                Err(e.error).context("failed to persist .cwasm temp file")
-            }
-        })
+    tmp.persist(dest).map(|_| ()).or_else(|e| {
+        // On Windows, `persist` can fail if another writer raced us and
+        // already placed the file.  If the dest now exists, treat it as a
+        // concurrent write success.
+        if dest.exists() {
+            Ok(())
+        } else {
+            Err(e.error).context("failed to persist .cwasm temp file")
+        }
+    })
 }
 
 #[cfg(test)]

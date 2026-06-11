@@ -24,12 +24,9 @@ use anyhow::{Result, anyhow};
 use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
-use boss_engine::work::{
-    CiRemediationInsertInput, ConflictResolutionInsertInput, WorkDb,
-};
+use boss_engine::work::{CiRemediationInsertInput, ConflictResolutionInsertInput, WorkDb};
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem,
-    WorkItemPatch,
+    CreateChoreInput, CreateProductInput, FrontendEvent, FrontendRequest, Product, WorkItem, WorkItemPatch,
 };
 use serde_json::Value;
 
@@ -47,17 +44,17 @@ impl TestEngine {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
         let db_path = temp.path().join("state.db");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path.clone()).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(db_path.clone())
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
         Ok(Self {
             socket_path,
@@ -91,16 +88,11 @@ async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> 
         docs_repo: None,
         worker_branch_prefix: None,
     };
-    match client
-        .send_request(&FrontendRequest::CreateProduct { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
         FrontendEvent::WorkItemCreated {
             item: WorkItem::Product(p),
         } => Ok(p),
-        other => Err(anyhow!(
-            "unexpected engine event for product create: {other:?}"
-        )),
+        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
     }
 }
 
@@ -230,22 +222,9 @@ async fn ci_list_returns_rows_freshest_first_in_json_and_text() -> Result<()> {
     let product = create_product(&mut client, "Boss").await?;
     let db = engine.db()?;
 
-    let (chore_a, _) = seed_chore_with_ci_attempt(
-        &db,
-        &product.id,
-        "chore-list-a",
-        500,
-        "fix",
-        "head-aaa-1",
-    )?;
-    let (_chore_b, attempt_b) = seed_chore_with_ci_attempt(
-        &db,
-        &product.id,
-        "chore-list-b",
-        501,
-        "retrigger",
-        "head-bbb-1",
-    )?;
+    let (chore_a, _) = seed_chore_with_ci_attempt(&db, &product.id, "chore-list-a", 500, "fix", "head-aaa-1")?;
+    let (_chore_b, attempt_b) =
+        seed_chore_with_ci_attempt(&db, &product.id, "chore-list-b", 501, "retrigger", "head-bbb-1")?;
 
     let response = run_boss_json(engine.socket_str(), &["engine", "ci", "list"])?;
     let attempts = response["attempts"].as_array().expect("attempts array");
@@ -253,28 +232,27 @@ async fn ci_list_returns_rows_freshest_first_in_json_and_text() -> Result<()> {
     // The most-recently inserted row should land at index 0.
     assert_eq!(attempts[0]["id"].as_str(), Some(attempt_b.as_str()));
     assert!(
-        attempts.iter().all(|r| r["product_id"].as_str() == Some(product.id.as_str())),
+        attempts
+            .iter()
+            .all(|r| r["product_id"].as_str() == Some(product.id.as_str())),
         "all rows must echo the seed product"
     );
 
     // Filter by work-item should narrow to one row.
-    let by_item = run_boss_json(
-        engine.socket_str(),
-        &["engine", "ci", "list", "--work-item", &chore_a],
-    )?;
+    let by_item = run_boss_json(engine.socket_str(), &["engine", "ci", "list", "--work-item", &chore_a])?;
     let by_item_attempts = by_item["attempts"].as_array().expect("attempts array");
     assert_eq!(by_item_attempts.len(), 1);
-    assert_eq!(
-        by_item_attempts[0]["work_item_id"].as_str(),
-        Some(chore_a.as_str()),
-    );
+    assert_eq!(by_item_attempts[0]["work_item_id"].as_str(), Some(chore_a.as_str()),);
 
     // Text mode renders a table with the documented columns + an
     // attempt_kind column for the CI view.
     let text = run_boss_text(engine.socket_str(), &["engine", "ci", "list"])?;
     assert!(text.contains("KIND"), "text output must include KIND column: {text}");
     assert!(text.contains("STATUS"));
-    assert!(text.contains("retrigger"), "text output must show the kind value: {text}");
+    assert!(
+        text.contains("retrigger"),
+        "text output must show the kind value: {text}"
+    );
     Ok(())
 }
 
@@ -284,21 +262,14 @@ async fn ci_show_returns_single_row_with_failed_checks_and_log() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(&mut client, "Boss").await?;
     let db = engine.db()?;
-    let (_, attempt_id) =
-        seed_chore_with_ci_attempt(&db, &product.id, "chore-show", 600, "fix", "head-show-1")?;
-    let shown = run_boss_json(
-        engine.socket_str(),
-        &["engine", "ci", "show", &attempt_id],
-    )?;
+    let (_, attempt_id) = seed_chore_with_ci_attempt(&db, &product.id, "chore-show", 600, "fix", "head-show-1")?;
+    let shown = run_boss_json(engine.socket_str(), &["engine", "ci", "show", &attempt_id])?;
     assert_eq!(shown["attempt"]["id"].as_str(), Some(attempt_id.as_str()));
     assert_eq!(shown["attempt"]["attempt_kind"].as_str(), Some("fix"));
     assert_eq!(shown["attempt"]["consumes_budget"].as_i64(), Some(1));
 
     // Unknown id → CliError::Application (exit 6), with a clear message.
-    let stderr = run_boss_expect_failure(
-        engine.socket_str(),
-        &["engine", "ci", "show", "cir_does_not_exist"],
-    )?;
+    let stderr = run_boss_expect_failure(engine.socket_str(), &["engine", "ci", "show", "cir_does_not_exist"])?;
     assert!(
         stderr.contains("unknown"),
         "expected 'unknown' in stderr, got: {stderr}",
@@ -312,17 +283,13 @@ async fn ci_abandon_marks_attempt_abandoned() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(&mut client, "Boss").await?;
     let db = engine.db()?;
-    let (_, attempt_id) =
-        seed_chore_with_ci_attempt(&db, &product.id, "chore-abandon", 700, "fix", "head-abandon-1")?;
+    let (_, attempt_id) = seed_chore_with_ci_attempt(&db, &product.id, "chore-abandon", 700, "fix", "head-abandon-1")?;
     let result = run_boss_json(
         engine.socket_str(),
         &["engine", "ci", "abandon", &attempt_id, "--reason", "manual_test"],
     )?;
     assert_eq!(result["attempt"]["status"].as_str(), Some("abandoned"));
-    assert_eq!(
-        result["attempt"]["failure_reason"].as_str(),
-        Some("manual_test"),
-    );
+    assert_eq!(result["attempt"]["failure_reason"].as_str(), Some("manual_test"),);
 
     // Second call on the already-terminal row must surface an error.
     let stderr = run_boss_expect_failure(
@@ -346,17 +313,11 @@ async fn ci_retry_accepts_work_item_id_and_attempt_id() -> Result<()> {
         seed_chore_with_ci_attempt(&db, &product.id, "chore-retry", 800, "fix", "head-retry-1")?;
     db.increment_ci_attempts_used(&chore_id)?;
     db.increment_ci_attempts_used(&chore_id)?;
-    db.mark_chore_blocked_ci_failure_exhausted(
-        &chore_id,
-        &format!("https://github.com/test/boss/pull/{}", 800),
-    )?;
+    db.mark_chore_blocked_ci_failure_exhausted(&chore_id, &format!("https://github.com/test/boss/pull/{}", 800))?;
     assert!(db.get_ci_attempts_used(&chore_id)? >= 2);
 
     // Call retry with the work-item id.
-    let response = run_boss_json(
-        engine.socket_str(),
-        &["engine", "ci", "retry", &chore_id],
-    )?;
+    let response = run_boss_json(engine.socket_str(), &["engine", "ci", "retry", &chore_id])?;
     assert_eq!(response["work_item_id"].as_str(), Some(chore_id.as_str()));
     assert_eq!(response["was_exhausted"].as_bool(), Some(true));
     assert_eq!(response["budget"]["used"].as_i64(), Some(0));
@@ -364,10 +325,7 @@ async fn ci_retry_accepts_work_item_id_and_attempt_id() -> Result<()> {
     // Second retry: now via the attempt id (the engine resolves it
     // back to the same parent). The counter is already zero and the
     // parent is no longer exhausted.
-    let response2 = run_boss_json(
-        engine.socket_str(),
-        &["engine", "ci", "retry", &attempt_id],
-    )?;
+    let response2 = run_boss_json(engine.socket_str(), &["engine", "ci", "retry", &attempt_id])?;
     assert_eq!(response2["work_item_id"].as_str(), Some(chore_id.as_str()));
     assert_eq!(response2["was_exhausted"].as_bool(), Some(false));
     Ok(())
@@ -379,14 +337,10 @@ async fn ci_budget_show_and_set_round_trips() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let product = create_product(&mut client, "Boss").await?;
     let db = engine.db()?;
-    let (chore_id, _) =
-        seed_chore_with_ci_attempt(&db, &product.id, "chore-budget", 900, "fix", "head-budget-1")?;
+    let (chore_id, _) = seed_chore_with_ci_attempt(&db, &product.id, "chore-budget", 900, "fix", "head-budget-1")?;
 
     // Initial: no per-PR override, product default = 3.
-    let initial = run_boss_json(
-        engine.socket_str(),
-        &["engine", "ci", "budget", "show", &chore_id],
-    )?;
+    let initial = run_boss_json(engine.socket_str(), &["engine", "ci", "budget", "show", &chore_id])?;
     assert!(initial["budget"]["per_pr_override"].is_null());
     assert_eq!(initial["budget"]["product_default"].as_i64(), Some(3));
     assert_eq!(initial["budget"]["effective"].as_i64(), Some(3));
@@ -415,10 +369,7 @@ async fn ci_budget_show_and_set_round_trips() -> Result<()> {
     assert_eq!(cleared["budget"]["effective"].as_i64(), Some(3));
 
     // Neither --budget nor --clear → usage error.
-    let stderr = run_boss_expect_failure(
-        engine.socket_str(),
-        &["engine", "ci", "budget", "set", &chore_id],
-    )?;
+    let stderr = run_boss_expect_failure(engine.socket_str(), &["engine", "ci", "budget", "set", &chore_id])?;
     assert!(
         stderr.contains("--budget") || stderr.contains("--clear"),
         "stderr: {stderr}"
@@ -435,8 +386,7 @@ async fn engine_attempts_list_includes_all_three_kinds() -> Result<()> {
 
     // Seed both a CI attempt and a conflict resolution attempt against
     // the same chore.
-    let (chore_id, _) =
-        seed_chore_with_ci_attempt(&db, &product.id, "chore-attempts", 1100, "fix", "head-1")?;
+    let (chore_id, _) = seed_chore_with_ci_attempt(&db, &product.id, "chore-attempts", 1100, "fix", "head-1")?;
     let pr_url = "https://github.com/test/boss/pull/1100".to_owned();
     db.insert_conflict_resolution(ConflictResolutionInsertInput {
         product_id: product.id.clone(),
@@ -452,18 +402,12 @@ async fn engine_attempts_list_includes_all_three_kinds() -> Result<()> {
 
     let listing = run_boss_json(engine.socket_str(), &["engine", "attempts", "list"])?;
     let attempts = listing["attempts"].as_array().expect("attempts array");
-    let kinds: Vec<&str> = attempts
-        .iter()
-        .filter_map(|r| r["kind"].as_str())
-        .collect();
+    let kinds: Vec<&str> = attempts.iter().filter_map(|r| r["kind"].as_str()).collect();
     assert!(kinds.contains(&"ci"), "expected ci kind in {kinds:?}");
     assert!(kinds.contains(&"conflict"), "expected conflict kind in {kinds:?}");
 
     // --kind filter narrows to one subsystem.
-    let only_ci = run_boss_json(
-        engine.socket_str(),
-        &["engine", "attempts", "list", "--kind", "ci"],
-    )?;
+    let only_ci = run_boss_json(engine.socket_str(), &["engine", "attempts", "list", "--kind", "ci"])?;
     let only_ci_rows = only_ci["attempts"].as_array().expect("attempts array");
     assert!(!only_ci_rows.is_empty());
     for r in only_ci_rows {
@@ -474,6 +418,9 @@ async fn engine_attempts_list_includes_all_three_kinds() -> Result<()> {
     let text = run_boss_text(engine.socket_str(), &["engine", "attempts", "list"])?;
     assert!(text.contains("KIND"), "text output must include KIND column: {text}");
     assert!(text.contains("ci"), "text output must surface ci kind: {text}");
-    assert!(text.contains("conflict"), "text output must surface conflict kind: {text}");
+    assert!(
+        text.contains("conflict"),
+        "text output must surface conflict kind: {text}"
+    );
     Ok(())
 }

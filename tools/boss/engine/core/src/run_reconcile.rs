@@ -124,10 +124,8 @@ pub async fn probe_in_flight_runs(
     // vector for each in-flight row. Production fleets stay well under
     // the hard cap of 8 workspaces, but the indirection is cheap and
     // keeps the loop O(in_flight).
-    let by_workspace_id: HashMap<&str, &CubeWorkspaceStatus> = snapshot
-        .iter()
-        .map(|w| (w.workspace_id.as_str(), w))
-        .collect();
+    let by_workspace_id: HashMap<&str, &CubeWorkspaceStatus> =
+        snapshot.iter().map(|w| (w.workspace_id.as_str(), w)).collect();
 
     for execution in in_flight {
         let verdict = classify(execution, &by_workspace_id, now_epoch_s);
@@ -179,8 +177,7 @@ fn classify(
     // State must be `leased` with a matching `lease_id` for the worker
     // to be presumed alive. Anything else is the worker's lease being
     // gone (released, force-released, expired, or replaced).
-    let lease_active = workspace.state == "leased"
-        && workspace.lease_id.as_deref() == Some(cube_lease_id);
+    let lease_active = workspace.state == "leased" && workspace.lease_id.as_deref() == Some(cube_lease_id);
     if !lease_active {
         tracing::info!(
             execution_id = %execution.id,
@@ -200,17 +197,18 @@ fn classify(
     // long enough that auto-redispatch is safer than waiting for the
     // next dispatcher tick.
     if let Some(expires_at) = workspace.lease_expires_at_epoch_s
-        && expires_at <= now_epoch_s {
-            tracing::info!(
-                execution_id = %execution.id,
-                cube_workspace_id,
-                cube_lease_id,
-                expires_at,
-                now_epoch_s,
-                "cube reports lease has logically expired (TTL); reconciling as Dead"
-            );
-            return RunReconcileVerdict::Dead;
-        }
+        && expires_at <= now_epoch_s
+    {
+        tracing::info!(
+            execution_id = %execution.id,
+            cube_workspace_id,
+            cube_lease_id,
+            expires_at,
+            now_epoch_s,
+            "cube reports lease has logically expired (TTL); reconciling as Dead"
+        );
+        return RunReconcileVerdict::Dead;
+    }
 
     RunReconcileVerdict::Live
 }
@@ -243,8 +241,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
     };
 
     struct StubCube {
@@ -283,11 +280,7 @@ mod tests {
             unimplemented!("not used by probe")
         }
 
-        async fn create_change(
-            &self,
-            _workspace_path: &Path,
-            _title: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
             unimplemented!("not used by probe")
         }
 
@@ -303,11 +296,7 @@ mod tests {
             unimplemented!("not used by probe")
         }
 
-        async fn force_release_lease(
-            &self,
-            _lease_id: &str,
-            _reason: Option<&str>,
-        ) -> Result<()> {
+        async fn force_release_lease(&self, _lease_id: &str, _reason: Option<&str>) -> Result<()> {
             unimplemented!("not used by probe")
         }
 
@@ -386,10 +375,7 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        assert_eq!(
-            report.verdicts.get("exec-X").copied(),
-            Some(RunReconcileVerdict::Live),
-        );
+        assert_eq!(report.verdicts.get("exec-X").copied(), Some(RunReconcileVerdict::Live),);
         assert_eq!(report.live_count, 1);
         assert_eq!(report.dead_count, 0);
         assert_eq!(report.unknown_count, 0);
@@ -407,10 +393,7 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        assert_eq!(
-            report.verdicts.get("exec-Y").copied(),
-            Some(RunReconcileVerdict::Dead),
-        );
+        assert_eq!(report.verdicts.get("exec-Y").copied(), Some(RunReconcileVerdict::Dead),);
         assert_eq!(report.dead_count, 1);
     }
 
@@ -430,10 +413,7 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        assert_eq!(
-            report.verdicts.get("exec-Z").copied(),
-            Some(RunReconcileVerdict::Dead),
-        );
+        assert_eq!(report.verdicts.get("exec-Z").copied(), Some(RunReconcileVerdict::Dead),);
         assert_eq!(report.dead_count, 1);
     }
 
@@ -456,10 +436,7 @@ mod tests {
             1_700_000_000,
         )
         .await;
-        assert_eq!(
-            report.verdicts.get("exec-W").copied(),
-            Some(RunReconcileVerdict::Dead),
-        );
+        assert_eq!(report.verdicts.get("exec-W").copied(), Some(RunReconcileVerdict::Dead),);
     }
 
     #[tokio::test]
@@ -519,12 +496,7 @@ mod tests {
         // sparse to probe (nothing to match against the snapshot). We
         // shouldn't crash and shouldn't blindly redispatch; mark
         // Unknown and surface the gap.
-        let cube = StubCube::ok(vec![workspace(
-            "mono-agent-001",
-            "leased",
-            Some("lease-L"),
-            None,
-        )]);
+        let cube = StubCube::ok(vec![workspace("mono-agent-001", "leased", Some("lease-L"), None)]);
         let mut sparse = execution("exec-S", "lease-L", "mono-agent-001");
         sparse.cube_workspace_id = None;
         let report = probe_in_flight_runs(&cube, &[sparse], 1_700_000_000).await;

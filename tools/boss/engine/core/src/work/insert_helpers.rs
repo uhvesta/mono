@@ -26,11 +26,7 @@ use super::*;
 /// We also reset `ci_attempts_used` so the next CI failure (on a new
 /// head sha — the suppression has expired by then) starts with a
 /// fresh budget; mirrors the manual `boss engine ci retry` reset rule.
-pub(crate) fn record_ci_failure_suppression_in_tx(
-    conn: &Connection,
-    work_item_id: &str,
-    now: &str,
-) -> Result<()> {
+pub(crate) fn record_ci_failure_suppression_in_tx(conn: &Connection, work_item_id: &str, now: &str) -> Result<()> {
     // The most recent `ci_remediations` row carries the head sha the
     // engine was reacting to. Prefer the latest attempt regardless of
     // status — the user may be moving off `ci_failure_exhausted`, in
@@ -122,14 +118,14 @@ pub(crate) fn check_recent_duplicate(
         )
         .optional()?;
 
-    Ok(row.map(
-        |(existing_id, existing_short_id, created_at)| DuplicateTaskError {
+    Ok(
+        row.map(|(existing_id, existing_short_id, created_at)| DuplicateTaskError {
             existing_id,
             existing_short_id: existing_short_id.unwrap_or(0),
             name: trimmed.to_owned(),
             age_secs: now_secs - created_at,
-        },
-    ))
+        }),
+    )
 }
 
 pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Result<Task> {
@@ -137,16 +133,13 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     ensure_project_belongs_to_product(conn, &input.project_id, &input.product_id)?;
 
     if !input.force_duplicate
-        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
-            return Err(anyhow::Error::new(dup));
-        }
+        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)?
+    {
+        return Err(anyhow::Error::new(dup));
+    }
 
-    let product = query_product(conn, &input.product_id)?.with_context(|| {
-        format!(
-            "missing product after existence check: {}",
-            input.product_id
-        )
-    })?;
+    let product = query_product(conn, &input.product_id)?
+        .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
     let id = next_id("task");
     let now = now_string();
     let ordinal = next_task_ordinal(conn, &input.project_id)?;
@@ -172,16 +165,13 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     ensure_product_exists(conn, &input.product_id)?;
 
     if !input.force_duplicate
-        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
-            return Err(anyhow::Error::new(dup));
-        }
+        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)?
+    {
+        return Err(anyhow::Error::new(dup));
+    }
 
-    let product = query_product(conn, &input.product_id)?.with_context(|| {
-        format!(
-            "missing product after existence check: {}",
-            input.product_id
-        )
-    })?;
+    let product = query_product(conn, &input.product_id)?
+        .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
     let id = next_id("task");
     let now = now_string();
     let description = input.description.unwrap_or_default();
@@ -218,9 +208,10 @@ pub(crate) fn insert_investigation_in_tx(
         ensure_project_belongs_to_product(conn, pid, &input.product_id)?;
     }
     if !input.force_duplicate
-        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)? {
-            return Err(anyhow::Error::new(dup));
-        }
+        && let Some(dup) = check_recent_duplicate(conn, &input.product_id, &input.name)?
+    {
+        return Err(anyhow::Error::new(dup));
+    }
     let id = next_id("task");
     let now = now_string();
     let description = input.description.unwrap_or_default();

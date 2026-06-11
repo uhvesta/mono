@@ -1,9 +1,6 @@
 use super::*;
 
-pub(crate) fn execution_kind_for_work_item(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<ExecutionKind> {
+pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Result<ExecutionKind> {
     Ok(match classify_id(work_item_id)? {
         ItemKind::Product => ExecutionKind::ProductDesign,
         // Project ids no longer host their own executions — the
@@ -126,10 +123,7 @@ pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) ->
 /// This is the single resolution point per the multi-repo design's R1
 /// mitigation: every dispatch and listing surface must route through
 /// this helper so the rule never diverges.
-pub(crate) fn resolve_repo_for_work_item(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<Option<String>> {
+pub(crate) fn resolve_repo_for_work_item(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     let row: Option<(Option<String>, String, String)> = conn
         .query_row(
             "SELECT repo_remote_url, product_id, kind FROM tasks WHERE id = ?1",
@@ -149,9 +143,8 @@ pub(crate) fn resolve_repo_for_work_item(
         return Ok(Some(url.to_owned()));
     }
 
-    let product = query_product(conn, &product_id)?.with_context(|| {
-        format!("orphan task {work_item_id}: parent product {product_id} missing")
-    })?;
+    let product = query_product(conn, &product_id)?
+        .with_context(|| format!("orphan task {work_item_id}: parent product {product_id} missing"))?;
     match kind {
         TaskKind::Design => {
             if let Some(url) = product.design_repo.as_deref().filter(|s| !s.is_empty()) {
@@ -168,7 +161,8 @@ pub(crate) fn resolve_repo_for_work_item(
                 return Ok(Some(url.to_owned()));
             }
             if let Ok(user_docs) = std::env::var("BOSS_USER_DOCS_REPO")
-                && !user_docs.is_empty() {
+                && !user_docs.is_empty()
+            {
                 return Ok(Some(user_docs));
             }
         }
@@ -192,9 +186,7 @@ pub(crate) fn resolve_execution_repo_remote_url(
     // overrides on `tasks.repo_remote_url` beat the product default.
     // Errors keep the same shape the bossctl path expects.
     resolve_repo_for_work_item(conn, work_item_id)?.with_context(|| {
-        format!(
-            "work item {work_item_id} does not resolve to a repo_remote_url; provide one explicitly"
-        )
+        format!("work item {work_item_id} does not resolve to a repo_remote_url; provide one explicitly")
     })
 }
 
@@ -223,11 +215,7 @@ pub(crate) fn unique_product_slug(conn: &Connection, base_slug: &str) -> Result<
     Ok(candidate)
 }
 
-pub(crate) fn unique_product_slug_for_update(
-    conn: &Connection,
-    id: &str,
-    base_slug: &str,
-) -> Result<String> {
+pub(crate) fn unique_product_slug_for_update(conn: &Connection, id: &str, base_slug: &str) -> Result<String> {
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
@@ -242,11 +230,7 @@ pub(crate) fn unique_product_slug_for_update(
     Ok(candidate)
 }
 
-pub(crate) fn unique_project_slug(
-    conn: &Connection,
-    product_id: &str,
-    base_slug: &str,
-) -> Result<String> {
+pub(crate) fn unique_project_slug(conn: &Connection, product_id: &str, base_slug: &str) -> Result<String> {
     let base_slug = default_slug(base_slug);
     let mut candidate = base_slug.clone();
     let mut suffix = 2;
@@ -345,7 +329,16 @@ mod tests {
         for status in [Running, WaitingHuman] {
             assert!(status.is_live(), "{status} should be live");
         }
-        for status in [Queued, Ready, WaitingDependency, Completed, Failed, Abandoned, Cancelled, Orphaned] {
+        for status in [
+            Queued,
+            Ready,
+            WaitingDependency,
+            Completed,
+            Failed,
+            Abandoned,
+            Cancelled,
+            Orphaned,
+        ] {
             assert!(!status.is_live(), "{status} should not be live");
         }
     }

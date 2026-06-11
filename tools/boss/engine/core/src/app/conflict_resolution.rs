@@ -27,17 +27,8 @@ pub(super) async fn handle_list_conflict_resolutions(ctx: Dispatch, req: Fronten
         // Read-only listing surface for `boss engine conflicts
         // list`. No auth gate — the rows are diagnostic and the
         // caller can already read the SQLite file.
-        match work_db.list_conflict_resolutions(
-            product_id.as_deref(),
-            &status,
-            work_item_id.as_deref(),
-            limit,
-        ) {
-            Ok(attempts) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::ConflictResolutionsList { attempts },
-            ),
+        match work_db.list_conflict_resolutions(product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
+            Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::ConflictResolutionsList { attempts }),
             Err(err) => send_response(
                 &sink,
                 &request_id,
@@ -61,11 +52,7 @@ pub(super) async fn handle_get_conflict_resolution(ctx: Dispatch, req: FrontendR
     };
     {
         match work_db.get_conflict_resolution(&attempt_id) {
-            Ok(Some(attempt)) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::ConflictResolution { attempt },
-            ),
+            Ok(Some(attempt)) => send_response(&sink, &request_id, FrontendEvent::ConflictResolution { attempt }),
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -121,11 +108,7 @@ pub(super) async fn handle_retry_conflict_resolution(ctx: Dispatch, req: Fronten
                         },
                     )
                     .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::ConflictResolutionRetried { attempt },
-                );
+                send_response(&sink, &request_id, FrontendEvent::ConflictResolutionRetried { attempt });
             }
             Ok(None) => {
                 send_response(
@@ -196,9 +179,7 @@ pub(super) async fn handle_abandon_conflict_resolution(ctx: Dispatch, req: Front
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: format!(
-                            "conflict resolution attempt {attempt_id:?} is unknown or already terminal",
-                        ),
+                        message: format!("conflict resolution attempt {attempt_id:?} is unknown or already terminal",),
                     },
                 );
             }
@@ -272,9 +253,7 @@ pub(super) async fn handle_mark_conflict_resolution_failed(ctx: Dispatch, req: F
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: format!(
-                            "conflict resolution attempt {attempt_id:?} is unknown or already terminal",
-                        ),
+                        message: format!("conflict resolution attempt {attempt_id:?} is unknown or already terminal",),
                     },
                 );
             }

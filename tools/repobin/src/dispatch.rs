@@ -39,15 +39,14 @@ pub fn prepare_dispatch_from_repo_config<B: BazelAdapter>(
     tool_name: &str,
     forwarded_args: &[OsString],
 ) -> Result<DispatchPlan, RepobinError> {
-    let tool =
-        repo_config
-            .config
-            .tools
-            .get(tool_name)
-            .ok_or_else(|| RepobinError::ToolNotConfigured {
-                tool: tool_name.to_string(),
-                config_path: repo_config.config_path.clone(),
-            })?;
+    let tool = repo_config
+        .config
+        .tools
+        .get(tool_name)
+        .ok_or_else(|| RepobinError::ToolNotConfigured {
+            tool: tool_name.to_string(),
+            config_path: repo_config.config_path.clone(),
+        })?;
 
     let cache_root = effective_cache_root();
     plan_from_target(
@@ -71,20 +70,21 @@ fn plan_from_target<B: BazelAdapter>(
     forwarded_args: &[OsString],
 ) -> Result<DispatchPlan, RepobinError> {
     if let Some(root) = cache_root
-        && let Some(executable_path) = dispatch_cache::lookup_in(root, repo_root, target) {
-            trace(format_args!(
-                "dispatch-cache hit target={target} repo_root={}",
-                repo_root.display()
-            ));
-            return Ok(DispatchPlan {
-                repo_root: repo_root.to_path_buf(),
-                tool_name: tool_name.to_string(),
-                target: target.to_string(),
-                executable_path,
-                original_cwd: cwd.to_path_buf(),
-                forwarded_args: forwarded_args.to_vec(),
-            });
-        }
+        && let Some(executable_path) = dispatch_cache::lookup_in(root, repo_root, target)
+    {
+        trace(format_args!(
+            "dispatch-cache hit target={target} repo_root={}",
+            repo_root.display()
+        ));
+        return Ok(DispatchPlan {
+            repo_root: repo_root.to_path_buf(),
+            tool_name: tool_name.to_string(),
+            target: target.to_string(),
+            executable_path,
+            original_cwd: cwd.to_path_buf(),
+            forwarded_args: forwarded_args.to_vec(),
+        });
+    }
 
     trace(format_args!(
         "dispatch-cache miss target={target} repo_root={} (running bazel build + cquery)",
@@ -101,9 +101,7 @@ fn plan_from_target<B: BazelAdapter>(
                 Vec::new()
             }
         };
-        if let Err(error) =
-            dispatch_cache::record_in(root, repo_root, target, &executable_path, &source_files)
-        {
+        if let Err(error) = dispatch_cache::record_in(root, repo_root, target, &executable_path, &source_files) {
             trace(format_args!("dispatch-cache record failed: {error}"));
         }
     }
@@ -164,11 +162,7 @@ mod tests {
             Ok(())
         }
 
-        fn resolve_executable(
-            &self,
-            repo_root: &Path,
-            target: &str,
-        ) -> Result<PathBuf, crate::app::RepobinError> {
+        fn resolve_executable(&self, repo_root: &Path, target: &str) -> Result<PathBuf, crate::app::RepobinError> {
             self.queries
                 .borrow_mut()
                 .push((repo_root.to_path_buf(), target.to_string()));
@@ -212,10 +206,7 @@ mod tests {
             sample_repo_config(),
             Path::new("/repo/subdir"),
             "boss",
-            &[
-                std::ffi::OsString::from("task"),
-                std::ffi::OsString::from("list"),
-            ],
+            &[std::ffi::OsString::from("task"), std::ffi::OsString::from("list")],
         )
         .expect("dispatch plan");
 
@@ -251,30 +242,14 @@ mod tests {
             ..FakeBazel::default()
         };
 
-        let cold_plan = plan_from_target(
-            &bazel,
-            Some(&cache_root),
-            &repo_root,
-            "boss",
-            target,
-            &repo_root,
-            &[],
-        )
-        .expect("cold plan");
+        let cold_plan = plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("cold plan");
         assert_eq!(cold_plan.executable_path, exe);
         assert_eq!(bazel.builds.borrow().len(), 1);
         assert_eq!(bazel.queries.borrow().len(), 1);
 
-        let warm_plan = plan_from_target(
-            &bazel,
-            Some(&cache_root),
-            &repo_root,
-            "boss",
-            target,
-            &repo_root,
-            &[],
-        )
-        .expect("warm plan");
+        let warm_plan = plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("warm plan");
         assert_eq!(warm_plan.executable_path, exe);
         // Counts must not increase on the warm hit.
         assert_eq!(
@@ -308,16 +283,7 @@ mod tests {
             ..FakeBazel::default()
         };
 
-        plan_from_target(
-            &bazel,
-            Some(&cache_root),
-            &repo_root,
-            "boss",
-            target,
-            &repo_root,
-            &[],
-        )
-        .expect("first plan");
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[]).expect("first plan");
         assert_eq!(bazel.builds.borrow().len(), 1);
 
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
@@ -328,16 +294,8 @@ mod tests {
             .set_modified(later)
             .unwrap();
 
-        plan_from_target(
-            &bazel,
-            Some(&cache_root),
-            &repo_root,
-            "boss",
-            target,
-            &repo_root,
-            &[],
-        )
-        .expect("invalidated plan");
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
+            .expect("invalidated plan");
         assert_eq!(
             bazel.builds.borrow().len(),
             2,
@@ -401,8 +359,7 @@ mod tests {
         };
 
         for _ in 0..3 {
-            plan_from_target(&bazel, None, &repo_root, "boss", target, &repo_root, &[])
-                .expect("plan");
+            plan_from_target(&bazel, None, &repo_root, "boss", target, &repo_root, &[]).expect("plan");
         }
         assert_eq!(bazel.builds.borrow().len(), 3);
         assert_eq!(bazel.queries.borrow().len(), 3);
@@ -434,23 +391,13 @@ mod tests {
         };
 
         // Cold dispatch: triggers build + cquery + source query.
-        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
-            .expect("cold plan");
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[]).expect("cold plan");
         assert_eq!(bazel.builds.borrow().len(), 1, "cold: one bazel build");
 
         // Warm dispatch: no source change → must not call bazel.
-        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
-            .expect("warm plan");
-        assert_eq!(
-            bazel.builds.borrow().len(),
-            1,
-            "warm hit must not invoke bazel build"
-        );
-        assert_eq!(
-            bazel.queries.borrow().len(),
-            1,
-            "warm hit must not invoke bazel cquery"
-        );
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[]).expect("warm plan");
+        assert_eq!(bazel.builds.borrow().len(), 1, "warm hit must not invoke bazel build");
+        assert_eq!(bazel.queries.borrow().len(), 1, "warm hit must not invoke bazel cquery");
 
         // Source file mtime advances (simulates editing a .rs file; BUILD.bazel untouched).
         let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
@@ -471,8 +418,7 @@ mod tests {
         );
 
         // Immediately after rebuild: warm hit again, no extra bazel call.
-        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[])
-            .expect("re-warm plan");
+        plan_from_target(&bazel, Some(&cache_root), &repo_root, "boss", target, &repo_root, &[]).expect("re-warm plan");
         assert_eq!(
             bazel.builds.borrow().len(),
             2,

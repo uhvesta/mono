@@ -18,8 +18,8 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest,
-    Product, Project, Task, WorkItem,
+    CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest, Product, Project, Task,
+    WorkItem,
 };
 use serde_json::Value;
 
@@ -35,17 +35,17 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
         Ok(Self {
             socket_path,
@@ -170,14 +170,8 @@ async fn project_show_infers_product_from_typed_id() -> Result<()> {
     // The bug: `project show proj_…` errored with
     // "product is required" even though the id is globally unique.
     let value = run_boss(engine.socket_str(), &["project", "show", &project.id])?;
-    assert_eq!(
-        value["project"]["id"].as_str(),
-        Some(project.id.as_str()),
-    );
-    assert_eq!(
-        value["project"]["product_id"].as_str(),
-        Some(product.id.as_str()),
-    );
+    assert_eq!(value["project"]["id"].as_str(), Some(project.id.as_str()),);
+    assert_eq!(value["project"]["product_id"].as_str(), Some(product.id.as_str()),);
     Ok(())
 }
 
@@ -233,10 +227,7 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
     )
     .await?;
 
-    let value = run_boss(
-        engine.socket_str(),
-        &["task", "list", "--project", &project.id],
-    )?;
+    let value = run_boss(engine.socket_str(), &["task", "list", "--project", &project.id])?;
     let tasks = value["tasks"]
         .as_array()
         .ok_or_else(|| anyhow!("expected `tasks` array in CLI output: {value}"))?;

@@ -24,18 +24,12 @@ pub(super) async fn handle_set_product_external_tracker(ctx: Dispatch, req: Fron
             Ok(())
         } else {
             match (input.kind.as_deref(), input.config.as_ref()) {
-                (None, _) | (_, None) => {
-                    Err("both kind and config must be provided when not using unset".to_owned())
-                }
+                (None, _) | (_, None) => Err("both kind and config must be provided when not using unset".to_owned()),
                 (Some(kind), Some(config)) => validate_external_tracker_config(kind, config),
             }
         };
         match validation_result {
-            Err(msg) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::WorkError { message: msg },
-            ),
+            Err(msg) => send_response(&sink, &request_id, FrontendEvent::WorkError { message: msg }),
             Ok(()) => {
                 let result = work_db.set_product_external_tracker(
                     &input.product_id,
@@ -128,9 +122,7 @@ pub(super) async fn handle_sync_product_external_tracker(ctx: Dispatch, req: Fro
                         &sink2,
                         &request_id2,
                         FrontendEvent::WorkError {
-                            message: format!(
-                                "product '{product_id}' has no external tracker binding"
-                            ),
+                            message: format!("product '{product_id}' has no external tracker binding"),
                         },
                     );
                 }
@@ -173,12 +165,7 @@ pub(super) async fn handle_link_work_item_external_ref(ctx: Dispatch, req: Front
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_response(
                 &sink,
@@ -223,12 +210,7 @@ pub(super) async fn handle_unlink_work_item_external_ref(ctx: Dispatch, req: Fro
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_response(
                 &sink,

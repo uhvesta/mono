@@ -25,11 +25,7 @@ pub trait RefProber {
 /// 3. `git symbolic-ref refs/remotes/origin/HEAD` (the remote's default).
 /// 4. Probe `origin/main` → `origin/master` → local `main` → local `master`.
 /// 5. Fallback: `"main"` with a warning.
-pub fn resolve_default_branch(
-    env: &CiEnvironment,
-    prober: &dyn RefProber,
-    override_branch: Option<&str>,
-) -> String {
+pub fn resolve_default_branch(env: &CiEnvironment, prober: &dyn RefProber, override_branch: Option<&str>) -> String {
     // 1. Explicit override.
     if let Some(branch) = override_branch.filter(|s| !s.is_empty()) {
         return branch.to_owned();
@@ -48,20 +44,21 @@ pub fn resolve_default_branch(
     //     `gh-readonly-queue/<target>/…`.
     if let Some(bk_branch) = env.buildkite_branch.as_deref()
         && let Some(rest) = bk_branch.strip_prefix("gh-readonly-queue/")
-            && let Some(target) = rest.split('/').next().filter(|s| !s.is_empty()) {
-                return target.to_owned();
-            }
+        && let Some(target) = rest.split('/').next().filter(|s| !s.is_empty())
+    {
+        return target.to_owned();
+    }
 
     // 2c. GHA: `repository.default_branch` from the event payload.
     if env.github_actions
         && let Some(payload) = env.read_github_event_payload()
-            && let Some(branch) = payload
-                .repository
-                .and_then(|r| r.default_branch)
-                .filter(|s| !s.is_empty())
-            {
-                return branch;
-            }
+        && let Some(branch) = payload
+            .repository
+            .and_then(|r| r.default_branch)
+            .filter(|s| !s.is_empty())
+    {
+        return branch;
+    }
 
     // 3. Remote symbolic ref.
     if let Some(branch) = prober
@@ -74,10 +71,7 @@ pub fn resolve_default_branch(
     // 4. Probe candidates in preference order.
     for candidate in &["origin/main", "origin/master", "main", "master"] {
         if prober.ref_exists(candidate) {
-            return candidate
-                .strip_prefix("origin/")
-                .unwrap_or(candidate)
-                .to_owned();
+            return candidate.strip_prefix("origin/").unwrap_or(candidate).to_owned();
         }
     }
 
@@ -139,10 +133,7 @@ mod tests {
     #[test]
     fn explicit_override_wins() {
         let p = prober(Some("refs/remotes/origin/HEAD -> refs/remotes/origin/master"), vec![]);
-        assert_eq!(
-            resolve_default_branch(&no_ci(), &p, Some("develop")),
-            "develop"
-        );
+        assert_eq!(resolve_default_branch(&no_ci(), &p, Some("develop")), "develop");
     }
 
     #[test]
@@ -219,10 +210,7 @@ mod tests {
     fn override_beats_buildkite_pipeline_default() {
         let env = bk_env(Some("master"), None);
         let p = prober(None, vec![]);
-        assert_eq!(
-            resolve_default_branch(&env, &p, Some("develop")),
-            "develop"
-        );
+        assert_eq!(resolve_default_branch(&env, &p, Some("develop")), "develop");
     }
 
     #[test]

@@ -18,11 +18,7 @@ pub fn bin_dir_on_path(bin_dir: &Path, path_var: Option<&OsStr>) -> bool {
     env::split_paths(path_var).any(|entry| normalize_for_compare(&entry) == wanted)
 }
 
-pub fn path_update_fragment(
-    bin_dir: &Path,
-    shell_var: Option<&OsStr>,
-    home_dir: Option<&Path>,
-) -> ShellFragment {
+pub fn path_update_fragment(bin_dir: &Path, shell_var: Option<&OsStr>, home_dir: Option<&Path>) -> ShellFragment {
     let shell_name = shell_var
         .and_then(|value| Path::new(value).file_name())
         .map(|value| value.to_string_lossy().to_string())
@@ -91,10 +87,7 @@ mod tests {
             Some(OsStr::new("/usr/local/bin/fish")),
             Some(Path::new("/Users/test")),
         );
-        assert_eq!(
-            fish.config_hint.as_deref(),
-            Some("~/.config/fish/config.fish")
-        );
+        assert_eq!(fish.config_hint.as_deref(), Some("~/.config/fish/config.fish"));
         assert_eq!(fish.fragment, "fish_add_path '/tmp/bin'");
     }
 

@@ -26,9 +26,9 @@
 //! The shared driver only owns the parent's `tasks.status` /
 //! `task_blocked_signals` transitions, which are identical across signals.
 
-use crate::work::{PendingMergeCheck, WorkDb};
 #[cfg(test)]
 use crate::work::TaskStatus;
+use crate::work::{PendingMergeCheck, WorkDb};
 
 /// Which blocking signal a remediation flow is handling. The variants map to
 /// the `tasks.blocked_reason` / `task_blocked_signals.reason` literals and
@@ -54,16 +54,9 @@ impl SignalKind {
     /// Clear the parent's `blocked: <reason>` flip back to `in_review` (the
     /// relaxed, non-attempt-guarded variant). Returns `true` when a row was
     /// flipped.
-    fn clear_blocked(
-        self,
-        db: &WorkDb,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> anyhow::Result<bool> {
+    fn clear_blocked(self, db: &WorkDb, work_item_id: &str, pr_url: &str) -> anyhow::Result<bool> {
         let cleared = match self {
-            SignalKind::MergeConflict => {
-                db.clear_chore_blocked_merge_conflict(work_item_id, pr_url)?
-            }
+            SignalKind::MergeConflict => db.clear_chore_blocked_merge_conflict(work_item_id, pr_url)?,
             SignalKind::CiFailure => db.clear_chore_blocked_ci_failure(work_item_id, pr_url)?,
         };
         Ok(cleared.is_some())
@@ -71,16 +64,9 @@ impl SignalKind {
 
     /// Upsert the in-flight side-table signal so `maybe_clear_blocked` keeps
     /// dispatching the kind's retire probe while the parent stays `in_review`.
-    fn record_in_flight(
-        self,
-        db: &WorkDb,
-        work_item_id: &str,
-        attempt_id: &str,
-    ) -> anyhow::Result<()> {
+    fn record_in_flight(self, db: &WorkDb, work_item_id: &str, attempt_id: &str) -> anyhow::Result<()> {
         match self {
-            SignalKind::MergeConflict => {
-                db.record_merge_conflict_in_flight(work_item_id, attempt_id)
-            }
+            SignalKind::MergeConflict => db.record_merge_conflict_in_flight(work_item_id, attempt_id),
             SignalKind::CiFailure => db.record_ci_failure_in_flight(work_item_id, attempt_id),
         }
     }
@@ -105,12 +91,7 @@ impl SignalKind {
 /// call. Failures are logged and swallowed (mirrors the original conflict
 /// path): a failed clear leaves the parent `blocked`, which the next sweep
 /// re-reconciles via [`reconcile_blocked_parent_with_revision`].
-pub fn unblock_for_revision(
-    db: &WorkDb,
-    kind: SignalKind,
-    candidate: &PendingMergeCheck,
-    attempt_id: &str,
-) -> bool {
+pub fn unblock_for_revision(db: &WorkDb, kind: SignalKind, candidate: &PendingMergeCheck, attempt_id: &str) -> bool {
     let cleared = match kind.clear_blocked(db, &candidate.work_item_id, &candidate.pr_url) {
         Ok(v) => v,
         Err(err) => {
@@ -150,7 +131,6 @@ pub fn reconcile_blocked_parent_with_revision(
 ) -> bool {
     unblock_for_revision(db, kind, candidate, attempt_id)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -244,8 +224,7 @@ mod tests {
             let (status, _) = status_of(&db, &chore);
             assert_eq!(status, TaskStatus::Blocked, "{kind:?}: precondition blocked");
 
-            let cleared =
-                unblock_for_revision(&db, kind, &candidate(&product, &chore, pr), "att-1");
+            let cleared = unblock_for_revision(&db, kind, &candidate(&product, &chore, pr), "att-1");
             assert!(cleared, "{kind:?}: parent must clear back to in_review");
             let (status, reason) = status_of(&db, &chore);
             assert_eq!(status, TaskStatus::InReview, "{kind:?}");
@@ -265,16 +244,9 @@ mod tests {
             let (product, chore) = in_review_chore(&db, pr);
             block_parent(&db, kind, &chore, pr);
 
-            let reconciled = reconcile_blocked_parent_with_revision(
-                &db,
-                kind,
-                &candidate(&product, &chore, pr),
-                "att-2",
-            );
-            assert!(
-                reconciled,
-                "{kind:?}: pre-blocked parent must reconcile to in_review",
-            );
+            let reconciled =
+                reconcile_blocked_parent_with_revision(&db, kind, &candidate(&product, &chore, pr), "att-2");
+            assert!(reconciled, "{kind:?}: pre-blocked parent must reconcile to in_review",);
             let (status, _) = status_of(&db, &chore);
             assert_eq!(status, TaskStatus::InReview, "{kind:?}");
             assert!(signal_active(&db, &chore, kind.reason()), "{kind:?}");

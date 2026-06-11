@@ -117,11 +117,7 @@ impl CompiledRule {
 
 impl CompiledAllowedVersionPatternsRule {
     fn evaluate(&self, path: &Path, version: &str) -> Option<Finding> {
-        if self
-            .patterns
-            .iter()
-            .any(|pattern| pattern.is_match(Path::new(version)))
-        {
+        if self.patterns.iter().any(|pattern| pattern.is_match(Path::new(version))) {
             return None;
         }
 
@@ -162,8 +158,7 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelversionPoliciesConf
         bail!("bazelversion-policies check config must contain at least one `rules` entry");
     }
 
-    let default_severity =
-        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_severity = Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
     let default_remediation = normalize_optional_string(parsed.remediation, "remediation")?;
 
     let mut rules = Vec::with_capacity(parsed.rules.len());
@@ -176,24 +171,15 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelversionPoliciesConf
                 remediation,
                 severity,
             } => {
-                let pattern_strings = normalize_non_empty_unique_strings(
-                    patterns,
-                    &format!("{field_prefix}.patterns"),
-                )?;
-                let patterns =
-                    compile_patterns(&format!("{field_prefix}.patterns"), &pattern_strings)?;
+                let pattern_strings =
+                    normalize_non_empty_unique_strings(patterns, &format!("{field_prefix}.patterns"))?;
+                let patterns = compile_patterns(&format!("{field_prefix}.patterns"), &pattern_strings)?;
                 CompiledRule::AllowedVersionPatterns(CompiledAllowedVersionPatternsRule {
                     pattern_strings,
                     patterns,
-                    message: normalize_optional_string(
-                        message,
-                        &format!("{field_prefix}.message"),
-                    )?,
-                    remediation: normalize_optional_string(
-                        remediation,
-                        &format!("{field_prefix}.remediation"),
-                    )?
-                    .or_else(|| default_remediation.clone()),
+                    message: normalize_optional_string(message, &format!("{field_prefix}.message"))?,
+                    remediation: normalize_optional_string(remediation, &format!("{field_prefix}.remediation"))?
+                        .or_else(|| default_remediation.clone()),
                     severity: Severity::parse_with_default(severity.as_deref(), default_severity),
                 })
             }
@@ -214,10 +200,7 @@ fn normalize_optional_string(value: Option<String>, field_name: &str) -> Result<
     Ok(Some(trimmed.to_owned()))
 }
 
-fn normalize_non_empty_unique_strings(
-    values: Vec<String>,
-    field_name: &str,
-) -> Result<Vec<String>> {
+fn normalize_non_empty_unique_strings(values: Vec<String>, field_name: &str) -> Result<Vec<String>> {
     if values.is_empty() {
         bail!("bazelversion-policies check config `{field_name}` must contain at least one value");
     }
@@ -227,9 +210,7 @@ fn normalize_non_empty_unique_strings(
     for value in values {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            bail!(
-                "bazelversion-policies check config `{field_name}` must not contain empty values"
-            );
+            bail!("bazelversion-policies check config `{field_name}` must not contain empty values");
         }
         if seen.insert(trimmed.to_owned()) {
             output.push(trimmed.to_owned());
@@ -351,9 +332,6 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(
-            err.to_string()
-                .contains("invalid `rules[0].patterns` glob pattern: [")
-        );
+        assert!(err.to_string().contains("invalid `rules[0].patterns` glob pattern: ["));
     }
 }

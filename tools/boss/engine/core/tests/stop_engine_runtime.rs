@@ -52,20 +52,19 @@ impl TestEngine {
         // with the RPC, so we need a process that actually exists.
         std::fs::write(&pid_path, std::process::id().to_string())?;
 
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(db_path)
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let token_for_serve = token_path.clone();
-        let join = tokio::spawn(async move {
-            serve(cfg, socket_for_serve, None, None, Some(token_for_serve), None).await
-        });
+        let join =
+            tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, Some(token_for_serve), None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
 
         Ok(Self {
@@ -127,10 +126,7 @@ async fn stop_engine_from_tokio_runtime_completes_via_rpc() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        socket_closed,
-        "engine should have closed its socket after stop_engine"
-    );
+    assert!(socket_closed, "engine should have closed its socket after stop_engine");
 
     // And the RPC-success branch in stop_engine removes the PID file
     // (since the PID it wrote still matches what we put there).

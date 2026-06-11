@@ -467,22 +467,23 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     // their `events_socket_path` is the forwarded `/tmp` socket, not a
     // Boss data dir, and the python guard script is never shipped there.
     if sandbox == EngineDataDirSandbox::Enabled
-        && let Some(state_dir) = input.events_socket_path.parent() {
-            let guard_command = format!(
-                "BOSS_DATA_DIR={dir} python3 {script}",
-                dir = shell_escape(&state_dir.display().to_string()),
-                script = shell_escape(&path_guard_script_path().display().to_string()),
-            );
-            pre_tool_use_hooks.push(serde_json::json!({
-                "matcher": "*",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": guard_command,
-                    }
-                ],
-            }));
-        }
+        && let Some(state_dir) = input.events_socket_path.parent()
+    {
+        let guard_command = format!(
+            "BOSS_DATA_DIR={dir} python3 {script}",
+            dir = shell_escape(&state_dir.display().to_string()),
+            script = shell_escape(&path_guard_script_path().display().to_string()),
+        );
+        pre_tool_use_hooks.push(serde_json::json!({
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": guard_command,
+                }
+            ],
+        }));
+    }
 
     // Block a worker from *launching Boss itself* — the macOS app or its
     // bundled engine. A worker that starts Boss attaches to the operator's
@@ -529,8 +530,8 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
         ],
     }));
 
-    let is_revision = input.execution_kind == "revision_implementation"
-        || input.task_kind.as_deref() == Some("revision");
+    let is_revision =
+        input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
     if is_revision {
         pre_tool_use_hooks.push(serde_json::json!({
             "matcher": "Bash",
@@ -610,17 +611,18 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
     // wrongly fence the worker off all of `/tmp`; skip them there. The
     // static `bossctl` / `boss engine` guards below still apply to both.
     if sandbox == EngineDataDirSandbox::Enabled
-        && let Some(state_dir) = input.events_socket_path.parent() {
-            let dir = state_dir.display().to_string();
-            // Both the bare directory and the `**` subtree are listed
-            // explicitly: glob `**` doesn't match the directory itself in
-            // every harness, and we want a `Read("…/Boss")` ls attempt to
-            // be denied just like a `Read("…/Boss/state.db")`.
-            for prefix in ["Read", "Edit", "Write"] {
-                rules.push(format!("{prefix}({dir})"));
-                rules.push(format!("{prefix}({dir}/**)"));
-            }
+        && let Some(state_dir) = input.events_socket_path.parent()
+    {
+        let dir = state_dir.display().to_string();
+        // Both the bare directory and the `**` subtree are listed
+        // explicitly: glob `**` doesn't match the directory itself in
+        // every harness, and we want a `Read("…/Boss")` ls attempt to
+        // be denied just like a `Read("…/Boss/state.db")`.
+        for prefix in ["Read", "Edit", "Write"] {
+            rules.push(format!("{prefix}({dir})"));
+            rules.push(format!("{prefix}({dir}/**)"));
         }
+    }
 
     // `bossctl` is the coordinator's CLI surface (probes, agents
     // list, work mutations). Workers don't drive the coordinator,
@@ -1086,8 +1088,7 @@ fn purge_leaked_hooks_in_file(path: &Path) -> io::Result<()> {
         );
         return Ok(());
     }
-    let serialized = serde_json::to_string_pretty(&value)
-        .expect("settings JSON value is always serializable");
+    let serialized = serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable");
     std::fs::write(path, serialized)?;
     tracing::info!(
         path = %path.display(),
@@ -1131,16 +1132,13 @@ fn strip_leaked_hooks(value: &mut serde_json::Value) -> bool {
 /// A hook group `{matcher, hooks: [{type, command}, ...]}` is leaked if
 /// any of its inner command strings carries the signature.
 fn hook_group_is_leaked(group: &serde_json::Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(|h| h.as_array())
-        .is_some_and(|inner| {
-            inner.iter().any(|h| {
-                h.get("command")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.contains(LEAKED_HOOK_SIGNATURE))
-            })
+    group.get("hooks").and_then(|h| h.as_array()).is_some_and(|inner| {
+        inner.iter().any(|h| {
+            h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains(LEAKED_HOOK_SIGNATURE))
         })
+    })
 }
 
 /// Absolute path to Claude Code's user-global config file
@@ -1211,22 +1209,19 @@ fn pre_trust_workspace_in(config_path: &Path, workspace_path: &Path) -> io::Resu
 
     let mut root: serde_json::Value = match std::fs::read_to_string(config_path) {
         Ok(s) if s.trim().is_empty() => serde_json::json!({}),
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        Ok(s) => serde_json::from_str(&s).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(e),
     };
 
-    let obj = root.as_object_mut().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json is not a JSON object")
-    })?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json is not a JSON object"))?;
     let projects = obj
         .entry("projects")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
         .as_object_mut()
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json `projects` is not an object")
-        })?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "~/.claude.json `projects` is not an object"))?;
     let entry = projects
         .entry(key)
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
@@ -1250,8 +1245,7 @@ fn pre_trust_workspace_in(config_path: &Path, workspace_path: &Path) -> io::Resu
         .entry("projectOnboardingSeenCount")
         .or_insert_with(|| serde_json::Value::from(0));
 
-    let serialized = serde_json::to_string_pretty(&root)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let serialized = serde_json::to_string_pretty(&root).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     write_atomic(config_path, serialized.as_bytes())
 }
 
@@ -1357,12 +1351,7 @@ pub(crate) fn heal_hook_command(command: &str, new_boss_event_path: &Path) -> St
     };
     let close_pos = after + close_offset;
     let new_escaped = shell_escape(&new_boss_event_path.display().to_string());
-    format!(
-        "{}{}{}",
-        &command[..open_pos],
-        new_escaped,
-        &command[close_pos + 1..]
-    )
+    format!("{}{}{}", &command[..open_pos], new_escaped, &command[close_pos + 1..])
 }
 
 /// Walk every `*.json` file in `settings_dir` (the
@@ -1421,18 +1410,15 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
 
 /// Returns `Ok(true)` if any hook commands were updated, `Ok(false)` if
 /// the file was absent or unchanged.
-fn heal_single_settings_json(
-    settings_path: &Path,
-    new_boss_event_path: &Path,
-) -> io::Result<bool> {
+fn heal_single_settings_json(settings_path: &Path, new_boss_event_path: &Path) -> io::Result<bool> {
     let content = match std::fs::read_to_string(settings_path) {
         Ok(c) => c,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(err),
     };
 
-    let mut parsed: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut parsed: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut changed = false;
 
@@ -1440,16 +1426,9 @@ fn heal_single_settings_json(
         for (_name, entries) in hooks.iter_mut() {
             if let Some(arr) = entries.as_array_mut() {
                 for entry in arr.iter_mut() {
-                    if let Some(inner_hooks) = entry
-                        .get_mut("hooks")
-                        .and_then(|h| h.as_array_mut())
-                    {
+                    if let Some(inner_hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
                         for inner in inner_hooks.iter_mut() {
-                            if let Some(cmd) = inner
-                                .get("command")
-                                .and_then(|c| c.as_str())
-                                .map(str::to_owned)
-                            {
+                            if let Some(cmd) = inner.get("command").and_then(|c| c.as_str()).map(str::to_owned) {
                                 let healed = heal_hook_command(&cmd, new_boss_event_path);
                                 if healed != cmd {
                                     inner["command"] = serde_json::Value::String(healed);
@@ -1464,14 +1443,13 @@ fn heal_single_settings_json(
     }
 
     if changed {
-        let new_content = serde_json::to_string_pretty(&parsed)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let new_content =
+            serde_json::to_string_pretty(&parsed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(settings_path, new_content)?;
     }
 
     Ok(changed)
 }
-
 
 #[cfg(test)]
 #[path = "worker_setup_tests.rs"]

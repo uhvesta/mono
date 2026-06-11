@@ -37,10 +37,7 @@ impl HomeGuard {
         unsafe {
             std::env::set_var("HOME", home.path());
         }
-        Self {
-            _home: home,
-            original,
-        }
+        Self { _home: home, original }
     }
 }
 
@@ -58,12 +55,8 @@ fn sample_input() -> WorkerSetupInput {
         run_id: "run-sample".into(),
         lease_id: "lease-uuid-abc".into(),
         workspace_path: PathBuf::from("/Users/brianduff/Documents/dev/workspaces/mono-agent-007"),
-        events_socket_path: PathBuf::from(
-            "/Users/brianduff/Library/Application Support/Boss/events.sock",
-        ),
-        boss_event_path: PathBuf::from(
-            "/Users/brianduff/Library/Application Support/Boss/bin/boss-event",
-        ),
+        events_socket_path: PathBuf::from("/Users/brianduff/Library/Application Support/Boss/events.sock"),
+        boss_event_path: PathBuf::from("/Users/brianduff/Library/Application Support/Boss/bin/boss-event"),
         draft_pr_mode: false,
         execution_kind: "chore_implementation".into(),
         task_kind: Some("chore".into()),
@@ -86,8 +79,7 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
         task_kind: Some("task".into()),
         worker_kind: WorkerKind::Standard,
     };
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_remote_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input)).unwrap();
 
     // All seven boss-event hook events are still wired.
     let hooks = parsed.get("hooks").unwrap().as_object().unwrap();
@@ -117,9 +109,7 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
     assert!(
         !deny.iter().any(|r| {
             let s = r.as_str().unwrap();
-            s.starts_with("Read(/tmp")
-                || s.starts_with("Write(/tmp")
-                || s.starts_with("Edit(/tmp")
+            s.starts_with("Read(/tmp") || s.starts_with("Write(/tmp") || s.starts_with("Edit(/tmp")
         }),
         "remote settings must not fence the worker off /tmp: {deny:?}"
     );
@@ -209,11 +199,8 @@ fn settings_json_is_valid_json_with_all_seven_hooks() {
 #[test]
 fn settings_json_threads_socket_lease_and_shim_into_command() {
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
-    let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
     assert!(command.contains("events.sock"));
     assert!(command.contains("lease-uuid-abc"));
     assert!(command.contains("boss-event"));
@@ -227,8 +214,7 @@ fn settings_json_inlines_workspace_into_every_hook_command() {
     // hook command must inline-prefix this env var so the buffer
     // lives in the lease's workspace regardless of cwd.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let workspace_str = input.workspace_path.display().to_string();
     for hook_name in [
         "SessionStart",
@@ -258,8 +244,7 @@ fn settings_json_inlines_run_id_into_every_hook_command() {
     // can't correlate hook events to runs and the live worker
     // state stays pinned at `Spawning` for the worker's lifetime.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     for hook_name in [
         "SessionStart",
         "UserPromptSubmit",
@@ -288,11 +273,8 @@ fn settings_json_denies_boss_state_dir_reads_writes_and_edits() {
     // so a `Read("…/Boss")` ls and a `Read("…/Boss/state.db")`
     // both deny.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
-    let deny = parsed["permissions"]["deny"]
-        .as_array()
-        .expect("deny array present");
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let deny = parsed["permissions"]["deny"].as_array().expect("deny array present");
     let deny_set: Vec<&str> = deny.iter().filter_map(|v| v.as_str()).collect();
     let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
     for tool in ["Read", "Edit", "Write"] {
@@ -315,8 +297,7 @@ fn settings_json_denies_bossctl_and_engine_lifecycle_verbs() {
     // into engine process state. The rest of the `boss` surface
     // talks to the engine over its IPC socket and is fine.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let deny: Vec<&str> = parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -331,10 +312,7 @@ fn settings_json_denies_bossctl_and_engine_lifecycle_verbs() {
         "Bash(boss engine stop)",
         "Bash(boss engine stop:*)",
     ] {
-        assert!(
-            deny.contains(&rule),
-            "expected deny rule {rule} in {deny:?}",
-        );
+        assert!(deny.contains(&rule), "expected deny rule {rule} in {deny:?}",);
     }
 }
 
@@ -343,8 +321,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
     // Standard workers must not carry the reviewer deny rules — that
     // would break every implementation worker.
     let std_input = sample_input(); // worker_kind: Standard
-    let std_parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input)).unwrap();
     let std_deny: Vec<&str> = std_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -361,8 +338,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
     // Reviewer workers must carry every rule from reviewer_deny_rules().
     let mut rev_input = sample_input();
     rev_input.worker_kind = WorkerKind::Reviewer;
-    let rev_parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
+    let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
     let rev_deny: Vec<&str> = rev_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -376,7 +352,12 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
         );
     }
     // Spot-check the most critical publish rules.
-    for critical in ["Bash(jj git push:*)", "Bash(gh pr create:*)", "Bash(gh pr comment:*)", "Bash(cube pr:*)"] {
+    for critical in [
+        "Bash(jj git push:*)",
+        "Bash(gh pr create:*)",
+        "Bash(gh pr comment:*)",
+        "Bash(cube pr:*)",
+    ] {
         assert!(
             rev_deny.contains(&critical),
             "reviewer must deny {critical} (got {rev_deny:?})",
@@ -411,8 +392,7 @@ fn reviewer_settings_json_has_fast_mode_standard_does_not() {
     // Reviewer workers are latency-sensitive: fastMode must be true.
     let mut rev_input = sample_input();
     rev_input.worker_kind = WorkerKind::Reviewer;
-    let rev_parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
+    let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
     assert_eq!(
         rev_parsed["fastMode"],
         serde_json::json!(true),
@@ -421,11 +401,9 @@ fn reviewer_settings_json_has_fast_mode_standard_does_not() {
 
     // Standard workers must NOT have fastMode set at all.
     let std_input = sample_input();
-    let std_parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input)).unwrap();
     assert!(
-        std_parsed.get("fastMode").is_none()
-            || std_parsed["fastMode"] == serde_json::json!(null),
+        std_parsed.get("fastMode").is_none() || std_parsed["fastMode"] == serde_json::json!(null),
         "standard worker settings.json must not carry fastMode (got {:?})",
         std_parsed.get("fastMode"),
     );
@@ -437,8 +415,7 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
     // investigate and emit a marker; they must not edit, push, or open a
     // PR). Standard implementation workers must NOT carry it.
     let std_input = sample_input(); // worker_kind: Standard
-    let std_parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input)).unwrap();
     let std_deny: Vec<&str> = std_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -454,8 +431,7 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
 
     let mut triage_input = sample_input();
     triage_input.worker_kind = WorkerKind::Triage;
-    let triage_parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&triage_input)).unwrap();
+    let triage_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&triage_input)).unwrap();
     let triage_deny: Vec<&str> = triage_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -518,8 +494,7 @@ fn settings_json_does_not_deny_workspace_paths() {
     // (their lease lives there). Verify no deny rule names the
     // workspace root.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let deny: Vec<&str> = parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -564,8 +539,7 @@ fn settings_json_pins_permissions_default_mode_to_auto() {
     // autonomously while still honoring the user's permission
     // allow/deny rules, which the environment policy requires.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     assert_eq!(
         parsed["permissions"]["defaultMode"],
         serde_json::Value::String("auto".into()),
@@ -576,11 +550,8 @@ fn settings_json_pins_permissions_default_mode_to_auto() {
 #[test]
 fn shell_escape_quotes_paths_with_spaces() {
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
-    let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"]
-        .as_str()
-        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
     // Application Support has a space — must round-trip through
     // single-quote escaping.
     assert!(command.contains("'/Users/brianduff/Library/Application Support/Boss/events.sock'"));
@@ -617,14 +588,8 @@ fn write_workspace_files_creates_claude_dir_and_writes_all_files() {
     assert!(written.claude_md_path.exists());
     assert!(written.settings_path.exists());
     assert!(written.gitignore_path.exists());
-    assert_eq!(
-        written.claude_md_path,
-        dir.path().join(".claude").join("CLAUDE.md")
-    );
-    assert_eq!(
-        written.gitignore_path,
-        dir.path().join(".claude").join(".gitignore")
-    );
+    assert_eq!(written.claude_md_path, dir.path().join(".claude").join("CLAUDE.md"));
+    assert_eq!(written.gitignore_path, dir.path().join(".claude").join(".gitignore"));
 
     let claude_md_contents = std::fs::read_to_string(&written.claude_md_path).unwrap();
     assert!(claude_md_contents.contains("test-lease"));
@@ -684,8 +649,7 @@ fn write_workspace_files_pre_trusts_workspace_in_claude_json() {
     // workspace as trusted, so the worker's claude session skips the
     // folder-trust dialog.
     let config_path = claude_global_config_path().unwrap();
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     let key = dir.path().display().to_string();
     assert_eq!(
         config["projects"][&key]["hasTrustDialogAccepted"],
@@ -701,8 +665,7 @@ fn pre_trust_creates_config_when_absent() {
 
     pre_trust_workspace_in(&config, &workspace).unwrap();
 
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     let key = workspace.display().to_string();
     assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
     // The onboarding counter is seeded so onboarding doesn't re-prompt.
@@ -729,15 +692,11 @@ fn pre_trust_preserves_other_projects_and_top_level_keys() {
     let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-002");
     pre_trust_workspace_in(&config, &workspace).unwrap();
 
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     // Top-level key and the pre-existing project survive verbatim.
     assert_eq!(value["numStartups"], 42);
     assert_eq!(value["projects"]["/some/other/project"]["lastCost"], 1.23);
-    assert_eq!(
-        value["projects"]["/some/other/project"]["hasTrustDialogAccepted"],
-        true
-    );
+    assert_eq!(value["projects"]["/some/other/project"]["hasTrustDialogAccepted"], true);
     // The new workspace is now trusted.
     let key = workspace.display().to_string();
     assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
@@ -790,8 +749,7 @@ fn pre_trust_treats_empty_config_as_fresh() {
     let workspace = PathBuf::from("/Users/x/.local/share/cube/workspaces/mono-agent-005");
     pre_trust_workspace_in(&config, &workspace).unwrap();
 
-    let value: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
     let key = workspace.display().to_string();
     assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
 }
@@ -836,8 +794,7 @@ fn purge_leaked_worker_hooks_strips_stale_boss_hooks_but_keeps_other_content() {
     // a worker session can no longer fire a second Stop with the
     // stale run id. Non-hook content (the repo-style deny rules)
     // survives.
-    let after: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let after: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
     assert!(
         !std::fs::read_to_string(&settings).unwrap().contains("BOSS_RUN_ID"),
         "no leaked BOSS_RUN_ID hook may remain",
@@ -920,11 +877,7 @@ fn write_workspace_files_purges_leaked_in_tree_settings() {
     std::fs::create_dir_all(&claude_dir).unwrap();
     // Simulate a warm-cached workspace carrying a stale settings.json
     // from a prior execution.
-    std::fs::write(
-        claude_dir.join("settings.json"),
-        leaked_settings_json("exec_prev_run"),
-    )
-    .unwrap();
+    std::fs::write(claude_dir.join("settings.json"), leaked_settings_json("exec_prev_run")).unwrap();
 
     let input = WorkerSetupInput {
         run_id: "exec_current".into(),
@@ -970,9 +923,9 @@ fn claude_md_pr_section_is_front_and_centre() {
     // again, this test will fail and the writer can move it back.
     let input = sample_input();
     let rendered = render_claude_md(&input);
-    let pr_offset = rendered.find("Pull requests are the deliverable").expect(
-        "expected the strengthened PR heading to be present",
-    );
+    let pr_offset = rendered
+        .find("Pull requests are the deliverable")
+        .expect("expected the strengthened PR heading to be present");
     let workspace_offset = rendered
         .find("## Your workspace")
         .expect("expected the workspace heading to be present");
@@ -1038,10 +991,7 @@ fn claude_md_has_cube_pr_ensure_section() {
         rendered.contains("cube pr ensure"),
         "expected cube pr ensure to be the canonical PR creation command",
     );
-    assert!(
-        rendered.contains("--branch"),
-        "expected --branch flag guidance",
-    );
+    assert!(rendered.contains("--branch"), "expected --branch flag guidance",);
     assert!(
         rendered.contains("jj bookmark create"),
         "expected canonical bookmark creation command",
@@ -1054,8 +1004,7 @@ fn claude_md_explains_no_git_at_workspace_root() {
     let input = sample_input();
     let rendered = render_claude_md(&input);
     assert!(
-        rendered.contains("fatal: not a git repository")
-            || rendered.contains("no `.git/`"),
+        rendered.contains("fatal: not a git repository") || rendered.contains("no `.git/`"),
         "expected an explanation of why bare gh fails in a jj workspace",
     );
 }
@@ -1192,9 +1141,7 @@ fn heal_worker_settings_json_updates_all_hook_events() {
         lease_id: "lease-heal".into(),
         workspace_path: PathBuf::from("/some/workspace/mono-agent-heal"),
         events_socket_path: PathBuf::from("/tmp/events.sock"),
-        boss_event_path: PathBuf::from(
-            "/old/bazel-bin/tools/boss/event-shim/boss-event",
-        ),
+        boss_event_path: PathBuf::from("/old/bazel-bin/tools/boss/event-shim/boss-event"),
         draft_pr_mode: false,
         execution_kind: "chore_implementation".into(),
         task_kind: Some("chore".into()),
@@ -1244,8 +1191,7 @@ fn heal_worker_settings_json_skips_missing_settings_dir() {
 fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
     let mut input = sample_input();
     input.execution_kind = "revision_implementation".into();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
@@ -1282,8 +1228,7 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
 #[test]
 fn chore_implementation_has_shim_and_path_guard_but_no_revision_guard() {
     let input = sample_input(); // execution_kind: "chore_implementation"
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
@@ -1324,8 +1269,7 @@ fn every_worker_blocks_launching_boss_in_pre_tool_use() {
     for kind in ["chore_implementation", "revision_implementation"] {
         let mut input = sample_input();
         input.execution_kind = kind.into();
-        let parsed: serde_json::Value =
-            serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
@@ -1375,8 +1319,7 @@ fn revision_task_kind_adds_gh_pr_create_guard_even_with_wrong_execution_kind() {
     input.execution_kind = "task_implementation".into();
     input.task_kind = Some("revision".into());
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
@@ -1415,10 +1358,8 @@ fn settings_json_adds_deterministic_path_guard_hook() {
     // Boss data dir passed via BOSS_DATA_DIR so the script resolves
     // candidate paths against the right boundary.
     let input = sample_input();
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
-    let cmd = path_guard_command(&parsed)
-        .expect("PreToolUse must include the deterministic path-guard hook");
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let cmd = path_guard_command(&parsed).expect("PreToolUse must include the deterministic path-guard hook");
     assert!(cmd.contains("python3"), "guard must run via python3: {cmd}");
     // The data dir is the Boss state dir (events socket parent),
     // single-quoted because of the space in "Application Support".
@@ -1442,8 +1383,7 @@ fn path_guard_present_for_revision_sessions_too() {
     let mut input = sample_input();
     input.execution_kind = "revision_implementation".into();
     input.task_kind = Some("revision".into());
-    let parsed: serde_json::Value =
-        serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     assert!(
         path_guard_command(&parsed).is_some(),
         "revision sessions must also carry the deterministic path guard",
@@ -1459,12 +1399,18 @@ fn path_guard_script_has_the_load_bearing_logic() {
     let s = PATH_GUARD_SCRIPT;
     assert!(s.contains("BOSS_DATA_DIR"), "must read the data dir from env");
     assert!(s.contains("realpath"), "must canonicalise paths via realpath");
-    assert!(s.contains("expanduser") && s.contains("expandvars"),
-        "must expand ~ and $VAR indirection");
-    assert!(s.contains("\"decision\"") && s.contains("\"block\""),
-        "must be able to emit a block decision");
-    assert!(s.contains("boss task restore") || s.contains("boss shake"),
-        "block message must point at the sanctioned recovery surface");
+    assert!(
+        s.contains("expanduser") && s.contains("expandvars"),
+        "must expand ~ and $VAR indirection"
+    );
+    assert!(
+        s.contains("\"decision\"") && s.contains("\"block\""),
+        "must be able to emit a block decision"
+    );
+    assert!(
+        s.contains("boss task restore") || s.contains("boss shake"),
+        "block message must point at the sanctioned recovery surface"
+    );
 }
 
 #[test]
@@ -1553,18 +1499,14 @@ fn run_revision_guard(bash_command: &str) -> String {
 
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!(
-                "guard produced invalid JSON for command {:?}: {e}\nstdout={stdout}\nstderr={}",
-                bash_command,
-                String::from_utf8_lossy(&out.stderr),
-            )
-        });
-    parsed["decision"]
-        .as_str()
-        .unwrap_or("missing")
-        .to_owned()
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "guard produced invalid JSON for command {:?}: {e}\nstdout={stdout}\nstderr={}",
+            bash_command,
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    parsed["decision"].as_str().unwrap_or("missing").to_owned()
 }
 
 // --- false-positive regression tests (must APPROVE) ---
@@ -1573,9 +1515,8 @@ fn run_revision_guard(bash_command: &str) -> String {
 fn guard_approves_jj_describe_with_cube_pr_ensure_in_message() {
     // The bug: `jj describe -m "...cube pr ensure..."` was blocked
     // because the phrase appeared inside the quoted commit message.
-    let decision = run_revision_guard(
-        r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr ensure""#,
-    );
+    let decision =
+        run_revision_guard(r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr ensure""#);
     assert_eq!(
         decision, "approve",
         "guard must NOT block jj describe when the phrase is in the commit message",
@@ -1584,9 +1525,7 @@ fn guard_approves_jj_describe_with_cube_pr_ensure_in_message() {
 
 #[test]
 fn guard_approves_git_commit_with_gh_pr_create_in_message() {
-    let decision = run_revision_guard(
-        r#"git commit -m "docs: explain how gh pr create interacts with the hook""#,
-    );
+    let decision = run_revision_guard(r#"git commit -m "docs: explain how gh pr create interacts with the hook""#);
     assert_eq!(
         decision, "approve",
         "guard must NOT block git commit when the phrase is in the commit message",
@@ -1601,9 +1540,7 @@ fn guard_approves_echo_with_pr_creation_phrase() {
 
 #[test]
 fn guard_approves_jj_describe_with_gh_pr_create_in_message() {
-    let decision = run_revision_guard(
-        r#"jj describe -m "fix: the gh pr create story in this branch""#,
-    );
+    let decision = run_revision_guard(r#"jj describe -m "fix: the gh pr create story in this branch""#);
     assert_eq!(decision, "approve", "jj describe must not be blocked");
 }
 
@@ -1612,26 +1549,18 @@ fn guard_approves_jj_describe_with_gh_pr_create_in_message() {
 #[test]
 fn guard_blocks_gh_pr_create() {
     let decision = run_revision_guard("gh pr create --title 'My PR' --body 'content'");
-    assert_eq!(
-        decision, "block",
-        "guard must block a bare gh pr create",
-    );
+    assert_eq!(decision, "block", "guard must block a bare gh pr create",);
 }
 
 #[test]
 fn guard_blocks_cube_pr_ensure() {
     let decision = run_revision_guard("cube pr ensure --branch feat/foo --title 'My PR'");
-    assert_eq!(
-        decision, "block",
-        "guard must block a bare cube pr ensure",
-    );
+    assert_eq!(decision, "block", "guard must block a bare cube pr ensure",);
 }
 
 #[test]
 fn guard_blocks_gh_pr_create_with_git_dir_prefix() {
-    let decision = run_revision_guard(
-        "GIT_DIR=.jj/repo/store/git gh pr create --title 'x' --body 'y'",
-    );
+    let decision = run_revision_guard("GIT_DIR=.jj/repo/store/git gh pr create --title 'x' --body 'y'");
     assert_eq!(
         decision, "block",
         "guard must block gh pr create even with a GIT_DIR= prefix",
@@ -1642,9 +1571,7 @@ fn guard_blocks_gh_pr_create_with_git_dir_prefix() {
 fn guard_blocks_cube_pr_ensure_in_compound_command() {
     // A compound command: benign `jj describe` first, then a real
     // `cube pr ensure` — the guard must catch the second part.
-    let decision = run_revision_guard(
-        r#"jj describe -m "push changes" && cube pr ensure --branch feat/x"#,
-    );
+    let decision = run_revision_guard(r#"jj describe -m "push changes" && cube pr ensure --branch feat/x"#);
     assert_eq!(
         decision, "block",
         "guard must block cube pr ensure in a compound command",

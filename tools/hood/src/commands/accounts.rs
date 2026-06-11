@@ -56,11 +56,7 @@ fn format_account_lines(accounts: &[RobinhoodAccount]) -> Vec<String> {
         .collect()
 }
 
-fn format_account_line(
-    account: &RobinhoodAccount,
-    account_number_width: usize,
-    account_type_width: usize,
-) -> String {
+fn format_account_line(account: &RobinhoodAccount, account_number_width: usize, account_type_width: usize) -> String {
     let account_number = format!("{:<account_number_width$}", account.account_number);
     let account_type = format!(
         "{:<account_type_width$}",

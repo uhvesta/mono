@@ -39,11 +39,7 @@ pub(super) async fn handle_metrics_show_live(ctx: Dispatch, req: FrontendRequest
                 stale: snap.stale,
             })
         };
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::MetricsShowLiveResult { entry },
-        );
+        send_response(&sink, &request_id, FrontendEvent::MetricsShowLiveResult { entry });
     }
 }
 
@@ -80,11 +76,7 @@ pub(super) async fn handle_metrics_list_live(ctx: Dispatch, req: FrontendRequest
             });
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::MetricsListLiveResult { entries },
-        );
+        send_response(&sink, &request_id, FrontendEvent::MetricsListLiveResult { entries });
     }
 }
 

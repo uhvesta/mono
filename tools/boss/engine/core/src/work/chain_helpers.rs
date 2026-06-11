@@ -57,11 +57,7 @@ pub(crate) fn chain_root(conn: &Connection, task_id: &str) -> Result<String> {
 /// The revision's own `pr_url` is intentionally left `NULL` — the chain
 /// root's `pr_url` is the source of truth for the PR that delivered the
 /// revision's commit.
-pub(crate) fn flip_in_review_revisions_to_done(
-    conn: &Connection,
-    chain_root_id: &str,
-    now: &str,
-) -> Result<()> {
+pub(crate) fn flip_in_review_revisions_to_done(conn: &Connection, chain_root_id: &str, now: &str) -> Result<()> {
     // Find all revisions whose immediate `parent_task_id` chain leads to
     // `chain_root_id`.  Because chains are short (typically 1-3 deep) and
     // bounded by `MAX_CHAIN_DEPTH = 64`, we collect all revision IDs
@@ -90,10 +86,7 @@ pub(crate) fn flip_in_review_revisions_to_done(
 
 /// Collect the ids of every revision task in the chain rooted at
 /// `chain_root_id`, using BFS over `parent_task_id`.
-pub(crate) fn collect_chain_revision_ids(
-    conn: &Connection,
-    chain_root_id: &str,
-) -> Result<Vec<String>> {
+pub(crate) fn collect_chain_revision_ids(conn: &Connection, chain_root_id: &str) -> Result<Vec<String>> {
     let mut ids = Vec::new();
     let mut frontier = vec![chain_root_id.to_owned()];
     for _ in 0..64 {
@@ -134,11 +127,7 @@ pub(crate) fn collect_chain_revision_ids(
 /// Each newly blocked revision gets a `work_attention_items` row so
 /// the kanban card explains what happened and points the operator to
 /// `boss task create` for follow-up work.
-pub(crate) fn block_pending_revisions_on_parent_close(
-    conn: &Connection,
-    chain_root_id: &str,
-    now: &str,
-) -> Result<()> {
+pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_root_id: &str, now: &str) -> Result<()> {
     let revision_ids = collect_chain_revision_ids(conn, chain_root_id)?;
     if revision_ids.is_empty() {
         return Ok(());

@@ -89,27 +89,21 @@ struct CompiledTodoExpiryConfig {
 }
 
 fn parse_config(config: &toml::Value) -> Result<CompiledTodoExpiryConfig> {
-    let parsed: TodoExpiryConfig = config
-        .clone()
-        .try_into()
-        .context("invalid todo-expiry config")?;
+    let parsed: TodoExpiryConfig = config.clone().try_into().context("invalid todo-expiry config")?;
 
-    let required_pattern = parsed.required_pattern.unwrap_or_else(|| {
-        r"(?i)\b(?:TODO|FIXME)\s*\(@[A-Za-z0-9._-]+,\s*\d{4}-\d{2}-\d{2}\)\s*:".to_owned()
-    });
-    let required_format = Regex::new(&required_pattern)
-        .with_context(|| format!("invalid required_pattern regex: {required_pattern}"))?;
+    let required_pattern = parsed
+        .required_pattern
+        .unwrap_or_else(|| r"(?i)\b(?:TODO|FIXME)\s*\(@[A-Za-z0-9._-]+,\s*\d{4}-\d{2}-\d{2}\)\s*:".to_owned());
+    let required_format =
+        Regex::new(&required_pattern).with_context(|| format!("invalid required_pattern regex: {required_pattern}"))?;
 
     Ok(CompiledTodoExpiryConfig {
-        todo_detector: Regex::new(
-            r"(?i)^\s*(?://|#|/\*|\*|<!--)\s*(?:TODO|FIXME)\s*(?:\([^)]*\)\s*)?:",
-        )
-        .expect("valid detector regex"),
+        todo_detector: Regex::new(r"(?i)^\s*(?://|#|/\*|\*|<!--)\s*(?:TODO|FIXME)\s*(?:\([^)]*\)\s*)?:")
+            .expect("valid detector regex"),
         required_format,
         severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Warning),
         remediation: parsed.remediation.unwrap_or_else(|| {
-            "Use format `TODO(@owner,YYYY-MM-DD): ...` or `FIXME(@owner,YYYY-MM-DD): ...`."
-                .to_owned()
+            "Use format `TODO(@owner,YYYY-MM-DD): ...` or `FIXME(@owner,YYYY-MM-DD): ...`.".to_owned()
         }),
     })
 }
@@ -130,11 +124,7 @@ mod tests {
     #[tokio::test]
     async fn flags_todo_without_owner_and_date() {
         let temp = tempdir().expect("create temp dir");
-        fs::write(
-            temp.path().join("notes.txt"),
-            "// TODO: clean this up later\n",
-        )
-        .expect("write file");
+        fs::write(temp.path().join("notes.txt"), "// TODO: clean this up later\n").expect("write file");
 
         let check = TodoExpiryCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");

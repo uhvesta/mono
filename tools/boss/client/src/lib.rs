@@ -12,9 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use boss_protocol::{
-    FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope,
-};
+use boss_protocol::{FrontendEvent, FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -68,8 +66,7 @@ impl Discovery {
             .map(str::to_owned)
             .or_else(|| std::env::var("BOSS_SOCKET_PATH").ok())
             .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
-        let pid_file_path =
-            std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
+        let pid_file_path = std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| DEFAULT_PID_PATH.to_owned());
         let launch_directory = resolve_launch_directory()?;
         let engine = resolve_engine_command(&socket_path)?;
 
@@ -104,10 +101,7 @@ impl BossClient {
         }
 
         if !discovery.autostart {
-            bail!(
-                "boss engine is not reachable at {}",
-                discovery.socket_path
-            );
+            bail!("boss engine is not reachable at {}", discovery.socket_path);
         }
 
         ensure_engine_running(discovery).await?;
@@ -129,10 +123,7 @@ impl BossClient {
 
     /// Send a request and wait for the matching response by `request_id`.
     pub async fn send_request(&mut self, request: &FrontendRequest) -> Result<FrontendEvent> {
-        let request_id = format!(
-            "client-{}",
-            self.next_request_id.fetch_add(1, Ordering::Relaxed)
-        );
+        let request_id = format!("client-{}", self.next_request_id.fetch_add(1, Ordering::Relaxed));
         let payload = serde_json::to_string(&FrontendRequestEnvelope {
             request_id: request_id.clone(),
             payload: request.clone(),
@@ -145,8 +136,8 @@ impl BossClient {
             if line.trim().is_empty() {
                 continue;
             }
-            let envelope: FrontendEventEnvelope = serde_json::from_str(&line)
-                .with_context(|| format!("failed to decode engine event: {line}"))?;
+            let envelope: FrontendEventEnvelope =
+                serde_json::from_str(&line).with_context(|| format!("failed to decode engine event: {line}"))?;
             if envelope.request_id.as_deref() == Some(request_id.as_str()) {
                 return Ok(envelope.payload);
             }
@@ -172,10 +163,7 @@ impl BossClient {
                 build_time,
                 binary_fingerprint,
             } => Ok((git_sha, build_time, binary_fingerprint)),
-            other => anyhow::bail!(
-                "unexpected response to GetEngineVersion: {:?}",
-                other
-            ),
+            other => anyhow::bail!("unexpected response to GetEngineVersion: {:?}", other),
         }
     }
 }
@@ -268,16 +256,14 @@ pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
     match try_shutdown_via_rpc().await {
         Ok(()) => {
             if let Some(owner) = read_pid_file(pid_file_path)
-                && owner == pid {
-                    let _ = std::fs::remove_file(pid_file_path);
-                }
+                && owner == pid
+            {
+                let _ = std::fs::remove_file(pid_file_path);
+            }
             return Ok(());
         }
         Err(err) => {
-            tracing::debug!(
-                ?err,
-                "stop_engine: rpc shutdown unavailable; falling back to SIGTERM",
-            );
+            tracing::debug!(?err, "stop_engine: rpc shutdown unavailable; falling back to SIGTERM",);
         }
     }
 
@@ -293,9 +279,10 @@ pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
     }
 
     if let Some(owner) = read_pid_file(pid_file_path)
-        && owner == pid {
-            let _ = std::fs::remove_file(pid_file_path);
-        }
+        && owner == pid
+    {
+        let _ = std::fs::remove_file(pid_file_path);
+    }
 
     Ok(())
 }
@@ -310,8 +297,8 @@ pub async fn stop_engine(pid_file_path: &str) -> Result<()> {
 /// calling `block_on` here panics with "Cannot start a runtime from
 /// within a runtime" (#720).
 async fn try_shutdown_via_rpc() -> Result<()> {
-    let token_path = default_control_token_path()
-        .ok_or_else(|| anyhow::anyhow!("could not resolve engine-control token path"))?;
+    let token_path =
+        default_control_token_path().ok_or_else(|| anyhow::anyhow!("could not resolve engine-control token path"))?;
     try_shutdown_via_rpc_at(&token_path).await
 }
 
@@ -319,12 +306,8 @@ async fn try_shutdown_via_rpc() -> Result<()> {
 /// separate so tests can drive the RPC without mutating the global
 /// `BOSS_ENGINE_CONTROL_TOKEN_PATH` env var.
 async fn try_shutdown_via_rpc_at(token_path: &Path) -> Result<()> {
-    let raw = std::fs::read_to_string(token_path).with_context(|| {
-        format!(
-            "failed to read engine-control token file {}",
-            token_path.display()
-        )
-    })?;
+    let raw = std::fs::read_to_string(token_path)
+        .with_context(|| format!("failed to read engine-control token file {}", token_path.display()))?;
     let parsed: ControlTokenFile = serde_json::from_str(&raw)
         .with_context(|| format!("malformed engine-control token file {}", token_path.display()))?;
 
@@ -418,16 +401,12 @@ fn resolve_engine_command(socket_path: &str) -> Result<EngineCommand> {
 ///      executable — covers `bazel run` runfiles layouts.
 ///   5. Bare `boss-engine` on `$PATH` (current default; fails loudly if
 ///      the binary isn't installed).
-pub fn resolve_engine_command_with(
-    socket_path: &str,
-    input: &EngineResolverInput,
-) -> Result<EngineCommand> {
+pub fn resolve_engine_command_with(socket_path: &str, input: &EngineResolverInput) -> Result<EngineCommand> {
     let mut attempted = Vec::new();
 
     if let Some(value) = input.env_cmd.as_deref() {
         attempted.push(format!("BOSS_ENGINE_CMD={value}"));
-        let parts = shlex::split(value)
-            .with_context(|| format!("failed to parse BOSS_ENGINE_CMD: {value}"))?;
+        let parts = shlex::split(value).with_context(|| format!("failed to parse BOSS_ENGINE_CMD: {value}"))?;
         let Some((program, args)) = parts.split_first() else {
             bail!("BOSS_ENGINE_CMD resolved to an empty command");
         };
@@ -480,10 +459,7 @@ pub fn resolve_engine_command_with(
                 attempted,
             });
         }
-        attempted.push(format!(
-            "sibling-of-exe miss next to {}",
-            exe.display()
-        ));
+        attempted.push(format!("sibling-of-exe miss next to {}", exe.display()));
     } else {
         attempted.push("sibling-of-exe skipped (current_exe unavailable)".to_owned());
     }
@@ -548,9 +524,7 @@ fn walk_to_workspace_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn is_bazel_workspace(dir: &Path) -> bool {
-    dir.join("MODULE.bazel").exists()
-        || dir.join("WORKSPACE").exists()
-        || dir.join("WORKSPACE.bazel").exists()
+    dir.join("MODULE.bazel").exists() || dir.join("WORKSPACE").exists() || dir.join("WORKSPACE.bazel").exists()
 }
 
 fn format_engine_command(program: &str, args: &[String]) -> String {
@@ -614,10 +588,7 @@ mod tests {
         };
         let cmd = resolve_engine_command_with("/tmp/sock", &input).unwrap();
         assert_eq!(cmd.program, "/explicit/engine");
-        assert_eq!(
-            cmd.args,
-            vec!["--socket-path".to_owned(), "/tmp/sock".to_owned(),]
-        );
+        assert_eq!(cmd.args, vec!["--socket-path".to_owned(), "/tmp/sock".to_owned(),]);
         assert_eq!(cmd.source, "BOSS_ENGINE_BIN env var");
     }
 

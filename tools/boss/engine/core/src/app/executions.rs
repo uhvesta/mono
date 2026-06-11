@@ -27,11 +27,7 @@ pub(super) async fn handle_create_execution(ctx: Dispatch, req: FrontendRequest)
     };
     match work_db.create_execution(input) {
         Ok(execution) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::ExecutionCreated { execution },
-            );
+            send_response(&sink, &request_id, FrontendEvent::ExecutionCreated { execution });
         }
         Err(err) => {
             send_response(
@@ -77,8 +73,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         // request path would otherwise hit.
         let force = input.force;
         let live_states = server_state.live_worker_states.clone();
-        let result = work_db
-            .request_execution_with_live_check(input, |run_id| live_states.is_run_live(run_id));
+        let result = work_db.request_execution_with_live_check(input, |run_id| live_states.is_run_live(run_id));
         match result {
             Ok(execution) => {
                 if force {
@@ -115,9 +110,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                     send_response(
                         &sink,
                         &request_id,
-                        FrontendEvent::ExecutionRequested {
-                            execution: refreshed,
-                        },
+                        FrontendEvent::ExecutionRequested { execution: refreshed },
                     );
                 } else {
                     // Log every queued request so an operator can pair
@@ -134,11 +127,7 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
                         "RequestExecution accepted -> kicking scheduler"
                     );
                     server_state.execution_coordinator.kick();
-                    send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::ExecutionRequested { execution },
-                    );
+                    send_response(&sink, &request_id, FrontendEvent::ExecutionRequested { execution });
                 }
             }
             Err(err) => {
@@ -214,11 +203,7 @@ pub(super) async fn handle_get_task_runtime(ctx: Dispatch, req: FrontendRequest)
     {
         match work_db.get_task_runtime(&work_item_id) {
             Ok(runtime) => {
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::TaskRuntimeResult { runtime },
-                );
+                send_response(&sink, &request_id, FrontendEvent::TaskRuntimeResult { runtime });
             }
             Err(err) => {
                 send_response(
@@ -245,11 +230,7 @@ pub(super) async fn handle_get_execution(ctx: Dispatch, req: FrontendRequest) {
     };
     match work_db.get_execution(&id) {
         Ok(execution) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::ExecutionResult { execution },
-            );
+            send_response(&sink, &request_id, FrontendEvent::ExecutionResult { execution });
         }
         Err(err) => {
             send_response(
@@ -301,11 +282,7 @@ pub(super) async fn handle_list_runs(ctx: Dispatch, req: FrontendRequest) {
     };
     match work_db.list_runs(&execution_id) {
         Ok(runs) => {
-            send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::RunsList { execution_id, runs },
-            );
+            send_response(&sink, &request_id, FrontendEvent::RunsList { execution_id, runs });
         }
         Err(err) => {
             send_response(
@@ -368,12 +345,7 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::ProbeRun {
-        run_id,
-        text,
-        urgent,
-    } = req
-    else {
+    let FrontendRequest::ProbeRun { run_id, text, urgent } = req else {
         unreachable!()
     };
     {
@@ -534,11 +506,7 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
                     // when the execution had no active run.
                     handler.force_release(&exec_for_release).await;
                 });
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::ExecutionCancelled { execution },
-                );
+                send_response(&sink, &request_id, FrontendEvent::ExecutionCancelled { execution });
             }
             Err(err) => {
                 send_response(
@@ -588,10 +556,7 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
             return;
         }
         let reason = "manual reap via bossctl agents reap";
-        match server_state
-            .work_db
-            .mark_execution_orphaned(&run_id, reason)
-        {
+        match server_state.work_db.mark_execution_orphaned(&run_id, reason) {
             Ok(execution) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -599,11 +564,7 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "reap_run: marked execution orphaned (workspace preserved)",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::RunReaped { run_id, execution },
-                );
+                send_response(&sink, &request_id, FrontendEvent::RunReaped { run_id, execution });
             }
             Err(err) => {
                 send_response(
@@ -684,11 +645,7 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
                 } else {
                     match server_state
                         .execution_coordinator
-                        .read_remote_transcript_tail(
-                            &host,
-                            &transcript_path,
-                            REMOTE_TRANSCRIPT_TAIL_BYTES,
-                        )
+                        .read_remote_transcript_tail(&host, &transcript_path, REMOTE_TRANSCRIPT_TAIL_BYTES)
                         .await
                     {
                         Ok(Some(content)) => Ok(tail_lines_from_content(&content, lines)),
@@ -697,9 +654,7 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
                         // surface a spurious error.
                         Ok(None) => read_transcript_tail(&transcript_path, lines)
                             .await
-                            .map_err(|err| {
-                                format!("transcript read failed for {transcript_path}: {err}")
-                            }),
+                            .map_err(|err| format!("transcript read failed for {transcript_path}: {err}")),
                         Err(err) => Err(format!(
                             "remote transcript read failed for {transcript_path} on host {host}: {err:#}"
                         )),
@@ -719,11 +674,7 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
                         );
                     }
                     Err(message) => {
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::WorkError { message },
-                        );
+                        send_response(&sink, &request_id, FrontendEvent::WorkError { message });
                     }
                 }
             }
@@ -839,8 +790,7 @@ pub(super) async fn handle_execution_transcript(ctx: Dispatch, req: FrontendRequ
         match tokio::fs::read_to_string(&transcript_path).await {
             Ok(content) => {
                 let events = crate::transcript_markdown::parse_transcript(&content);
-                let segments =
-                    crate::transcript_markdown::events_to_segments(&events, &Default::default());
+                let segments = crate::transcript_markdown::events_to_segments(&events, &Default::default());
                 let wire_segments: Vec<boss_protocol::TranscriptSegment> =
                     segments.into_iter().map(segment_to_wire).collect();
                 send_response(
@@ -895,18 +845,8 @@ pub(super) async fn handle_list_engine_attempts(ctx: Dispatch, req: FrontendRequ
         unreachable!()
     };
     {
-        match work_db.list_engine_attempts(
-            &kinds,
-            product_id.as_deref(),
-            &status,
-            work_item_id.as_deref(),
-            limit,
-        ) {
-            Ok(attempts) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::EngineAttemptsList { attempts },
-            ),
+        match work_db.list_engine_attempts(&kinds, product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
+            Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::EngineAttemptsList { attempts }),
             Err(err) => send_response(
                 &sink,
                 &request_id,

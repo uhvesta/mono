@@ -66,19 +66,15 @@ impl ChangeSet {
     }
 
     pub fn with_file_diff(mut self, path: PathBuf, diff: FileDiff) -> Self {
-        self.file_line_deltas
-            .insert(path.clone(), diff.line_delta());
+        self.file_line_deltas.insert(path.clone(), diff.line_delta());
         self.file_diffs.insert(path, diff);
         self
     }
 
     pub fn bypass_reason(&self, bypass_name: &str) -> Option<String> {
-        parse_bypass_directives_from_descriptions(
-            self.commit_description.as_deref(),
-            self.pr_description.as_deref(),
-        )
-        .get(bypass_name)
-        .cloned()
+        parse_bypass_directives_from_descriptions(self.commit_description.as_deref(), self.pr_description.as_deref())
+            .get(bypass_name)
+            .cloned()
     }
 }
 

@@ -14,11 +14,7 @@ use crate::output::{CheckResult, Finding, Location, Severity};
 pub struct ForbiddenImportsDepsCheck;
 
 impl ForbiddenImportsDepsCheck {
-    fn configure_with_dir(
-        &self,
-        config: &toml::Value,
-        config_dir: &Path,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_with_dir(&self, config: &toml::Value, config_dir: &Path) -> Result<Arc<dyn ConfiguredCheck>> {
         Ok(Arc::new(parse_config(config, config_dir)?))
     }
 }
@@ -37,11 +33,7 @@ impl Check for ForbiddenImportsDepsCheck {
         self.configure_with_dir(config, Path::new(""))
     }
 
-    fn configure_scoped(
-        &self,
-        config: &toml::Value,
-        config_dir: Option<&Path>,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_scoped(&self, config: &toml::Value, config_dir: Option<&Path>) -> Result<Arc<dyn ConfiguredCheck>> {
         self.configure_with_dir(config, config_dir.unwrap_or_else(|| Path::new("")))
     }
 }
@@ -135,9 +127,10 @@ struct CompiledRule {
 impl CompiledRule {
     fn applies_to(&self, path: &Path) -> bool {
         if let Some(exclude_files) = &self.exclude_files
-            && is_excluded(path, exclude_files, &self.config_dir) {
-                return false;
-            }
+            && is_excluded(path, exclude_files, &self.config_dir)
+        {
+            return false;
+        }
         if let Some(include_globs) = &self.include_globs {
             return include_globs.is_match(path);
         }
@@ -145,10 +138,7 @@ impl CompiledRule {
     }
 }
 
-fn parse_config(
-    config: &toml::Value,
-    config_dir: &Path,
-) -> Result<CompiledForbiddenImportsDepsConfig> {
+fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<CompiledForbiddenImportsDepsConfig> {
     let parsed: ForbiddenImportsDepsConfig = config
         .clone()
         .try_into()
@@ -157,25 +147,21 @@ fn parse_config(
         bail!("forbidden-imports-deps config must contain at least one `rules` entry");
     }
 
-    let default_severity =
-        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
-    let default_remediation = parsed.remediation.unwrap_or_else(|| {
-        "Replace the forbidden import/dependency usage with approved project patterns.".to_owned()
-    });
+    let default_severity = Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_remediation = parsed
+        .remediation
+        .unwrap_or_else(|| "Replace the forbidden import/dependency usage with approved project patterns.".to_owned());
 
     let mut rules = Vec::with_capacity(parsed.rules.len());
     for rule in parsed.rules {
-        let pattern = Regex::new(&rule.pattern)
-            .with_context(|| format!("invalid rule regex: {}", rule.pattern))?;
+        let pattern = Regex::new(&rule.pattern).with_context(|| format!("invalid rule regex: {}", rule.pattern))?;
         rules.push(CompiledRule {
             pattern,
             include_globs: compile_globs("include_globs", &rule.include_globs)?,
             exclude_files: compile_globs("exclude_files", &rule.exclude_files)?,
             config_dir: config_dir.to_path_buf(),
             message: rule.message,
-            remediation: rule
-                .remediation
-                .unwrap_or_else(|| default_remediation.clone()),
+            remediation: rule.remediation.unwrap_or_else(|| default_remediation.clone()),
             severity: Severity::parse_with_default(rule.severity.as_deref(), default_severity),
         });
     }
@@ -198,8 +184,7 @@ fn compile_globs(field_name: &str, patterns: &[String]) -> Result<Option<GlobSet
     }
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
+        let glob = Glob::new(pattern).with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
         builder.add(glob);
     }
     let globset = builder

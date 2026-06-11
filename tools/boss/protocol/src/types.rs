@@ -15,8 +15,6 @@ use serde::{Deserialize, Serialize};
 // affect wire format.
 // ---------------------------------------------------------------------------
 
-
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddDependencyInput {
     /// Selector or id of the work item that becomes gated.
@@ -30,16 +28,13 @@ pub struct AddDependencyInput {
     pub relation: Option<String>,
 }
 
-
-
 /// One member of an [`AttentionGroup`]. Id prefix `atn`.
 ///
 /// Question groups carry the `question_type` / `prompt_text` /
 /// `choice_options` / `answer` fields. Followup groups carry the
 /// `proposed_*` / `rationale` fields. Both share `source_anchor`,
 /// `answer_state`, and `confidence_source`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Attention {
     pub id: String,
@@ -89,8 +84,6 @@ pub struct Attention {
     pub confidence_source: String,
 }
 
-
-
 /// One attention group — the human-actionable unit of the Attentions
 /// feature. Id prefix `atg`. Related attentions (questions or followups)
 /// collect into a group keyed by a stable `grouping_key`; the group is
@@ -98,8 +91,7 @@ pub struct Attention {
 /// artifact.
 ///
 /// Design: `tools/boss/docs/designs/attentions.md`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct AttentionGroup {
     pub id: String,
@@ -174,8 +166,6 @@ pub struct AttentionGroup {
     pub source_task_id: Option<String>,
 }
 
-
-
 /// A standing, triggered instruction that periodically asks whether a
 /// concrete maintenance task exists right now, and if so spawns one via
 /// a two-phase triage → execute flow. Automations live outside the normal
@@ -184,8 +174,7 @@ pub struct AttentionGroup {
 /// open-task cap.
 ///
 /// See `tools/boss/docs/designs/maintenance-tasks.md` for the full design.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Automation {
     pub id: String,
@@ -256,12 +245,9 @@ fn default_open_task_limit() -> i64 {
     1
 }
 
-
-
 /// Input to `UpdateAutomation`. All fields are `Option`; `None` means
 /// "leave unchanged."
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct AutomationPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,8 +272,6 @@ pub struct AutomationPatch {
     pub trigger: Option<AutomationTrigger>,
 }
 
-
-
 /// One recorded fire of an automation — the wire shape of an
 /// `automation_runs` row. Created for every occurrence, including
 /// no-ops (`skipped`) and failures (`failed_will_retry`,
@@ -306,8 +290,7 @@ pub struct AutomationPatch {
 ///   error); same `scheduled_for` will be retried with backoff.
 /// - `failed_gave_up` — retries exhausted; occurrence abandoned, schedule
 ///   advances.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct AutomationRun {
     pub id: String,
@@ -618,8 +601,6 @@ pub const EXECUTION_KIND_PR_REVIEW: &str = "pr_review";
 /// attempt supersedes the verdict.
 pub const BLOCKED_REASON_CI_FLAKY_RETRIGGERED: &str = "ci_flaky_retriggered";
 
-
-
 /// Trigger specification for an automation. The `schedule` variant is
 /// the only implemented trigger in v1; the enum is open to future
 /// variants (`Event`, `Manual`, etc.) without a schema migration because
@@ -639,8 +620,6 @@ pub enum AutomationTrigger {
         timezone: String,
     },
 }
-
-
 
 /// One active or historical blocked-reason for a work item — the
 /// wire shape of a `task_blocked_signals` row. The set of rows for
@@ -672,8 +651,6 @@ pub struct BlockedSignal {
     pub cleared_at: Option<String>,
 }
 
-
-
 /// Which naming strategy to use for worker branches pushed to this
 /// product's repo. The execution-id suffix is always appended for
 /// uniqueness; only the leading prefix component varies.
@@ -692,8 +669,6 @@ pub enum BranchNaming {
     /// orgs that enforce per-developer branch prefixes (e.g. `bduff/`).
     CustomPrefix { prefix: String },
 }
-
-
 
 /// Snapshot of a per-PR CI attempt budget — the wire shape behind the
 /// `boss engine ci budget show <work-item-id>` verb (design Phase 11
@@ -721,8 +696,6 @@ pub struct CiBudgetSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_pr_override: Option<i64>,
 }
-
-
 
 /// One engine attempt to clear a CI failure on an `in_review` PR —
 /// the wire shape of a `ci_remediations` row. Sibling of
@@ -840,8 +813,6 @@ pub struct CiRemediation {
     pub worker_id: Option<String>,
 }
 
-
-
 // ===========================================================================
 // Comments in the markdown viewer (design:
 // tools/boss/docs/designs/comments-in-markdown-viewer.md). Phase 2 adds the
@@ -906,8 +877,6 @@ pub fn default_comment_status() -> String {
     COMMENT_STATUS_ACTIVE.to_owned()
 }
 
-
-
 /// The outcome of resolving one comment's anchor against a doc's current
 /// plain-text projection. `start`/`length` are character offsets (Unicode
 /// scalar count) of the `exact` span within the plain text; both are `None`
@@ -926,8 +895,6 @@ pub struct CommentResolution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<i64>,
 }
-
-
 
 /// One engine attempt to clear a merge conflict on an `in_review`
 /// PR — the wire shape of a `conflict_resolutions` row. Stored as a
@@ -1006,8 +973,6 @@ pub struct ConflictResolution {
     pub worker_id: Option<String>,
 }
 
-
-
 /// Input for creating a new attention (question or followup member).
 /// The engine resolves or creates the appropriate group based on the
 /// association and source fields; callers may pass an explicit
@@ -1069,8 +1034,6 @@ pub struct CreateAttentionInput {
     pub confidence_source: Option<String>,
 }
 
-
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateAttentionItemInput {
     pub body_markdown: String,
@@ -1091,13 +1054,10 @@ pub struct CreateAttentionItemInput {
     pub work_item_id: Option<String>,
 }
 
-
-
 /// Input to `CreateAutomation`. Carries only the caller-supplied fields;
 /// the engine stamps `id`, `short_id`, `created_at`, `updated_at`, and the
 /// initial scheduler bookkeeping.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateAutomationInput {
     pub product_id: String,
@@ -1123,10 +1083,7 @@ pub struct CreateAutomationInput {
     pub repo_remote_url: Option<String>,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateChoreInput {
     pub product_id: String,
@@ -1173,8 +1130,6 @@ pub struct CreateChoreInput {
     pub repo_remote_url: Option<String>,
 }
 
-
-
 /// `comments_create` request body. The renderer supplies `doc_version` (it
 /// hashes the plain-text projection) so the engine and renderer agree on the
 /// authoring input without the engine having to render markdown itself.
@@ -1192,10 +1147,7 @@ pub struct CreateCommentInput {
     pub plain_text_projection_version: i64,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateExecutionInput {
     pub work_item_id: String,
@@ -1231,8 +1183,6 @@ pub struct CreateExecutionInput {
     pub status: Option<ExecutionStatus>,
     pub workspace_path: Option<String>,
 }
-
-
 
 /// Input for `boss task create --kind investigation`. Parallel to
 /// [`CreateChoreInput`] but adds `project_id` (investigation tasks
@@ -1275,16 +1225,12 @@ pub struct CreateInvestigationInput {
     pub repo_remote_url: Option<String>,
 }
 
-
-
 /// Batch counterpart of [`CreateChoreInput`]. See
 /// [`CreateManyTasksInput`] for atomicity / event semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateManyChoresInput {
     pub items: Vec<CreateChoreInput>,
 }
-
-
 
 /// Batch counterpart of [`CreateTaskInput`]. Items are fully resolved
 /// inputs — the CLI merges any top-level `--product` / `--project` /
@@ -1298,10 +1244,7 @@ pub struct CreateManyTasksInput {
     pub items: Vec<CreateTaskInput>,
 }
 
-
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateProductInput {
     pub name: String,
@@ -1323,10 +1266,7 @@ pub struct CreateProductInput {
     pub worker_branch_prefix: Option<String>,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateProjectInput {
     pub product_id: String,
@@ -1356,8 +1296,6 @@ pub struct CreateProjectInput {
     pub goal: Option<String>,
 }
 
-
-
 /// Input for `boss task create-revision`. Creates a `kind = 'revision'`
 /// task bound to an existing parent task whose PR is open and unmerged.
 /// The worker's deliverable is a new commit on the *parent's* PR branch —
@@ -1366,8 +1304,7 @@ pub struct CreateProjectInput {
 /// `insert_revision_in_tx` (Phase 2). `product_id` and `project_id` are
 /// inherited from the parent at create time; `repo_remote_url` is likewise
 /// inherited so the revision always targets the parent's repo.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateRevisionInput {
     /// The task whose PR this revision will commit to. Must refer to a task
@@ -1428,8 +1365,6 @@ pub struct CreateRevisionInput {
     pub autostart: bool,
 }
 
-
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateRunInput {
     pub agent_id: String,
@@ -1443,10 +1378,7 @@ pub struct CreateRunInput {
     pub transcript_path: Option<String>,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct CreateTaskInput {
     pub product_id: String,
@@ -1512,7 +1444,6 @@ pub enum DependencyDirection {
     Both,
 }
 
-
 /// One enriched dependency edge as displayed by `boss <kind> show`.
 /// Unlike [`WorkItemDependency`] (a raw storage row with both
 /// endpoints), this struct collapses the edge into "the peer + the
@@ -1533,8 +1464,6 @@ pub struct DependencyEdge {
     pub status: String,
 }
 
-
-
 /// Predicate applied to `boss <kind> list` requests to surface only
 /// the rows that match a dependency-graph question. Q6 spells out
 /// four flags; this enum is the one-flag-per-variant projection.
@@ -1554,8 +1483,6 @@ pub enum DependencyFilter {
     /// Only items currently gated by at least one incomplete prereq.
     BlockedByDeps,
 }
-
-
 
 /// One recorded enforcement action taken by the editorial-rules hook
 /// against a `gh` command invocation. Stored in `editorial_actions`
@@ -1584,8 +1511,6 @@ pub struct EditorialAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_url: Option<String>,
 }
-
-
 
 /// Per-product editorial rules constraining what workers write into
 /// GitHub-visible surfaces.
@@ -1623,8 +1548,6 @@ pub struct EditorialRules {
     pub instructions: Option<String>,
 }
 
-
-
 /// Suggested action a human reviewer might take, encoded so JSON
 /// consumers can branch on it without parsing free text. Mirrors
 /// the annotation strings in [`EffortAuditMarkerRow::annotation`].
@@ -1643,8 +1566,6 @@ pub enum EffortAuditAnnotation {
     /// volume too low to call. No callout.
     None,
 }
-
-
 
 /// Per-marker analysis row in the effort-audit report. One entry
 /// per marker in the §Q4 corpus that matched at least one chore in
@@ -1687,8 +1608,6 @@ pub struct EffortAuditMarkerRow {
     pub under_class_rate: Option<f64>,
 }
 
-
-
 /// Output shape for `boss product audit-effort <product>`. One
 /// snapshot of the marker corpus's under-classification rates
 /// against the recorded escalation events for a single product.
@@ -1726,8 +1645,6 @@ pub struct EffortAuditReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_days: Option<u32>,
 }
-
-
 
 /// One recorded effort-level escalation event — the wire shape of
 /// an `effort_escalations` row. Written by the coordinator's
@@ -1904,8 +1821,6 @@ impl std::str::FromStr for EffortLevel {
     }
 }
 
-
-
 /// Typed status for a [`Project`]. The five values mirror the
 /// free-form strings that were stored before this enum was introduced
 /// (`planned`, `active`, `blocked`, `done`, `archived`); the mapping
@@ -1953,8 +1868,6 @@ impl std::str::FromStr for ProjectStatus {
         }
     }
 }
-
-
 
 /// One row in the unified `boss engine attempts list` v2 result —
 /// design Phase 11 #36. A small projection across three attempt
@@ -2005,15 +1918,11 @@ pub struct EngineAttemptListEntry {
     pub work_item_id: Option<String>,
 }
 
-
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionReconcileResult {
     pub created: Vec<WorkExecution>,
     pub updated: Vec<WorkExecution>,
 }
-
-
 
 /// Display-safe GitHub OAuth auth state pushed from the engine to the UI.
 /// The token itself is never included — only fields safe to render.
@@ -2052,12 +1961,8 @@ pub enum GitHubAuthStateDto {
     /// The user denied the authorization request in the browser.
     Denied,
     /// A non-recoverable error occurred during the flow.
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
-
-
 
 /// Input to `LinkWorkItemExternalRef`: manually bind a work item to a
 /// specific upstream issue. The engine stores `kind`/`canonical_id` in
@@ -2076,8 +1981,6 @@ pub struct LinkExternalRefInput {
     pub kind: String,
 }
 
-
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListDependenciesInput {
     /// Selector or id of the work item to list edges for.
@@ -2087,15 +1990,12 @@ pub struct ListDependenciesInput {
     pub direction: Option<DependencyDirection>,
 }
 
-
-
 /// An engine-persisted magic-wand dispatch row (`magic_wand_dispatches` table).
 /// Records the one-shot specialised Claude call dispatched when the user clicks
 /// the magic-wand button on a comment (Phase 3: engine-owned doc; Phase 4:
 /// PR-backed doc → Boss chore worker). 13+ fields → builder pattern per project
 /// convention.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct MagicWandDispatch {
     pub id: String,
@@ -2144,8 +2044,6 @@ pub struct MagicWandDispatch {
     pub result_md: Option<String>,
 }
 
-
-
 /// Sub-state of `GitHubAuthStateDto::Authorized` that reflects whether the
 /// stored token can actually reach private org resources. A valid user token
 /// may still be blocked by org approval or SAML SSO requirements.
@@ -2157,23 +2055,16 @@ pub enum OrgAuthState {
     /// The OAuth App has not yet been approved by an org owner. Sync
     /// against private org resources will fail. `request_url` is the
     /// org-owner approval / request page.
-    NeedsOrgApproval {
-        request_url: String,
-    },
+    NeedsOrgApproval { request_url: String },
     /// The token requires SAML SSO authorization for the org. `sso_url`
     /// is the SSO authorization URL from GitHub's `X-GitHub-SSO` header.
-    NeedsSso {
-        sso_url: String,
-    },
+    NeedsSso { sso_url: String },
     /// Org auth state could not be determined (probe failed for an
     /// unexpected reason). Sync may or may not work.
     Unknown,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Product {
     pub id: String,
@@ -2255,10 +2146,7 @@ pub struct Product {
     pub worker_branch_prefix: Option<String>,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Project {
     pub id: String,
@@ -2314,8 +2202,6 @@ pub struct Project {
     pub design_doc_repo_remote_url: Option<String>,
 }
 
-
-
 /// Wire-level state returned by `ResolveProjectDesignDoc`. The UI
 /// uses this directly to pick the right affordance (hidden, plain
 /// icon, warning glyph) without re-implementing the resolution
@@ -2360,8 +2246,6 @@ pub enum ProjectDesignDocState {
     Broken { reason: String },
 }
 
-
-
 /// One work item bound to a given PR number, together with the
 /// revisions in that PR's chain. Returned by
 /// [`crate::wire::FrontendRequest::FindWorkItemsByPr`].
@@ -2380,8 +2264,6 @@ pub struct PrWorkItemMatch {
     pub revisions: Vec<Task>,
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Editorial controls (editorial-controls-for-agent-authored-prs-and-github-comments.md)
 // ---------------------------------------------------------------------------
@@ -2398,8 +2280,6 @@ pub enum RedactionKind {
     Block,
 }
 
-
-
 /// One user-configured redaction rule applied to `gh pr|issue` bodies.
 /// `pattern` is a regex (Rust `regex` crate syntax); `replacement` is
 /// substituted for every match when `kind = Rewrite` and ignored when
@@ -2413,8 +2293,6 @@ pub struct RedactionRule {
     pub replacement: String,
 }
 
-
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RemoveDependencyInput {
     pub dependent: String,
@@ -2423,10 +2301,7 @@ pub struct RemoveDependencyInput {
     pub relation: Option<String>,
 }
 
-
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct RequestExecutionInput {
     pub work_item_id: String,
@@ -2453,8 +2328,6 @@ pub struct RequestExecutionInput {
     pub priority: Option<i64>,
 }
 
-
-
 /// A comment paired with its resolution against the supplied plain text.
 /// Returned by `comments_resolve`. The comment carries any side-effects the
 /// resolve persisted (a fuzzy re-anchor, or a flip to `orphaned`).
@@ -2478,8 +2351,6 @@ pub const MAGIC_WAND_STATUS_FAILED: &str = "failed";
 /// chore's id for audit linkage. There is no further engine-side Claude call.
 pub const MAGIC_WAND_STATUS_CHORE_CREATED: &str = "chore_created";
 
-
-
 /// Result of resolving a project's design-doc pointer. Carries the
 /// concrete `(repo, branch, path)` triple plus a discriminator that
 /// tells the open affordance which fast path it can take.
@@ -2490,8 +2361,6 @@ pub struct ResolvedDesignDoc {
     pub path: String,
     pub repo_remote_url: String,
 }
-
-
 
 /// Where the resolved design doc actually lives relative to the
 /// project's product. Drives the open affordance: `SameProduct` and
@@ -2513,16 +2382,12 @@ pub enum ResolvedDesignDocKind {
     External,
 }
 
-
-
 /// Output of the `ResolveProjectDesignDoc` RPC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolveProjectDesignDocOutput {
     pub project_id: String,
     pub state: ProjectDesignDocState,
 }
-
-
 
 /// Role/origin of a rendered transcript segment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2534,8 +2399,6 @@ pub enum SegmentRole {
     Tool,
     System,
 }
-
-
 
 /// Input for `SetProductEditorialRules`: replace or clear a product's
 /// editorial-rules blob. `rules = None` clears the column and reverts
@@ -2628,8 +2491,6 @@ pub fn is_known_created_via(value: &str) -> bool {
         || value.starts_with("pr-comment:")
 }
 
-
-
 /// Input to `SetProductExternalTracker`: bind (or unbind) an external
 /// tracker on a product. When `unset` is `true`, the engine clears both
 /// `external_tracker_kind` and `external_tracker_config` regardless of the
@@ -2653,8 +2514,6 @@ pub struct SetProductExternalTrackerInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
 }
-
-
 
 /// Input to the `SetProjectDesignDoc` RPC: point a project at its
 /// design doc. Three optional fields (mirroring the three columns on
@@ -2692,8 +2551,6 @@ pub struct SetProjectDesignDocInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design_doc_repo_remote_url: Option<String>,
 }
-
-
 
 /// Discriminator for the `tasks.kind` column.  Exhaustive match
 /// enforces that every callsite handles new variants explicitly —
@@ -2747,8 +2604,7 @@ impl std::str::FromStr for TaskKind {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Task {
     pub id: String,
@@ -2997,8 +2853,6 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
-
-
 /// Live runtime status for a single task/chore — the current execution
 /// and most recent run, summarized for the kanban view. `None` fields
 /// mean no execution (or no run) exists yet for the work item.
@@ -3023,8 +2877,6 @@ pub struct TaskRuntime {
     pub run_status: Option<String>,
 }
 
-
-
 /// How strictly the product's `.github/PULL_REQUEST_TEMPLATE.md`
 /// conformance is enforced on PR bodies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3042,8 +2894,6 @@ pub enum TemplatePolicy {
     Enforce,
 }
 
-
-
 /// Whether the worker should append an AI co-author trailer to commit
 /// messages.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3057,8 +2907,6 @@ pub enum TrailerPolicy {
     /// commit`. The worker is also instructed not to add it.
     NoAiTrailer,
 }
-
-
 
 /// One rendered transcript segment, as returned by `executions.transcript`.
 ///
@@ -3087,16 +2935,12 @@ pub struct TranscriptSegment {
     pub truncated: Option<TruncationInfo>,
 }
 
-
-
 /// Set when a tool result was truncated by the renderer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TruncationInfo {
     pub shown_bytes: usize,
     pub total_bytes: usize,
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkAttentionItem {
@@ -3122,14 +2966,11 @@ pub struct WorkAttentionItem {
     pub work_item_id: Option<String>,
 }
 
-
-
 /// An engine-persisted comment row (`work_comments` table). Anchored to an
 /// artifact (`work_item:<id>` or `pr_doc:<repo>:<branch>:<path>`) via a
 /// [`CommentAnchor`]. 13 fields → uses the builder pattern per the project's
 /// `boss-protocol` convention.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkComment {
     pub id: String,
@@ -3180,10 +3021,7 @@ pub struct WorkComment {
     pub status_actor: Option<String>,
 }
 
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct WorkExecution {
     pub id: String,
@@ -3297,8 +3135,6 @@ pub struct WorkExecution {
     pub workspace_path: Option<String>,
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "item_type", rename_all = "snake_case")]
 pub enum WorkItem {
@@ -3307,8 +3143,6 @@ pub enum WorkItem {
     Task(Task),
     Chore(Task),
 }
-
-
 
 /// One row of the `work_item_dependencies` table — an edge from a
 /// dependent to a prerequisite. `relation` is `"blocks"` for v1; the
@@ -3327,8 +3161,6 @@ pub fn default_relation() -> String {
     "blocks".to_owned()
 }
 
-
-
 /// Resolved dependency listing for a single work item. Each side
 /// carries [`DependencyEdge`] entries with the peer's status and
 /// name already joined in. Used by `boss <kind> show` and (in time)
@@ -3341,8 +3173,6 @@ pub struct WorkItemDependencyDetail {
     pub prerequisites: Vec<DependencyEdge>,
 }
 
-
-
 /// Two parallel edge lists for one work item — incoming (rows that
 /// gate me) and outgoing (rows that I gate). Returned by
 /// `ListDependencies` and embedded in `boss <kind> show`.
@@ -3352,8 +3182,6 @@ pub struct WorkItemDependencyView {
     pub dependents: Vec<WorkItemDependency>,
     pub prerequisites: Vec<WorkItemDependency>,
 }
-
-
 
 /// Stable upstream pointer stored on a work item that has been linked to
 /// an external tracker issue. All three `kind`/`canonical_id`/`raw` fields
@@ -3389,8 +3217,6 @@ pub struct WorkItemExternalRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unbound_at: Option<String>,
 }
-
-
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkItemPatch {
@@ -3464,8 +3290,6 @@ pub struct WorkItemPatch {
     pub worker_branch_prefix: Option<String>,
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkRun {
     pub id: String,
@@ -3480,8 +3304,6 @@ pub struct WorkRun {
     pub started_at: Option<String>,
     pub transcript_path: Option<String>,
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkTree {
@@ -3500,7 +3322,6 @@ pub struct WorkTree {
 
     pub tasks: Vec<Task>,
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -3593,10 +3414,7 @@ mod tests {
 
         let reencoded = serde_json::to_value(&project).unwrap();
         let project2: Project = serde_json::from_value(reencoded).unwrap();
-        assert_eq!(
-            project.design_doc_repo_remote_url,
-            project2.design_doc_repo_remote_url,
-        );
+        assert_eq!(project.design_doc_repo_remote_url, project2.design_doc_repo_remote_url,);
         assert_eq!(project.design_doc_branch, project2.design_doc_branch);
         assert_eq!(project.design_doc_path, project2.design_doc_path);
     }
@@ -3639,18 +3457,14 @@ mod tests {
             product_id: "prod_1".into(),
         };
         let raw = serde_json::to_value(&same).unwrap();
-        assert_eq!(
-            raw,
-            json!({"type": "same_product", "product_id": "prod_1"})
-        );
+        assert_eq!(raw, json!({"type": "same_product", "product_id": "prod_1"}));
 
         let external = ResolvedDesignDocKind::External;
         let raw = serde_json::to_value(&external).unwrap();
         assert_eq!(raw, json!({"type": "external"}));
 
         let back: ResolvedDesignDocKind =
-            serde_json::from_value(json!({"type": "other_product", "product_id": "prod_2"}))
-                .unwrap();
+            serde_json::from_value(json!({"type": "other_product", "product_id": "prod_2"})).unwrap();
         assert_eq!(
             back,
             ResolvedDesignDocKind::OtherProduct {
@@ -3664,10 +3478,7 @@ mod tests {
         let not_set = ProjectDesignDocState::NotSet;
         let raw = serde_json::to_value(&not_set).unwrap();
         assert_eq!(raw, json!({"type": "not_set"}));
-        assert_eq!(
-            serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
-            not_set,
-        );
+        assert_eq!(serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(), not_set,);
 
         let resolved = ProjectDesignDocState::Resolved {
             resolved: ResolvedDesignDoc {
@@ -3680,26 +3491,18 @@ mod tests {
             },
             workspace_path: Some("/Users/me/Documents/dev/workspaces/mono-agent-001".into()),
             web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
-            raw_content_url: Some(
-                "https://raw.githubusercontent.com/foo/bar/main/docs/x.md".into(),
-            ),
+            raw_content_url: Some("https://raw.githubusercontent.com/foo/bar/main/docs/x.md".into()),
         };
         let raw = serde_json::to_value(&resolved).unwrap();
         assert_eq!(raw["type"], "resolved");
-        assert_eq!(
-            serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
-            resolved,
-        );
+        assert_eq!(serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(), resolved,);
 
         let broken = ProjectDesignDocState::Broken {
             reason: "no repo".into(),
         };
         let raw = serde_json::to_value(&broken).unwrap();
         assert_eq!(raw, json!({"type": "broken", "reason": "no repo"}));
-        assert_eq!(
-            serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(),
-            broken,
-        );
+        assert_eq!(serde_json::from_value::<ProjectDesignDocState>(raw).unwrap(), broken,);
     }
 
     fn sample_task_json(extra: Value) -> Value {
@@ -3772,10 +3575,7 @@ mod tests {
             "repo_remote_url": "https://github.com/foo/bar.git",
         }));
         let task: Task = serde_json::from_value(raw).unwrap();
-        assert_eq!(
-            task.repo_remote_url.as_deref(),
-            Some("https://github.com/foo/bar.git"),
-        );
+        assert_eq!(task.repo_remote_url.as_deref(), Some("https://github.com/foo/bar.git"),);
         let reencoded = serde_json::to_value(&task).unwrap();
         let task2: Task = serde_json::from_value(reencoded).unwrap();
         assert_eq!(task.repo_remote_url, task2.repo_remote_url);
@@ -3791,10 +3591,7 @@ mod tests {
             "repo_remote_url": "git@github.com:foo/bar.git",
         });
         let parsed: CreateTaskInput = serde_json::from_value(raw).unwrap();
-        assert_eq!(
-            parsed.repo_remote_url.as_deref(),
-            Some("git@github.com:foo/bar.git"),
-        );
+        assert_eq!(parsed.repo_remote_url.as_deref(), Some("git@github.com:foo/bar.git"),);
         let encoded = serde_json::to_value(&parsed).unwrap();
         assert_eq!(
             encoded["repo_remote_url"],
@@ -3851,9 +3648,7 @@ mod tests {
                 },
                 workspace_path: None,
                 web_url: "https://github.com/foo/bar/blob/main/docs/x.md".into(),
-                raw_content_url: Some(
-                    "https://raw.githubusercontent.com/foo/bar/main/docs/x.md".into(),
-                ),
+                raw_content_url: Some("https://raw.githubusercontent.com/foo/bar/main/docs/x.md".into()),
             },
         };
         let raw = serde_json::to_value(&output).unwrap();
@@ -3970,10 +3765,7 @@ mod tests {
             "started_at",
             "finished_at",
         ] {
-            assert!(
-                !obj.contains_key(absent),
-                "expected {absent} omitted on encode",
-            );
+            assert!(!obj.contains_key(absent), "expected {absent} omitted on encode",);
         }
         let back: ConflictResolution = serde_json::from_value(encoded).unwrap();
         assert_eq!(attempt, back);
@@ -4083,9 +3875,7 @@ mod tests {
 
     #[test]
     fn product_roundtrips_with_design_repo() {
-        let raw = sample_product_json(
-            json!({"design_repo": "https://github.com/linkedin-sandbox/bduff.git"}),
-        );
+        let raw = sample_product_json(json!({"design_repo": "https://github.com/linkedin-sandbox/bduff.git"}));
         let product: Product = serde_json::from_value(raw).unwrap();
         assert_eq!(
             product.design_repo.as_deref(),
@@ -4161,10 +3951,7 @@ mod tests {
         // decode side is what makes the omitted-from-payload shape
         // legal.
         assert_eq!(obj.get("ci_attempts_used"), Some(&Value::from(0_i64)));
-        assert_eq!(
-            obj.get("blocked_signals"),
-            Some(&Value::Array(Vec::new())),
-        );
+        assert_eq!(obj.get("blocked_signals"), Some(&Value::Array(Vec::new())),);
     }
 
     #[test]
@@ -4193,10 +3980,7 @@ mod tests {
         assert_eq!(task.ci_attempts_used, 2);
         assert_eq!(task.blocked_signals.len(), 2);
         assert_eq!(task.blocked_signals[0].reason, "ci_failure");
-        assert_eq!(
-            task.blocked_signals[0].attempt_id.as_deref(),
-            Some("ci_18ab_1"),
-        );
+        assert_eq!(task.blocked_signals[0].attempt_id.as_deref(), Some("ci_18ab_1"),);
 
         let reencoded = serde_json::to_value(&task).unwrap();
         let task2: Task = serde_json::from_value(reencoded).unwrap();
@@ -4400,10 +4184,7 @@ mod tests {
             "before_commit_sha",
             "revision_task_id",
         ] {
-            assert!(
-                !obj.contains_key(absent),
-                "expected {absent} omitted on encode",
-            );
+            assert!(!obj.contains_key(absent), "expected {absent} omitted on encode",);
         }
         let back: CiRemediation = serde_json::from_value(encoded).unwrap();
         assert_eq!(attempt, back);
@@ -4432,9 +4213,7 @@ mod tests {
         let state = GitHubAuthStateDto::PendingUserAuth {
             user_code: "WDJB-MJHT".into(),
             verification_uri: "https://github.com/login/device".into(),
-            verification_uri_complete: Some(
-                "https://github.com/login/device?user_code=WDJB-MJHT".into(),
-            ),
+            verification_uri_complete: Some("https://github.com/login/device?user_code=WDJB-MJHT".into()),
             expires_at: 1_748_000_000,
             interval_seconds: 5,
         };
@@ -4705,9 +4484,9 @@ mod tests {
         ];
         for kind in &all {
             let s = kind.to_string();
-            let back: TaskKind = s.parse().unwrap_or_else(|e| {
-                panic!("TaskKind::from_str({s:?}) failed: {e}")
-            });
+            let back: TaskKind = s
+                .parse()
+                .unwrap_or_else(|e| panic!("TaskKind::from_str({s:?}) failed: {e}"));
             assert_eq!(*kind, back, "round-trip failed for {kind:?}");
         }
     }
@@ -4716,8 +4495,14 @@ mod tests {
     fn task_kind_serde_uses_wire_strings() {
         assert_eq!(serde_json::to_string(&TaskKind::Chore).unwrap(), r#""chore""#);
         assert_eq!(serde_json::to_string(&TaskKind::Design).unwrap(), r#""design""#);
-        assert_eq!(serde_json::to_string(&TaskKind::Investigation).unwrap(), r#""investigation""#);
-        assert_eq!(serde_json::to_string(&TaskKind::ProjectTask).unwrap(), r#""project_task""#);
+        assert_eq!(
+            serde_json::to_string(&TaskKind::Investigation).unwrap(),
+            r#""investigation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskKind::ProjectTask).unwrap(),
+            r#""project_task""#
+        );
         assert_eq!(serde_json::to_string(&TaskKind::Revision).unwrap(), r#""revision""#);
         assert_eq!(serde_json::to_string(&TaskKind::Task).unwrap(), r#""task""#);
 
@@ -4743,9 +4528,9 @@ mod tests {
         ];
         for kind in &all {
             let s = kind.to_string();
-            let back: ExecutionKind = s.parse().unwrap_or_else(|e| {
-                panic!("ExecutionKind::from_str({s:?}) failed: {e}")
-            });
+            let back: ExecutionKind = s
+                .parse()
+                .unwrap_or_else(|e| panic!("ExecutionKind::from_str({s:?}) failed: {e}"));
             assert_eq!(*kind, back, "round-trip failed for {kind:?}");
         }
     }
@@ -4785,10 +4570,6 @@ mod tests {
             EXECUTION_KIND_AUTOMATION_TRIAGE,
             ExecutionKind::AutomationTriage.as_str()
         );
-        assert_eq!(
-            EXECUTION_KIND_PR_REVIEW,
-            ExecutionKind::PrReview.as_str()
-        );
+        assert_eq!(EXECUTION_KIND_PR_REVIEW, ExecutionKind::PrReview.as_str());
     }
 }
-

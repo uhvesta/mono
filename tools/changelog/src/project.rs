@@ -16,10 +16,10 @@ pub struct ProjectYaml {
 /// is implicitly owned. `paths` lists additional owned directories.
 /// All directory entries are normalized to `<dir>/**` for globset matching.
 pub fn derive_paths_from_project(project_file: &Path, repo_root: &Path) -> Result<Vec<String>> {
-    let content = std::fs::read_to_string(project_file)
-        .with_context(|| format!("could not read {}", project_file.display()))?;
-    let project: ProjectYaml = serde_yaml::from_str(&content)
-        .with_context(|| format!("invalid PROJECT.yaml: {}", project_file.display()))?;
+    let content =
+        std::fs::read_to_string(project_file).with_context(|| format!("could not read {}", project_file.display()))?;
+    let project: ProjectYaml =
+        serde_yaml::from_str(&content).with_context(|| format!("invalid PROJECT.yaml: {}", project_file.display()))?;
 
     let project_canonical = project_file
         .canonicalize()

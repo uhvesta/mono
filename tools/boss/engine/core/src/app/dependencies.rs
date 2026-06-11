@@ -45,12 +45,7 @@ pub(super) async fn handle_add_dependency(ctx: Dispatch, req: FrontendRequest) {
                 } else {
                     server_state.current_work_revision()
                 };
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::DependencyAdded { edge },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::DependencyAdded { edge });
             }
             Err(err) => {
                 send_response(
@@ -80,10 +75,7 @@ pub(super) async fn handle_remove_dependency(ctx: Dispatch, req: FrontendRequest
     {
         let dependent_id = input.dependent.clone();
         let prerequisite_id = input.prerequisite.clone();
-        let relation = input
-            .relation
-            .clone()
-            .unwrap_or_else(|| "blocks".to_owned());
+        let relation = input.relation.clone().unwrap_or_else(|| "blocks".to_owned());
         match work_db.remove_dependency(input) {
             Ok(removed) => {
                 let product_id = match work_db.get_work_item(&dependent_id) {
@@ -163,11 +155,7 @@ pub(super) async fn handle_list_dependencies_detailed(ctx: Dispatch, req: Fronte
     };
     {
         match work_db.list_dependencies_detailed(input) {
-            Ok(detail) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::DependencyDetail { detail },
-            ),
+            Ok(detail) => send_response(&sink, &request_id, FrontendEvent::DependencyDetail { detail }),
             Err(err) => send_response(
                 &sink,
                 &request_id,

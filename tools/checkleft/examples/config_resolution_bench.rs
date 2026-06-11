@@ -64,10 +64,7 @@ fn main() -> Result<()> {
 
 fn seed_fixture(root: &Path) -> Result<()> {
     fs::create_dir_all(root.join("backend"))?;
-    fs::write(
-        root.join("CHECKS.toml"),
-        checks_file("root-check", ROOT_CHECKS),
-    )?;
+    fs::write(root.join("CHECKS.toml"), checks_file("root-check", ROOT_CHECKS))?;
     fs::write(
         root.join("backend/CHECKS.toml"),
         checks_file("backend-check", BACKEND_CHECKS),
@@ -77,10 +74,7 @@ fn seed_fixture(root: &Path) -> Result<()> {
         let dir = root.join(format!("backend/service-{dir_index:03}"));
         fs::create_dir_all(&dir)?;
         for file_index in 0..FILES_PER_DIR {
-            fs::write(
-                dir.join(format!("file-{file_index:03}.rs")),
-                "fn main() {}\n",
-            )?;
+            fs::write(dir.join(format!("file-{file_index:03}.rs")), "fn main() {}\n")?;
         }
     }
 
@@ -156,11 +150,7 @@ where
     })
 }
 
-fn measure_with_setup<Setup, Run>(
-    label: &'static str,
-    samples: usize,
-    mut setup: Setup,
-) -> Result<Measurement>
+fn measure_with_setup<Setup, Run>(label: &'static str, samples: usize, mut setup: Setup) -> Result<Measurement>
 where
     Setup: FnMut() -> Result<Run>,
     Run: FnMut() -> Result<u64>,

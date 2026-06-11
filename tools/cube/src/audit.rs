@@ -143,10 +143,7 @@ fn prune(dir: &Path, now_epoch_s: i64) -> std::io::Result<()> {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(date_str) = name
-            .strip_prefix(FILE_PREFIX)
-            .and_then(|s| s.strip_suffix(FILE_SUFFIX))
-        else {
+        let Some(date_str) = name.strip_prefix(FILE_PREFIX).and_then(|s| s.strip_suffix(FILE_SUFFIX)) else {
             continue;
         };
         if let Some(file_epoch) = parse_yyyy_mm_dd(date_str)
@@ -266,8 +263,7 @@ mod tests {
         let ts = epoch_for(2026, 4, 30, 14, 5, 30);
         append_at(dir.path(), ts, "lease.acquired", fields()).unwrap();
 
-        let contents =
-            fs::read_to_string(dir.path().join("audit-2026-04-27.log")).expect("audit file");
+        let contents = fs::read_to_string(dir.path().join("audit-2026-04-27.log")).expect("audit file");
         let parsed: Value = serde_json::from_str(contents.trim_end()).unwrap();
         assert_eq!(parsed["event"], "lease.acquired");
         assert_eq!(parsed["ts"], "2026-04-30T14:05:30Z");
@@ -285,10 +281,7 @@ mod tests {
         append_at(dir.path(), mon, "lease.acquired", fields()).unwrap();
         append_at(dir.path(), fri, "lease.released", fields()).unwrap();
 
-        let entries: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(entries.len(), 1);
         let lines = fs::read_to_string(dir.path().join("audit-2026-04-27.log")).unwrap();
         assert_eq!(lines.lines().count(), 2);

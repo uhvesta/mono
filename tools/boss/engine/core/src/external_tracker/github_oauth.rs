@@ -35,8 +35,7 @@ pub const CLIENT_ID: &str = "Ov23li9VOztDIjoOA7eW";
 // Scope "repo project" → space becomes "+" in application/x-www-form-urlencoded.
 const SCOPE_ENCODED: &str = "repo+project";
 // grant_type URN with colons percent-encoded.
-const GRANT_TYPE_ENCODED: &str =
-    "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code";
+const GRANT_TYPE_ENCODED: &str = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code";
 
 const DEFAULT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const DEFAULT_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -186,10 +185,7 @@ impl DeviceFlow {
 
     /// **Step 1** — POST to `/login/device/code` and return the device-code info.
     pub async fn request_device_code(&self) -> Result<DeviceCodeInfo, FlowError> {
-        let form_body = format!(
-            "client_id={}&scope={}",
-            self.config.client_id, SCOPE_ENCODED
-        );
+        let form_body = format!("client_id={}&scope={}", self.config.client_id, SCOPE_ENCODED);
         let raw: RawDeviceCodeResponse = self
             .client
             .post(&self.config.device_code_url)
@@ -418,19 +414,18 @@ impl DeviceFlow {
             // Check for SAML SSO requirement header.
             if let Some(sso_header) = response.headers().get("X-GitHub-SSO")
                 && let Ok(s) = sso_header.to_str()
-                    && s.contains("required") {
-                        // Header format: "required; url=https://github.com/orgs/foo/sso?..."
-                        if let Some(url_part) = s.split("url=").nth(1) {
-                            return OrgAuthState::NeedsSso {
-                                sso_url: url_part.trim().to_owned(),
-                            };
-                        }
-                    }
+                && s.contains("required")
+            {
+                // Header format: "required; url=https://github.com/orgs/foo/sso?..."
+                if let Some(url_part) = s.split("url=").nth(1) {
+                    return OrgAuthState::NeedsSso {
+                        sso_url: url_part.trim().to_owned(),
+                    };
+                }
+            }
             // 403 without SSO header: OAuth App not yet approved for this org.
             return OrgAuthState::NeedsOrgApproval {
-                request_url: format!(
-                    "https://github.com/orgs/{org}/policies/applications"
-                ),
+                request_url: format!("https://github.com/orgs/{org}/policies/applications"),
             };
         }
 
@@ -507,13 +502,19 @@ impl GitHubAuthState {
             },
             Self::Expired => GitHubAuthStateDto::Expired,
             Self::Denied => GitHubAuthStateDto::Denied,
-            Self::Error { message } => GitHubAuthStateDto::Error { message: message.clone() },
+            Self::Error { message } => GitHubAuthStateDto::Error {
+                message: message.clone(),
+            },
         }
     }
 
     /// Returns the stored [`TokenRecord`] if in `Authorized` state.
     pub fn token_record(&self) -> Option<&TokenRecord> {
-        if let Self::Authorized { record, .. } = self { Some(record) } else { None }
+        if let Self::Authorized { record, .. } = self {
+            Some(record)
+        } else {
+            None
+        }
     }
 }
 
@@ -554,17 +555,11 @@ impl GitHubAuthController {
     /// broadcast, so a sync that fires immediately afterward finds it) and
     /// deleted on `disconnect`.  This is the production constructor T-4 uses
     /// from `app.rs`.
-    pub fn with_store(
-        flow: DeviceFlow,
-        store: Arc<KeychainTokenStore>,
-    ) -> (Self, watch::Receiver<GitHubAuthState>) {
+    pub fn with_store(flow: DeviceFlow, store: Arc<KeychainTokenStore>) -> (Self, watch::Receiver<GitHubAuthState>) {
         Self::build(flow, Some(store))
     }
 
-    fn build(
-        flow: DeviceFlow,
-        store: Option<Arc<KeychainTokenStore>>,
-    ) -> (Self, watch::Receiver<GitHubAuthState>) {
+    fn build(flow: DeviceFlow, store: Option<Arc<KeychainTokenStore>>) -> (Self, watch::Receiver<GitHubAuthState>) {
         let (tx, rx) = watch::channel(GitHubAuthState::Disconnected);
         let ctrl = Self {
             state_tx: tx,
@@ -653,8 +648,7 @@ impl GitHubAuthController {
                         error = %e,
                         "device flow: failed to request device code"
                     );
-                    state_tx
-                        .send_replace(GitHubAuthState::Error { message: e.to_string() });
+                    state_tx.send_replace(GitHubAuthState::Error { message: e.to_string() });
                     return;
                 }
             };
@@ -689,14 +683,15 @@ impl GitHubAuthController {
                     // flow — the in-memory state still reflects the live token
                     // (design §5: keychain unavailable → fall back, don't abort).
                     if let Some(store) = &store
-                        && let Err(e) = store.set(&record) {
-                            tracing::error!(
-                                target: "boss_engine::external_tracker::github_oauth",
-                                error = %e,
-                                "failed to persist OAuth token to keychain; \
-                                 token held in memory only"
-                            );
-                        }
+                        && let Err(e) = store.set(&record)
+                    {
+                        tracing::error!(
+                            target: "boss_engine::external_tracker::github_oauth",
+                            error = %e,
+                            "failed to persist OAuth token to keychain; \
+                             token held in memory only"
+                        );
+                    }
                     // Org state is Unknown here; T-4's orchestrator runs the
                     // org/SSO probe and calls `update_org_state` to resolve it.
                     GitHubAuthState::Authorized {
@@ -727,13 +722,14 @@ impl GitHubAuthController {
     pub async fn disconnect(&self) {
         self.signal_cancel().await;
         if let Some(store) = &self.store
-            && let Err(e) = store.delete() {
-                tracing::warn!(
-                    target: "boss_engine::external_tracker::github_oauth",
-                    error = %e,
-                    "disconnect: failed to delete OAuth token from keychain"
-                );
-            }
+            && let Err(e) = store.delete()
+        {
+            tracing::warn!(
+                target: "boss_engine::external_tracker::github_oauth",
+                error = %e,
+                "disconnect: failed to delete OAuth token from keychain"
+            );
+        }
         self.state_tx.send_replace(GitHubAuthState::Disconnected);
     }
 
@@ -786,11 +782,7 @@ pub(crate) const ATTN_SSO_REQUIRED: &str = "github_oauth_sso_required";
 /// (`NeedsSso` > `NeedsOrgApproval` > `Ok` > `Unknown`); the orchestrator
 /// records it on the controller via `update_org_state`. When no GitHub-bound
 /// product exists the result is `Unknown`.
-pub(crate) async fn probe_and_record_org_state(
-    work_db: &WorkDb,
-    flow: &DeviceFlow,
-    token: &str,
-) -> OrgAuthState {
+pub(crate) async fn probe_and_record_org_state(work_db: &WorkDb, flow: &DeviceFlow, token: &str) -> OrgAuthState {
     let products = match work_db.list_products() {
         Ok(p) => p,
         Err(e) => {
@@ -812,19 +804,17 @@ pub(crate) async fn probe_and_record_org_state(
             product.external_tracker_kind.as_deref(),
             product.external_tracker_config.as_ref(),
         ) {
-            (Some("github"), Some(config)) => {
-                match serde_json::from_value::<GitHubConfig>(config.clone()) {
-                    Ok(cfg) => cfg.org,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "boss_engine::external_tracker::github_oauth",
-                            product_id = %product.id, error = %e,
-                            "probe_and_record_org_state: invalid GitHub config; skipping product"
-                        );
-                        continue;
-                    }
+            (Some("github"), Some(config)) => match serde_json::from_value::<GitHubConfig>(config.clone()) {
+                Ok(cfg) => cfg.org,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "boss_engine::external_tracker::github_oauth",
+                        product_id = %product.id, error = %e,
+                        "probe_and_record_org_state: invalid GitHub config; skipping product"
+                    );
+                    continue;
                 }
-            }
+            },
             _ => continue,
         };
 
@@ -898,11 +888,7 @@ fn apply_org_attention(work_db: &WorkDb, product_id: &str, state: &OrgAuthState)
                  read its private issues.\n\nAuthorize the token via SSO at:\n\n{sso_url}\n\n\
                  Sync recovers automatically once the token is SSO-authorized."
             );
-            raise(
-                ATTN_SSO_REQUIRED,
-                "GitHub token needs SAML SSO authorization",
-                &body,
-            );
+            raise(ATTN_SSO_REQUIRED, "GitHub token needs SAML SSO authorization", &body);
             resolve(ATTN_ORG_UNAPPROVED);
         }
         OrgAuthState::Unknown => {
@@ -1024,17 +1010,14 @@ impl KeystoreBackend for KeyringBackend {
 /// item without a user prompt, even after a re-sign.
 #[cfg(target_os = "macos")]
 mod macos_backends {
-    use super::{KeystoreBackend, TokenStoreError, KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE};
+    use super::{KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE, KeystoreBackend, TokenStoreError};
 
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
     use core_foundation_sys::base::{CFRelease, CFTypeRef};
-    use core_foundation_sys::string::{
-        CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8,
-    };
+    use core_foundation_sys::string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8};
     use security_framework::passwords::{
-        PasswordOptions, delete_generic_password_options, generic_password,
-        set_generic_password_options,
+        PasswordOptions, delete_generic_password_options, generic_password, set_generic_password_options,
     };
     use security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
     use security_framework_sys::base::errSecItemNotFound;
@@ -1077,11 +1060,8 @@ mod macos_backends {
             }
 
             let entitlement = CString::new("keychain-access-groups").unwrap();
-            let cf_entitlement = CFStringCreateWithCString(
-                std::ptr::null_mut(),
-                entitlement.as_ptr(),
-                kCFStringEncodingUTF8,
-            );
+            let cf_entitlement =
+                CFStringCreateWithCString(std::ptr::null_mut(), entitlement.as_ptr(), kCFStringEncodingUTF8);
             if cf_entitlement.is_null() {
                 CFRelease(task);
                 return false;
@@ -1117,12 +1097,8 @@ mod macos_backends {
             unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
             // SAFETY: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly is a permanent
             // static string in Security.framework; cast from CFStringRef to CFTypeRef is valid.
-            unsafe {
-                CFString::wrap_under_get_rule(
-                    kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as CFStringRef,
-                )
-            }
-            .into_CFType(),
+            unsafe { CFString::wrap_under_get_rule(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as CFStringRef) }
+                .into_CFType(),
         ));
         opts
     }
@@ -1255,18 +1231,24 @@ impl KeychainTokenStore {
                     target: "boss_engine::external_tracker::github_oauth",
                     "github token store: data-protection keychain (release build)"
                 );
-                Self { backend: Box::new(macos_backends::DataProtectionKeychainBackend) }
+                Self {
+                    backend: Box::new(macos_backends::DataProtectionKeychainBackend),
+                }
             } else {
                 tracing::debug!(
                     target: "boss_engine::external_tracker::github_oauth",
                     "github token store: file backend (dev build, no keychain-access-groups entitlement)"
                 );
-                Self { backend: Box::new(macos_backends::FileBackend::new()) }
+                Self {
+                    backend: Box::new(macos_backends::FileBackend::new()),
+                }
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Self { backend: Box::new(KeyringBackend) }
+            Self {
+                backend: Box::new(KeyringBackend),
+            }
         }
     }
 
@@ -1274,7 +1256,9 @@ impl KeychainTokenStore {
     /// `#[cfg(test)]` builds.
     #[cfg(test)]
     pub(crate) fn with_backend(backend: impl KeystoreBackend + 'static) -> Self {
-        Self { backend: Box::new(backend) }
+        Self {
+            backend: Box::new(backend),
+        }
     }
 
     /// Returns the stored [`TokenRecord`], or `None` if no token is present.
@@ -1434,12 +1418,10 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "gho_test_token",
-                    "token_type": "bearer"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_test_token",
+                "token_type": "bearer"
+            })))
             .mount(&server)
             .await;
 
@@ -1450,8 +1432,7 @@ mod tests {
             .await;
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         let PollOutcome::Authorized(rec) = outcome else {
             panic!("expected Authorized");
@@ -1468,11 +1449,9 @@ mod tests {
         // First two calls: authorization_pending.
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "error": "authorization_pending"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "authorization_pending"
+            })))
             .up_to_n_times(2)
             .mount(&server)
             .await;
@@ -1480,12 +1459,10 @@ mod tests {
         // Third call: success.
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "gho_tok_after_pending",
-                    "token_type": "bearer"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_tok_after_pending",
+                "token_type": "bearer"
+            })))
             .mount(&server)
             .await;
 
@@ -1496,8 +1473,7 @@ mod tests {
             .await;
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(
             matches!(outcome, PollOutcome::Authorized(ref r) if r.login == "alice"),
@@ -1512,10 +1488,7 @@ mod tests {
         // First call: slow_down.
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "error": "slow_down" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "error": "slow_down" })))
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -1523,12 +1496,10 @@ mod tests {
         // Second call: success.
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "gho_tok_after_slowdown",
-                    "token_type": "bearer"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_tok_after_slowdown",
+                "token_type": "bearer"
+            })))
             .mount(&server)
             .await;
 
@@ -1542,8 +1513,7 @@ mod tests {
         // After slow_down, interval grows by SLOW_DOWN_BACKOFF_SECS (5s).
         // The test will sleep ~5s on the second iteration; this is acceptable
         // under the "moderate" timeout assigned to this shard.
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(
             matches!(outcome, PollOutcome::Authorized(ref r) if r.login == "bob"),
@@ -1557,16 +1527,12 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "error": "expired_token" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "error": "expired_token" })))
             .mount(&server)
             .await;
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(matches!(outcome, PollOutcome::Expired), "expected Expired");
     }
@@ -1577,16 +1543,12 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "error": "access_denied" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "error": "access_denied" })))
             .mount(&server)
             .await;
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(matches!(outcome, PollOutcome::Denied), "expected Denied");
     }
@@ -1606,12 +1568,10 @@ mod tests {
         // Second call: success.
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "gho_tok_after_5xx",
-                    "token_type": "bearer"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_tok_after_5xx",
+                "token_type": "bearer"
+            })))
             .mount(&server)
             .await;
 
@@ -1622,8 +1582,7 @@ mod tests {
             .await;
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(
             matches!(outcome, PollOutcome::Authorized(ref r) if r.login == "carol"),
@@ -1637,17 +1596,14 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "error": "incorrect_device_code"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": "incorrect_device_code"
+            })))
             .mount(&server)
             .await;
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, no_cancel()).await;
 
         assert!(matches!(outcome, PollOutcome::Error(_)), "expected Error");
     }
@@ -1659,8 +1615,7 @@ mod tests {
 
         let flow = DeviceFlow::new(config_for(&server), test_client());
         let (_cancel_tx, cancel_rx) = watch::channel(true); // pre-cancelled
-        let outcome =
-            flow.poll_for_token("dc-abc", 0, unix_now() + 900, cancel_rx).await;
+        let outcome = flow.poll_for_token("dc-abc", 0, unix_now() + 900, cancel_rx).await;
 
         assert!(matches!(outcome, PollOutcome::Cancelled), "expected Cancelled");
     }
@@ -1673,8 +1628,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "error": "authorization_pending" })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "error": "authorization_pending" })),
             )
             .mount(&server)
             .await;
@@ -1683,11 +1637,7 @@ mod tests {
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
         let flow2 = Arc::clone(&flow);
-        let handle = tokio::spawn(async move {
-            flow2
-                .poll_for_token("dc-abc", 0, unix_now() + 900, cancel_rx)
-                .await
-        });
+        let handle = tokio::spawn(async move { flow2.poll_for_token("dc-abc", 0, unix_now() + 900, cancel_rx).await });
 
         // Yield to let the spawned task run at least one poll iteration.
         tokio::task::yield_now().await;
@@ -1715,10 +1665,7 @@ mod tests {
 
         assert_eq!(record.login, "dave");
         assert_eq!(record.token, "gho_some_token");
-        assert_eq!(
-            record.granted_scopes,
-            vec!["repo", "project", "read:org"]
-        );
+        assert_eq!(record.granted_scopes, vec!["repo", "project", "read:org"]);
     }
 
     #[tokio::test]
@@ -1728,8 +1675,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/user"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "login": "eve", "id": 5 })),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": "eve", "id": 5 })),
                 // No X-OAuth-Scopes header.
             )
             .mount(&server)
@@ -1750,9 +1696,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/orgs/spinyfin"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": "spinyfin" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": "spinyfin" })))
             .mount(&server)
             .await;
 
@@ -1787,13 +1731,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/orgs/spinyfin"))
-            .respond_with(
-                ResponseTemplate::new(403)
-                    .append_header(
-                        "X-GitHub-SSO",
-                        "required; url=https://github.com/orgs/spinyfin/sso?token=abc",
-                    ),
-            )
+            .respond_with(ResponseTemplate::new(403).append_header(
+                "X-GitHub-SSO",
+                "required; url=https://github.com/orgs/spinyfin/sso?token=abc",
+            ))
             .mount(&server)
             .await;
 
@@ -1875,7 +1816,11 @@ mod tests {
         };
         let dto = state.to_dto();
         match dto {
-            GitHubAuthStateDto::Authorized { login, granted_scopes, org_state } => {
+            GitHubAuthStateDto::Authorized {
+                login,
+                granted_scopes,
+                org_state,
+            } => {
                 assert_eq!(login, "alice");
                 assert_eq!(granted_scopes, vec!["repo", "project"]);
                 assert!(matches!(org_state, OrgAuthState::Ok));
@@ -1936,26 +1881,22 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/login/device/code"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "device_code": "dc-test",
-                    "user_code": "TEST-CODE",
-                    "verification_uri": "https://github.com/login/device",
-                    "expires_in": 900,
-                    "interval": 0
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "dc-test",
+                "user_code": "TEST-CODE",
+                "verification_uri": "https://github.com/login/device",
+                "expires_in": 900,
+                "interval": 0
+            })))
             .mount(&server)
             .await;
 
         Mock::given(method("POST"))
             .and(path("/login/oauth/access_token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "access_token": "gho_ctrl_test",
-                    "token_type": "bearer"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "gho_ctrl_test",
+                "token_type": "bearer"
+            })))
             .mount(&server)
             .await;
 
@@ -1973,9 +1914,7 @@ mod tests {
         // Wait until the state is no longer RequestingCode/PendingUserAuth.
         while matches!(
             *rx.borrow(),
-            GitHubAuthState::Disconnected
-                | GitHubAuthState::RequestingCode
-                | GitHubAuthState::PendingUserAuth { .. }
+            GitHubAuthState::Disconnected | GitHubAuthState::RequestingCode | GitHubAuthState::PendingUserAuth { .. }
         ) {
             rx.changed().await.unwrap();
         }
@@ -2031,7 +1970,10 @@ mod tests {
         assert!(
             matches!(
                 state,
-                GitHubAuthState::Authorized { org_state: OrgAuthState::Ok, .. }
+                GitHubAuthState::Authorized {
+                    org_state: OrgAuthState::Ok,
+                    ..
+                }
             ),
             "expected OrgAuthState::Ok"
         );
@@ -2069,9 +2011,7 @@ mod tests {
     async fn wait_until_authorized(rx: &mut watch::Receiver<GitHubAuthState>) {
         while matches!(
             *rx.borrow(),
-            GitHubAuthState::Disconnected
-                | GitHubAuthState::RequestingCode
-                | GitHubAuthState::PendingUserAuth { .. }
+            GitHubAuthState::Disconnected | GitHubAuthState::RequestingCode | GitHubAuthState::PendingUserAuth { .. }
         ) {
             rx.changed().await.unwrap();
         }
@@ -2097,8 +2037,7 @@ mod tests {
     #[tokio::test]
     async fn controller_with_store_deletes_token_on_disconnect() {
         let server = MockServer::start().await;
-        let store =
-            Arc::new(KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record())));
+        let store = Arc::new(KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record())));
         let flow = DeviceFlow::new(config_for(&server), test_client());
         let (ctrl, _rx) = GitHubAuthController::with_store(flow, Arc::clone(&store));
 
@@ -2115,8 +2054,7 @@ mod tests {
     #[tokio::test]
     async fn controller_restore_from_store_rehydrates_authorized() {
         let server = MockServer::start().await;
-        let store =
-            Arc::new(KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record())));
+        let store = Arc::new(KeychainTokenStore::with_backend(FakeStore::prefilled(&sample_record())));
         let flow = DeviceFlow::new(config_for(&server), test_client());
         let (ctrl, _rx) = GitHubAuthController::with_store(flow, store);
 
@@ -2239,10 +2177,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/orgs/spinyfin"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "login": "spinyfin" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "login": "spinyfin" })))
             .mount(&server)
             .await;
 
@@ -2290,14 +2225,8 @@ mod tests {
             merge_org_state(ok.clone(), approval.clone()),
             OrgAuthState::NeedsOrgApproval { .. }
         ));
-        assert!(matches!(
-            merge_org_state(approval, sso),
-            OrgAuthState::NeedsSso { .. }
-        ));
+        assert!(matches!(merge_org_state(approval, sso), OrgAuthState::NeedsSso { .. }));
         // A transient Unknown never downgrades an Ok.
-        assert!(matches!(
-            merge_org_state(ok, OrgAuthState::Unknown),
-            OrgAuthState::Ok
-        ));
+        assert!(matches!(merge_org_state(ok, OrgAuthState::Unknown), OrgAuthState::Ok));
     }
 }

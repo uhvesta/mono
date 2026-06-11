@@ -4,22 +4,19 @@ use std::process::{Command, ExitCode};
 
 use anyhow::Result;
 use boss_client::{
-    BossClient, Discovery, engine_socket_reachable, ensure_engine_running, running_engine_pid,
-    stop_engine,
+    BossClient, Discovery, engine_socket_reachable, ensure_engine_running, running_engine_pid, stop_engine,
 };
 use boss_protocol::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
-    AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution,
-    CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateInvestigationInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateRevisionInput,
-    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyEdge,
-    DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel,
-    EngineAttemptListEntry, FrontendEvent, FrontendRequest, GitHubAuthStateDto,
-    LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
+    CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictResolution, CreateAttentionInput, CreateAutomationInput,
+    CreateChoreInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
+    EditorialAction, EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry, FrontendEvent,
+    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PrWorkItemMatch,
+    Product, Project, ProjectDesignDocState, RemoveDependencyInput, ResolveProjectDesignDocOutput,
+    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    Task, TaskRuntime, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch,
 };
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use comfy_table::{ContentArrangement, Table};
@@ -2275,18 +2272,14 @@ mod status_vocab {
     /// the two vocabularies. `done` and `blocked` are identical in both
     /// and so are absent here — [`to_ui`] passes them (and any unknown
     /// value) through unchanged.
-    const RENAMED: [(&str, &str); 3] =
-        [("todo", "backlog"), ("active", "doing"), ("in_review", "review")];
+    const RENAMED: [(&str, &str); 3] = [("todo", "backlog"), ("active", "doing"), ("in_review", "review")];
 
     /// Map a stored status string to the board (UI) name shown to
     /// humans and emitted in `--json`. Unknown values pass through so
     /// the CLI never hides a status the engine starts emitting before
     /// this table is updated.
     pub fn to_ui(stored: &str) -> &str {
-        RENAMED
-            .iter()
-            .find(|(s, _)| *s == stored)
-            .map_or(stored, |(_, ui)| *ui)
+        RENAMED.iter().find(|(s, _)| *s == stored).map_or(stored, |(_, ui)| *ui)
     }
 }
 
@@ -2521,9 +2514,7 @@ async fn main() -> ExitCode {
     // Intercept --version/-V before Cli::parse() so we print the
     // canonical version string.
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(|s| s.as_str()) == Some("--version")
-        || argv.get(1).map(|s| s.as_str()) == Some("-V")
-    {
+    if argv.get(1).map(|s| s.as_str()) == Some("--version") || argv.get(1).map(|s| s.as_str()) == Some("-V") {
         println!("{}", boss_version_string());
         return ExitCode::SUCCESS;
     }
@@ -2594,8 +2585,7 @@ fn run_reference_command(flags: &GlobalFlags) -> Result<(), CliError> {
     match output_mode {
         OutputMode::Human => print_cli_reference_human(&reference).map_err(CliError::internal)?,
         OutputMode::Json => {
-            serde_json::to_writer_pretty(io::stdout().lock(), &reference)
-                .map_err(CliError::internal)?;
+            serde_json::to_writer_pretty(io::stdout().lock(), &reference).map_err(CliError::internal)?;
             println!();
         }
     }
@@ -2670,9 +2660,7 @@ fn collect_cli_reference_sections(
 fn render_command_help(mut command: clap::Command) -> Result<String, CliError> {
     command = command.color(clap::ColorChoice::Never);
     let mut buffer = Vec::new();
-    command
-        .write_long_help(&mut buffer)
-        .map_err(CliError::internal)?;
+    command.write_long_help(&mut buffer).map_err(CliError::internal)?;
     let help = String::from_utf8(buffer).map_err(CliError::internal)?;
     Ok(help.trim().to_owned())
 }
@@ -2682,17 +2670,9 @@ fn print_cli_reference_human(reference: &CliReferenceDocument) -> io::Result<()>
     writeln!(stdout, "Boss CLI reference:")?;
     writeln!(stdout)?;
     print_reference_list(&mut stdout, "General rules", &reference.usage_rules)?;
-    print_reference_list(
-        &mut stdout,
-        "Selector semantics",
-        &reference.selector_semantics,
-    )?;
+    print_reference_list(&mut stdout, "Selector semantics", &reference.selector_semantics)?;
     print_reference_list(&mut stdout, "Status semantics", &reference.status_semantics)?;
-    print_reference_list(
-        &mut stdout,
-        "Workflow guidance",
-        &reference.workflow_guidance,
-    )?;
+    print_reference_list(&mut stdout, "Workflow guidance", &reference.workflow_guidance)?;
     writeln!(stdout, "Command help:")?;
     for section in &reference.commands {
         writeln!(stdout, "[{}]", section.path)?;
@@ -2713,8 +2693,7 @@ fn print_reference_list(writer: &mut impl Write, title: &str, items: &[&str]) ->
 
 impl RunContext {
     fn from_flags(flags: &GlobalFlags) -> Result<Self, CliError> {
-        let allow_input =
-            !flags.no_input && io::stdin().is_terminal() && io::stdout().is_terminal();
+        let allow_input = !flags.no_input && io::stdin().is_terminal() && io::stdout().is_terminal();
         let discovery = Discovery::from_env(flags.socket_path.as_deref())
             .map_err(CliError::internal)?
             .with_autostart(!flags.no_engine_autostart);
@@ -2801,8 +2780,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 status: Some(ProductStatus::Archived.as_str().to_owned()),
                 ..WorkItemPatch::default()
             };
-            let archived =
-                expect_product(update_work_item(&mut client, &product.id, patch).await?)?;
+            let archived = expect_product(update_work_item(&mut client, &product.id, patch).await?)?;
             print_entity(
                 ctx,
                 &serde_json::json!({
@@ -2833,9 +2811,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
         }
         ProductCommand::SetDefaultModel(args) => {
             if !args.unset && args.model.is_none() {
-                return Err(CliError::usage(
-                    "provide either --model <slug> or --unset",
-                ));
+                return Err(CliError::usage("provide either --model <slug> or --unset"));
             }
             let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
             let model = if args.unset { None } else { args.model };
@@ -2854,11 +2830,11 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::EffortAuditReport { report } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "report": report }),
-                    || print_effort_audit_report(&report),
-                ),
+                FrontendEvent::EffortAuditReport { report } => {
+                    print_entity(ctx, &serde_json::json!({ "report": report }), || {
+                        print_effort_audit_report(&report)
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -2867,9 +2843,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
         }
         ProductCommand::SetEditorialRules(args) => {
             if !args.unset && args.from_file.is_none() {
-                return Err(CliError::usage(
-                    "provide either --from-file <path> or --unset",
-                ));
+                return Err(CliError::usage("provide either --from-file <path> or --unset"));
             }
             let selector = args.selector.clone();
             let product = resolve_product(&mut client, Some(selector), ctx).await?;
@@ -2877,16 +2851,10 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 None
             } else {
                 let path = args.from_file.as_ref().unwrap();
-                let contents = std::fs::read_to_string(path).map_err(|e| {
-                    CliError::usage(format!("could not read {}: {e}", path.display()))
-                })?;
-                let parsed: EditorialRules =
-                    serde_json::from_str(&contents).map_err(|e| {
-                        CliError::usage(format!(
-                            "invalid EditorialRules JSON in {}: {e}",
-                            path.display()
-                        ))
-                    })?;
+                let contents = std::fs::read_to_string(path)
+                    .map_err(|e| CliError::usage(format!("could not read {}: {e}", path.display())))?;
+                let parsed: EditorialRules = serde_json::from_str(&contents)
+                    .map_err(|e| CliError::usage(format!("invalid EditorialRules JSON in {}: {e}", path.display())))?;
                 Some(parsed)
             };
             let input = SetProductEditorialRulesInput {
@@ -2903,10 +2871,7 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                     print_entity(ctx, &serde_json::json!({ "product": updated }), || {
                         if args.unset {
                             if !ctx.quiet {
-                                println!(
-                                    "Editorial rules cleared from product {}.",
-                                    updated.slug
-                                );
+                                println!("Editorial rules cleared from product {}.", updated.slug);
                             }
                         } else {
                             print_product_details("Updated product", &updated);
@@ -2972,17 +2937,15 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::ExternalTrackerSyncStarted { product_id } => {
-                    print_entity(
-                        ctx,
-                        &serde_json::json!({ "product_id": product_id, "synced": true }),
-                        || {
-                            if !ctx.quiet {
-                                println!("External tracker sync complete for product {}.", product.slug);
-                            }
-                        },
-                    )
-                }
+                FrontendEvent::ExternalTrackerSyncStarted { product_id } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "product_id": product_id, "synced": true }),
+                    || {
+                        if !ctx.quiet {
+                            println!("External tracker sync complete for product {}.", product.slug);
+                        }
+                    },
+                ),
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -3071,11 +3034,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
         }
         ProjectCommand::Show(args) => {
             let with_primary_id = args.with_primary_id;
-            let product =
-                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
-                    .await?;
-            let project =
-                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let detail = list_dependencies_detailed(
                 &mut client,
                 ListDependenciesInput {
@@ -3102,11 +3062,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::Update(args) => {
-            let product =
-                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
-                    .await?;
-            let project =
-                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
                 name: args.name,
                 description: args.description,
@@ -3126,17 +3083,13 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             })
         }
         ProjectCommand::Delete(args) => {
-            let product =
-                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
-                    .await?;
-            let project =
-                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
                 status: Some(ProjectStatusArg::Archived.as_str().to_owned()),
                 ..WorkItemPatch::default()
             };
-            let archived =
-                expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
+            let archived = expect_project(update_work_item(&mut client, &project.id, patch).await?)?;
             print_entity(
                 ctx,
                 &serde_json::json!({
@@ -3155,11 +3108,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::Move(args) => {
-            let product =
-                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
-                    .await?;
-            let project =
-                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let patch = WorkItemPatch {
                 status: Some(args.target.as_str().to_owned()),
                 ..WorkItemPatch::default()
@@ -3175,11 +3125,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                     "provide --path <p> (with optional --repo/--branch) or --unset",
                 ));
             }
-            let product =
-                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
-                    .await?;
-            let project =
-                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let input = if args.unset {
                 SetProjectDesignDocInput {
                     project_id: project.id.clone(),
@@ -3209,11 +3156,8 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
             )
         }
         ProjectCommand::OpenDesign(args) => {
-            let product =
-                resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx)
-                    .await?;
-            let project =
-                resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
+            let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
+            let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
             let resolved = resolve_project_design_doc(&mut client, &project.id).await?;
             let action = decide_open_design_action(&resolved.state, args.web)?;
             print_entity(
@@ -3244,11 +3188,7 @@ async fn run_project_command(command: ProjectCommand, ctx: &RunContext) -> Resul
                 let projects = list_projects(&mut client, &product.id, None).await?;
                 for project in projects {
                     let state = if project.design_doc_path.is_some() {
-                        Some(
-                            resolve_project_design_doc(&mut client, &project.id)
-                                .await?
-                                .state,
-                        )
+                        Some(resolve_project_design_doc(&mut client, &project.id).await?.state)
                     } else {
                         None
                     };
@@ -3302,26 +3242,17 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             // task is product-level (no project) and routed to the automations
             // pool; the engine owns provenance stamping + the cap re-check.
             if let Some(selector) = args.automation.clone() {
-                let product =
-                    resolve_optional_product(&mut client, args.product.clone(), ctx).await?;
-                let automation =
-                    resolve_automation(&mut client, &selector, product.as_ref()).await?;
+                let product = resolve_optional_product(&mut client, args.product.clone(), ctx).await?;
+                let automation = resolve_automation(&mut client, &selector, product.as_ref()).await?;
                 let name = required_text(args.name, "Task name", ctx)?;
                 let description = optional_text(args.description, "Description", ctx)?;
-                let task =
-                    create_automation_task(&mut client, &automation.id, name, description).await?;
+                let task = create_automation_task(&mut client, &automation.id, name, description).await?;
                 let task = with_display_status(task);
                 return print_entity(ctx, &serde_json::json!({ "task": task }), || {
                     print_task_details("Created automation task", &task, None, false);
                 });
             }
-            let product = resolve_product_inferable(
-                &mut client,
-                args.product,
-                args.project.as_deref(),
-                ctx,
-            )
-            .await?;
+            let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
             let name = required_text(args.name, "Task name", ctx)?;
             let description = optional_text(args.description, "Description", ctx)?;
@@ -3362,17 +3293,9 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             })
         }
         TaskCommand::List(args) => {
-            let product = resolve_product_inferable(
-                &mut client,
-                args.product,
-                args.project.as_deref(),
-                ctx,
-            )
-            .await?;
+            let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
             let project = match args.project {
-                Some(selector) => {
-                    Some(resolve_project(&mut client, &product.id, Some(selector), ctx).await?)
-                }
+                Some(selector) => Some(resolve_project(&mut client, &product.id, Some(selector), ctx).await?),
                 None => None,
             };
             let dep_filter = args.dep.into_filter();
@@ -3409,13 +3332,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         TaskCommand::Reorder(args) => {
-            let product = resolve_product_inferable(
-                &mut client,
-                args.product,
-                args.project.as_deref(),
-                ctx,
-            )
-            .await?;
+            let product = resolve_product_inferable(&mut client, args.product, args.project.as_deref(), ctx).await?;
             let project = resolve_project(&mut client, &product.id, args.project, ctx).await?;
             if args.ids.is_empty() {
                 return Err(CliError::usage("provide at least one task id via --ids"));
@@ -3426,11 +3343,7 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
                 &serde_json::json!({ "project_id": project.id, "task_ids": args.ids }),
                 || {
                     if !ctx.quiet {
-                        println!(
-                            "Reordered {} tasks for project {}",
-                            args.ids.len(),
-                            project.name
-                        );
+                        println!("Reordered {} tasks for project {}", args.ids.len(), project.name);
                     }
                 },
             )
@@ -3440,12 +3353,8 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
         TaskCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
         TaskCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,
-        TaskCommand::CreateInvestigation(args) => {
-            run_create_investigation(&mut client, ctx, args).await
-        }
-        TaskCommand::CreateRevision(args) => {
-            run_create_revision(&mut client, ctx, args).await
-        }
+        TaskCommand::CreateInvestigation(args) => run_create_investigation(&mut client, ctx, args).await,
+        TaskCommand::CreateRevision(args) => run_create_revision(&mut client, ctx, args).await,
     }
 }
 
@@ -3495,8 +3404,7 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let dep_filter = args.dep.into_filter();
             let repo_selector = args.repo.as_deref().map(RepoSelector::parse).transpose()?;
-            let chores =
-                list_chores(&mut client, &product.id, dep_filter, args.include_deleted).await?;
+            let chores = list_chores(&mut client, &product.id, dep_filter, args.include_deleted).await?;
             let chores = apply_task_list_filters(
                 chores,
                 &args.status,
@@ -3554,9 +3462,7 @@ async fn run_show_leaf(
             check_task_kind_for_verb(&item, n, chore_only)?;
             item
         }
-        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => {
-            get_work_item(client, &id).await?
-        }
+        WorkItemSelector::PrimaryId(id) | WorkItemSelector::Other(id) => get_work_item(client, &id).await?,
     };
     let (item, label) = expect_leaf_work_item(work_item)?;
     let item = with_display_status(item);
@@ -3659,11 +3565,7 @@ fn check_task_kind_for_verb(item: &WorkItem, short_id: i64, chore_only: bool) ->
 }
 
 /// Shared handler for `boss task update` and `boss chore update`.
-async fn run_update_leaf(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: TaskUpdateArgs,
-) -> Result<(), CliError> {
+async fn run_update_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskUpdateArgs) -> Result<(), CliError> {
     let effort_level = if args.unset_effort {
         Some(String::new())
     } else {
@@ -3712,11 +3614,7 @@ async fn run_update_leaf(
 }
 
 /// Shared handler for `boss task move` and `boss chore move`.
-async fn run_move_leaf(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: TaskMoveArgs,
-) -> Result<(), CliError> {
+async fn run_move_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskMoveArgs) -> Result<(), CliError> {
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
     let patch = WorkItemPatch {
         status: Some(args.target.as_status().to_owned()),
@@ -3733,33 +3631,21 @@ async fn run_move_leaf(
 /// engine doesn't need the kind to delete; we read it back from the
 /// pre-delete fetch only so the human-mode message names the right
 /// noun.
-async fn run_delete_leaf(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: TaskDeleteArgs,
-) -> Result<(), CliError> {
+async fn run_delete_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskDeleteArgs) -> Result<(), CliError> {
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
     let label = match get_work_item(client, &resolved_id).await {
         Ok(item) => expect_leaf_work_item(item).map(|(_, l)| l).unwrap_or("item"),
         Err(_) => "item",
     };
     delete_work_item(client, &resolved_id).await?;
-    print_entity(
-        ctx,
-        &serde_json::json!({ "id": resolved_id, "deleted": true }),
-        || {
-            if !ctx.quiet {
-                println!("Deleted {label} {resolved_id}");
-            }
-        },
-    )
+    print_entity(ctx, &serde_json::json!({ "id": resolved_id, "deleted": true }), || {
+        if !ctx.quiet {
+            println!("Deleted {label} {resolved_id}");
+        }
+    })
 }
 
-async fn run_restore_leaf(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: TaskRestoreArgs,
-) -> Result<(), CliError> {
+async fn run_restore_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskRestoreArgs) -> Result<(), CliError> {
     // Restore resolution is intentionally not routed through
     // `resolve_selector_to_primary_id`: a soft-deleted row is hidden
     // from the per-product short-id resolver, so bare `#43` / `boss/43`
@@ -3796,10 +3682,7 @@ async fn run_github_command(command: GithubCommand, ctx: &RunContext) -> Result<
     }
 }
 
-async fn run_github_auth_command(
-    command: GithubAuthCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_github_auth_command(command: GithubAuthCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         GithubAuthCommand::Login => run_github_auth_login(ctx).await,
         GithubAuthCommand::Status => run_github_auth_status(ctx).await,
@@ -3839,8 +3722,7 @@ async fn run_github_auth_login(ctx: &RunContext) -> Result<(), CliError> {
                     "granted_scopes": granted_scopes,
                     "org_state": org_state,
                 });
-                let (login, granted_scopes, org_state) =
-                    (login.clone(), granted_scopes.clone(), org_state.clone());
+                let (login, granted_scopes, org_state) = (login.clone(), granted_scopes.clone(), org_state.clone());
                 return print_entity(ctx, &json, move || {
                     println!("Authorized as @{login}");
                     println!("Scopes: {}", granted_scopes.join(", "));
@@ -3871,10 +3753,7 @@ async fn run_github_auth_login(ctx: &RunContext) -> Result<(), CliError> {
                     println!("Open this URL in a browser to authorize Boss:");
                     if let Some(complete) = verification_uri_complete {
                         println!("  {complete}");
-                        println!(
-                            "Or visit {} and enter code: {user_code}",
-                            verification_uri
-                        );
+                        println!("Or visit {} and enter code: {user_code}", verification_uri);
                     } else {
                         println!("  {verification_uri}");
                         println!("Enter code: {user_code}");
@@ -3928,18 +3807,16 @@ async fn run_github_auth_logout(ctx: &RunContext) -> Result<(), CliError> {
         .await
         .map_err(CliError::internal)?;
     match response {
-        FrontendEvent::GitHubAuthState { .. } => print_entity(
-            ctx,
-            &serde_json::json!({ "status": "disconnected" }),
-            || {
+        FrontendEvent::GitHubAuthState { .. } => {
+            print_entity(ctx, &serde_json::json!({ "status": "disconnected" }), || {
                 if !ctx.quiet {
                     println!(
                         "Disconnected. Token removed from keychain. Issue sync will fall back \
                          to ambient `gh auth` credentials."
                     );
                 }
-            },
-        ),
+            })
+        }
         other => Err(CliError::internal(anyhow::anyhow!(
             "unexpected response to GitHubAuthDisconnect: {other:?}"
         ))),
@@ -4028,15 +3905,17 @@ fn parse_automation_selector(s: &str) -> Result<AutomationSelector, CliError> {
         let first = s.as_bytes()[0];
         if (first == b'A' || first == b'a')
             && let Ok(n) = s[1..].parse::<i64>()
-                && n > 0 {
-                    return Ok(AutomationSelector::ShortId(n));
-                }
+            && n > 0
+        {
+            return Ok(AutomationSelector::ShortId(n));
+        }
     }
     // Plain positive integer → short id
     if let Ok(n) = s.parse::<i64>()
-        && n > 0 {
-            return Ok(AutomationSelector::ShortId(n));
-        }
+        && n > 0
+    {
+        return Ok(AutomationSelector::ShortId(n));
+    }
     Err(CliError::usage(format!(
         "automation selector must be A<n> (e.g. A1) or an auto_… id; got {s:?}"
     )))
@@ -4055,20 +3934,13 @@ async fn resolve_automation(
         AutomationSelector::PrimaryId(id) => get_automation(client, &id).await,
         AutomationSelector::ShortId(n) => {
             let product = product.ok_or_else(|| {
-                CliError::usage(
-                    "A<n> selectors require --product to identify the automation namespace",
-                )
+                CliError::usage("A<n> selectors require --product to identify the automation namespace")
             })?;
             let automations = list_automations(client, &product.id).await?;
             automations
                 .into_iter()
                 .find(|a| a.short_id == Some(n))
-                .ok_or_else(|| {
-                    CliError::not_found(format!(
-                        "no automation A{n} found in product '{}'",
-                        product.slug
-                    ))
-                })
+                .ok_or_else(|| CliError::not_found(format!("no automation A{n} found in product '{}'", product.slug)))
         }
     }
 }
@@ -4082,10 +3954,10 @@ async fn resolve_automation(
 /// Each preset compiles to a standard 5-field cron expression (min hour dom month dow).
 /// The timezone is supplied separately via `--timezone`.
 const SCHEDULE_PRESETS: &[(&str, &str, &str)] = &[
-    ("weekday-2pm",   "0 14 * * 1-5", "Every weekday at 2:00 pm"),
-    ("nightly",       "0 2 * * *",    "Every day at 2:00 am"),
-    ("weekly-mon-am", "0 9 * * 1",    "Every Monday at 9:00 am"),
-    ("hourly",        "0 * * * *",    "Every hour"),
+    ("weekday-2pm", "0 14 * * 1-5", "Every weekday at 2:00 pm"),
+    ("nightly", "0 2 * * *", "Every day at 2:00 am"),
+    ("weekly-mon-am", "0 9 * * 1", "Every Monday at 9:00 am"),
+    ("hourly", "0 * * * *", "Every hour"),
 ];
 
 /// Compile a `--schedule` value to a cron expression.
@@ -4144,10 +4016,7 @@ fn validate_cron_expression(cron: &str) -> Result<String, CliError> {
 // Automation RPC helpers
 // ---------------------------------------------------------------------------
 
-async fn create_automation(
-    client: &mut BossClient,
-    input: CreateAutomationInput,
-) -> Result<Automation, CliError> {
+async fn create_automation(client: &mut BossClient, input: CreateAutomationInput) -> Result<Automation, CliError> {
     match client
         .send_request(&FrontendRequest::CreateAutomation { input })
         .await
@@ -4161,10 +4030,7 @@ async fn create_automation(
     }
 }
 
-async fn list_automations(
-    client: &mut BossClient,
-    product_id: &str,
-) -> Result<Vec<Automation>, CliError> {
+async fn list_automations(client: &mut BossClient, product_id: &str) -> Result<Vec<Automation>, CliError> {
     match client
         .send_request(&FrontendRequest::ListAutomations {
             product_id: product_id.to_owned(),
@@ -4180,10 +4046,7 @@ async fn list_automations(
     }
 }
 
-async fn get_automation(
-    client: &mut BossClient,
-    id: &str,
-) -> Result<Automation, CliError> {
+async fn get_automation(client: &mut BossClient, id: &str) -> Result<Automation, CliError> {
     match client
         .send_request(&FrontendRequest::GetAutomation { id: id.to_owned() })
         .await
@@ -4197,11 +4060,7 @@ async fn get_automation(
     }
 }
 
-async fn update_automation(
-    client: &mut BossClient,
-    id: &str,
-    patch: AutomationPatch,
-) -> Result<Automation, CliError> {
+async fn update_automation(client: &mut BossClient, id: &str, patch: AutomationPatch) -> Result<Automation, CliError> {
     match client
         .send_request(&FrontendRequest::UpdateAutomation {
             id: id.to_owned(),
@@ -4260,10 +4119,7 @@ async fn delete_automation(client: &mut BossClient, id: &str) -> Result<(), CliE
     }
 }
 
-async fn list_automation_runs(
-    client: &mut BossClient,
-    automation_id: &str,
-) -> Result<Vec<AutomationRun>, CliError> {
+async fn list_automation_runs(client: &mut BossClient, automation_id: &str) -> Result<Vec<AutomationRun>, CliError> {
     match client
         .send_request(&FrontendRequest::ListAutomationRuns {
             automation_id: automation_id.to_owned(),
@@ -4279,10 +4135,7 @@ async fn list_automation_runs(
     }
 }
 
-async fn list_automation_tasks(
-    client: &mut BossClient,
-    automation_id: &str,
-) -> Result<Vec<Task>, CliError> {
+async fn list_automation_tasks(client: &mut BossClient, automation_id: &str) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListAutomationTasks {
             automation_id: automation_id.to_owned(),
@@ -4304,14 +4157,17 @@ async fn list_automation_tasks(
 
 fn print_automations_table(automations: &[Automation]) {
     let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(["#", "NAME", "SCHEDULE", "ENABLED", "OPEN", "LAST OUTCOME", "NEXT DUE"]);
+    table.set_content_arrangement(ContentArrangement::Dynamic).set_header([
+        "#",
+        "NAME",
+        "SCHEDULE",
+        "ENABLED",
+        "OPEN",
+        "LAST OUTCOME",
+        "NEXT DUE",
+    ]);
     for a in automations {
-        let short = a
-            .short_id
-            .map(|n| format!("A{n}"))
-            .unwrap_or_default();
+        let short = a.short_id.map(|n| format!("A{n}")).unwrap_or_default();
         let schedule = match &a.trigger {
             AutomationTrigger::Schedule { cron, timezone } => {
                 format!("{cron} ({timezone})")
@@ -4320,14 +4176,7 @@ fn print_automations_table(automations: &[Automation]) {
         let enabled = if a.enabled { "yes" } else { "no" };
         let last_outcome = a.last_outcome.as_deref().unwrap_or("-");
         let next_due = a.next_due_at.as_deref().unwrap_or("-");
-        table.add_row([
-            &short,
-            a.name.as_str(),
-            &schedule,
-            enabled,
-            last_outcome,
-            next_due,
-        ]);
+        table.add_row([&short, a.name.as_str(), &schedule, enabled, last_outcome, next_due]);
     }
     println!("{table}");
 }
@@ -4364,9 +4213,13 @@ fn print_automation_details(label: &str, a: &Automation) {
 
 fn print_automation_runs_table(runs: &[AutomationRun]) {
     let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(["SCHEDULED FOR", "OUTCOME", "STARTED", "PRODUCED TASK", "DETAIL"]);
+    table.set_content_arrangement(ContentArrangement::Dynamic).set_header([
+        "SCHEDULED FOR",
+        "OUTCOME",
+        "STARTED",
+        "PRODUCED TASK",
+        "DETAIL",
+    ]);
     for r in runs {
         let produced = r.produced_task_id.as_deref().unwrap_or("-");
         let detail = r.detail.as_deref().unwrap_or("-");
@@ -4385,10 +4238,7 @@ fn print_automation_runs_table(runs: &[AutomationRun]) {
 // Editorial command handler
 // ---------------------------------------------------------------------------
 
-async fn run_editorial_command(
-    command: EditorialCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_editorial_command(command: EditorialCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EditorialCommand::Show(args) => run_editorial_show(args, ctx).await,
         EditorialCommand::Test(args) => run_editorial_test(args, ctx).await,
@@ -4411,12 +4261,7 @@ async fn run_editorial_show(args: EditorialShowArgs, ctx: &RunContext) -> Result
                 let suffix = format!("/{pr_num}");
                 actions
                     .iter()
-                    .filter(|a| {
-                        a.pr_url
-                            .as_deref()
-                            .map(|u| u.ends_with(&suffix))
-                            .unwrap_or(false)
-                    })
+                    .filter(|a| a.pr_url.as_deref().map(|u| u.ends_with(&suffix)).unwrap_or(false))
                     .collect()
             } else {
                 actions.iter().collect()
@@ -4430,18 +4275,11 @@ async fn run_editorial_show(args: EditorialShowArgs, ctx: &RunContext) -> Result
                             println!("No editorial actions recorded for product {}.", product.slug);
                         }
                     } else {
-                        println!(
-                            "Editorial actions for product {} ({}):",
-                            product.name, product.slug
-                        );
+                        println!("Editorial actions for product {} ({}):", product.name, product.slug);
                         for action in &filtered {
                             let pr = action.pr_url.as_deref().unwrap_or("(no PR)");
-                            let first_reason_line =
-                                action.reason.lines().next().unwrap_or("");
-                            println!(
-                                "  [{}] {} — {}",
-                                action.action, pr, first_reason_line
-                            );
+                            let first_reason_line = action.reason.lines().next().unwrap_or("");
+                            println!("  [{}] {} — {}", action.action, pr, first_reason_line);
                             println!("    at {}", action.created_at);
                         }
                     }
@@ -4458,27 +4296,20 @@ async fn run_editorial_show(args: EditorialShowArgs, ctx: &RunContext) -> Result
 async fn run_editorial_test(args: EditorialTestArgs, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
-    let body = std::fs::read_to_string(&args.body_file).map_err(|e| {
-        CliError::usage(format!(
-            "could not read {}: {e}",
-            args.body_file.display()
-        ))
-    })?;
+    let body = std::fs::read_to_string(&args.body_file)
+        .map_err(|e| CliError::usage(format!("could not read {}: {e}", args.body_file.display())))?;
     let rules = product.editorial_rules.clone().unwrap_or_default();
-    let compiled = boss_editorial::CompiledRules::compile(rules).map_err(|e| {
-        CliError::application(format!("invalid redaction regex in editorial_rules: {e}"))
-    })?;
+    let compiled = boss_editorial::CompiledRules::compile(rules)
+        .map_err(|e| CliError::application(format!("invalid redaction regex in editorial_rules: {e}")))?;
     let decision = boss_editorial::evaluate(&body, &args.title, &compiled, None);
     let (decision_str, findings): (&str, Vec<String>) = match &decision {
         boss_editorial::EditorialDecision::Allow => ("allow", vec![]),
-        boss_editorial::EditorialDecision::Rewrite { findings, .. } => (
-            "rewrite",
-            findings.iter().map(|f| f.description.clone()).collect(),
-        ),
-        boss_editorial::EditorialDecision::Block { findings } => (
-            "deny",
-            findings.iter().map(|f| f.description.clone()).collect(),
-        ),
+        boss_editorial::EditorialDecision::Rewrite { findings, .. } => {
+            ("rewrite", findings.iter().map(|f| f.description.clone()).collect())
+        }
+        boss_editorial::EditorialDecision::Block { findings } => {
+            ("deny", findings.iter().map(|f| f.description.clone()).collect())
+        }
     };
     let rewritten_body: Option<&str> = match &decision {
         boss_editorial::EditorialDecision::Rewrite { body, .. } => Some(body.as_str()),
@@ -4513,17 +4344,13 @@ async fn run_editorial_test(args: EditorialTestArgs, ctx: &RunContext) -> Result
 // Automation command handler
 // ---------------------------------------------------------------------------
 
-async fn run_automation_command(
-    command: AutomationCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_automation_command(command: AutomationCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
         AutomationCommand::Create(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let name = required_text(args.name, "Automation name", ctx)?;
-            let instruction =
-                required_text(args.instruction, "Standing instruction", ctx)?;
+            let instruction = required_text(args.instruction, "Standing instruction", ctx)?;
             let schedule_raw = required_text(args.schedule, "Schedule", ctx)?;
             let cron = compile_schedule(&schedule_raw)?;
             let trigger = AutomationTrigger::Schedule {
@@ -4552,23 +4379,18 @@ async fn run_automation_command(
         AutomationCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let automations = list_automations(&mut client, &product.id).await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "automations": automations }),
-                || {
-                    if automations.is_empty() {
-                        println!("No automations for product '{}'.", product.slug);
-                    } else {
-                        print_automations_table(&automations);
-                    }
-                },
-            )
+            print_entity(ctx, &serde_json::json!({ "automations": automations }), || {
+                if automations.is_empty() {
+                    println!("No automations for product '{}'.", product.slug);
+                } else {
+                    print_automations_table(&automations);
+                }
+            })
         }
 
         AutomationCommand::Show(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             print_entity(ctx, &serde_json::json!({ "automation": automation }), || {
                 print_automation_details("Automation", &automation);
             })
@@ -4576,8 +4398,7 @@ async fn run_automation_command(
 
         AutomationCommand::Update(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
 
             // Build a trigger patch only when schedule or timezone changed.
             let trigger_patch = match (&args.schedule, &args.timezone) {
@@ -4615,8 +4436,7 @@ async fn run_automation_command(
 
         AutomationCommand::Enable(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             let updated = enable_automation(&mut client, &automation.id).await?;
             print_entity(ctx, &serde_json::json!({ "automation": updated }), || {
                 if !ctx.quiet {
@@ -4627,8 +4447,7 @@ async fn run_automation_command(
 
         AutomationCommand::Disable(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             let updated = disable_automation(&mut client, &automation.id).await?;
             print_entity(ctx, &serde_json::json!({ "automation": updated }), || {
                 if !ctx.quiet {
@@ -4639,8 +4458,7 @@ async fn run_automation_command(
 
         AutomationCommand::Delete(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             delete_automation(&mut client, &automation.id).await?;
             print_entity(
                 ctx,
@@ -4655,8 +4473,7 @@ async fn run_automation_command(
 
         AutomationCommand::Run(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             match client
                 .send_request(&FrontendRequest::RunAutomation {
                     automation_id: automation.id.clone(),
@@ -4665,17 +4482,15 @@ async fn run_automation_command(
                 .await
                 .map_err(CliError::internal)?
             {
-                FrontendEvent::AutomationRunEnqueued { .. } => {
-                    print_entity(
-                        ctx,
-                        &serde_json::json!({ "automation_id": automation.id, "enqueued": true }),
-                        || {
-                            if !ctx.quiet {
-                                println!("Triage enqueued for automation {}", automation.id);
-                            }
-                        },
-                    )
-                }
+                FrontendEvent::AutomationRunEnqueued { .. } => print_entity(
+                    ctx,
+                    &serde_json::json!({ "automation_id": automation.id, "enqueued": true }),
+                    || {
+                        if !ctx.quiet {
+                            println!("Triage enqueued for automation {}", automation.id);
+                        }
+                    },
+                ),
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -4685,8 +4500,7 @@ async fn run_automation_command(
 
         AutomationCommand::Runs(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             let runs = list_automation_runs(&mut client, &automation.id).await?;
             print_entity(ctx, &serde_json::json!({ "runs": runs }), || {
                 if runs.is_empty() {
@@ -4699,8 +4513,7 @@ async fn run_automation_command(
 
         AutomationCommand::Tasks(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let automation =
-                resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
+            let automation = resolve_automation(&mut client, &args.selector, product.as_ref()).await?;
             let tasks = list_automation_tasks(&mut client, &automation.id).await?;
             let tasks: Vec<Task> = tasks.into_iter().map(with_display_status).collect();
             print_entity(ctx, &serde_json::json!({ "tasks": tasks }), || {
@@ -4735,14 +4548,16 @@ fn parse_attention_group_selector(s: &str) -> Result<AttentionGroupSelector, Cli
         let first = s.as_bytes()[0];
         if (first == b'A' || first == b'a')
             && let Ok(n) = s[1..].parse::<i64>()
-                && n > 0 {
-                    return Ok(AttentionGroupSelector::ShortId(n));
-                }
-    }
-    if let Ok(n) = s.parse::<i64>()
-        && n > 0 {
+            && n > 0
+        {
             return Ok(AttentionGroupSelector::ShortId(n));
         }
+    }
+    if let Ok(n) = s.parse::<i64>()
+        && n > 0
+    {
+        return Ok(AttentionGroupSelector::ShortId(n));
+    }
     Err(CliError::usage(format!(
         "attention group selector must be A<n> (e.g. A1) or an atg_… id; got {s:?}"
     )))
@@ -4764,22 +4579,16 @@ async fn resolve_attention_group(
         AttentionGroupSelector::PrimaryId(id) => get_attention_group(client, &id).await,
         AttentionGroupSelector::ShortId(n) => {
             let product = product.ok_or_else(|| {
-                CliError::usage(
-                    "A<n> selectors require --product to identify the attention group namespace",
-                )
+                CliError::usage("A<n> selectors require --product to identify the attention group namespace")
             })?;
-            let groups =
-                list_attention_groups(client, &product.id, None, None, None, None).await?;
-            groups
-                .into_iter()
-                .find(|g| g.short_id == Some(n))
-                .ok_or_else(|| {
-                    CliError::not_found(format!(
-                        "no active attention group A{n} found in product '{}' \
+            let groups = list_attention_groups(client, &product.id, None, None, None, None).await?;
+            groups.into_iter().find(|g| g.short_id == Some(n)).ok_or_else(|| {
+                CliError::not_found(format!(
+                    "no active attention group A{n} found in product '{}' \
                          (use the atg_… id to reference actioned or dismissed groups)",
-                        product.slug
-                    ))
-                })
+                    product.slug
+                ))
+            })
         }
     }
 }
@@ -4815,10 +4624,7 @@ async fn list_attention_groups(
     }
 }
 
-async fn get_attention_group(
-    client: &mut BossClient,
-    id: &str,
-) -> Result<AttentionGroup, CliError> {
+async fn get_attention_group(client: &mut BossClient, id: &str) -> Result<AttentionGroup, CliError> {
     match client
         .send_request(&FrontendRequest::GetAttentionGroup { id: id.to_owned() })
         .await
@@ -4922,14 +4728,16 @@ async fn dismiss_attention_rpc(
 
 fn print_attention_groups_table(groups: &[AttentionGroup]) {
     let mut table = Table::new();
-    table
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(["ID", "SHORT", "KIND", "STATE", "ASSOCIATION", "CREATED"]);
+    table.set_content_arrangement(ContentArrangement::Dynamic).set_header([
+        "ID",
+        "SHORT",
+        "KIND",
+        "STATE",
+        "ASSOCIATION",
+        "CREATED",
+    ]);
     for g in groups {
-        let short = g
-            .short_id
-            .map(|n| format!("A{n}"))
-            .unwrap_or_default();
+        let short = g.short_id.map(|n| format!("A{n}")).unwrap_or_default();
         let assoc = g
             .association_project_id
             .as_deref()
@@ -4986,43 +4794,26 @@ fn print_attention_group_details(label: &str, g: &AttentionGroup) {
 // Attention command handler
 // ---------------------------------------------------------------------------
 
-async fn run_attention_command(
-    command: AttentionCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_attention_command(command: AttentionCommand, ctx: &RunContext) -> Result<(), CliError> {
     let mut client = connect_for_work(ctx).await?;
     match command {
         AttentionCommand::List(args) => {
             let product = resolve_product(&mut client, args.product, ctx).await?;
             let project_id = if let Some(sel) = args.project {
-                Some(
-                    resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?,
-                )
+                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
             } else {
                 None
             };
             let task_id = if let Some(sel) = args.task {
-                Some(
-                    resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?,
-                )
+                Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
             } else {
                 None
             };
-            let groups = list_attention_groups(
-                &mut client,
-                &product.id,
-                project_id,
-                task_id,
-                args.kind,
-                args.state,
-            )
-            .await?;
+            let groups =
+                list_attention_groups(&mut client, &product.id, project_id, task_id, args.kind, args.state).await?;
             print_entity(ctx, &serde_json::json!({ "attention_groups": groups }), || {
                 if groups.is_empty() {
-                    println!(
-                        "No attention groups found for product '{}'.",
-                        product.slug
-                    );
+                    println!("No attention groups found for product '{}'.", product.slug);
                 } else {
                     print_attention_groups_table(&groups);
                 }
@@ -5031,27 +4822,18 @@ async fn run_attention_command(
 
         AttentionCommand::Show(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let group =
-                resolve_attention_group(&mut client, &args.selector, product.as_ref()).await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "attention_group": group }),
-                || {
-                    print_attention_group_details("Attention group", &group);
-                },
-            )
+            let group = resolve_attention_group(&mut client, &args.selector, product.as_ref()).await?;
+            print_entity(ctx, &serde_json::json!({ "attention_group": group }), || {
+                print_attention_group_details("Attention group", &group);
+            })
         }
 
         AttentionCommand::Create(args) => {
             if args.project.is_none() && args.task.is_none() {
-                return Err(CliError::usage(
-                    "exactly one of --project or --task is required",
-                ));
+                return Err(CliError::usage("exactly one of --project or --task is required"));
             }
             if args.project.is_some() && args.task.is_some() {
-                return Err(CliError::usage(
-                    "--project and --task are mutually exclusive",
-                ));
+                return Err(CliError::usage("--project and --task are mutually exclusive"));
             }
             let association_project_id = if let Some(sel) = args.project {
                 Some(resolve_selector_to_primary_id(&mut client, ctx, &sel, None).await?)
@@ -5135,20 +4917,12 @@ async fn run_attention_command(
             } else {
                 (None, true, false)
             };
-            let group =
-                answer_attention_rpc(&mut client, &args.id, answer, skip, dismiss).await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "attention_group": group }),
-                || {
-                    if !ctx.quiet {
-                        println!(
-                            "Recorded answer for {} (group state: {})",
-                            args.id, group.state
-                        );
-                    }
-                },
-            )
+            let group = answer_attention_rpc(&mut client, &args.id, answer, skip, dismiss).await?;
+            print_entity(ctx, &serde_json::json!({ "attention_group": group }), || {
+                if !ctx.quiet {
+                    println!("Recorded answer for {} (group state: {})", args.id, group.state);
+                }
+            })
         }
 
         AttentionCommand::Dismiss(args) => {
@@ -5157,31 +4931,21 @@ async fn run_attention_command(
             let resolved_id = if args.id.starts_with("atg_") || args.id.starts_with("atn_") {
                 args.id.clone()
             } else {
-                let product =
-                    resolve_optional_product(&mut client, args.product.clone(), ctx).await?;
-                let group =
-                    resolve_attention_group(&mut client, &args.id, product.as_ref()).await?;
+                let product = resolve_optional_product(&mut client, args.product.clone(), ctx).await?;
+                let group = resolve_attention_group(&mut client, &args.id, product.as_ref()).await?;
                 group.id
             };
             let group = dismiss_attention_rpc(&mut client, &resolved_id, args.reason).await?;
-            print_entity(
-                ctx,
-                &serde_json::json!({ "attention_group": group }),
-                || {
-                    if !ctx.quiet {
-                        println!(
-                            "Dismissed {} (group state: {})",
-                            resolved_id, group.state
-                        );
-                    }
-                },
-            )
+            print_entity(ctx, &serde_json::json!({ "attention_group": group }), || {
+                if !ctx.quiet {
+                    println!("Dismissed {} (group state: {})", resolved_id, group.state);
+                }
+            })
         }
 
         AttentionCommand::Action(args) => {
             let product = resolve_optional_product(&mut client, args.product, ctx).await?;
-            let group =
-                resolve_attention_group(&mut client, &args.selector, product.as_ref()).await?;
+            let group = resolve_attention_group(&mut client, &args.selector, product.as_ref()).await?;
             if !args.confirm {
                 if !ctx.allow_input {
                     return Err(CliError::usage(
@@ -5208,8 +4972,7 @@ async fn run_attention_command(
                     return Ok(());
                 }
             }
-            let actioned =
-                action_attention_group_rpc(&mut client, &group.id, args.skip_unanswered).await?;
+            let actioned = action_attention_group_rpc(&mut client, &group.id, args.skip_unanswered).await?;
             let produced_kind = actioned.produced_artifact_kind.clone();
             let produced_ref = actioned.produced_artifact_ref.clone();
             print_entity(
@@ -5225,10 +4988,7 @@ async fn run_attention_command(
                     if !ctx.quiet {
                         let artifact = produced_kind.as_deref().unwrap_or("none");
                         let artifact_ref = produced_ref.as_deref().unwrap_or("");
-                        println!(
-                            "Actioned group {} → produced {artifact} {artifact_ref}",
-                            actioned.id
-                        );
+                        println!("Actioned group {} → produced {artifact} {artifact_ref}", actioned.id);
                     }
                 },
             )
@@ -5297,10 +5057,7 @@ async fn run_engine_command(command: EngineCommand, ctx: &RunContext) -> Result<
     }
 }
 
-async fn run_engine_ci_command(
-    command: EngineCiCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_engine_ci_command(command: EngineCiCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EngineCiCommand::Classify(args) => {
             let mut client = connect_for_work(ctx).await?;
@@ -5375,10 +5132,7 @@ async fn run_engine_ci_command(
                     &serde_json::json!({ "attempt": attempt, "new_id": new_id }),
                     || {
                         if !ctx.quiet {
-                            println!(
-                                "ci_remediation {} retrigger recorded (new id: {}).",
-                                attempt.id, new_id,
-                            );
+                            println!("ci_remediation {} retrigger recorded (new id: {}).", attempt.id, new_id,);
                         }
                     },
                 ),
@@ -5429,11 +5183,7 @@ async fn run_engine_ci_command(
         EngineCiCommand::List(args) => {
             let mut client = connect_for_work(ctx).await?;
             let product_id = match args.product.clone() {
-                Some(selector) => Some(
-                    resolve_product(&mut client, Some(selector), ctx)
-                        .await?
-                        .id,
-                ),
+                Some(selector) => Some(resolve_product(&mut client, Some(selector), ctx).await?.id),
                 None => None,
             };
             // Mirror conflicts: `--limit 0` → no cap, default 50.
@@ -5452,11 +5202,11 @@ async fn run_engine_ci_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::CiRemediationsList { attempts } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempts": attempts }),
-                    || print_ci_remediations_table(&attempts),
-                ),
+                FrontendEvent::CiRemediationsList { attempts } => {
+                    print_entity(ctx, &serde_json::json!({ "attempts": attempts }), || {
+                        print_ci_remediations_table(&attempts)
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5472,11 +5222,11 @@ async fn run_engine_ci_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::CiRemediation { attempt } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempt": attempt }),
-                    || print_ci_remediation_detail(&attempt),
-                ),
+                FrontendEvent::CiRemediation { attempt } => {
+                    print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
+                        print_ci_remediation_detail(&attempt)
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5525,10 +5275,8 @@ async fn run_engine_ci_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::CiRemediationMarkedAbandoned { attempt } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempt": attempt }),
-                    || {
+                FrontendEvent::CiRemediationMarkedAbandoned { attempt } => {
+                    print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
                         if !ctx.quiet {
                             println!(
                                 "ci_remediation {} marked abandoned (reason: {}).",
@@ -5536,8 +5284,8 @@ async fn run_engine_ci_command(
                                 attempt.failure_reason.as_deref().unwrap_or("<unset>"),
                             );
                         }
-                    },
-                ),
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5554,15 +5302,13 @@ async fn run_engine_ci_command(
                     .await
                     .map_err(CliError::internal)?;
                 match response {
-                    FrontendEvent::CiBudget { budget } => print_entity(
-                        ctx,
-                        &serde_json::json!({ "budget": budget }),
-                        || {
+                    FrontendEvent::CiBudget { budget } => {
+                        print_entity(ctx, &serde_json::json!({ "budget": budget }), || {
                             if !ctx.quiet {
                                 print_ci_budget_snapshot(&budget);
                             }
-                        },
-                    ),
+                        })
+                    }
                     FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                         Err(CliError::application(message))
                     }
@@ -5584,15 +5330,13 @@ async fn run_engine_ci_command(
                     .await
                     .map_err(CliError::internal)?;
                 match response {
-                    FrontendEvent::CiBudgetUpdated { budget } => print_entity(
-                        ctx,
-                        &serde_json::json!({ "budget": budget }),
-                        || {
+                    FrontendEvent::CiBudgetUpdated { budget } => {
+                        print_entity(ctx, &serde_json::json!({ "budget": budget }), || {
                             if !ctx.quiet {
                                 print_ci_budget_snapshot(&budget);
                             }
-                        },
-                    ),
+                        })
+                    }
                     FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                         Err(CliError::application(message))
                     }
@@ -5603,19 +5347,12 @@ async fn run_engine_ci_command(
     }
 }
 
-async fn run_engine_attempts_command(
-    command: EngineAttemptsCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_engine_attempts_command(command: EngineAttemptsCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EngineAttemptsCommand::List(args) => {
             let mut client = connect_for_work(ctx).await?;
             let product_id = match args.product.clone() {
-                Some(selector) => Some(
-                    resolve_product(&mut client, Some(selector), ctx)
-                        .await?
-                        .id,
-                ),
+                Some(selector) => Some(resolve_product(&mut client, Some(selector), ctx).await?.id),
                 None => None,
             };
             let limit = match args.limit {
@@ -5634,11 +5371,11 @@ async fn run_engine_attempts_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::EngineAttemptsList { attempts } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempts": attempts }),
-                    || print_engine_attempts_table(&attempts),
-                ),
+                FrontendEvent::EngineAttemptsList { attempts } => {
+                    print_entity(ctx, &serde_json::json!({ "attempts": attempts }), || {
+                        print_engine_attempts_table(&attempts)
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5648,19 +5385,12 @@ async fn run_engine_attempts_command(
     }
 }
 
-async fn run_engine_conflicts_command(
-    command: EngineConflictsCommand,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_engine_conflicts_command(command: EngineConflictsCommand, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         EngineConflictsCommand::List(args) => {
             let mut client = connect_for_work(ctx).await?;
             let product_id = match args.product.clone() {
-                Some(selector) => Some(
-                    resolve_product(&mut client, Some(selector), ctx)
-                        .await?
-                        .id,
-                ),
+                Some(selector) => Some(resolve_product(&mut client, Some(selector), ctx).await?.id),
                 None => None,
             };
             // CLI-side default cap so human output stays readable; an
@@ -5681,11 +5411,11 @@ async fn run_engine_conflicts_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::ConflictResolutionsList { attempts } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempts": attempts }),
-                    || print_conflict_resolutions_table(&attempts),
-                ),
+                FrontendEvent::ConflictResolutionsList { attempts } => {
+                    print_entity(ctx, &serde_json::json!({ "attempts": attempts }), || {
+                        print_conflict_resolutions_table(&attempts)
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5701,11 +5431,11 @@ async fn run_engine_conflicts_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::ConflictResolution { attempt } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempt": attempt }),
-                    || print_conflict_resolution_detail(&attempt),
-                ),
+                FrontendEvent::ConflictResolution { attempt } => {
+                    print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
+                        print_conflict_resolution_detail(&attempt)
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5721,18 +5451,16 @@ async fn run_engine_conflicts_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::ConflictResolutionRetried { attempt } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempt": attempt }),
-                    || {
+                FrontendEvent::ConflictResolutionRetried { attempt } => {
+                    print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
                         if !ctx.quiet {
                             println!(
                                 "Conflict resolution {} reset to pending; engine will re-dispatch a worker.",
                                 attempt.id,
                             );
                         }
-                    },
-                ),
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5749,10 +5477,8 @@ async fn run_engine_conflicts_command(
                 .await
                 .map_err(CliError::internal)?;
             match response {
-                FrontendEvent::ConflictResolutionMarkedAbandoned { attempt } => print_entity(
-                    ctx,
-                    &serde_json::json!({ "attempt": attempt }),
-                    || {
+                FrontendEvent::ConflictResolutionMarkedAbandoned { attempt } => {
+                    print_entity(ctx, &serde_json::json!({ "attempt": attempt }), || {
                         if !ctx.quiet {
                             println!(
                                 "Conflict resolution {} marked abandoned (reason: {}).",
@@ -5760,8 +5486,8 @@ async fn run_engine_conflicts_command(
                                 attempt.failure_reason.as_deref().unwrap_or("<unset>"),
                             );
                         }
-                    },
-                ),
+                    })
+                }
                 FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
                     Err(CliError::application(message))
                 }
@@ -5804,9 +5530,7 @@ fn print_conflict_resolutions_table(attempts: &[ConflictResolution]) {
     let mut table = Table::new();
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED",
-        ]);
+        .set_header(vec!["ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for attempt in attempts {
         table.add_row(vec![
             attempt.id.as_str(),
@@ -5858,10 +5582,7 @@ fn print_conflict_resolution_detail(attempt: &ConflictResolution) {
             "cube_workspace_id",
             attempt.cube_workspace_id.clone().unwrap_or_else(|| unset.clone()),
         ),
-        (
-            "worker_id",
-            attempt.worker_id.clone().unwrap_or_else(|| unset.clone()),
-        ),
+        ("worker_id", attempt.worker_id.clone().unwrap_or_else(|| unset.clone())),
         ("created_at", attempt.created_at.clone()),
         (
             "started_at",
@@ -5887,9 +5608,7 @@ fn print_ci_remediations_table(attempts: &[CiRemediation]) {
     let mut table = Table::new();
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "ID", "KIND", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED",
-        ]);
+        .set_header(vec!["ID", "KIND", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for attempt in attempts {
         table.add_row(vec![
             attempt.id.as_str(),
@@ -5940,10 +5659,7 @@ fn print_ci_remediation_detail(attempt: &CiRemediation) {
             "cube_workspace_id",
             attempt.cube_workspace_id.clone().unwrap_or_else(|| unset.clone()),
         ),
-        (
-            "worker_id",
-            attempt.worker_id.clone().unwrap_or_else(|| unset.clone()),
-        ),
+        ("worker_id", attempt.worker_id.clone().unwrap_or_else(|| unset.clone())),
         ("created_at", attempt.created_at.clone()),
         (
             "started_at",
@@ -6000,9 +5716,7 @@ fn print_ci_budget_after_retry(work_item_id: &str, budget: &CiBudgetSnapshot, wa
             work_item_id, budget.used, budget.effective,
         );
         println!("Cleared blocked_reason='ci_failure_exhausted'.");
-        println!(
-            "Parent will re-enter in_review on next probe; engine will auto-fix on detection of failure.",
-        );
+        println!("Parent will re-enter in_review on next probe; engine will auto-fix on detection of failure.",);
     } else {
         println!(
             "Reset ci_attempts_used for {} (used: {}/{} effective).",
@@ -6016,9 +5730,7 @@ fn print_engine_attempts_table(attempts: &[EngineAttemptListEntry]) {
     let mut table = Table::new();
     table
         .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "KIND", "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED",
-        ]);
+        .set_header(vec!["KIND", "ID", "STATUS", "PR", "WORK ITEM", "REASON", "CREATED"]);
     for row in attempts {
         table.add_row(vec![
             row.kind.as_str(),
@@ -6180,10 +5892,7 @@ async fn list_chores(
     }
 }
 
-async fn find_work_items_by_pr(
-    client: &mut BossClient,
-    pr_number: i64,
-) -> Result<Vec<PrWorkItemMatch>, CliError> {
+async fn find_work_items_by_pr(client: &mut BossClient, pr_number: i64) -> Result<Vec<PrWorkItemMatch>, CliError> {
     match client
         .send_request(&FrontendRequest::FindWorkItemsByPr { pr_number })
         .await
@@ -6197,10 +5906,7 @@ async fn find_work_items_by_pr(
     }
 }
 
-async fn create_product(
-    client: &mut BossClient,
-    input: CreateProductInput,
-) -> Result<Product, CliError> {
+async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product, CliError> {
     match client
         .send_request(&FrontendRequest::CreateProduct { input })
         .await
@@ -6242,15 +5948,19 @@ fn build_external_tracker_config(
 ) -> Result<serde_json::Value, CliError> {
     match kind {
         "github" => {
-            let org = args.org.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-                CliError::usage("--org is required for --kind github")
-            })?;
-            let repo = args.repo.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-                CliError::usage("--repo is required for --kind github")
-            })?;
-            let project_number = args.project.ok_or_else(|| {
-                CliError::usage("--project is required for --kind github")
-            })?;
+            let org = args
+                .org
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| CliError::usage("--org is required for --kind github"))?;
+            let repo = args
+                .repo
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| CliError::usage("--repo is required for --kind github"))?;
+            let project_number = args
+                .project
+                .ok_or_else(|| CliError::usage("--project is required for --kind github"))?;
             Ok(serde_json::json!({
                 "org": org,
                 "repo": repo,
@@ -6264,10 +5974,7 @@ fn build_external_tracker_config(
     }
 }
 
-async fn create_project(
-    client: &mut BossClient,
-    input: CreateProjectInput,
-) -> Result<Project, CliError> {
+async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project, CliError> {
     match client
         .send_request(&FrontendRequest::CreateProject { input })
         .await
@@ -6281,10 +5988,7 @@ async fn create_project(
     }
 }
 
-async fn set_project_design_doc(
-    client: &mut BossClient,
-    input: SetProjectDesignDocInput,
-) -> Result<Project, CliError> {
+async fn set_project_design_doc(client: &mut BossClient, input: SetProjectDesignDocInput) -> Result<Project, CliError> {
     match client
         .send_request(&FrontendRequest::SetProjectDesignDoc { input })
         .await
@@ -6390,10 +6094,7 @@ async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Resul
     }
 }
 
-async fn create_investigation(
-    client: &mut BossClient,
-    input: CreateInvestigationInput,
-) -> Result<Task, CliError> {
+async fn create_investigation(client: &mut BossClient, input: CreateInvestigationInput) -> Result<Task, CliError> {
     match client
         .send_request(&FrontendRequest::CreateInvestigation { input })
         .await
@@ -6421,13 +6122,7 @@ async fn run_create_investigation(
     ctx: &RunContext,
     args: InvestigationCreateArgs,
 ) -> Result<(), CliError> {
-    let product = resolve_product_inferable(
-        client,
-        args.product,
-        args.project.as_deref(),
-        ctx,
-    )
-    .await?;
+    let product = resolve_product_inferable(client, args.product, args.project.as_deref(), ctx).await?;
     let project_id = if let Some(proj) = args.project {
         let project = resolve_project(client, &product.id, Some(proj), ctx).await?;
         Some(project.id)
@@ -6461,10 +6156,7 @@ async fn run_create_investigation(
     Ok(())
 }
 
-async fn create_revision_rpc(
-    client: &mut BossClient,
-    input: CreateRevisionInput,
-) -> Result<Task, CliError> {
+async fn create_revision_rpc(client: &mut BossClient, input: CreateRevisionInput) -> Result<Task, CliError> {
     match client
         .send_request(&FrontendRequest::CreateRevision { input })
         .await
@@ -6486,10 +6178,7 @@ async fn create_revision_rpc(
 /// (via `get_work_item_resolving_short_id` in the engine). This is the only
 /// product-free resolution we allow here; `#42` / `42` bare forms still need
 /// a product and are rejected with a helpful message.
-async fn resolve_create_revision_parent(
-    client: &mut BossClient,
-    selector: &str,
-) -> Result<String, CliError> {
+async fn resolve_create_revision_parent(client: &mut BossClient, selector: &str) -> Result<String, CliError> {
     match parse_work_item_selector(selector) {
         // T-form short ids are globally unique — pass the friendly form
         // straight to GetWorkItem; the engine resolves it without a product.
@@ -6524,7 +6213,12 @@ async fn run_create_revision(
     if description.is_empty() {
         return Err(CliError::usage("--description must be non-empty"));
     }
-    let name = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+    let name = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
     let task = create_revision_rpc(
         client,
         CreateRevisionInput {
@@ -6542,11 +6236,7 @@ async fn run_create_revision(
     .await?;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
         if !ctx.quiet {
-            println!(
-                "created revision T{}: {}",
-                task.short_id.unwrap_or(0),
-                description
-            );
+            println!("created revision T{}: {}", task.short_id.unwrap_or(0), description);
         }
     })?;
     Ok(())
@@ -6566,11 +6256,7 @@ async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, Cl
     }
 }
 
-async fn update_work_item(
-    client: &mut BossClient,
-    id: &str,
-    patch: WorkItemPatch,
-) -> Result<WorkItem, CliError> {
+async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatch) -> Result<WorkItem, CliError> {
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
@@ -6618,11 +6304,7 @@ fn with_display_pr_match(m: PrWorkItemMatch) -> PrWorkItemMatch {
 /// owning row plus any revisions in the PR's chain.
 fn print_pr_match(m: &PrWorkItemMatch) {
     let owner = &m.owner;
-    let repo = owner
-        .pr_url
-        .as_deref()
-        .map(repo_url_from_pr_url)
-        .unwrap_or("");
+    let repo = owner.pr_url.as_deref().map(repo_url_from_pr_url).unwrap_or("");
     println!(
         "{}  {}  [{}]  {}",
         friendly_task_id(owner),
@@ -6641,10 +6323,7 @@ fn print_pr_match(m: &PrWorkItemMatch) {
     }
     println!("Revisions in this PR's chain:");
     for revision in &m.revisions {
-        let seq = revision
-            .revision_seq
-            .map(|n| format!("R{n} "))
-            .unwrap_or_default();
+        let seq = revision.revision_seq.map(|n| format!("R{n} ")).unwrap_or_default();
         println!(
             "  {seq}{}  [{}]  {}",
             friendly_task_id(revision),
@@ -6659,11 +6338,7 @@ fn print_pr_match(m: &PrWorkItemMatch) {
 /// `--repo` is given, matches are filtered by the repo parsed from
 /// each owner's PR URL; ambiguity (the same number in >1 repo) and
 /// not-found are surfaced as clear errors.
-async fn run_by_pr(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: ByPrArgs,
-) -> Result<(), CliError> {
+async fn run_by_pr(client: &mut BossClient, ctx: &RunContext, args: ByPrArgs) -> Result<(), CliError> {
     if args.pr_number <= 0 {
         return Err(CliError::usage("PR number must be a positive integer"));
     }
@@ -6698,9 +6373,7 @@ async fn run_by_pr(
             )))
         }
         1 => {
-            let matched = with_display_pr_match(
-                matches.into_iter().next().expect("len checked == 1"),
-            );
+            let matched = with_display_pr_match(matches.into_iter().next().expect("len checked == 1"));
             print_entity(ctx, &serde_json::json!({ "match": &matched }), || {
                 print_pr_match(&matched);
             })
@@ -6753,11 +6426,7 @@ fn classify_bind_pr<'a>(prior: Option<&'a str>, new: &str) -> BindPrAction<'a> {
 /// Shared handler for `boss task bind-pr` and `boss chore bind-pr`.
 /// The kind is read from the actual item, not the noun the user
 /// typed, so either invocation works against any leaf work item id.
-async fn run_bind_pr(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: BindPrArgs,
-) -> Result<(), CliError> {
+async fn run_bind_pr(client: &mut BossClient, ctx: &RunContext, args: BindPrArgs) -> Result<(), CliError> {
     let new_url = validate_github_pr_url(&args.pr_url)?;
 
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
@@ -6809,11 +6478,7 @@ async fn run_bind_pr(
 }
 
 /// Shared handler for `boss task link-external` and `boss chore link-external`.
-async fn run_link_external(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: LinkExternalArgs,
-) -> Result<(), CliError> {
+async fn run_link_external(client: &mut BossClient, ctx: &RunContext, args: LinkExternalArgs) -> Result<(), CliError> {
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
     let item = match client
         .send_request(&FrontendRequest::LinkWorkItemExternalRef {
@@ -6834,19 +6499,13 @@ async fn run_link_external(
     };
     let (updated, label) = expect_leaf_work_item(item)?;
     let title = format!("Linked external ref on {label}");
-    print_entity(
-        ctx,
-        &serde_json::json!({ label: updated }),
-        || print_task_details(&title, &updated, None, false),
-    )
+    print_entity(ctx, &serde_json::json!({ label: updated }), || {
+        print_task_details(&title, &updated, None, false)
+    })
 }
 
 /// Shared handler for `boss task unlink-external` and `boss chore unlink-external`.
-async fn run_unlink_external(
-    client: &mut BossClient,
-    ctx: &RunContext,
-    args: TaskIdArg,
-) -> Result<(), CliError> {
+async fn run_unlink_external(client: &mut BossClient, ctx: &RunContext, args: TaskIdArg) -> Result<(), CliError> {
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, None).await?;
     let item = match client
         .send_request(&FrontendRequest::UnlinkWorkItemExternalRef {
@@ -6863,11 +6522,9 @@ async fn run_unlink_external(
     };
     let (updated, label) = expect_leaf_work_item(item)?;
     let title = format!("Unlinked external ref on {label}");
-    print_entity(
-        ctx,
-        &serde_json::json!({ label: updated }),
-        || print_task_details(&title, &updated, None, false),
-    )
+    print_entity(ctx, &serde_json::json!({ label: updated }), || {
+        print_task_details(&title, &updated, None, false)
+    })
 }
 
 /// One entry in a bulk-create input file. Mirrors the documented
@@ -6945,8 +6602,7 @@ async fn run_task_create_many(
     // Resolve --product / --project once; per-item project_id (if
     // present) is treated as an already-resolved engine id so we
     // don't pay an extra round-trip per row.
-    let product =
-        resolve_product_inferable(client, args.product, args.project.as_deref(), ctx).await?;
+    let product = resolve_product_inferable(client, args.product, args.project.as_deref(), ctx).await?;
     let default_project = match args.project {
         Some(selector) => Some(resolve_project(client, &product.id, Some(selector), ctx).await?),
         None => None,
@@ -7042,10 +6698,7 @@ async fn run_chore_create_many(
     )
 }
 
-async fn create_many_tasks(
-    client: &mut BossClient,
-    input: CreateManyTasksInput,
-) -> Result<Vec<Task>, CliError> {
+async fn create_many_tasks(client: &mut BossClient, input: CreateManyTasksInput) -> Result<Vec<Task>, CliError> {
     handle_create_many_response(
         client
             .send_request(&FrontendRequest::CreateManyTasks { input })
@@ -7062,10 +6715,7 @@ async fn create_many_tasks(
     )
 }
 
-async fn create_many_chores(
-    client: &mut BossClient,
-    input: CreateManyChoresInput,
-) -> Result<Vec<Task>, CliError> {
+async fn create_many_chores(client: &mut BossClient, input: CreateManyChoresInput) -> Result<Vec<Task>, CliError> {
     handle_create_many_response(
         client
             .send_request(&FrontendRequest::CreateManyChores { input })
@@ -7082,11 +6732,7 @@ async fn create_many_chores(
     )
 }
 
-fn handle_create_many_response<F>(
-    event: FrontendEvent,
-    context: &str,
-    extract: F,
-) -> Result<Vec<Task>, CliError>
+fn handle_create_many_response<F>(event: FrontendEvent, context: &str, extract: F) -> Result<Vec<Task>, CliError>
 where
     F: Fn(WorkItem) -> Result<Task, CliError>,
 {
@@ -7112,9 +6758,9 @@ where
 /// trimmed canonical form on success.
 fn validate_github_pr_url(raw: &str) -> Result<&str, CliError> {
     let trimmed = raw.trim();
-    let rest = trimmed.strip_prefix("https://github.com/").ok_or_else(|| {
-        CliError::usage("PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>")
-    })?;
+    let rest = trimmed
+        .strip_prefix("https://github.com/")
+        .ok_or_else(|| CliError::usage("PR URL must be of the form https://github.com/<org>/<repo>/pull/<n>"))?;
     let mut parts = rest.split('/');
     let org = parts.next().unwrap_or("");
     let repo = parts.next().unwrap_or("");
@@ -7163,11 +6809,7 @@ async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem
     }
 }
 
-async fn run_depend_command(
-    command: DependCommand,
-    client: &mut BossClient,
-    ctx: &RunContext,
-) -> Result<(), CliError> {
+async fn run_depend_command(command: DependCommand, client: &mut BossClient, ctx: &RunContext) -> Result<(), CliError> {
     match command {
         DependCommand::Add(args) => {
             let dependent = resolve_selector_to_primary_id(client, ctx, &args.dependent, None).await?;
@@ -7213,15 +6855,9 @@ async fn run_depend_command(
                 || {
                     if !ctx.quiet {
                         if removed {
-                            println!(
-                                "Removed dependency: {} → {}",
-                                dependent, prerequisite,
-                            );
+                            println!("Removed dependency: {} → {}", dependent, prerequisite,);
                         } else {
-                            println!(
-                                "No dependency {} → {} (no-op)",
-                                dependent, prerequisite,
-                            );
+                            println!("No dependency {} → {} (no-op)", dependent, prerequisite,);
                         }
                     }
                 },
@@ -7244,10 +6880,7 @@ async fn run_depend_command(
     }
 }
 
-async fn add_dependency(
-    client: &mut BossClient,
-    input: AddDependencyInput,
-) -> Result<WorkItemDependency, CliError> {
+async fn add_dependency(client: &mut BossClient, input: AddDependencyInput) -> Result<WorkItemDependency, CliError> {
     match client
         .send_request(&FrontendRequest::AddDependency { input })
         .await
@@ -7261,10 +6894,7 @@ async fn add_dependency(
     }
 }
 
-async fn remove_dependency(
-    client: &mut BossClient,
-    input: RemoveDependencyInput,
-) -> Result<bool, CliError> {
+async fn remove_dependency(client: &mut BossClient, input: RemoveDependencyInput) -> Result<bool, CliError> {
     match client
         .send_request(&FrontendRequest::RemoveDependency { input })
         .await
@@ -7312,10 +6942,7 @@ async fn list_dependencies_detailed(
     }
 }
 
-async fn list_executions_for_item(
-    client: &mut BossClient,
-    work_item_id: &str,
-) -> Result<Vec<WorkExecution>, CliError> {
+async fn list_executions_for_item(client: &mut BossClient, work_item_id: &str) -> Result<Vec<WorkExecution>, CliError> {
     match client
         .send_request(&FrontendRequest::ListExecutions {
             work_item_id: Some(work_item_id.to_owned()),
@@ -7336,10 +6963,7 @@ async fn list_executions_for_item(
     }
 }
 
-async fn get_task_runtime(
-    client: &mut BossClient,
-    work_item_id: &str,
-) -> Result<TaskRuntime, CliError> {
+async fn get_task_runtime(client: &mut BossClient, work_item_id: &str) -> Result<TaskRuntime, CliError> {
     match client
         .send_request(&FrontendRequest::GetTaskRuntime {
             work_item_id: work_item_id.to_owned(),
@@ -7364,7 +6988,10 @@ fn print_executions_section(executions: &[WorkExecution]) {
     for exec in executions {
         let started = exec.started_at.as_deref().unwrap_or("-");
         let finished = exec.finished_at.as_deref().unwrap_or("-");
-        print!("  {} [{}] started={} finished={}", exec.id, exec.status, started, finished);
+        print!(
+            "  {} [{}] started={} finished={}",
+            exec.id, exec.status, started, finished
+        );
         if let Some(pr) = &exec.pr_url {
             print!(" pr={pr}");
         }
@@ -7415,10 +7042,7 @@ fn format_dependency_section(detail: &WorkItemDependencyDetail) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("Dependencies:".to_owned());
     if !detail.prerequisites.is_empty() {
-        lines.push(format!(
-            "  Prerequisites ({}):",
-            detail.prerequisites.len()
-        ));
+        lines.push(format!("  Prerequisites ({}):", detail.prerequisites.len()));
         for edge in &detail.prerequisites {
             lines.push(format_dependency_edge_line(edge, true));
         }
@@ -7450,10 +7074,7 @@ fn format_dependency_edge_line(edge: &DependencyEdge, mark_incomplete: bool) -> 
     } else {
         status_vocab::to_ui(&edge.status)
     };
-    format!(
-        "    {id:<32}  {status:<10}{name}{suffix}",
-        id = edge.id,
-    )
+    format!("    {id:<32}  {status:<10}{name}{suffix}", id = edge.id,)
 }
 
 /// Whether `status` counts as "this prereq is no longer gating its
@@ -7469,11 +7090,7 @@ fn dependency_status_is_satisfied(id: &str, status: &str) -> bool {
     }
 }
 
-async fn reorder_project_tasks(
-    client: &mut BossClient,
-    project_id: &str,
-    task_ids: &[String],
-) -> Result<(), CliError> {
+async fn reorder_project_tasks(client: &mut BossClient, project_id: &str, task_ids: &[String]) -> Result<(), CliError> {
     match client
         .send_request(&FrontendRequest::ReorderProjectTasks {
             project_id: project_id.to_owned(),
@@ -7584,34 +7201,38 @@ fn parse_work_item_selector(s: &str) -> WorkItemSelector {
         let rest = s[slash + 1..].trim_start_matches('#');
         if !product_slug.is_empty()
             && let Ok(n) = rest.parse::<i64>()
-                && n > 0 {
-                    return WorkItemSelector::ProductShortId {
-                        product_slug: product_slug.to_owned(),
-                        n,
-                    };
-                }
+            && n > 0
+        {
+            return WorkItemSelector::ProductShortId {
+                product_slug: product_slug.to_owned(),
+                n,
+            };
+        }
     }
     // `#42` form (explicit friendly-id prefix)
     if let Some(rest) = s.strip_prefix('#')
         && let Ok(n) = rest.parse::<i64>()
-            && n > 0 {
-                return WorkItemSelector::ShortId(n);
-            }
+        && n > 0
+    {
+        return WorkItemSelector::ShortId(n);
+    }
     // `T441` / `t441` / `P12` / `p12` — friendly kanban id (T for tasks/chores, P for projects).
     // Case-insensitive; the leading letter is just visual sugar for the short_id number.
     if s.len() >= 2 {
         let first = s.as_bytes()[0];
         if (first == b'T' || first == b't' || first == b'P' || first == b'p')
             && let Ok(n) = s[1..].parse::<i64>()
-                && n > 0 {
-                    return WorkItemSelector::ShortId(n);
-                }
+            && n > 0
+        {
+            return WorkItemSelector::ShortId(n);
+        }
     }
     // Plain integer → short id (Q5 step 2: `#` is optional)
     if let Ok(n) = s.parse::<i64>()
-        && n > 0 {
-            return WorkItemSelector::ShortId(n);
-        }
+        && n > 0
+    {
+        return WorkItemSelector::ShortId(n);
+    }
     // Primary id prefixes
     if is_typed_work_item_id(s) {
         return WorkItemSelector::PrimaryId(s.to_owned());
@@ -7678,10 +7299,7 @@ async fn resolve_selector_to_primary_id(
 /// its product id. Returns `Ok(None)` when the selector isn't shaped
 /// like a typed id; callers then fall back to slug / interactive
 /// resolution against the existing [`resolve_product`] path.
-async fn product_id_from_typed_selector(
-    client: &mut BossClient,
-    selector: &str,
-) -> Result<Option<String>, CliError> {
+async fn product_id_from_typed_selector(client: &mut BossClient, selector: &str) -> Result<Option<String>, CliError> {
     let trimmed = selector.trim();
     if !is_typed_work_item_id(trimmed) {
         return Ok(None);
@@ -7740,16 +7358,12 @@ async fn resolve_product_inferable(
     };
 
     let products = list_products(client).await?;
-    let inferred = products
-        .iter()
-        .find(|p| p.id == inferred_id)
-        .cloned()
-        .ok_or_else(|| {
-            CliError::not_found(format!(
-                "id {hint} references product {inferred_id}, but no such product exists",
-                hint = typed_id_hint.unwrap_or("(typed id)"),
-            ))
-        })?;
+    let inferred = products.iter().find(|p| p.id == inferred_id).cloned().ok_or_else(|| {
+        CliError::not_found(format!(
+            "id {hint} references product {inferred_id}, but no such product exists",
+            hint = typed_id_hint.unwrap_or("(typed id)"),
+        ))
+    })?;
 
     ensure_explicit_product_matches(
         &products,
@@ -7768,9 +7382,7 @@ async fn resolve_project(
 ) -> Result<Project, CliError> {
     let projects = list_projects(client, product_id, None).await?;
     if projects.is_empty() {
-        return Err(CliError::not_found(
-            "no projects exist for the selected product",
-        ));
+        return Err(CliError::not_found("no projects exist for the selected product"));
     }
 
     let selector = match selector {
@@ -7829,9 +7441,7 @@ fn resolve_single_match<T>(matches: Vec<T>, not_found_message: String) -> Result
     match matches.len() {
         0 => Err(CliError::not_found(not_found_message)),
         1 => Ok(matches.into_iter().next().expect("len checked")),
-        _ => Err(CliError::conflict(
-            "selector resolved to multiple work items",
-        )),
+        _ => Err(CliError::conflict("selector resolved to multiple work items")),
     }
 }
 
@@ -7882,11 +7492,7 @@ fn required_text(value: Option<String>, label: &str, ctx: &RunContext) -> Result
     }
 }
 
-fn optional_text(
-    value: Option<String>,
-    label: &str,
-    ctx: &RunContext,
-) -> Result<Option<String>, CliError> {
+fn optional_text(value: Option<String>, label: &str, ctx: &RunContext) -> Result<Option<String>, CliError> {
     if value.is_some() || !ctx.allow_input {
         return Ok(normalize_non_empty(value));
     }
@@ -8107,9 +7713,7 @@ fn apply_task_list_filters(
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
                 return false;
             }
-            if !allowed_priorities.is_empty()
-                && !allowed_priorities.contains(&task.priority.as_str())
-            {
+            if !allowed_priorities.is_empty() && !allowed_priorities.contains(&task.priority.as_str()) {
                 return false;
             }
             if !id_set.is_empty() && !id_set.contains(task.id.as_str()) {
@@ -8123,9 +7727,10 @@ fn apply_task_list_filters(
                 }
             }
             if let Some(selector) = repo
-                && !selector.matches(resolved_repo_for_task(task, product_repo)) {
-                    return false;
-                }
+                && !selector.matches(resolved_repo_for_task(task, product_repo))
+            {
+                return false;
+            }
             true
         })
         .take(limit.unwrap_or(usize::MAX))
@@ -8147,8 +7752,7 @@ fn apply_project_list_filters(
     items
         .into_iter()
         .filter(|project| {
-            if !allowed_statuses.is_empty() && !allowed_statuses.contains(&project.status.as_str())
-            {
+            if !allowed_statuses.is_empty() && !allowed_statuses.contains(&project.status.as_str()) {
                 return false;
             }
             if !id_set.is_empty() && !id_set.contains(project.id.as_str()) {
@@ -8235,10 +7839,7 @@ fn print_projects_table(projects: &[Project], with_primary_id: bool) {
     for project in projects {
         let mut row: Vec<String> = Vec::new();
         if show_short_id {
-            let friendly = project
-                .short_id
-                .map(|n| format!("P{n}"))
-                .unwrap_or_default();
+            let friendly = project.short_id.map(|n| format!("P{n}")).unwrap_or_default();
             row.push(friendly);
         }
         if !show_short_id || with_primary_id {
@@ -8286,10 +7887,7 @@ fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(header);
     for task in tasks {
-        let ordinal = task
-            .ordinal
-            .map(|value| value.to_string())
-            .unwrap_or_default();
+        let ordinal = task.ordinal.map(|value| value.to_string()).unwrap_or_default();
         let friendly = task.short_id.map(|n| format!("T{n}")).unwrap_or_default();
         let effort_str = task.effort_level.map(|l| l.as_str().to_owned()).unwrap_or_default();
         let mut row: Vec<String> = Vec::new();
@@ -8366,7 +7964,9 @@ fn print_product_details(title: &str, product: &Product) {
             println!("  Instructions: {instructions}");
         }
         if product.dispatch_preamble.is_some() && rules.instructions.is_some() {
-            println!("  [note] Both dispatch_preamble and editorial_rules.instructions are set — consider consolidating into editorial_rules.instructions (R11).");
+            println!(
+                "  [note] Both dispatch_preamble and editorial_rules.instructions are set — consider consolidating into editorial_rules.instructions (R11)."
+            );
         }
     }
     if let Some(kind) = product.external_tracker_kind.as_deref() {
@@ -8409,11 +8009,7 @@ fn format_repo_line(override_url: Option<&str>, product: &Product) -> String {
     if let Some(url) = override_url.filter(|s| !s.is_empty()) {
         return format!("{url} (override on this work item)");
     }
-    if let Some(url) = product
-        .repo_remote_url
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(url) = product.repo_remote_url.as_deref().filter(|s| !s.is_empty()) {
         return format!("{url} (inherited from product `{}`)", product.slug);
     }
     "(none — work item cannot dispatch)".to_owned()
@@ -8537,9 +8133,7 @@ where
                 design_doc_repo_remote_url: None,
                 design_doc_branch: None,
                 reason: "no design-doc pointer set".to_owned(),
-                suggested_fix: format!(
-                    "boss project set-design-doc {selector} --path <repo-relative-path>"
-                ),
+                suggested_fix: format!("boss project set-design-doc {selector} --path <repo-relative-path>"),
             })
         }
         Some(ProjectDesignDocState::NotSet) => {
@@ -8560,9 +8154,7 @@ where
                 design_doc_repo_remote_url: None,
                 design_doc_branch: None,
                 reason: "no design-doc pointer set".to_owned(),
-                suggested_fix: format!(
-                    "boss project set-design-doc {selector} --path <repo-relative-path>"
-                ),
+                suggested_fix: format!("boss project set-design-doc {selector} --path <repo-relative-path>"),
             })
         }
         Some(ProjectDesignDocState::Broken { reason }) => Some(LintDesignDocEntry {
@@ -8576,9 +8168,7 @@ where
             design_doc_repo_remote_url: project.design_doc_repo_remote_url.clone(),
             design_doc_branch: project.design_doc_branch.clone(),
             reason: reason.clone(),
-            suggested_fix: format!(
-                "boss project set-design-doc {selector} --path <p> --repo <repo-url>"
-            ),
+            suggested_fix: format!("boss project set-design-doc {selector} --path <p> --repo <repo-url>"),
         }),
         Some(ProjectDesignDocState::Resolved {
             resolved,
@@ -8603,9 +8193,7 @@ where
                             "file not found at {}/{} (pointer may be stale after a rename)",
                             workspace, resolved.path,
                         ),
-                        suggested_fix: format!(
-                            "boss project set-design-doc {selector} --path <new-path>"
-                        ),
+                        suggested_fix: format!("boss project set-design-doc {selector} --path <new-path>"),
                     })
                 }
             }
@@ -8717,12 +8305,8 @@ fn lint_summary_line(entries: &[LintDesignDocEntry]) -> String {
 fn format_project_design_doc_line(state: &ProjectDesignDocState) -> Option<String> {
     match state {
         ProjectDesignDocState::NotSet => None,
-        ProjectDesignDocState::Resolved { resolved, web_url, .. } => {
-            Some(format!("{} ({})", resolved.path, web_url))
-        }
-        ProjectDesignDocState::Broken { reason } => {
-            Some(format!("(broken) {reason}"))
-        }
+        ProjectDesignDocState::Resolved { resolved, web_url, .. } => Some(format!("{} ({})", resolved.path, web_url)),
+        ProjectDesignDocState::Broken { reason } => Some(format!("(broken) {reason}")),
     }
 }
 
@@ -8772,9 +8356,7 @@ impl OpenDesignAction {
             Self::LocalFile { path, web_url } => match std::env::var_os("EDITOR") {
                 Some(editor) => spawn_opener(editor, [path.as_os_str()]),
                 None => {
-                    eprintln!(
-                        "warning: $EDITOR not set; falling back to web URL ({web_url})",
-                    );
+                    eprintln!("warning: $EDITOR not set; falling back to web URL ({web_url})",);
                     spawn_opener_for_url(web_url)
                 }
             },
@@ -8815,17 +8397,14 @@ fn spawn_opener_for_url(url: &str) -> Result<(), CliError> {
 /// pointer is `NotSet` (caller error — should not invoke
 /// `open-design` on a project without a pointer) or `Broken` (the
 /// pointer can't resolve to a target).
-fn decide_open_design_action(
-    state: &ProjectDesignDocState,
-    force_web: bool,
-) -> Result<OpenDesignAction, CliError> {
+fn decide_open_design_action(state: &ProjectDesignDocState, force_web: bool) -> Result<OpenDesignAction, CliError> {
     match state {
         ProjectDesignDocState::NotSet => Err(CliError::not_found(
             "project has no design-doc pointer (set one with `boss project set-design-doc`)",
         )),
-        ProjectDesignDocState::Broken { reason } => Err(CliError::conflict(format!(
-            "design-doc pointer is broken: {reason}",
-        ))),
+        ProjectDesignDocState::Broken { reason } => {
+            Err(CliError::conflict(format!("design-doc pointer is broken: {reason}",)))
+        }
         ProjectDesignDocState::Resolved {
             resolved,
             workspace_path,
@@ -8833,14 +8412,11 @@ fn decide_open_design_action(
             ..
         } => {
             if force_web {
-                return Ok(OpenDesignAction::Web {
-                    url: web_url.clone(),
-                });
+                return Ok(OpenDesignAction::Web { url: web_url.clone() });
             }
             let can_use_filesystem = matches!(
                 resolved.kind,
-                ResolvedDesignDocKind::SameProduct { .. }
-                    | ResolvedDesignDocKind::OtherProduct { .. },
+                ResolvedDesignDocKind::SameProduct { .. } | ResolvedDesignDocKind::OtherProduct { .. },
             ) && workspace_path.is_some();
             if can_use_filesystem {
                 Ok(OpenDesignAction::LocalFile {
@@ -8848,9 +8424,7 @@ fn decide_open_design_action(
                     web_url: web_url.clone(),
                 })
             } else {
-                Ok(OpenDesignAction::Web {
-                    url: web_url.clone(),
-                })
+                Ok(OpenDesignAction::Web { url: web_url.clone() })
             }
         }
     }
@@ -8875,10 +8449,7 @@ fn print_task_details(title: &str, task: &Task, parent_product: Option<&Product>
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status.display_label());
     if let Some(product) = parent_product {
-        println!(
-            "Repo: {}",
-            format_repo_line(task.repo_remote_url.as_deref(), product),
-        );
+        println!("Repo: {}", format_repo_line(task.repo_remote_url.as_deref(), product),);
     }
     println!("Priority: {}", task.priority);
     if let Some(level) = task.effort_level {
@@ -8903,9 +8474,8 @@ fn resolve_install_root() -> Result<PathBuf, CliError> {
     if let Ok(root) = std::env::var("BOSS_INSTALL_ROOT") {
         return Ok(PathBuf::from(root));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        CliError::internal(anyhow::anyhow!("HOME is not set; cannot resolve install root"))
-    })?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| CliError::internal(anyhow::anyhow!("HOME is not set; cannot resolve install root")))?;
     Ok(PathBuf::from(home).join("Applications"))
 }
 
@@ -8944,10 +8514,7 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
                 })
             );
         } else {
-            eprintln!(
-                "boss uninstall: no installed Boss found at {}",
-                app_path.display()
-            );
+            eprintln!("boss uninstall: no installed Boss found at {}", app_path.display());
             eprintln!("If Boss is running from a dev build, uninstall is not applicable.");
         }
         return Err(CliError::internal(anyhow::anyhow!("no installed Boss to uninstall")));
@@ -8959,9 +8526,10 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
         println!("This will remove:");
         println!("  {}", app_path.display());
         if args.purge_state
-            && let Some(ref state) = state_root {
-                println!("  {} (--purge-state)", state.display());
-            }
+            && let Some(ref state) = state_root
+        {
+            println!("  {} (--purge-state)", state.display());
+        }
     }
 
     if !args.yes {
@@ -8984,8 +8552,8 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
     }
 
     if using_default_install_root {
-        let pid_path = std::env::var("BOSS_ENGINE_PID_PATH")
-            .unwrap_or_else(|_| boss_client::DEFAULT_PID_PATH.to_owned());
+        let pid_path =
+            std::env::var("BOSS_ENGINE_PID_PATH").unwrap_or_else(|_| boss_client::DEFAULT_PID_PATH.to_owned());
         let _ = stop_engine(&pid_path).await;
     } else {
         eprintln!(
@@ -8994,23 +8562,19 @@ async fn run_uninstall_command(args: UninstallArgs, flags: &GlobalFlags) -> Resu
         );
     }
 
-    std::fs::remove_dir_all(&app_path).map_err(|e| {
-        CliError::internal(anyhow::anyhow!("failed to remove {}: {e}", app_path.display()))
-    })?;
+    std::fs::remove_dir_all(&app_path)
+        .map_err(|e| CliError::internal(anyhow::anyhow!("failed to remove {}: {e}", app_path.display())))?;
 
     let mut removed = vec![app_path.display().to_string()];
 
     if args.purge_state
         && let Some(state) = state_root
-            && state.exists() {
-                std::fs::remove_dir_all(&state).map_err(|e| {
-                    CliError::internal(anyhow::anyhow!(
-                        "failed to remove {}: {e}",
-                        state.display()
-                    ))
-                })?;
-                removed.push(state.display().to_string());
-            }
+        && state.exists()
+    {
+        std::fs::remove_dir_all(&state)
+            .map_err(|e| CliError::internal(anyhow::anyhow!("failed to remove {}: {e}", state.display())))?;
+        removed.push(state.display().to_string());
+    }
 
     if flags.json {
         println!(
@@ -9070,9 +8634,8 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
             .map_err(|e| CliError::internal(anyhow::anyhow!("read stdin: {e}")))?;
         s
     } else {
-        std::fs::read_to_string(&args.file).map_err(|e| {
-            CliError::usage(format!("cannot read bug report {}: {e}", args.file))
-        })?
+        std::fs::read_to_string(&args.file)
+            .map_err(|e| CliError::usage(format!("cannot read bug report {}: {e}", args.file)))?
     };
 
     let (title, body) = if let Some(explicit_title) = args.title.as_deref() {
@@ -9083,9 +8646,7 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
         (title.to_owned(), blob.trim_end_matches('\n').to_owned())
     } else {
         split_shake_report(&blob).ok_or_else(|| {
-            CliError::usage(
-                "bug report is empty — need at least one non-blank line for a title".to_owned(),
-            )
+            CliError::usage("bug report is empty — need at least one non-blank line for a title".to_owned())
         })?
     };
 
@@ -9118,8 +8679,7 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
     }
 
     let cfg = github_app::embedded_config().map_err(|e| CliError::application(e.to_string()))?;
-    let api_base = std::env::var("BOSS_GITHUB_API_BASE")
-        .unwrap_or_else(|_| github_app::DEFAULT_API_BASE.to_owned());
+    let api_base = std::env::var("BOSS_GITHUB_API_BASE").unwrap_or_else(|_| github_app::DEFAULT_API_BASE.to_owned());
 
     let issue = github_app::file_issue(&cfg, &api_base, &args.repo, &title, &body, &args.labels)
         .await
@@ -9129,14 +8689,9 @@ async fn run_shake_command(args: ShakeArgs, flags: &GlobalFlags) -> Result<(), C
     // Boss importer (which scopes to that project) can reconcile it.
     // Skip if the caller explicitly passed an empty project node ID.
     if !args.github_project.is_empty() {
-        github_app::add_issue_to_project_with_embedded_token(
-            &cfg,
-            &api_base,
-            &args.github_project,
-            &issue.node_id,
-        )
-        .await
-        .map_err(|e| CliError::application(format!("add issue to project: {e:#}")))?;
+        github_app::add_issue_to_project_with_embedded_token(&cfg, &api_base, &args.github_project, &issue.node_id)
+            .await
+            .map_err(|e| CliError::application(format!("add issue to project: {e:#}")))?;
     }
 
     if flags.json {
@@ -9177,8 +8732,7 @@ async fn run_release_command(flags: &GlobalFlags) -> Result<(), CliError> {
         ));
     }
 
-    let api_base = std::env::var("BOSS_BK_API_BASE")
-        .unwrap_or_else(|_| buildkite_release::DEFAULT_API_BASE.to_owned());
+    let api_base = std::env::var("BOSS_BK_API_BASE").unwrap_or_else(|_| buildkite_release::DEFAULT_API_BASE.to_owned());
 
     let build = buildkite_release::trigger_release_build(&api_base, &token)
         .await
@@ -9205,18 +8759,17 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem,
-        ChoreCommand, Cli, Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction,
-        ProductCommand, ProductStatus, ProjectCommand, ProjectStatusArg, RepoSelector, RunContext,
-        TaskCommand, TaskStatusArg, classify_bind_pr, classify_lint_finding, compile_schedule,
-        decide_open_design_action, ensure_explicit_product_matches, expect_leaf_work_item,
-        format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
+        AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem, ChoreCommand, Cli,
+        Commands, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand, ProductStatus,
+        ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand, TaskStatusArg, classify_bind_pr,
+        classify_lint_finding, compile_schedule, decide_open_design_action, ensure_explicit_product_matches,
+        expect_leaf_work_item, format_project_design_doc_line, format_repo_line, is_typed_work_item_id,
         lint_summary_line, parse_attention_group_selector, parse_automation_selector, pick_by_index,
         split_shake_report, status_vocab, validate_github_pr_url, with_display_status,
     };
     use boss_protocol::{
-        Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc,
-        ResolvedDesignDocKind, Task, TaskKind, TaskStatus, WorkItem,
+        Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task,
+        TaskKind, TaskStatus, WorkItem,
     };
 
     #[test]
@@ -9336,14 +8889,7 @@ mod tests {
     /// task id; this test pins the parser shape.
     #[test]
     fn parses_task_move_command_with_chore_shaped_id() {
-        let cli = Cli::parse_from([
-            "boss",
-            "task",
-            "move",
-            "task_18ad79226b0ca630_1a",
-            "--to",
-            "blocked",
-        ]);
+        let cli = Cli::parse_from(["boss", "task", "move", "task_18ad79226b0ca630_1a", "--to", "blocked"]);
         match cli.command {
             Commands::Task {
                 command: TaskCommand::Move(args),
@@ -9496,10 +9042,7 @@ mod tests {
     fn format_repo_line_override_on_work_item() {
         let product = dummy_product("boss", Some("git@github.com:spinyfin/mono.git"));
         let rendered = format_repo_line(Some("git@github.com:myorg/nimbus.git"), &product);
-        assert_eq!(
-            rendered,
-            "git@github.com:myorg/nimbus.git (override on this work item)",
-        );
+        assert_eq!(rendered, "git@github.com:myorg/nimbus.git (override on this work item)",);
     }
 
     /// Golden output: no override (or empty override) falls through to
@@ -9671,10 +9214,7 @@ mod tests {
     #[test]
     fn numeric_selection_is_one_based() {
         let values = vec!["alpha".to_owned(), "beta".to_owned()];
-        assert_eq!(
-            pick_by_index(&values, "2").unwrap(),
-            Some("beta".to_owned())
-        );
+        assert_eq!(pick_by_index(&values, "2").unwrap(), Some("beta".to_owned()));
         assert!(pick_by_index(&values, "0").is_err());
     }
 
@@ -9704,10 +9244,7 @@ mod tests {
             "https://github.com//repo/pull/1",     // empty org
             "https://github.com/org//pull/1",      // empty repo
         ] {
-            assert!(
-                validate_github_pr_url(bad).is_err(),
-                "expected `{bad}` to be rejected"
-            );
+            assert!(validate_github_pr_url(bad).is_err(), "expected `{bad}` to be rejected");
         }
     }
 
@@ -9743,13 +9280,7 @@ mod tests {
 
     #[test]
     fn parses_task_bind_pr_command() {
-        let cli = Cli::parse_from([
-            "boss",
-            "task",
-            "bind-pr",
-            "task_1",
-            "https://github.com/a/b/pull/9",
-        ]);
+        let cli = Cli::parse_from(["boss", "task", "bind-pr", "task_1", "https://github.com/a/b/pull/9"]);
         match cli.command {
             Commands::Task {
                 command: TaskCommand::BindPr(args),
@@ -9763,13 +9294,7 @@ mod tests {
 
     #[test]
     fn parses_chore_bind_pr_command() {
-        let cli = Cli::parse_from([
-            "boss",
-            "chore",
-            "bind-pr",
-            "task_2",
-            "https://github.com/a/b/pull/10",
-        ]);
+        let cli = Cli::parse_from(["boss", "chore", "bind-pr", "task_2", "https://github.com/a/b/pull/10"]);
         match cli.command {
             Commands::Chore {
                 command: ChoreCommand::BindPr(args),
@@ -9882,15 +9407,7 @@ mod tests {
 
     #[test]
     fn parses_chore_create_many_with_stdin() {
-        let cli = Cli::parse_from([
-            "boss",
-            "chore",
-            "create-many",
-            "--from-file",
-            "-",
-            "--product",
-            "boss",
-        ]);
+        let cli = Cli::parse_from(["boss", "chore", "create-many", "--from-file", "-", "--product", "boss"]);
         match cli.command {
             Commands::Chore {
                 command: ChoreCommand::CreateMany(args),
@@ -9942,10 +9459,7 @@ mod tests {
             } => {
                 assert_eq!(args.selector, "pointer");
                 assert_eq!(args.product.as_deref(), Some("boss"));
-                assert_eq!(
-                    args.path.as_deref(),
-                    Some("tools/boss/docs/designs/foo.md"),
-                );
+                assert_eq!(args.path.as_deref(), Some("tools/boss/docs/designs/foo.md"),);
                 assert!(!args.unset);
                 assert!(args.repo.is_none());
                 assert!(args.branch.is_none());
@@ -9974,10 +9488,7 @@ mod tests {
             Commands::Project {
                 command: ProjectCommand::SetDesignDoc(args),
             } => {
-                assert_eq!(
-                    args.repo.as_deref(),
-                    Some("https://github.com/myorg/wiki.git"),
-                );
+                assert_eq!(args.repo.as_deref(), Some("https://github.com/myorg/wiki.git"),);
                 assert_eq!(args.branch.as_deref(), Some("trunk"));
             }
             _ => panic!("expected project set-design-doc command"),
@@ -10022,7 +9533,10 @@ mod tests {
         ])
         .expect_err("unset + path must conflict");
         let rendered = err.to_string();
-        assert!(rendered.contains("--unset") || rendered.contains("--path"), "{rendered}");
+        assert!(
+            rendered.contains("--unset") || rendered.contains("--path"),
+            "{rendered}"
+        );
     }
 
     /// `--repo` without `--path` is meaningless — clap rejects it at
@@ -10066,10 +9580,7 @@ mod tests {
         }
     }
 
-    fn resolved_state(
-        kind: ResolvedDesignDocKind,
-        local: bool,
-    ) -> ProjectDesignDocState {
+    fn resolved_state(kind: ResolvedDesignDocKind, local: bool) -> ProjectDesignDocState {
         ProjectDesignDocState::Resolved {
             resolved: ResolvedDesignDoc {
                 repo_remote_url: "git@github.com:spinyfin/mono.git".to_owned(),
@@ -10077,13 +9588,10 @@ mod tests {
                 path: "tools/boss/docs/designs/foo.md".to_owned(),
                 kind,
             },
-            workspace_path: local
-                .then(|| "/tmp/mono-agent-007".to_owned()),
-            web_url: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md"
-                .to_owned(),
+            workspace_path: local.then(|| "/tmp/mono-agent-007".to_owned()),
+            web_url: "https://github.com/spinyfin/mono/blob/main/tools/boss/docs/designs/foo.md".to_owned(),
             raw_content_url: Some(
-                "https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md"
-                    .to_owned(),
+                "https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md".to_owned(),
             ),
         }
     }
@@ -10093,7 +9601,9 @@ mod tests {
     #[test]
     fn open_design_same_product_with_workspace_uses_local_file() {
         let state = resolved_state(
-            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            ResolvedDesignDocKind::SameProduct {
+                product_id: "prod_1".into(),
+            },
             true,
         );
         let action = decide_open_design_action(&state, false).unwrap();
@@ -10111,7 +9621,9 @@ mod tests {
     #[test]
     fn open_design_same_product_without_workspace_falls_back_to_web() {
         let state = resolved_state(
-            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            ResolvedDesignDocKind::SameProduct {
+                product_id: "prod_1".into(),
+            },
             false,
         );
         let action = decide_open_design_action(&state, false).unwrap();
@@ -10122,7 +9634,9 @@ mod tests {
     #[test]
     fn open_design_force_web_overrides_local_path() {
         let state = resolved_state(
-            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            ResolvedDesignDocKind::SameProduct {
+                product_id: "prod_1".into(),
+            },
             true,
         );
         let action = decide_open_design_action(&state, true).unwrap();
@@ -10140,8 +9654,7 @@ mod tests {
 
     #[test]
     fn open_design_not_set_errors() {
-        let err = decide_open_design_action(&ProjectDesignDocState::NotSet, false)
-            .expect_err("not-set must error");
+        let err = decide_open_design_action(&ProjectDesignDocState::NotSet, false).expect_err("not-set must error");
         assert!(err.to_string().contains("no design-doc pointer"), "{err}");
     }
 
@@ -10162,7 +9675,9 @@ mod tests {
     #[test]
     fn design_doc_line_renders_resolved_state() {
         let state = resolved_state(
-            ResolvedDesignDocKind::SameProduct { product_id: "prod_1".into() },
+            ResolvedDesignDocKind::SameProduct {
+                product_id: "prod_1".into(),
+            },
             false,
         );
         let line = format_project_design_doc_line(&state).expect("resolved → line");
@@ -10405,15 +9920,7 @@ mod tests {
                 false,
             )
             .unwrap(),
-            classify_lint_finding(
-                &product,
-                &lint_project("c", None),
-                None,
-                |_, _| true,
-                true,
-                false,
-            )
-            .unwrap(),
+            classify_lint_finding(&product, &lint_project("c", None), None, |_, _| true, true, false).unwrap(),
         ];
         assert_eq!(lint_summary_line(&entries), "3 finding(s): 2 broken, 1 missing");
     }
@@ -10474,10 +9981,7 @@ mod tests {
                 command: ChoreCommand::Create(args),
             } => {
                 assert_eq!(args.product.as_deref(), Some("work"));
-                assert_eq!(
-                    args.repo_remote_url.as_deref(),
-                    Some("git@github.com:myorg/nimbus.git")
-                );
+                assert_eq!(args.repo_remote_url.as_deref(), Some("git@github.com:myorg/nimbus.git"));
             }
             _ => panic!("expected chore create command"),
         }
@@ -10517,9 +10021,7 @@ mod tests {
     /// into `None` so the task inherits from the product again.
     #[test]
     fn parses_task_update_with_repo_clear() {
-        let cli = Cli::parse_from([
-            "boss", "task", "update", "task_1", "--repo", "",
-        ]);
+        let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--repo", ""]);
         match cli.command {
             Commands::Task {
                 command: TaskCommand::Update(args),
@@ -10583,14 +10085,7 @@ mod tests {
 
     #[test]
     fn parses_task_update_with_effort_clear_and_model_clear() {
-        let cli = Cli::parse_from([
-            "boss",
-            "task",
-            "update",
-            "task_1",
-            "--unset-effort",
-            "--unset-model",
-        ]);
+        let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--unset-effort", "--unset-model"]);
         match cli.command {
             Commands::Task {
                 command: TaskCommand::Update(args),
@@ -10623,14 +10118,7 @@ mod tests {
 
     #[test]
     fn parses_product_set_default_model_with_model() {
-        let cli = Cli::parse_from([
-            "boss",
-            "product",
-            "set-default-model",
-            "boss",
-            "--model",
-            "sonnet",
-        ]);
+        let cli = Cli::parse_from(["boss", "product", "set-default-model", "boss", "--model", "sonnet"]);
         match cli.command {
             Commands::Product {
                 command: ProductCommand::SetDefaultModel(args),
@@ -10645,13 +10133,7 @@ mod tests {
 
     #[test]
     fn parses_product_set_default_model_with_unset() {
-        let cli = Cli::parse_from([
-            "boss",
-            "product",
-            "set-default-model",
-            "boss",
-            "--unset",
-        ]);
+        let cli = Cli::parse_from(["boss", "product", "set-default-model", "boss", "--unset"]);
         match cli.command {
             Commands::Product {
                 command: ProductCommand::SetDefaultModel(args),
@@ -10678,10 +10160,7 @@ mod tests {
             "sonnet",
             "--unset",
         ]);
-        assert!(
-            result.is_err(),
-            "expected clap to reject --model and --unset together",
-        );
+        assert!(result.is_err(), "expected clap to reject --model and --unset together",);
     }
 
     #[test]
@@ -10698,10 +10177,7 @@ mod tests {
             Commands::Chore {
                 command: ChoreCommand::Update(args),
             } => {
-                assert_eq!(
-                    args.repo_remote_url.as_deref(),
-                    Some("git@github.com:myorg/nimbus.git")
-                );
+                assert_eq!(args.repo_remote_url.as_deref(), Some("git@github.com:myorg/nimbus.git"));
             }
             _ => panic!("expected chore update command"),
         }
@@ -10709,9 +10185,7 @@ mod tests {
 
     #[test]
     fn parses_task_list_with_repo_filter() {
-        let cli = Cli::parse_from([
-            "boss", "task", "list", "--product", "work", "--repo", "nimbus",
-        ]);
+        let cli = Cli::parse_from(["boss", "task", "list", "--product", "work", "--repo", "nimbus"]);
         match cli.command {
             Commands::Task {
                 command: TaskCommand::List(args),
@@ -10782,8 +10256,7 @@ mod tests {
         let sel = RepoSelector::parse("nimbus").unwrap();
         let task = dummy_task("task_1", TaskKind::Task);
         assert!(task.repo_remote_url.is_none());
-        let resolved =
-            super::resolved_repo_for_task(&task, Some("git@github.com:myorg/nimbus.git"));
+        let resolved = super::resolved_repo_for_task(&task, Some("git@github.com:myorg/nimbus.git"));
         assert!(sel.matches(resolved));
     }
 
@@ -10818,20 +10291,35 @@ mod tests {
     fn friendly_tnnn_form_parses_as_short_id() {
         use super::{WorkItemSelector, parse_work_item_selector};
         // uppercase T
-        assert!(matches!(parse_work_item_selector("T441"), WorkItemSelector::ShortId(441)));
+        assert!(matches!(
+            parse_work_item_selector("T441"),
+            WorkItemSelector::ShortId(441)
+        ));
         // lowercase t
-        assert!(matches!(parse_work_item_selector("t441"), WorkItemSelector::ShortId(441)));
+        assert!(matches!(
+            parse_work_item_selector("t441"),
+            WorkItemSelector::ShortId(441)
+        ));
         // leading whitespace is trimmed
-        assert!(matches!(parse_work_item_selector("  T12  "), WorkItemSelector::ShortId(12)));
+        assert!(matches!(
+            parse_work_item_selector("  T12  "),
+            WorkItemSelector::ShortId(12)
+        ));
         // P-form (projects)
         assert!(matches!(parse_work_item_selector("P7"), WorkItemSelector::ShortId(7)));
-        assert!(matches!(parse_work_item_selector("p100"), WorkItemSelector::ShortId(100)));
+        assert!(matches!(
+            parse_work_item_selector("p100"),
+            WorkItemSelector::ShortId(100)
+        ));
         // zero is rejected (short_ids are positive)
         assert!(matches!(parse_work_item_selector("T0"), WorkItemSelector::Other(_)));
         // non-digit suffix is NOT a short id — falls through to Other
         assert!(matches!(parse_work_item_selector("Tabc"), WorkItemSelector::Other(_)));
         // plain primary id is still PrimaryId, not confused with T-form
-        assert!(matches!(parse_work_item_selector("task_18ae0000_1"), WorkItemSelector::PrimaryId(_)));
+        assert!(matches!(
+            parse_work_item_selector("task_18ae0000_1"),
+            WorkItemSelector::PrimaryId(_)
+        ));
     }
 
     /// `boss project show proj_…` accepts a globally-unique typed id
@@ -10840,12 +10328,7 @@ mod tests {
     /// the in-process integration test in `tests/infer_product.rs`.
     #[test]
     fn parses_project_show_with_typed_id_and_no_product() {
-        let cli = Cli::parse_from([
-            "boss",
-            "project",
-            "show",
-            "proj_18aeacce8acf9140_27",
-        ]);
+        let cli = Cli::parse_from(["boss", "project", "show", "proj_18aeacce8acf9140_27"]);
         match cli.command {
             Commands::Project {
                 command: ProjectCommand::Show(args),
@@ -10859,13 +10342,7 @@ mod tests {
 
     #[test]
     fn parses_task_list_with_project_typed_id_and_no_product() {
-        let cli = Cli::parse_from([
-            "boss",
-            "task",
-            "list",
-            "--project",
-            "proj_18aeacce8acf9140_27",
-        ]);
+        let cli = Cli::parse_from(["boss", "task", "list", "--project", "proj_18aeacce8acf9140_27"]);
         match cli.command {
             Commands::Task {
                 command: TaskCommand::List(args),
@@ -10892,20 +10369,14 @@ mod tests {
     #[test]
     fn explicit_product_validator_accepts_omitted_explicit() {
         let products = vec![product_with_id("prod_1", "boss")];
-        assert!(
-            ensure_explicit_product_matches(&products, None, "prod_1", "proj_x").is_ok()
-        );
+        assert!(ensure_explicit_product_matches(&products, None, "prod_1", "proj_x").is_ok());
     }
 
     #[test]
     fn explicit_product_validator_accepts_matching_id_or_slug() {
         let products = vec![product_with_id("prod_1", "boss")];
-        assert!(
-            ensure_explicit_product_matches(&products, Some("prod_1"), "prod_1", "proj_x").is_ok()
-        );
-        assert!(
-            ensure_explicit_product_matches(&products, Some("boss"), "prod_1", "proj_x").is_ok()
-        );
+        assert!(ensure_explicit_product_matches(&products, Some("prod_1"), "prod_1", "proj_x").is_ok());
+        assert!(ensure_explicit_product_matches(&products, Some("boss"), "prod_1", "proj_x").is_ok());
     }
 
     /// When the user passes `--product` AND a typed id whose product
@@ -10914,10 +10385,7 @@ mod tests {
     /// "product/project disagree" check.
     #[test]
     fn explicit_product_validator_rejects_mismatch() {
-        let products = vec![
-            product_with_id("prod_1", "boss"),
-            product_with_id("prod_2", "mono"),
-        ];
+        let products = vec![product_with_id("prod_1", "boss"), product_with_id("prod_2", "mono")];
         let err = ensure_explicit_product_matches(&products, Some("mono"), "prod_1", "proj_x")
             .expect_err("disagreement must error");
         let msg = format!("{err:?}");
@@ -10934,8 +10402,7 @@ mod tests {
 
     #[test]
     fn shake_report_strips_h1_marker_from_title() {
-        let (title, body) =
-            split_shake_report("# Engine wedges on close\n\nrepro: …\nstep two\n").unwrap();
+        let (title, body) = split_shake_report("# Engine wedges on close\n\nrepro: …\nstep two\n").unwrap();
         assert_eq!(title, "Engine wedges on close");
         assert_eq!(body, "repro: …\nstep two");
     }
@@ -10985,10 +10452,7 @@ mod tests {
             } => {
                 assert_eq!(args.product.as_deref(), Some("boss"));
                 assert_eq!(args.name.as_deref(), Some("Fix clippy"));
-                assert_eq!(
-                    args.instruction.as_deref(),
-                    Some("Look for clippy warnings")
-                );
+                assert_eq!(args.instruction.as_deref(), Some("Look for clippy warnings"));
                 assert_eq!(args.schedule.as_deref(), Some("weekday-2pm"));
                 assert_eq!(args.timezone, "America/Los_Angeles");
                 assert!(!args.disabled);
@@ -11057,8 +10521,7 @@ mod tests {
 
     #[test]
     fn parses_automation_show_with_canonical_id() {
-        let cli =
-            Cli::parse_from(["boss", "automation", "show", "auto_abc123"]);
+        let cli = Cli::parse_from(["boss", "automation", "show", "auto_abc123"]);
         match cli.command {
             Commands::Automation {
                 command: AutomationCommand::Show(args),
@@ -11102,10 +10565,8 @@ mod tests {
 
     #[test]
     fn parses_automation_enable_disable_commands() {
-        let cli_enable =
-            Cli::parse_from(["boss", "automation", "enable", "A1", "--product", "boss"]);
-        let cli_disable =
-            Cli::parse_from(["boss", "automation", "disable", "A1", "--product", "boss"]);
+        let cli_enable = Cli::parse_from(["boss", "automation", "enable", "A1", "--product", "boss"]);
+        let cli_disable = Cli::parse_from(["boss", "automation", "disable", "A1", "--product", "boss"]);
         assert!(matches!(
             cli_enable.command,
             Commands::Automation {
@@ -11122,15 +10583,7 @@ mod tests {
 
     #[test]
     fn parses_automation_run_command_with_force() {
-        let cli = Cli::parse_from([
-            "boss",
-            "automation",
-            "run",
-            "A3",
-            "--product",
-            "boss",
-            "--force",
-        ]);
+        let cli = Cli::parse_from(["boss", "automation", "run", "A3", "--product", "boss", "--force"]);
         match cli.command {
             Commands::Automation {
                 command: AutomationCommand::Run(args),
@@ -11144,10 +10597,8 @@ mod tests {
 
     #[test]
     fn parses_automation_runs_and_tasks_commands() {
-        let cli_runs =
-            Cli::parse_from(["boss", "automation", "runs", "A1", "--product", "boss"]);
-        let cli_tasks =
-            Cli::parse_from(["boss", "automation", "tasks", "A1", "--product", "boss"]);
+        let cli_runs = Cli::parse_from(["boss", "automation", "runs", "A1", "--product", "boss"]);
+        let cli_tasks = Cli::parse_from(["boss", "automation", "tasks", "A1", "--product", "boss"]);
         assert!(matches!(
             cli_runs.command,
             Commands::Automation {
@@ -11176,15 +10627,9 @@ mod tests {
 
     #[test]
     fn compile_schedule_accepts_valid_raw_cron() {
-        assert_eq!(
-            compile_schedule("0 14 * * 1-5").unwrap(),
-            "0 14 * * 1-5"
-        );
+        assert_eq!(compile_schedule("0 14 * * 1-5").unwrap(), "0 14 * * 1-5");
         assert_eq!(compile_schedule("*/15 * * * *").unwrap(), "*/15 * * * *");
-        assert_eq!(
-            compile_schedule("0 9 1,15 * *").unwrap(),
-            "0 9 1,15 * *"
-        );
+        assert_eq!(compile_schedule("0 9 1,15 * *").unwrap(), "0 9 1,15 * *");
     }
 
     #[test]

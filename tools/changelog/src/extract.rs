@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 
@@ -60,10 +60,7 @@ pub fn extract_changelog(config: &ExtractionConfig) -> Result<ChangelogRange> {
 
         seen.insert(raw.pr_number);
 
-        let pr_url = format!(
-            "https://github.com/{}/pull/{}",
-            config.repo_slug, raw.pr_number
-        );
+        let pr_url = format!("https://github.com/{}/pull/{}", config.repo_slug, raw.pr_number);
         entries.push(ChangelogEntry {
             pr_number: raw.pr_number,
             title: raw.title,
@@ -106,8 +103,7 @@ pub fn repo_slug_from_remote(repo_path: &Path, remote: &str) -> Result<String> {
     }
 
     let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    parse_github_slug(&url)
-        .ok_or_else(|| anyhow!("could not parse a GitHub owner/repo slug from remote URL: {url}"))
+    parse_github_slug(&url).ok_or_else(|| anyhow!("could not parse a GitHub owner/repo slug from remote URL: {url}"))
 }
 
 fn parse_github_slug(url: &str) -> Option<String> {
@@ -140,9 +136,7 @@ fn get_commits(repo_path: &Path, from: &str, to: &str) -> Result<Vec<CommitInfo>
     const FIELD_SEP: &str = "\x04\x05\x06";
 
     let range = format!("{from}..{to}");
-    let format = format!(
-        "%H{FIELD_SEP}%s{FIELD_SEP}%an{FIELD_SEP}%b{REC_SEP}"
-    );
+    let format = format!("%H{FIELD_SEP}%s{FIELD_SEP}%an{FIELD_SEP}%b{REC_SEP}");
 
     let output = Command::new("git")
         .args(["log", &range, &format!("--format={format}")])
@@ -151,10 +145,7 @@ fn get_commits(repo_path: &Path, from: &str, to: &str) -> Result<Vec<CommitInfo>
         .context("failed to run git log")?;
 
     if !output.status.success() {
-        bail!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("git log failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
@@ -180,11 +171,7 @@ fn get_commits(repo_path: &Path, from: &str, to: &str) -> Result<Vec<CommitInfo>
     Ok(commits)
 }
 
-fn parse_pr_from_commit(
-    commit: &CommitInfo,
-    squash_re: &Regex,
-    merge_re: &Regex,
-) -> Option<RawPr> {
+fn parse_pr_from_commit(commit: &CommitInfo, squash_re: &Regex, merge_re: &Regex) -> Option<RawPr> {
     // Style 1: squash merge — subject ends with (##N)
     if let Some(cap) = squash_re.captures(&commit.subject) {
         let title = cap[1].to_string();
@@ -221,32 +208,19 @@ fn parse_pr_from_commit(
 
 /// Convert a git author name to a plausible GitHub-style login for git-only mode.
 fn normalize_author(name: &str) -> String {
-    name.to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join("-")
+    name.to_lowercase().split_whitespace().collect::<Vec<_>>().join("-")
 }
 
 fn get_changed_files(repo_path: &Path, commit_hash: &str) -> Result<Vec<String>> {
     // -m handles merge commits by diffing against all parents.
     let output = Command::new("git")
-        .args([
-            "diff-tree",
-            "--no-commit-id",
-            "-r",
-            "--name-only",
-            "-m",
-            commit_hash,
-        ])
+        .args(["diff-tree", "--no-commit-id", "-r", "--name-only", "-m", commit_hash])
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff-tree")?;
 
     if !output.status.success() {
-        bail!(
-            "git diff-tree failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        bail!("git diff-tree failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     let files = String::from_utf8_lossy(&output.stdout)
@@ -262,8 +236,7 @@ fn get_changed_files(repo_path: &Path, commit_hash: &str) -> Result<Vec<String>>
 fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid glob pattern: {pattern}"))?;
+        let glob = Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?;
         builder.add(glob);
     }
     builder.build().context("failed to build globset")
@@ -283,10 +256,7 @@ fn enrich_entries(entries: &mut Vec<ChangelogEntry>, repo_slug: &str) {
                 entry.author_login = login;
             }
             Err(e) => {
-                eprintln!(
-                    "warning: could not enrich PR #{}: {e}",
-                    entry.pr_number
-                );
+                eprintln!("warning: could not enrich PR #{}: {e}", entry.pr_number);
             }
         }
     }
@@ -309,9 +279,7 @@ fn fetch_pr_metadata(repo_slug: &str, pr_number: u64) -> Result<(String, String)
 
     let raw = String::from_utf8_lossy(&output.stdout);
     let raw = raw.trim();
-    let tab = raw
-        .find('\t')
-        .ok_or_else(|| anyhow!("unexpected gh output: {raw}"))?;
+    let tab = raw.find('\t').ok_or_else(|| anyhow!("unexpected gh output: {raw}"))?;
     let title = raw[..tab].to_string();
     let login = raw[tab + 1..].to_string();
     Ok((title, login))
@@ -371,11 +339,7 @@ mod tests {
 
     #[test]
     fn merge_commit_no_body_falls_back_to_subject() {
-        let c = commit(
-            "Merge pull request #3 from user/branch",
-            "GitHub",
-            "",
-        );
+        let c = commit("Merge pull request #3 from user/branch", "GitHub", "");
         let raw = parse_pr_from_commit(&c, &squash_re(), &merge_re()).unwrap();
         assert_eq!(raw.pr_number, 3);
         assert_eq!(raw.title, "Merge pull request #3 from user/branch");
@@ -398,11 +362,7 @@ mod tests {
 
     #[test]
     fn globset_any_pattern_matches() {
-        let gs = build_globset(&[
-            "tools/boss/**".to_string(),
-            "tools/cube/**".to_string(),
-        ])
-        .unwrap();
+        let gs = build_globset(&["tools/boss/**".to_string(), "tools/cube/**".to_string()]).unwrap();
         assert!(gs.is_match("tools/boss/cli/src/main.rs"));
         assert!(gs.is_match("tools/cube/src/app.rs"));
         assert!(!gs.is_match("tools/checkleft/src/lib.rs"));
@@ -442,9 +402,6 @@ mod tests {
 
     #[test]
     fn parse_unknown_remote_returns_none() {
-        assert_eq!(
-            parse_github_slug("https://gitlab.com/spinyfin/mono.git"),
-            None
-        );
+        assert_eq!(parse_github_slug("https://gitlab.com/spinyfin/mono.git"), None);
     }
 }

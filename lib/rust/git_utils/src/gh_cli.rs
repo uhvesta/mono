@@ -89,15 +89,9 @@ pub async fn fetch_pr_head_ref(repo_slug: &str, pr_number: u64) -> Result<String
 /// Validate and return the SHA string from `gh pr view ... --jq .headRefOid`
 /// stdout. Returns an error when the output is empty (which means GitHub
 /// returned a null or the JQ filter found nothing).
-pub(crate) fn parse_head_sha_output(
-    sha: String,
-    pr_number: u64,
-    repo_slug: &str,
-) -> Result<String> {
+pub(crate) fn parse_head_sha_output(sha: String, pr_number: u64, repo_slug: &str) -> Result<String> {
     if sha.is_empty() {
-        return Err(anyhow!(
-            "empty headRefOid for PR {pr_number} in {repo_slug}"
-        ));
+        return Err(anyhow!("empty headRefOid for PR {pr_number} in {repo_slug}"));
     }
     Ok(sha)
 }
@@ -108,12 +102,7 @@ mod tests {
 
     #[test]
     fn parse_head_sha_output_returns_sha_unchanged() {
-        let sha = parse_head_sha_output(
-            "abc123deadbeef".to_owned(),
-            42,
-            "spinyfin/mono",
-        )
-        .unwrap();
+        let sha = parse_head_sha_output("abc123deadbeef".to_owned(), 42, "spinyfin/mono").unwrap();
         assert_eq!(sha, "abc123deadbeef");
     }
 
@@ -125,14 +114,8 @@ mod tests {
             msg.contains("empty headRefOid"),
             "error should mention empty headRefOid: {msg}"
         );
-        assert!(
-            msg.contains("99"),
-            "error should include the PR number: {msg}"
-        );
-        assert!(
-            msg.contains("owner/repo"),
-            "error should include the repo slug: {msg}"
-        );
+        assert!(msg.contains("99"), "error should include the PR number: {msg}");
+        assert!(msg.contains("owner/repo"), "error should include the repo slug: {msg}");
     }
 
     #[test]

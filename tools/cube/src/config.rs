@@ -11,12 +11,8 @@ pub fn config_dir() -> Result<PathBuf, CubeError> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path).join("cube"));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        CubeError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "HOME is not set",
-        ))
-    })?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| CubeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")))?;
     Ok(PathBuf::from(home).join(".config").join("cube"))
 }
 
@@ -47,18 +43,12 @@ impl RepoResolver {
     /// caller can keep walking the chain.
     pub fn resolve_origin(&self, name: &str) -> Option<String> {
         let url = self.origin_pattern.replace("{name}", name);
-        if url.trim().is_empty() {
-            None
-        } else {
-            Some(url)
-        }
+        if url.trim().is_empty() { None } else { Some(url) }
     }
 
     /// The `{name}`-substituted clone command, if this resolver declares one.
     pub fn resolve_clone_command(&self, name: &str) -> Option<String> {
-        self.clone_command
-            .as_ref()
-            .map(|cmd| cmd.replace("{name}", name))
+        self.clone_command.as_ref().map(|cmd| cmd.replace("{name}", name))
     }
 }
 
@@ -133,12 +123,8 @@ pub fn load_config() -> Result<CubeConfig, CubeError> {
         return Ok(CubeConfig::default());
     }
     let content = std::fs::read_to_string(&path).map_err(CubeError::Io)?;
-    toml::from_str(&content).map_err(|e| {
-        CubeError::InvalidArgument(format!(
-            "failed to parse cube config at {}: {e}",
-            path.display()
-        ))
-    })
+    toml::from_str(&content)
+        .map_err(|e| CubeError::InvalidArgument(format!("failed to parse cube config at {}: {e}", path.display())))
 }
 
 #[cfg(test)]

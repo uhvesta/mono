@@ -110,20 +110,18 @@ fn parse_config(config: &toml::Value) -> Result<CompiledApiBreakingSurfaceConfig
         trigger_globs: compile_globs("trigger_globs", &parsed.trigger_globs)?,
         required_globs: compile_globs("required_globs", &parsed.required_globs)?,
         message: parsed.message.unwrap_or_else(|| {
-            "backend API surface changed without required changelog/version marker update"
-                .to_owned()
+            "backend API surface changed without required changelog/version marker update".to_owned()
         }),
-        remediation: parsed.remediation.unwrap_or_else(|| {
-            "Update the configured companion docs/version marker files in this change.".to_owned()
-        }),
+        remediation: parsed
+            .remediation
+            .unwrap_or_else(|| "Update the configured companion docs/version marker files in this change.".to_owned()),
     })
 }
 
 fn compile_globs(field_name: &str, patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
+        let glob = Glob::new(pattern).with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
         builder.add(glob);
     }
     builder

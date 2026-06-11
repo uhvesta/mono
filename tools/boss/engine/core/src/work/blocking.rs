@@ -59,9 +59,7 @@ impl WorkDb {
     /// resurrecting the dormant dispatch for a row that already has a revision
     /// fix-vehicle; only legacy / `retrigger` / `merge_queue_rebounce` pending
     /// rows (all `revision_task_id IS NULL`) are recovered.
-    pub fn list_stranded_ci_remediation_attempts(
-        &self,
-    ) -> Result<Vec<StrandedCiRemediationAttempt>> {
+    pub fn list_stranded_ci_remediation_attempts(&self) -> Result<Vec<StrandedCiRemediationAttempt>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT cr.id, cr.work_item_id, cr.product_id, cr.pr_url
@@ -212,11 +210,7 @@ impl WorkDb {
     /// scalar reason is filled in and the signal armed. Returns the updated
     /// task on the flip; `Ok(None)` on a WHERE-guard miss (the row was
     /// moved or cleared concurrently).
-    pub fn recanonicalize_blocked_merge_conflict(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn recanonicalize_blocked_merge_conflict(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         self.recanonicalize_blocked_signal(work_item_id, pr_url, "merge_conflict")
     }
 
@@ -225,20 +219,11 @@ impl WorkDb {
     /// `blocked: ci_failure` and re-arm the matching `task_blocked_signals`
     /// row so the merge poller re-discovers it and the CI detection path
     /// spawns a fresh remediation revision.
-    pub fn recanonicalize_blocked_ci_failure(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn recanonicalize_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         self.recanonicalize_blocked_signal(work_item_id, pr_url, "ci_failure")
     }
 
-    fn recanonicalize_blocked_signal(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-        reason: &str,
-    ) -> Result<Option<Task>> {
+    fn recanonicalize_blocked_signal(&self, work_item_id: &str, pr_url: &str, reason: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -259,9 +244,8 @@ impl WorkDb {
             return Ok(None);
         }
         upsert_task_blocked_signal(&tx, work_item_id, reason, None, &now)?;
-        let updated = query_task(&tx, work_item_id)?.with_context(|| {
-            format!("unknown task after {reason} re-canonicalisation: {work_item_id}")
-        })?;
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after {reason} re-canonicalisation: {work_item_id}"))?;
         tx.commit()?;
         Ok(Some(updated))
     }
@@ -275,11 +259,7 @@ impl WorkDb {
     /// load-bearing: it prevents the engine from clobbering a row a
     /// human just moved elsewhere (e.g. manually back to `active`)
     /// or a PR that has been re-pointed at a different URL.
-    pub fn mark_chore_blocked_merge_conflict(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn mark_chore_blocked_merge_conflict(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -320,11 +300,7 @@ impl WorkDb {
     /// task on the transition; `Ok(None)` when the WHERE clause
     /// missed (row already cleared, manually moved, or its PR url
     /// changed underneath us).
-    pub fn clear_chore_blocked_merge_conflict(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn clear_chore_blocked_merge_conflict(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -426,11 +402,7 @@ impl WorkDb {
     /// mergeable, even though the parent's status never moved to
     /// `blocked`. Idempotent — a second call for the same
     /// `(work_item_id, attempt_id)` re-arms `cleared_at = NULL`.
-    pub fn record_merge_conflict_in_flight(
-        &self,
-        work_item_id: &str,
-        attempt_id: &str,
-    ) -> Result<()> {
+    pub fn record_merge_conflict_in_flight(&self, work_item_id: &str, attempt_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = now_string();
         upsert_task_blocked_signal(&conn, work_item_id, "merge_conflict", Some(attempt_id), &now)?;
@@ -496,11 +468,7 @@ impl WorkDb {
     /// ci_failure → exhausted transitions — the WHERE clause matches
     /// either as long as the parent isn't already exhausted, the row
     /// hasn't been deleted, and the PR url still matches.
-    pub fn mark_chore_blocked_ci_failure_exhausted(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn mark_chore_blocked_ci_failure_exhausted(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -526,9 +494,8 @@ impl WorkDb {
             return Ok(None);
         }
         upsert_task_blocked_signal(&tx, work_item_id, "ci_failure_exhausted", None, &now)?;
-        let updated = query_task(&tx, work_item_id)?.with_context(|| {
-            format!("unknown task after ci_failure_exhausted flip: {work_item_id}")
-        })?;
+        let updated = query_task(&tx, work_item_id)?
+            .with_context(|| format!("unknown task after ci_failure_exhausted flip: {work_item_id}"))?;
         tx.commit()?;
         Ok(Some(updated))
     }
@@ -572,11 +539,7 @@ impl WorkDb {
     /// `in_review`, clear the reason / attempt-id columns, and stamp
     /// the matching `task_blocked_signals` rows as `cleared_at`.
     /// Idempotent — returns `Ok(None)` on WHERE-guard miss.
-    pub fn clear_chore_blocked_ci_failure(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<Option<Task>> {
+    pub fn clear_chore_blocked_ci_failure(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -624,11 +587,7 @@ impl WorkDb {
     /// though the parent's status never moved to `blocked`. Idempotent — a
     /// second call for the same `(work_item_id, attempt_id)` re-arms
     /// `cleared_at = NULL`.
-    pub fn record_ci_failure_in_flight(
-        &self,
-        work_item_id: &str,
-        attempt_id: &str,
-    ) -> Result<()> {
+    pub fn record_ci_failure_in_flight(&self, work_item_id: &str, attempt_id: &str) -> Result<()> {
         let conn = self.connect()?;
         let now = now_string();
         upsert_task_blocked_signal(&conn, work_item_id, "ci_failure", Some(attempt_id), &now)?;
@@ -865,10 +824,7 @@ impl WorkDb {
     /// must be `1` for `attempt_kind='fix'` and `0` for `'retrigger'`.
     /// Phase 9 ships the worker-spawn wiring; this method is the
     /// Phase 8 detection-side seam used by `ci_watch`.
-    pub fn insert_ci_remediation(
-        &self,
-        input: CiRemediationInsertInput,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn insert_ci_remediation(&self, input: CiRemediationInsertInput) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let id = next_id("cir");
@@ -915,8 +871,8 @@ impl WorkDb {
                 boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED
             ],
         )?;
-        let inserted = query_ci_remediation(&tx, &id)?
-            .with_context(|| format!("unknown ci_remediation after insert: {id}"))?;
+        let inserted =
+            query_ci_remediation(&tx, &id)?.with_context(|| format!("unknown ci_remediation after insert: {id}"))?;
         tx.commit()?;
         Ok(Some(inserted))
     }
@@ -980,10 +936,7 @@ impl WorkDb {
             params_vec.push(Box::new(cap as i64));
         }
         let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-            .collect();
+        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
         let rows = stmt.query_map(refs.as_slice(), map_ci_remediation)?;
         let mut out = Vec::new();
         for row in rows {
@@ -1007,10 +960,7 @@ impl WorkDb {
     /// the time of the call (so the CLI can render "now unblocked"
     /// vs "counter reset only"). `Ok(None)` when `work_item_id` does
     /// not exist (or has been soft-deleted).
-    pub fn retry_ci_remediation_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<(CiBudgetSnapshot, bool)>> {
+    pub fn retry_ci_remediation_for_work_item(&self, work_item_id: &str) -> Result<Option<(CiBudgetSnapshot, bool)>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         // Confirm the parent exists (and capture its current
@@ -1022,12 +972,7 @@ impl WorkDb {
                 "SELECT status, blocked_reason FROM tasks
                   WHERE id = ?1 AND deleted_at IS NULL",
                 params![work_item_id],
-                |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?,
-                        r.get::<_, Option<String>>(1)?,
-                    ))
-                },
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
             )
             .optional()?;
         let Some((status, blocked_reason)) = row else {
@@ -1180,11 +1125,7 @@ impl WorkDb {
     /// `Some(n)` is clamped server-side to `0..=10` per the design's
     /// reserved range. Returns the post-update [`CiBudgetSnapshot`];
     /// `Ok(None)` when the work item does not exist.
-    pub fn set_ci_attempt_budget(
-        &self,
-        work_item_id: &str,
-        budget: Option<i64>,
-    ) -> Result<Option<CiBudgetSnapshot>> {
+    pub fn set_ci_attempt_budget(&self, work_item_id: &str, budget: Option<i64>) -> Result<Option<CiBudgetSnapshot>> {
         let conn = self.connect()?;
         let clamped = budget.map(|b| b.clamp(0, 10));
         let now = now_string();
@@ -1303,10 +1244,8 @@ impl WorkDb {
                 sql.push_str(" ORDER BY created_at DESC, id DESC");
                 // Use a sub-scope so the prepared statement borrow
                 // ends before we move `conn` again.
-                let refs: Vec<&dyn rusqlite::ToSql> = params_vec
-                    .iter()
-                    .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-                    .collect();
+                let refs: Vec<&dyn rusqlite::ToSql> =
+                    params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
                 let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(refs.as_slice(), |row| {
                     Ok((
@@ -1352,10 +1291,7 @@ impl WorkDb {
     /// or `None`. Used by `ci_watch` to detect "an attempt is already
     /// in flight" and by the retire path to find the row to flip to
     /// `succeeded` when the next probe reports CI back at clean.
-    pub fn active_ci_remediation_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn active_ci_remediation_for_work_item(&self, work_item_id: &str) -> Result<Option<CiRemediation>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, product_id, work_item_id, pr_url, pr_number,
@@ -1431,11 +1367,7 @@ impl WorkDb {
     /// `now`; subsequent calls find the existing row and leave it
     /// alone (so elapsed-time math always reads from the *first*
     /// observation, never the most recent). Per design Phase 12 #39.
-    pub fn observe_ci_in_flight(
-        &self,
-        work_item_id: &str,
-        head_sha: &str,
-    ) -> Result<CiInFlightObservation> {
+    pub fn observe_ci_in_flight(&self, work_item_id: &str, head_sha: &str) -> Result<CiInFlightObservation> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -1467,12 +1399,7 @@ impl WorkDb {
     /// pass the level they're emitting *now* and the WHERE guard
     /// ensures we never downgrade. The write is idempotent — a
     /// repeated emit of the same level is a no-op.
-    pub fn mark_ci_inflight_alert_level(
-        &self,
-        work_item_id: &str,
-        head_sha: &str,
-        level: &str,
-    ) -> Result<()> {
+    pub fn mark_ci_inflight_alert_level(&self, work_item_id: &str, head_sha: &str, level: &str) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE ci_inflight_observations
@@ -1505,11 +1432,7 @@ impl WorkDb {
     /// guard: a manual `boss engine ci retry` invocation that pushes
     /// the count to ≥5 over the last hour signals the engine should
     /// rate-limit the next retry until the user explicitly overrides.
-    pub fn count_recent_ci_remediations(
-        &self,
-        work_item_id: &str,
-        window_secs: i64,
-    ) -> Result<i64> {
+    pub fn count_recent_ci_remediations(&self, work_item_id: &str, window_secs: i64) -> Result<i64> {
         let conn = self.connect()?;
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1537,11 +1460,7 @@ impl WorkDb {
     /// set, the function always returns `false` so the engine still
     /// fires the retry (but the caller is expected to surface a loud
     /// warning to the user before doing so).
-    pub fn is_ci_retry_rate_limited(
-        &self,
-        work_item_id: &str,
-        allow_override: bool,
-    ) -> Result<bool> {
+    pub fn is_ci_retry_rate_limited(&self, work_item_id: &str, allow_override: bool) -> Result<bool> {
         if allow_override {
             return Ok(false);
         }
@@ -1624,11 +1543,7 @@ impl WorkDb {
     /// `boss engine ci mark-failed` to classify its own outcome —
     /// the engine defaults to `failure_reason='no_push_no_classification'`.
     /// Idempotent — a row already terminal returns `Ok(None)`.
-    pub fn mark_ci_remediation_failed(
-        &self,
-        attempt_id: &str,
-        reason: &str,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn mark_ci_remediation_failed(&self, attempt_id: &str, reason: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -1658,10 +1573,7 @@ impl WorkDb {
     /// Returns the number of rows affected. A return value of `0` means
     /// there were no active attempts (normal when CI had already resolved
     /// before the merge).
-    pub fn abandon_active_ci_remediations_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<usize> {
+    pub fn abandon_active_ci_remediations_for_work_item(&self, work_item_id: &str) -> Result<usize> {
         let conn = self.connect()?;
         let now = now_string();
         let rows = conn.execute(
@@ -1679,11 +1591,7 @@ impl WorkDb {
     /// Engine-side abandon for a `ci_remediations` attempt. Used for
     /// the budget-exhausted / opt-out / suppression paths — the
     /// engine declined to spawn, so the attempt row never ran.
-    pub fn mark_ci_remediation_abandoned(
-        &self,
-        attempt_id: &str,
-        reason: &str,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn mark_ci_remediation_abandoned(&self, attempt_id: &str, reason: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -1745,11 +1653,7 @@ impl WorkDb {
     /// per-provider `CiLogReader::read_log_tail`. Idempotent — overwriting
     /// is fine because the row is `pending` and the worker hasn't read
     /// it yet. `Ok(None)` when the id is missing.
-    pub fn set_ci_remediation_log_excerpt(
-        &self,
-        attempt_id: &str,
-        log_excerpt: &str,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn set_ci_remediation_log_excerpt(&self, attempt_id: &str, log_excerpt: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let rows = tx.execute(
@@ -1812,10 +1716,7 @@ impl WorkDb {
     ///
     /// Idempotent: a row already terminal returns `Ok(None)` and writes
     /// nothing (so the signal is not re-armed on a duplicate marker).
-    pub fn mark_ci_remediation_retriggered(
-        &self,
-        attempt_id: &str,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn mark_ci_remediation_retriggered(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -1857,10 +1758,7 @@ impl WorkDb {
               WHERE work_item_id = ?1
                 AND reason = ?2
                 AND cleared_at IS NULL",
-            params![
-                work_item_id,
-                boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED
-            ],
+            params![work_item_id, boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED],
             |row| row.get(0),
         )?;
         Ok(n > 0)
@@ -1880,11 +1778,7 @@ impl WorkDb {
               WHERE work_item_id = ?1
                 AND reason = ?3
                 AND cleared_at IS NULL",
-            params![
-                work_item_id,
-                now,
-                boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED
-            ],
+            params![work_item_id, now, boss_protocol::BLOCKED_REASON_CI_FLAKY_RETRIGGERED],
         )?;
         Ok(rows)
     }
@@ -1904,10 +1798,7 @@ impl WorkDb {
     /// detection-side bump (only when the row was originally
     /// `consumes_budget = 1`; idempotent re-call is a no-op).
     /// Idempotent — `Ok(None)` on a terminal row.
-    pub fn mark_ci_remediation_succeeded_via_rebase(
-        &self,
-        attempt_id: &str,
-    ) -> Result<Option<CiRemediation>> {
+    pub fn mark_ci_remediation_succeeded_via_rebase(&self, attempt_id: &str) -> Result<Option<CiRemediation>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
@@ -1930,18 +1821,19 @@ impl WorkDb {
             return Ok(None);
         }
         if let Some(snap) = snapshot
-            && snap.consumes_budget != 0 {
-                tx.execute(
-                    "UPDATE tasks
+            && snap.consumes_budget != 0
+        {
+            tx.execute(
+                "UPDATE tasks
                         SET ci_attempts_used = CASE
                                 WHEN ci_attempts_used > 0 THEN ci_attempts_used - 1
                                 ELSE 0
                             END
                       WHERE id = ?1
                         AND deleted_at IS NULL",
-                    params![snap.work_item_id],
-                )?;
-            }
+                params![snap.work_item_id],
+            )?;
+        }
         let updated = query_ci_remediation(&tx, attempt_id)?;
         tx.commit()?;
         Ok(updated)

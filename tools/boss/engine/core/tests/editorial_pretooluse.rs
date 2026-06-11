@@ -28,9 +28,7 @@ use std::path::Path;
 use std::process::Command;
 
 use boss_editorial::CompiledRules;
-use boss_engine::editorial_hook::{
-    DenyTracker, EditorialActionKind, PreToolUseDecision, evaluate_gh_pretooluse,
-};
+use boss_engine::editorial_hook::{DenyTracker, EditorialActionKind, PreToolUseDecision, evaluate_gh_pretooluse};
 use boss_protocol::{EditorialRules, TemplatePolicy};
 use tempfile::TempDir;
 
@@ -88,14 +86,7 @@ fn bad_body_is_denied_and_gh_never_runs() {
     install_stub_gh(stub.path());
 
     let cmd = "gh pr create --title t --body 'Opened by a Boss worker for you.'";
-    let outcome = evaluate_gh_pretooluse(
-        cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
 
     match &outcome.decision {
         PreToolUseDecision::Deny { reason } => {
@@ -115,14 +106,7 @@ fn redactable_inline_body_rewrite_lands_through_gh() {
     install_stub_gh(stub.path());
 
     let cmd = format!("gh pr create --title t --body 'Fixes {EXEC_ID} in prod.'");
-    let outcome = evaluate_gh_pretooluse(
-        &cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(&cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
 
     let mutated = match &outcome.decision {
         PreToolUseDecision::AllowWithRewrite {
@@ -157,21 +141,12 @@ fn body_file_rewrite_lands_through_gh() {
     .unwrap();
 
     let cmd = "gh pr create --title t --body-file pr-body.md";
-    let outcome = evaluate_gh_pretooluse(
-        cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
 
     // A body-file rewrite leaves the command unchanged (the file on disk
     // is what changed).
     match &outcome.decision {
-        PreToolUseDecision::AllowWithRewrite {
-            updated_command, ..
-        } => assert!(updated_command.is_none()),
+        PreToolUseDecision::AllowWithRewrite { updated_command, .. } => assert!(updated_command.is_none()),
         other => panic!("expected AllowWithRewrite, got {other:?}"),
     }
 
@@ -232,14 +207,7 @@ fn three_denies_flip_to_allow_with_attention_item() {
 fn cube_pr_ensure_bad_body_is_denied() {
     let ws = TempDir::new().unwrap();
     let cmd = "cube pr ensure --branch feat/foo --title 'My PR' --body 'Opened by a Boss worker for you.'";
-    let outcome = evaluate_gh_pretooluse(
-        cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     match &outcome.decision {
         PreToolUseDecision::Deny { reason } => {
             assert!(reason.contains("Boss worker"), "reason: {reason}");
@@ -253,23 +221,13 @@ fn cube_pr_ensure_bad_body_is_denied() {
 fn cube_pr_ensure_redactable_body_is_rewritten() {
     let ws = TempDir::new().unwrap();
     let cmd = format!("cube pr ensure --branch feat/foo --title 'My PR' --body 'Fixes {EXEC_ID} in prod.'");
-    let outcome = evaluate_gh_pretooluse(
-        &cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(&cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     match &outcome.decision {
         PreToolUseDecision::AllowWithRewrite {
             updated_command: Some(c),
             ..
         } => {
-            assert!(
-                !c.contains(EXEC_ID),
-                "rewritten cube command still leaks id: {c:?}"
-            );
+            assert!(!c.contains(EXEC_ID), "rewritten cube command still leaks id: {c:?}");
         }
         other => panic!("expected AllowWithRewrite for cube pr ensure, got {other:?}"),
     }
@@ -286,18 +244,9 @@ fn cube_pr_ensure_body_file_is_redacted_on_disk() {
     )
     .unwrap();
     let cmd = "cube pr ensure --branch feat/foo --title t --body-file body.md";
-    let outcome = evaluate_gh_pretooluse(
-        cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     match &outcome.decision {
-        PreToolUseDecision::AllowWithRewrite {
-            updated_command, ..
-        } => {
+        PreToolUseDecision::AllowWithRewrite { updated_command, .. } => {
             // Body-file rewrites leave the command string unchanged; the
             // file on disk is what changed.
             assert!(updated_command.is_none());
@@ -312,14 +261,7 @@ fn cube_pr_ensure_body_file_is_redacted_on_disk() {
 fn cube_pr_ensure_clean_body_is_allowed() {
     let ws = TempDir::new().unwrap();
     let cmd = "cube pr ensure --branch feat/foo --title 'Clean title' --body 'No identifiers here.'";
-    let outcome = evaluate_gh_pretooluse(
-        cmd,
-        ws.path(),
-        &default_rules(),
-        None,
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     assert_eq!(outcome.decision, PreToolUseDecision::Allow);
     assert_eq!(outcome.action, EditorialActionKind::Allow);
 }
@@ -339,14 +281,7 @@ fn cube_pr_ensure_applies_template_policy() {
         };
         CompiledRules::compile(r).unwrap()
     };
-    let outcome = evaluate_gh_pretooluse(
-        cmd,
-        ws.path(),
-        &rules,
-        Some(template),
-        EXEC_ID,
-        &DenyTracker::new(),
-    );
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &rules, Some(template), EXEC_ID, &DenyTracker::new());
     // Template violation → deny.
     assert!(
         matches!(outcome.decision, PreToolUseDecision::Deny { .. }),

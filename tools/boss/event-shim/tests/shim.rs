@@ -103,8 +103,12 @@ fn forwards_stdin_payload_to_unix_socket() {
         Some(payload),
         Duration::from_secs(5),
     );
-    assert!(out.status.success(), "shim exit: {:?}, stderr: {}",
-        out.status, String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "shim exit: {:?}, stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let received = server.join().expect("server thread panicked");
     assert_eq!(received, payload);
@@ -113,19 +117,10 @@ fn forwards_stdin_payload_to_unix_socket() {
 #[test]
 fn fails_when_env_var_unset() {
     let workspace = TempDir::new().unwrap();
-    let out = run_shim(
-        None,
-        Some(workspace.path()),
-        None,
-        Some(b"{}"),
-        Duration::from_secs(5),
-    );
+    let out = run_shim(None, Some(workspace.path()), None, Some(b"{}"), Duration::from_secs(5));
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("BOSS_EVENTS_SOCKET"),
-        "stderr was: {stderr}"
-    );
+    assert!(stderr.contains("BOSS_EVENTS_SOCKET"), "stderr was: {stderr}");
 }
 
 #[test]
@@ -177,8 +172,7 @@ fn buffers_event_when_socket_is_unreachable_after_retries() {
     );
 
     let buffer_path = workspace.path().join(".boss/events-pending.jsonl");
-    let contents = fs::read_to_string(&buffer_path)
-        .expect("buffer file should exist after engine-down event");
+    let contents = fs::read_to_string(&buffer_path).expect("buffer file should exist after engine-down event");
     let lines: Vec<&str> = contents.lines().collect();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("\"session_id\":\"sess-x\""));
@@ -196,11 +190,7 @@ fn drains_buffered_events_on_next_successful_connect() {
     let workspace = TempDir::new().unwrap();
     let buffer_path = workspace.path().join(".boss/events-pending.jsonl");
     fs::create_dir_all(buffer_path.parent().unwrap()).unwrap();
-    fs::write(
-        &buffer_path,
-        b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n",
-    )
-    .unwrap();
+    fs::write(&buffer_path, b"{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n").unwrap();
 
     // Run a server that accepts 4 connections (3 buffered + 1 current)
     // and records what it received from each.
@@ -485,4 +475,3 @@ fn fails_when_socket_does_not_exist_then_buffers() {
         "stderr should call out engine-unreachable + buffering: {stderr}",
     );
 }
-

@@ -39,12 +39,7 @@ pub enum Transform {
 impl Transform {
     /// Project an invocation's output into findings. `input_file` is the file the
     /// invocation ran on (per-file mode) or `None` (batch mode).
-    pub fn apply(
-        &self,
-        stdout: &[u8],
-        exit_code: Option<i32>,
-        input_file: Option<&str>,
-    ) -> Result<Vec<Finding>> {
+    pub fn apply(&self, stdout: &[u8], exit_code: Option<i32>, input_file: Option<&str>) -> Result<Vec<Finding>> {
         match self {
             Transform::Json(json) => json.apply(stdout, exit_code, input_file),
             Transform::Passthrough => passthrough(stdout),
@@ -83,12 +78,7 @@ pub struct JsonTransform {
 }
 
 impl JsonTransform {
-    fn apply(
-        &self,
-        stdout: &[u8],
-        exit_code: Option<i32>,
-        input_file: Option<&str>,
-    ) -> Result<Vec<Finding>> {
+    fn apply(&self, stdout: &[u8], exit_code: Option<i32>, input_file: Option<&str>) -> Result<Vec<Finding>> {
         let root: Value = serde_json::from_slice(stdout).with_context(|| {
             format!(
                 "declarative json transform could not parse tool stdout as JSON; raw stdout: {:?}",

@@ -19,13 +19,10 @@ pub(super) async fn handle_set_live_status_enabled(ctx: Dispatch, req: FrontendR
         unreachable!()
     };
     {
-        server_state
-            .live_status_manager
-            .set_enabled(slot_id, enabled);
-        if let Err(err) = persist_live_status_disabled_slots(
-            &work_db,
-            &server_state.live_status_manager.disabled_snapshot(),
-        ) {
+        server_state.live_status_manager.set_enabled(slot_id, enabled);
+        if let Err(err) =
+            persist_live_status_disabled_slots(&work_db, &server_state.live_status_manager.disabled_snapshot())
+        {
             tracing::warn!(
                 slot_id,
                 enabled,
@@ -74,10 +71,6 @@ pub(super) async fn handle_debug_live_status_pipeline(ctx: Dispatch, req: Fronte
     };
     {
         let report = build_live_status_debug_report(&server_state, &work_db);
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::LiveStatusDebugReportEvent { report },
-        );
+        send_response(&sink, &request_id, FrontendEvent::LiveStatusDebugReportEvent { report });
     }
 }

@@ -118,24 +118,14 @@ fn parse_one_value(value: &Value, seq: &mut u64) -> Vec<TranscriptEvent> {
     let Some(type_str) = obj.get("type").and_then(|v| v.as_str()) else {
         return Vec::new();
     };
-    let timestamp = obj
-        .get("timestamp")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
-    let model = obj
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
+    let timestamp = obj.get("timestamp").and_then(|v| v.as_str()).map(|s| s.to_owned());
+    let model = obj.get("model").and_then(|v| v.as_str()).map(|s| s.to_owned());
 
     match type_str {
         "user" => parse_user_message(obj, timestamp, seq),
         "assistant" => parse_assistant_message(obj, timestamp, model, seq),
-        "tool_result" => parse_tool_result(obj, timestamp, seq)
-            .into_iter()
-            .collect(),
-        "system" => parse_system_event(obj, timestamp, seq)
-            .into_iter()
-            .collect(),
+        "tool_result" => parse_tool_result(obj, timestamp, seq).into_iter().collect(),
+        "system" => parse_system_event(obj, timestamp, seq).into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -166,20 +156,12 @@ fn parse_assistant_message(
     let Some(content) = message.get("content") else {
         return Vec::new();
     };
-    let model = model.or_else(|| {
-        message
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_owned())
-    });
+    let model = model.or_else(|| message.get("model").and_then(|v| v.as_str()).map(|s| s.to_owned()));
 
     let mut events = Vec::new();
     if let Some(arr) = content.as_array() {
         for block in arr {
-            let block_type = block
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("text");
+            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
             match block_type {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
@@ -252,21 +234,19 @@ fn extract_text_blocks(
     };
     if let Some(arr) = content.as_array() {
         for block in arr {
-            let bt = block
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("text");
+            let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
             if bt == "text"
-                && let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                    let s = *seq;
-                    *seq += 1;
-                    events.push(TranscriptEvent {
-                        seq: s,
-                        kind: make_kind(text.to_owned()),
-                        timestamp: timestamp.clone(),
-                        model: model.clone(),
-                    });
-                }
+                && let Some(text) = block.get("text").and_then(|v| v.as_str())
+            {
+                let s = *seq;
+                *seq += 1;
+                events.push(TranscriptEvent {
+                    seq: s,
+                    kind: make_kind(text.to_owned()),
+                    timestamp: timestamp.clone(),
+                    model: model.clone(),
+                });
+            }
         }
     } else if let Some(text) = content.as_str() {
         let s = *seq;
@@ -290,10 +270,7 @@ fn parse_tool_result(
         if let Some(arr) = content.as_array() {
             arr.iter()
                 .filter_map(|block| {
-                    let bt = block
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("text");
+                    let bt = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
                     if bt == "text" {
                         block.get("text").and_then(|v| v.as_str())
                     } else {
@@ -333,10 +310,7 @@ fn parse_system_event(
     timestamp: Option<String>,
     seq: &mut u64,
 ) -> Option<TranscriptEvent> {
-    let subtype = obj
-        .get("subtype")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
+    let subtype = obj.get("subtype").and_then(|v| v.as_str()).map(|s| s.to_owned());
 
     let body = match subtype.as_deref() {
         Some("pr-link") => {
@@ -377,10 +351,7 @@ fn parse_system_event(
 
 /// Convert normalized transcript events into renderable segments.
 pub fn events_to_segments(events: &[TranscriptEvent], opts: &RenderOpts) -> Vec<TranscriptSegment> {
-    events
-        .iter()
-        .filter_map(|ev| event_to_segment(ev, opts))
-        .collect()
+    events.iter().filter_map(|ev| event_to_segment(ev, opts)).collect()
 }
 
 fn event_to_segment(event: &TranscriptEvent, opts: &RenderOpts) -> Option<TranscriptSegment> {
@@ -445,19 +416,14 @@ fn event_to_segment(event: &TranscriptEvent, opts: &RenderOpts) -> Option<Transc
             render_tool_result_segment(event, output, *is_error, opts)
         }
 
-        TranscriptEventKind::System { subtype, body } => {
-            render_system_segment(event, subtype.as_deref(), body)
-        }
+        TranscriptEventKind::System { subtype, body } => render_system_segment(event, subtype.as_deref(), body),
     }
 }
 
 fn render_tool_use(name: &str, input: &Value) -> String {
     match name {
         "Bash" => {
-            let command = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
             format!("```sh\n{command}\n```")
         }
         "Edit" => {
@@ -469,12 +435,11 @@ fn render_tool_use(name: &str, input: &Value) -> String {
             let old = input.get("old_string").and_then(|v| v.as_str());
             let new = input.get("new_string").and_then(|v| v.as_str());
             match (old, new) {
-                (Some(old_str), Some(new_str)) => format!(
-                    "**Edit** `{path}`\n\n**Replace:**\n```\n{old_str}\n```\n\n**With:**\n```\n{new_str}\n```"
-                ),
+                (Some(old_str), Some(new_str)) => {
+                    format!("**Edit** `{path}`\n\n**Replace:**\n```\n{old_str}\n```\n\n**With:**\n```\n{new_str}\n```")
+                }
                 _ => {
-                    let json =
-                        serde_json::to_string_pretty(input).unwrap_or_default();
+                    let json = serde_json::to_string_pretty(input).unwrap_or_default();
                     format!("**Edit** `{path}`\n\n```json\n{json}\n```")
                 }
             }
@@ -485,10 +450,7 @@ fn render_tool_use(name: &str, input: &Value) -> String {
                 .or_else(|| input.get("path"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
-            let content = input
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
             format!("**Write** `{path}`\n\n```\n{content}\n```")
         }
         _ => {
@@ -535,11 +497,7 @@ fn render_tool_result_segment(
     )
 }
 
-fn render_system_segment(
-    event: &TranscriptEvent,
-    subtype: Option<&str>,
-    body: &str,
-) -> Option<TranscriptSegment> {
+fn render_system_segment(event: &TranscriptEvent, subtype: Option<&str>, body: &str) -> Option<TranscriptSegment> {
     match subtype {
         Some("init") => None,
         Some("pr-link") => {
@@ -633,10 +591,7 @@ pub fn segments_to_markdown(segs: &[TranscriptSegment]) -> String {
             out.push('\n');
         }
         if let Some(t) = &seg.truncated {
-            out.push_str(&format!(
-                "\n*…showing {} of {} bytes*\n",
-                t.shown_bytes, t.total_bytes
-            ));
+            out.push_str(&format!("\n*…showing {} of {} bytes*\n", t.shown_bytes, t.total_bytes));
         }
         out.push('\n');
     }
@@ -669,10 +624,7 @@ pub fn render_text(events: &[TranscriptEvent], opts: &RenderOpts) -> String {
             out.push('\n');
         }
         if let Some(t) = &seg.truncated {
-            out.push_str(&format!(
-                "[…showing {} of {} bytes]\n",
-                t.shown_bytes, t.total_bytes
-            ));
+            out.push_str(&format!("[…showing {} of {} bytes]\n", t.shown_bytes, t.total_bytes));
         }
         out.push('\n');
     }
@@ -685,10 +637,7 @@ fn blockquote(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    text.lines()
-        .map(|l| format!("> {l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
 }
 
 fn render_body_as_markdown(body: &str) -> String {
@@ -1082,7 +1031,10 @@ mod tests {
             timestamp: None,
             model: None,
         }];
-        let opts = RenderOpts { max_result_bytes: 1024, ..RenderOpts::default() };
+        let opts = RenderOpts {
+            max_result_bytes: 1024,
+            ..RenderOpts::default()
+        };
         let segs = events_to_segments(&events, &opts);
         assert!(segs[0].collapsible);
         let t = segs[0].truncated.as_ref().expect("truncated should be set");
@@ -1142,26 +1094,30 @@ mod tests {
 
     #[test]
     fn segments_to_markdown_produces_h2_headers() {
-        let segs = vec![TranscriptSegment::builder()
-            .seq(0)
-            .role(SegmentRole::User)
-            .label("User")
-            .markdown("Hello")
-            .build()];
+        let segs = vec![
+            TranscriptSegment::builder()
+                .seq(0)
+                .role(SegmentRole::User)
+                .label("User")
+                .markdown("Hello")
+                .build(),
+        ];
         let md = segments_to_markdown(&segs);
         assert!(md.contains("## User\n\nHello"), "got: {md}");
     }
 
     #[test]
     fn segments_to_markdown_includes_timestamp_in_header() {
-        let segs = vec![TranscriptSegment::builder()
-            .seq(0)
-            .role(SegmentRole::Assistant)
-            .label("Assistant")
-            .timestamp("2024-01-01T00:00:01Z")
-            .model("claude-sonnet-4-6")
-            .markdown("Reply")
-            .build()];
+        let segs = vec![
+            TranscriptSegment::builder()
+                .seq(0)
+                .role(SegmentRole::Assistant)
+                .label("Assistant")
+                .timestamp("2024-01-01T00:00:01Z")
+                .model("claude-sonnet-4-6")
+                .markdown("Reply")
+                .build(),
+        ];
         let md = segments_to_markdown(&segs);
         assert!(md.contains("2024-01-01T00:00:01Z"));
         assert!(md.contains("claude-sonnet-4-6"));
@@ -1169,17 +1125,19 @@ mod tests {
 
     #[test]
     fn segments_to_markdown_adds_truncation_note() {
-        let segs = vec![TranscriptSegment::builder()
-            .seq(0)
-            .role(SegmentRole::Tool)
-            .label("↳ result")
-            .markdown("```\nshort\n```")
-            .collapsible(true)
-            .maybe_truncated(Some(TruncationInfo {
-                shown_bytes: 100,
-                total_bytes: 5000,
-            }))
-            .build()];
+        let segs = vec![
+            TranscriptSegment::builder()
+                .seq(0)
+                .role(SegmentRole::Tool)
+                .label("↳ result")
+                .markdown("```\nshort\n```")
+                .collapsible(true)
+                .maybe_truncated(Some(TruncationInfo {
+                    shown_bytes: 100,
+                    total_bytes: 5000,
+                }))
+                .build(),
+        ];
         let md = segments_to_markdown(&segs);
         assert!(md.contains("showing 100 of 5000 bytes"), "got: {md}");
     }
@@ -1208,7 +1166,10 @@ mod tests {
             "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}"
         );
         let events = parse_transcript(jsonl);
-        let opts = RenderOpts { hide_tools: true, ..RenderOpts::default() };
+        let opts = RenderOpts {
+            hide_tools: true,
+            ..RenderOpts::default()
+        };
         let text = render_text(&events, &opts);
         assert!(!text.contains("Bash"), "tool_use should be hidden, got: {text}");
         assert!(!text.contains("file.txt"), "tool_result should be hidden, got: {text}");

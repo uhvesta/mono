@@ -97,28 +97,16 @@ impl Vcs {
                     &["diff", "--summary", "--from", base_ref, "--to", "@"],
                 )?;
                 let mut changeset = parse_jj_diff_summary(&summary)?;
-                let patch = run_command(
-                    &self.root,
-                    "jj",
-                    &["diff", "--git", "--from", base_ref, "--to", "@"],
-                )?;
+                let patch = run_command(&self.root, "jj", &["diff", "--git", "--from", base_ref, "--to", "@"])?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
             VcsKind::Git => {
                 let merge_base = resolve_git_merge_base(&self.root, base_ref)?;
                 info!(base_ref, merge_base, "resolved merge-base for changeset");
-                let summary = run_command(
-                    &self.root,
-                    "git",
-                    &["diff", "--name-status", &merge_base, "HEAD"],
-                )?;
+                let summary = run_command(&self.root, "git", &["diff", "--name-status", &merge_base, "HEAD"])?;
                 let mut changeset = parse_git_name_status(&summary)?;
-                let patch = run_command(
-                    &self.root,
-                    "git",
-                    &["diff", "--patch", &merge_base, "HEAD"],
-                )?;
+                let patch = run_command(&self.root, "git", &["diff", "--patch", &merge_base, "HEAD"])?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
@@ -158,20 +146,17 @@ impl Vcs {
 
     pub fn current_commit_description(&self) -> Result<String> {
         match self.kind {
-            VcsKind::Jujutsu => run_command(
-                &self.root,
-                "jj",
-                &["log", "-r", "@", "--no-graph", "-T", "description"],
-            ),
+            VcsKind::Jujutsu => run_command(&self.root, "jj", &["log", "-r", "@", "--no-graph", "-T", "description"]),
             VcsKind::Git => run_command(&self.root, "git", &["log", "-1", "--pretty=%B", "HEAD"]),
         }
     }
 
     pub fn remote_repo_slug(&self) -> Option<String> {
         if let Ok(output) = run_command(&self.root, "git", &["remote", "get-url", "origin"])
-            && let Some(slug) = parse_repo_slug_from_remote_url(output.trim()) {
-                return Some(slug);
-            }
+            && let Some(slug) = parse_repo_slug_from_remote_url(output.trim())
+        {
+            return Some(slug);
+        }
 
         None
     }
@@ -224,19 +209,11 @@ fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "command `{binary} {}` failed: {}",
-            args.join(" "),
-            stderr.trim()
-        );
+        bail!("command `{binary} {}` failed: {}", args.join(" "), stderr.trim());
     }
 
-    String::from_utf8(output.stdout).with_context(|| {
-        format!(
-            "command `{binary} {}` returned invalid utf-8",
-            args.join(" ")
-        )
-    })
+    String::from_utf8(output.stdout)
+        .with_context(|| format!("command `{binary} {}` returned invalid utf-8", args.join(" ")))
 }
 
 fn detect_jj_root(start: &Path) -> Result<Option<PathBuf>> {
@@ -435,9 +412,7 @@ fn parse_repo_slug_from_remote_url(remote_url: &str) -> Option<String> {
 }
 
 fn normalize_non_empty(value: Option<String>) -> Option<String> {
-    value
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
+    value.map(|text| text.trim().to_owned()).filter(|text| !text.is_empty())
 }
 
 #[cfg(test)]
@@ -468,10 +443,7 @@ R docs/old.md => docs/new.md
         assert_eq!(parsed.changed_files[1].kind, ChangeKind::Modified);
         assert_eq!(parsed.changed_files[2].kind, ChangeKind::Deleted);
         assert_eq!(parsed.changed_files[3].kind, ChangeKind::Renamed);
-        assert_eq!(
-            parsed.changed_files[3].old_path,
-            Some(PathBuf::from("docs/old.md"))
-        );
+        assert_eq!(parsed.changed_files[3].old_path, Some(PathBuf::from("docs/old.md")));
         assert_eq!(parsed.changed_files[3].path, PathBuf::from("docs/new.md"));
     }
 
@@ -487,10 +459,7 @@ R docs/old.md => docs/new.md
         assert_eq!(parsed.changed_files[1].kind, ChangeKind::Modified);
         assert_eq!(parsed.changed_files[2].kind, ChangeKind::Deleted);
         assert_eq!(parsed.changed_files[3].kind, ChangeKind::Renamed);
-        assert_eq!(
-            parsed.changed_files[3].old_path,
-            Some(PathBuf::from("docs/old.md"))
-        );
+        assert_eq!(parsed.changed_files[3].old_path, Some(PathBuf::from("docs/old.md")));
         assert_eq!(parsed.changed_files[3].path, PathBuf::from("docs/new.md"));
     }
 
@@ -498,10 +467,7 @@ R docs/old.md => docs/new.md
     fn parses_all_files_list() {
         let parsed = parse_tracked_file_list("checks/src/lib.rs\ndocs/index.md\n");
         assert_eq!(parsed.changed_files.len(), 2);
-        assert_eq!(
-            parsed.changed_files[0].path,
-            PathBuf::from("checks/src/lib.rs")
-        );
+        assert_eq!(parsed.changed_files[0].path, PathBuf::from("checks/src/lib.rs"));
         assert_eq!(parsed.changed_files[0].kind, ChangeKind::Modified);
     }
 
@@ -567,10 +533,7 @@ R docs/old.md => docs/new.md
         // machine's `init.defaultBranch` config (CI leaves it unset, which
         // defaults to `master`, breaking the `git merge-base main HEAD` below).
         run_git(temp.path(), &["init", "-b", "main"]);
-        run_git(
-            temp.path(),
-            &["config", "user.email", "test@checkleft.example"],
-        );
+        run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
         run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
 
         // Base commit on main
@@ -596,11 +559,7 @@ R docs/old.md => docs/new.md
         let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
         let changeset = vcs.changeset_since("main").expect("changeset since main");
 
-        let changed_paths: Vec<_> = changeset
-            .changed_files
-            .iter()
-            .map(|f| f.path.as_path())
-            .collect();
+        let changed_paths: Vec<_> = changeset.changed_files.iter().map(|f| f.path.as_path()).collect();
 
         assert_eq!(
             changed_paths,

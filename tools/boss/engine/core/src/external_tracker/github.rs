@@ -10,8 +10,8 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use super::{
-    CloseReason, ClosedReason, ExternalTracker, Result, TrackerConfigError, TrackerContext,
-    TrackerError, UpstreamItem, UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
+    CloseReason, ClosedReason, ExternalTracker, Result, TrackerConfigError, TrackerContext, TrackerError, UpstreamItem,
+    UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
 };
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -40,9 +40,8 @@ impl GitHubConfig {
 
 impl GitHubConfig {
     fn from_ctx(ctx: &TrackerContext) -> Result<Self> {
-        serde_json::from_value(ctx.config.clone()).map_err(|e| {
-            TrackerError::ConfigInvalid(format!("invalid GitHub tracker config: {e}"))
-        })
+        serde_json::from_value(ctx.config.clone())
+            .map_err(|e| TrackerError::ConfigInvalid(format!("invalid GitHub tracker config: {e}")))
     }
 }
 
@@ -58,11 +57,17 @@ pub(crate) struct GhRunnerError {
 
 impl GhRunnerError {
     fn transient(message: impl Into<String>) -> Self {
-        Self { http_status: None, message: message.into() }
+        Self {
+            http_status: None,
+            message: message.into(),
+        }
     }
 
     fn with_status(status: u16, message: impl Into<String>) -> Self {
-        Self { http_status: Some(status), message: message.into() }
+        Self {
+            http_status: Some(status),
+            message: message.into(),
+        }
     }
 }
 
@@ -86,11 +91,7 @@ pub(crate) trait GhRunner: Send + Sync {
 
     /// Run `gh api <path>` (GET) and return parsed JSON body.
     /// When `token` is `Some`, sets `GH_TOKEN` on the process.
-    async fn rest_get(
-        &self,
-        path: &str,
-        token: Option<&str>,
-    ) -> std::result::Result<GhResponse, GhRunnerError>;
+    async fn rest_get(&self, path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError>;
 
     /// Run `gh api -X PATCH <path> -f k=v ...` and return parsed JSON body.
     /// When `token` is `Some`, sets `GH_TOKEN` on the process.
@@ -166,11 +167,7 @@ impl GhRunner for CommandGhRunner {
             .map_err(|e| GhRunnerError::transient(format!("failed to parse graphql response: {e}")))
     }
 
-    async fn rest_get(
-        &self,
-        path: &str,
-        token: Option<&str>,
-    ) -> std::result::Result<GhResponse, GhRunnerError> {
+    async fn rest_get(&self, path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
         let mut cmd = Command::new("gh");
         if let Some(t) = token {
             cmd.env("GH_TOKEN", t);
@@ -252,9 +249,10 @@ impl GhRunner for CommandGhRunner {
             .spawn()
             .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&stdin_bytes).await.map_err(|e| {
-                GhRunnerError::transient(format!("failed to write POST body: {e}"))
-            })?;
+            stdin
+                .write_all(&stdin_bytes)
+                .await
+                .map_err(|e| GhRunnerError::transient(format!("failed to write POST body: {e}")))?;
         }
         let output = child
             .wait_with_output()
@@ -392,11 +390,7 @@ fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
     let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
     let a = y / 100;
     let b = 2 - a + a / 4;
-    let jd = (365.25 * (y + 4716) as f64) as i64
-        + (30.6001 * (m + 1) as f64) as i64
-        + d
-        + b
-        - 1524;
+    let jd = (365.25 * (y + 4716) as f64) as i64 + (30.6001 * (m + 1) as f64) as i64 + d + b - 1524;
     Some(jd - 2_440_588)
 }
 
@@ -437,9 +431,10 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
 
     // Apply label filter: if configured, at least one label must match.
     if let Some(filter) = &config.label_filter
-        && !filter.iter().any(|f| labels.iter().any(|l| l == f)) {
-            return None;
-        }
+        && !filter.iter().any(|f| labels.iter().any(|l| l == f))
+    {
+        return None;
+    }
 
     let assignees: Vec<String> = content
         .get("assignees")
@@ -459,9 +454,12 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
         .filter_map(|n| {
             let pr_url = n.get("url")?.as_str()?.to_owned();
             let merged = n.get("merged")?.as_bool()?;
-            let merged_at =
-                n.get("mergedAt").and_then(|v| v.as_str()).and_then(parse_iso8601);
-            Some(UpstreamPrAssociation { pr_url, merged, merged_at })
+            let merged_at = n.get("mergedAt").and_then(|v| v.as_str()).and_then(parse_iso8601);
+            Some(UpstreamPrAssociation {
+                pr_url,
+                merged,
+                merged_at,
+            })
         })
         .collect();
 
@@ -502,7 +500,11 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
     });
 
     Some(UpstreamItem {
-        upstream_ref: UpstreamRef { kind: "github".to_owned(), canonical_id, raw },
+        upstream_ref: UpstreamRef {
+            kind: "github".to_owned(),
+            canonical_id,
+            raw,
+        },
         title,
         body,
         status,
@@ -519,11 +521,9 @@ fn parse_project_item(node: &Value, config: &GitHubConfig) -> Option<UpstreamIte
 fn parse_rest_issue(body: &Value, org: &str, repo: &str) -> Option<UpstreamItem> {
     let number = body.get("number")?.as_u64()?;
     let title = body.get("title")?.as_str()?.to_owned();
-    let body_text =
-        body.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
+    let body_text = body.get("body").and_then(|b| b.as_str()).unwrap_or("").to_owned();
     let state = body.get("state")?.as_str()?;
-    let state_reason =
-        body.get("state_reason").and_then(|v| v.as_str()).unwrap_or("");
+    let state_reason = body.get("state_reason").and_then(|v| v.as_str()).unwrap_or("");
     let url = body.get("html_url")?.as_str()?.to_owned();
     let updated_at_str = body.get("updated_at")?.as_str()?;
     let updated_at = parse_iso8601(updated_at_str).unwrap_or(0);
@@ -560,7 +560,11 @@ fn parse_rest_issue(body: &Value, org: &str, repo: &str) -> Option<UpstreamItem>
     let raw = serde_json::json!({ "issue_number": number });
 
     Some(UpstreamItem {
-        upstream_ref: UpstreamRef { kind: "github".to_owned(), canonical_id, raw },
+        upstream_ref: UpstreamRef {
+            kind: "github".to_owned(),
+            canonical_id,
+            raw,
+        },
         title,
         body: body_text,
         status,
@@ -621,7 +625,11 @@ fn map_write_error(err: GhRunnerError) -> TrackerError {
 /// Extract the OAuth token from a `TrackerContext` as an `Option<&str>`.
 /// Returns `None` when the credential is ambient (empty token).
 fn opt_token(ctx: &TrackerContext) -> Option<&str> {
-    if ctx.credential.token.is_empty() { None } else { Some(&ctx.credential.token) }
+    if ctx.credential.token.is_empty() {
+        None
+    } else {
+        Some(&ctx.credential.token)
+    }
 }
 
 // ── GitHubTracker ─────────────────────────────────────────────────────────────
@@ -633,12 +641,16 @@ pub struct GitHubTracker {
 
 impl GitHubTracker {
     pub fn new() -> Self {
-        Self { runner: Box::new(CommandGhRunner) }
+        Self {
+            runner: Box::new(CommandGhRunner),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn with_runner(runner: impl GhRunner + 'static) -> Self {
-        Self { runner: Box::new(runner) }
+        Self {
+            runner: Box::new(runner),
+        }
     }
 }
 
@@ -654,13 +666,10 @@ impl ExternalTracker for GitHubTracker {
         "github"
     }
 
-    fn validate_config(
-        &self,
-        config: &serde_json::Value,
-    ) -> std::result::Result<(), TrackerConfigError> {
-        let obj = config.as_object().ok_or_else(|| {
-            TrackerConfigError::new("config must be a JSON object")
-        })?;
+    fn validate_config(&self, config: &serde_json::Value) -> std::result::Result<(), TrackerConfigError> {
+        let obj = config
+            .as_object()
+            .ok_or_else(|| TrackerConfigError::new("config must be a JSON object"))?;
         for field in ["org", "repo", "project_number"] {
             if !obj.contains_key(field) {
                 return Err(TrackerConfigError::new(format!("missing required field '{field}'")));
@@ -679,8 +688,7 @@ impl ExternalTracker for GitHubTracker {
 
         loop {
             let cursor_val = cursor.as_deref().unwrap_or("");
-            let mut vars: Vec<(&str, &str)> =
-                vec![("org", &config.org), ("number", &project_number_str)];
+            let mut vars: Vec<(&str, &str)> = vec![("org", &config.org), ("number", &project_number_str)];
             if let Some(c) = cursor.as_deref() {
                 vars.push(("after", c));
                 let _ = cursor_val; // suppress unused warning
@@ -695,7 +703,10 @@ impl ExternalTracker for GitHubTracker {
             check_graphql_errors(&response)?;
 
             // Null projectV2 means the project doesn't exist.
-            if response.pointer("/data/organization/projectV2").is_some_and(|v| v.is_null()) {
+            if response
+                .pointer("/data/organization/projectV2")
+                .is_some_and(|v| v.is_null())
+            {
                 return Err(TrackerError::ConfigInvalid(format!(
                     "project #{} not found in org '{}'",
                     config.project_number, config.org
@@ -706,9 +717,7 @@ impl ExternalTracker for GitHubTracker {
                 .pointer("/data/organization/projectV2/items/nodes")
                 .and_then(|n| n.as_array())
                 .ok_or_else(|| {
-                    TrackerError::Transient(
-                        "unexpected GraphQL response shape: missing items.nodes".to_owned(),
-                    )
+                    TrackerError::Transient("unexpected GraphQL response shape: missing items.nodes".to_owned())
                 })?;
 
             for node in nodes {
@@ -740,20 +749,11 @@ impl ExternalTracker for GitHubTracker {
         Ok(items)
     }
 
-    async fn fetch_item(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-    ) -> Result<Option<UpstreamItem>> {
+    async fn fetch_item(&self, ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<Option<UpstreamItem>> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number = ref_
-            .raw
-            .get("issue_number")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                TrackerError::ConfigInvalid(
-                    "upstream ref missing 'issue_number' in raw blob".to_owned(),
-                )
+        let issue_number =
+            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
+                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
             })?;
 
         let path = format!("repos/{}/{}/issues/{}", config.org, config.repo, issue_number);
@@ -764,21 +764,11 @@ impl ExternalTracker for GitHubTracker {
         }
     }
 
-    async fn close_issue(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-        reason: CloseReason,
-    ) -> Result<()> {
+    async fn close_issue(&self, ctx: &TrackerContext, ref_: &UpstreamRef, reason: CloseReason) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number = ref_
-            .raw
-            .get("issue_number")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                TrackerError::ConfigInvalid(
-                    "upstream ref missing 'issue_number' in raw blob".to_owned(),
-                )
+        let issue_number =
+            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
+                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
             })?;
 
         let state_reason = match reason {
@@ -797,27 +787,14 @@ impl ExternalTracker for GitHubTracker {
         }
     }
 
-    async fn post_closing_pr_comment(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-        pr_url: &str,
-    ) -> Result<()> {
+    async fn post_closing_pr_comment(&self, ctx: &TrackerContext, ref_: &UpstreamRef, pr_url: &str) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number = ref_
-            .raw
-            .get("issue_number")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                TrackerError::ConfigInvalid(
-                    "upstream ref missing 'issue_number' in raw blob".to_owned(),
-                )
+        let issue_number =
+            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
+                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
             })?;
 
-        let comments_path = format!(
-            "repos/{}/{}/issues/{}/comments",
-            config.org, config.repo, issue_number
-        );
+        let comments_path = format!("repos/{}/{}/issues/{}/comments", config.org, config.repo, issue_number);
 
         // Idempotency: skip if any existing comment already mentions this PR URL.
         match self.runner.rest_get(&comments_path, opt_token(ctx)).await {
@@ -841,7 +818,11 @@ impl ExternalTracker for GitHubTracker {
 
         let comment_text = format!("Closed by {pr_url}");
         let comment_body = serde_json::json!({ "body": comment_text });
-        match self.runner.rest_post(&comments_path, &comment_body, opt_token(ctx)).await {
+        match self
+            .runner
+            .rest_post(&comments_path, &comment_body, opt_token(ctx))
+            .await
+        {
             Ok(_) => Ok(()),
             // Issue gone between the GET and POST — treat as success.
             Err(e) if e.http_status == Some(404) => Ok(()),
@@ -849,11 +830,7 @@ impl ExternalTracker for GitHubTracker {
         }
     }
 
-    async fn set_project_status(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-    ) -> Result<()> {
+    async fn set_project_status(&self, ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
         let target_column = config.in_progress_column_name().to_owned();
 
@@ -862,9 +839,7 @@ impl ExternalTracker for GitHubTracker {
             .get("project_item_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                TrackerError::ConfigInvalid(
-                    "upstream ref missing 'project_item_id' in raw blob".to_owned(),
-                )
+                TrackerError::ConfigInvalid("upstream ref missing 'project_item_id' in raw blob".to_owned())
             })?
             .to_owned();
 
@@ -896,11 +871,7 @@ impl ExternalTracker for GitHubTracker {
         let fields_nodes = metadata
             .pointer("/data/organization/projectV2/fields/nodes")
             .and_then(|n| n.as_array())
-            .ok_or_else(|| {
-                TrackerError::Transient(
-                    "unexpected response shape: missing fields.nodes".to_owned(),
-                )
-            })?;
+            .ok_or_else(|| TrackerError::Transient("unexpected response shape: missing fields.nodes".to_owned()))?;
 
         // Find the Status single-select field and the option matching the target column.
         let (field_id, option_id) = fields_nodes
@@ -948,21 +919,11 @@ impl ExternalTracker for GitHubTracker {
         Ok(())
     }
 
-    async fn add_label(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-        label: &str,
-    ) -> Result<()> {
+    async fn add_label(&self, ctx: &TrackerContext, ref_: &UpstreamRef, label: &str) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number = ref_
-            .raw
-            .get("issue_number")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                TrackerError::ConfigInvalid(
-                    "upstream ref missing 'issue_number' in raw blob".to_owned(),
-                )
+        let issue_number =
+            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
+                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
             })?;
 
         // The repo lives in the canonical_id ("owner/repo#number") rather
@@ -1054,7 +1015,10 @@ mod tests {
         }
 
         fn push_rest_patch_ok(&mut self, v: Value) -> &mut Self {
-            self.rest_patch_q.get_mut().unwrap().push_back(Ok(GhResponse { body: v }));
+            self.rest_patch_q
+                .get_mut()
+                .unwrap()
+                .push_back(Ok(GhResponse { body: v }));
             self
         }
 
@@ -1067,7 +1031,10 @@ mod tests {
         }
 
         fn push_rest_post_ok(&mut self, v: Value) -> &mut Self {
-            self.rest_post_q.get_mut().unwrap().push_back(Ok(GhResponse { body: v }));
+            self.rest_post_q
+                .get_mut()
+                .unwrap()
+                .push_back(Ok(GhResponse { body: v }));
             self
         }
 
@@ -1096,11 +1063,7 @@ mod tests {
                 .expect("no graphql response queued")
         }
 
-        async fn rest_get(
-            &self,
-            _path: &str,
-            token: Option<&str>,
-        ) -> std::result::Result<GhResponse, GhRunnerError> {
+        async fn rest_get(&self, _path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
             *self.last_token.lock().unwrap() = Some(token.map(|t| t.to_owned()));
             self.rest_get_q
                 .lock()
@@ -1193,12 +1156,7 @@ mod tests {
         })
     }
 
-    fn open_issue_node_with_status(
-        id: &str,
-        number: u64,
-        title: &str,
-        project_status: &str,
-    ) -> Value {
+    fn open_issue_node_with_status(id: &str, number: u64, title: &str, project_status: &str) -> Value {
         json!({
             "id": id,
             "fieldValues": {
@@ -1226,11 +1184,7 @@ mod tests {
         })
     }
 
-    fn project_metadata_response(
-        project_id: &str,
-        field_id: &str,
-        options: &[(&str, &str)],
-    ) -> Value {
+    fn project_metadata_response(project_id: &str, field_id: &str, options: &[(&str, &str)]) -> Value {
         json!({
             "data": {
                 "organization": {
@@ -1309,7 +1263,9 @@ mod tests {
                 "repo": "mono",
                 "project_number": 1
             }),
-            credential: super::super::TrackerCredential { token: token.to_owned() },
+            credential: super::super::TrackerCredential {
+                token: token.to_owned(),
+            },
         }
     }
 
@@ -1322,11 +1278,12 @@ mod tests {
     }
 
     impl TokenCapturingRunner {
-        fn new_with_capture(
-            inner: FakeGhRunner,
-        ) -> (Self, std::sync::Arc<Mutex<Option<Option<String>>>>) {
+        fn new_with_capture(inner: FakeGhRunner) -> (Self, std::sync::Arc<Mutex<Option<Option<String>>>>) {
             let captured = std::sync::Arc::new(Mutex::new(None));
-            let r = Self { inner, captured: captured.clone() };
+            let r = Self {
+                inner,
+                captured: captured.clone(),
+            };
             (r, captured)
         }
     }
@@ -1343,11 +1300,7 @@ mod tests {
             self.inner.graphql(query, vars, token).await
         }
 
-        async fn rest_get(
-            &self,
-            path: &str,
-            token: Option<&str>,
-        ) -> std::result::Result<GhResponse, GhRunnerError> {
+        async fn rest_get(&self, path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
             *self.captured.lock().unwrap() = Some(token.map(|t| t.to_owned()));
             self.inner.rest_get(path, token).await
         }
@@ -1405,10 +1358,8 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_items_single_page_from_fixture() {
-        let fixture: Value = serde_json::from_str(include_str!(
-            "testdata/github_fetch_items_single_page.json"
-        ))
-        .expect("fixture must be valid JSON");
+        let fixture: Value = serde_json::from_str(include_str!("testdata/github_fetch_items_single_page.json"))
+            .expect("fixture must be valid JSON");
 
         let mut fake = FakeGhRunner::new();
         fake.push_graphql_ok(fixture);
@@ -1431,7 +1382,9 @@ mod tests {
         assert_eq!(closed.upstream_ref.canonical_id, "spinyfin/mono#561");
         assert!(matches!(
             closed.status,
-            UpstreamStatus::Closed { reason: ClosedReason::Completed }
+            UpstreamStatus::Closed {
+                reason: ClosedReason::Completed
+            }
         ));
         assert_eq!(closed.pr_associations.len(), 1);
         assert!(closed.pr_associations[0].merged);
@@ -1718,7 +1671,9 @@ mod tests {
     #[test]
     fn validate_config_rejects_non_object() {
         let tracker = GitHubTracker::new();
-        let err = tracker.validate_config(&json!("not an object")).expect_err("should fail");
+        let err = tracker
+            .validate_config(&json!("not an object"))
+            .expect_err("should fail");
         assert!(err.message.contains("object"), "{}", err.message);
     }
 
@@ -1763,7 +1718,10 @@ mod tests {
         let tracker = GitHubTracker::with_runner(fake);
         let items = tracker.fetch_items(&github_ctx()).await.expect("fetch_items");
         assert_eq!(items.len(), 1);
-        assert!(items[0].project_status.is_none(), "project_status should be None when fieldValues absent");
+        assert!(
+            items[0].project_status.is_none(),
+            "project_status should be None when fieldValues absent"
+        );
     }
 
     // ── set_project_status ────────────────────────────────────────────────────
@@ -1941,7 +1899,12 @@ mod tests {
     impl CapturingGhRunner {
         fn new() -> (Self, std::sync::Arc<Mutex<Vec<serde_json::Value>>>) {
             let bodies = std::sync::Arc::new(Mutex::new(Vec::new()));
-            (Self { post_bodies: bodies.clone() }, bodies)
+            (
+                Self {
+                    post_bodies: bodies.clone(),
+                },
+                bodies,
+            )
         }
     }
 
@@ -1956,11 +1919,7 @@ mod tests {
             unimplemented!("CapturingGhRunner only supports rest_post")
         }
 
-        async fn rest_get(
-            &self,
-            _path: &str,
-            _token: Option<&str>,
-        ) -> std::result::Result<GhResponse, GhRunnerError> {
+        async fn rest_get(&self, _path: &str, _token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
             unimplemented!("CapturingGhRunner only supports rest_post")
         }
 
@@ -1980,7 +1939,9 @@ mod tests {
             _token: Option<&str>,
         ) -> std::result::Result<GhResponse, GhRunnerError> {
             self.post_bodies.lock().unwrap().push(body.clone());
-            Ok(GhResponse { body: json!([{"name": "tracked"}]) })
+            Ok(GhResponse {
+                body: json!([{"name": "tracked"}]),
+            })
         }
     }
 

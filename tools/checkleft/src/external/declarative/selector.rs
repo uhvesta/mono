@@ -41,9 +41,7 @@ pub struct Selector {
 
 impl std::fmt::Debug for Selector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Selector")
-            .field("filter", &self.filter)
-            .finish()
+        f.debug_struct("Selector").field("filter", &self.filter).finish()
     }
 }
 
@@ -107,10 +105,7 @@ impl Selector {
         ctx.insert_defs(stdlib_defs.unwrap_or_default());
         let compiled = ctx.compile(f);
         if !ctx.errs.is_empty() {
-            bail!(
-                "selector `{raw}` jaq compile errors: {} error(s)",
-                ctx.errs.len()
-            );
+            bail!("selector `{raw}` jaq compile errors: {} error(s)", ctx.errs.len());
         }
 
         Ok(Self {

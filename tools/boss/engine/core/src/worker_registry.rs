@@ -121,11 +121,7 @@ impl WorkerRegistry {
     /// attempts (e.g. completion-detection plus a manual stop firing
     /// for the same run) see `None` on the second call and skip.
     pub fn take_slot_for_run(&self, run_id: &str) -> Option<u8> {
-        self.inner
-            .lock()
-            .expect("registry poisoned")
-            .run_to_slot
-            .remove(run_id)
+        self.inner.lock().expect("registry poisoned").run_to_slot.remove(run_id)
     }
 
     /// Drop the entry for `pid`. Called when a run terminates and the
@@ -168,11 +164,7 @@ impl WorkerRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("registry poisoned")
-            .pid_to_run
-            .len()
+        self.inner.lock().expect("registry poisoned").pid_to_run.len()
     }
 
     /// Snapshot of every registered worker shell pid. Used by the
@@ -256,17 +248,13 @@ pub fn parent_pid(pid: libc::pid_t) -> io::Result<Option<libc::pid_t>> {
         return Err(io::Error::last_os_error());
     }
     if (n as usize) < std::mem::size_of::<ProcBsdInfo>() {
-        return Err(io::Error::other(
-            format!("proc_pidinfo returned {n} bytes; expected {info_size}"),
-        ));
+        return Err(io::Error::other(format!(
+            "proc_pidinfo returned {n} bytes; expected {info_size}"
+        )));
     }
 
     let ppid = info.pbi_ppid as libc::pid_t;
-    if ppid == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(ppid))
-    }
+    if ppid == 0 { Ok(None) } else { Ok(Some(ppid)) }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -341,7 +329,10 @@ mod tests {
         let reg = WorkerRegistry::new();
         let (slot_a, fresh_a) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
         assert!(fresh_a, "first allocation must report freshly_allocated");
-        assert!(slot_a >= REMOTE_SLOT_BASE, "remote slot must come from the reserved range");
+        assert!(
+            slot_a >= REMOTE_SLOT_BASE,
+            "remote slot must come from the reserved range"
+        );
         // Second call for the same run returns the same slot, not fresh.
         let (slot_again, fresh_again) = reg.get_or_allocate_remote_slot("exec-a").unwrap();
         assert_eq!(slot_again, slot_a);
@@ -393,10 +384,7 @@ mod tests {
         let self_pid = std::process::id() as libc::pid_t;
         reg.register(self_pid, "self-run");
         // Walking up from self should hit self immediately.
-        assert_eq!(
-            reg.lookup_with_ancestor_walk(self_pid).as_deref(),
-            Some("self-run")
-        );
+        assert_eq!(reg.lookup_with_ancestor_walk(self_pid).as_deref(), Some("self-run"));
     }
 
     #[cfg(target_os = "macos")]
@@ -410,10 +398,7 @@ mod tests {
         };
         reg.register(parent, "parent-run");
         // Walking up from self should reach parent.
-        assert_eq!(
-            reg.lookup_with_ancestor_walk(self_pid).as_deref(),
-            Some("parent-run")
-        );
+        assert_eq!(reg.lookup_with_ancestor_walk(self_pid).as_deref(), Some("parent-run"));
     }
 
     #[cfg(target_os = "macos")]

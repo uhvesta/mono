@@ -90,10 +90,7 @@ pub fn generate_token() -> String {
         let word_bytes = word.to_le_bytes();
         chunk.copy_from_slice(&word_bytes[..chunk.len()]);
     }
-    bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
 }
 
 /// Write the token file with mode 0600, creating parent directories
@@ -102,14 +99,13 @@ pub fn generate_token() -> String {
 /// would otherwise authenticate against the wrong process.
 pub fn write_token_file(path: &Path, contents: &ControlTokenFile) -> Result<()> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create control-token directory {}", parent.display())
-            })?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create control-token directory {}", parent.display()))?;
+    }
 
-    let serialized = serde_json::to_string(contents)
-        .context("failed to serialize control-token file")?;
+    let serialized = serde_json::to_string(contents).context("failed to serialize control-token file")?;
 
     let mut file = OpenOptions::new()
         .create(true)
@@ -248,10 +244,7 @@ mod tests {
         {
             let _guard = ControlTokenGuard::new(path.clone(), 99);
         }
-        assert!(
-            path.exists(),
-            "guard with mismatched pid must not remove the file"
-        );
+        assert!(path.exists(), "guard with mismatched pid must not remove the file");
     }
 
     #[test]

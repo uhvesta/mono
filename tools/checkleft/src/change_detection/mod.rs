@@ -84,11 +84,7 @@ impl RefProber for GitRefProber<'_> {
 ///    exact idempotent semantics without touching classification.
 /// 3. Classify env → resolve default branch → ensure history (deepen if shallow)
 ///    → select base per the scenario matrix → [`ChangePlan`].
-pub fn resolve_change_plan(
-    env: &CiEnvironment,
-    vcs: &Vcs,
-    overrides: &ChangeOverrides,
-) -> Result<ChangePlan> {
+pub fn resolve_change_plan(env: &CiEnvironment, vcs: &Vcs, overrides: &ChangeOverrides) -> Result<ChangePlan> {
     // ── 1. --all: skip all classification. ───────────────────────────────────
     if overrides.all {
         info!("--all override active: checking all tracked files");
@@ -99,11 +95,9 @@ pub fn resolve_change_plan(
     if let Some(base_ref) = overrides.base_ref.as_deref().filter(|s| !s.trim().is_empty()) {
         info!(base_ref, "--base-ref override: computing merge-base(ref, HEAD)");
         let prober = GitHeadProber::new(vcs.root());
-        let base_sha = prober.merge_base(base_ref).ok_or_else(|| {
-            anyhow::anyhow!(
-                "git merge-base: no common ancestor between `{base_ref}` and HEAD"
-            )
-        })?;
+        let base_sha = prober
+            .merge_base(base_ref)
+            .ok_or_else(|| anyhow::anyhow!("git merge-base: no common ancestor between `{base_ref}` and HEAD"))?;
         info!(base_ref, base_sha, "--base-ref resolved to sha");
         return Ok(ChangePlan::Scoped {
             base_sha,
@@ -115,8 +109,7 @@ pub fn resolve_change_plan(
     let root = vcs.root();
     let kind = vcs.kind();
     let ref_prober = GitRefProber::new(root);
-    let default_branch =
-        resolve_default_branch(env, &ref_prober, overrides.default_branch.as_deref());
+    let default_branch = resolve_default_branch(env, &ref_prober, overrides.default_branch.as_deref());
     info!(default_branch, "resolved default branch");
 
     let scenario = classify(env, &default_branch);
@@ -163,9 +156,7 @@ pub fn resolve_change_plan(
             // MergeQueue and PushToDefault only need HEAD^1; deepen=1 always
             // succeeds for non-root commits, so base_reachable is always true here.
             Scenario::MergeQueue | Scenario::PushToDefault => {
-                unreachable!(
-                    "MergeQueue/PushToDefault deepen by 1 for HEAD^1, which is always reachable"
-                );
+                unreachable!("MergeQueue/PushToDefault deepen by 1 for HEAD^1, which is always reachable");
             }
         }
     }
@@ -190,10 +181,7 @@ pub fn resolve_change_plan(
 ///
 /// Uses the same `base_sha` as the diff so the changed-file set and base-tree
 /// reads are always consistent (no independent re-derivation).
-pub fn base_revision_from_plan(
-    vcs: &Vcs,
-    plan: &ChangePlan,
-) -> Option<crate::vcs::BaseRevision> {
+pub fn base_revision_from_plan(vcs: &Vcs, plan: &ChangePlan) -> Option<crate::vcs::BaseRevision> {
     match plan {
         ChangePlan::All | ChangePlan::Empty { .. } => None,
         ChangePlan::Scoped { base_sha, .. } => Some(match vcs.kind() {
@@ -215,11 +203,7 @@ mod tests {
     use crate::vcs::BaseRevision;
 
     fn git(root: &std::path::Path, args: &[&str]) {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .expect("git");
+        let out = Command::new("git").args(args).current_dir(root).output().expect("git");
         assert!(
             out.status.success(),
             "git {:?} failed: {}",
@@ -259,7 +243,11 @@ mod tests {
         let plan = resolve_change_plan(
             &CiEnvironment::default(),
             &vcs,
-            &ChangeOverrides { all: true, base_ref: None, default_branch: None },
+            &ChangeOverrides {
+                all: true,
+                base_ref: None,
+                default_branch: None,
+            },
         )
         .unwrap();
         assert_eq!(plan, ChangePlan::All);
@@ -345,9 +333,6 @@ mod tests {
             base_sha: sha.clone(),
             scenario: Scenario::Local,
         };
-        assert_eq!(
-            base_revision_from_plan(&vcs, &plan),
-            Some(BaseRevision::Git(sha))
-        );
+        assert_eq!(base_revision_from_plan(&vcs, &plan), Some(BaseRevision::Git(sha)));
     }
 }

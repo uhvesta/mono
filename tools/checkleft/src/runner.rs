@@ -11,8 +11,8 @@ use crate::check::{CheckRegistry, ConfiguredCheck};
 use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
 use crate::exclusion::ExclusionStatus;
 use crate::external::{
-    ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCheckPackageProvider, NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
+    ExternalCheckExecutor, ExternalCheckPackage, ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
+    NoopExternalCheckExecutor, NoopExternalCheckPackageProvider,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -74,11 +74,7 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn new(
-        registry: Arc<CheckRegistry>,
-        resolver: Arc<ConfigResolver>,
-        source_tree: Arc<dyn SourceTree>,
-    ) -> Self {
+    pub fn new(registry: Arc<CheckRegistry>, resolver: Arc<ConfigResolver>, source_tree: Arc<dyn SourceTree>) -> Self {
         Self::with_external(
             registry,
             resolver,
@@ -204,12 +200,7 @@ impl Runner {
                         let source_path_clone = source_path.clone();
                         tokio::task::spawn_blocking(move || {
                             external_executor
-                                .execute(
-                                    &package,
-                                    &run_changeset,
-                                    source_tree.as_ref(),
-                                    &run_config,
-                                )
+                                .execute(&package, &run_changeset, source_tree.as_ref(), &run_config)
                                 .map(|mut result| {
                                     result.check_id = configured_check_id.clone();
                                     apply_policy_to_result(result, &run_policy, &run_changeset)
@@ -217,15 +208,10 @@ impl Runner {
                                 .map_err(|err| (configured_check_id, source_path, err))
                         })
                         .await
-                        .unwrap_or_else(|e| {
-                            Err((check_id_clone, source_path_clone, anyhow!("executor panicked: {e}")))
-                        })
+                        .unwrap_or_else(|e| Err((check_id_clone, source_path_clone, anyhow!("executor panicked: {e}"))))
                     });
                 }
-                ScheduledExecution::Invalid {
-                    message,
-                    remediation,
-                } => {
+                ScheduledExecution::Invalid { message, remediation } => {
                     results.push(CheckResult {
                         check_id: run.configured_check_id,
                         findings: vec![Finding {
@@ -322,9 +308,7 @@ impl Runner {
                 let Some(built_in) = self.registry.get(&check.check) else {
                     continue;
                 };
-                let Ok(configured) =
-                    built_in.configure_scoped(&check.config, check.source_path.parent())
-                else {
+                let Ok(configured) = built_in.configure_scoped(&check.config, check.source_path.parent()) else {
                     // Misconfiguration is surfaced by the normal pass; stay quiet here.
                     continue;
                 };
@@ -345,11 +329,7 @@ impl Runner {
                     {
                         continue;
                     }
-                    let dedupe_key = (
-                        check.id.clone(),
-                        check.source_path.clone(),
-                        exclusion.entry.clone(),
-                    );
+                    let dedupe_key = (check.id.clone(), check.source_path.clone(), exclusion.entry.clone());
                     if !audited.insert(dedupe_key) {
                         continue;
                     }
@@ -374,32 +354,25 @@ impl Runner {
                         continue;
                     };
 
-                    let line = self.locate_exclusion_line(
-                        &check.source_path,
-                        &exclusion.entry,
-                        &mut config_text_cache,
-                    );
-                    findings_by_check
-                        .entry(check.id.clone())
-                        .or_default()
-                        .push(Finding {
-                            severity,
-                            message: format!(
-                                "exclusion `{}` is no longer needed: {reason}; remove this entry.",
-                                exclusion.entry
-                            ),
-                            location: Some(Location {
-                                path: check.source_path.clone(),
-                                line,
-                                column: None,
-                            }),
-                            remediations: vec![format!(
-                                "Remove `{}` from this check's exclusions in {}.",
-                                exclusion.entry,
-                                check.source_path.display()
-                            )],
-                            suggested_fix: None,
-                        });
+                    let line = self.locate_exclusion_line(&check.source_path, &exclusion.entry, &mut config_text_cache);
+                    findings_by_check.entry(check.id.clone()).or_default().push(Finding {
+                        severity,
+                        message: format!(
+                            "exclusion `{}` is no longer needed: {reason}; remove this entry.",
+                            exclusion.entry
+                        ),
+                        location: Some(Location {
+                            path: check.source_path.clone(),
+                            line,
+                            column: None,
+                        }),
+                        remediations: vec![format!(
+                            "Remove `{}` from this check's exclusions in {}.",
+                            exclusion.entry,
+                            check.source_path.display()
+                        )],
+                        suggested_fix: None,
+                    });
                 }
             }
         }
@@ -454,9 +427,7 @@ impl Runner {
                 continue;
             }
             for check in resolved.enabled() {
-                if let ScheduledExecution::Invalid { message, .. } =
-                    self.resolve_scheduled_execution(check)
-                {
+                if let ScheduledExecution::Invalid { message, .. } = self.resolve_scheduled_execution(check) {
                     resolution_errors.insert(check.id.clone(), message);
                 }
                 checks.insert(check.id.clone());
@@ -473,10 +444,7 @@ impl Runner {
         }
 
         if !config_diagnostics.is_empty() {
-            let details = config_diagnostics
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join("\n- ");
+            let details = config_diagnostics.into_iter().collect::<Vec<_>>().join("\n- ");
             bail!("failed to resolve checks configuration:\n- {details}");
         }
 
@@ -484,14 +452,8 @@ impl Runner {
     }
 
     fn schedule_runs(&self, changeset: &ChangeSet) -> Result<ScheduledRuns> {
-        info!(
-            changed_files = changeset.changed_files.len(),
-            "scheduling checks"
-        );
-        let mut grouped_runs: BTreeMap<
-            (String, String, String, String, String),
-            ScheduledCheckRun,
-        > = BTreeMap::new();
+        info!(changed_files = changeset.changed_files.len(), "scheduling checks");
+        let mut grouped_runs: BTreeMap<(String, String, String, String, String), ScheduledCheckRun> = BTreeMap::new();
         // Dedup key for config diagnostics:
         // (check_id, path, line, column, message, remediation).
         type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, String);
@@ -538,24 +500,22 @@ impl Runner {
                     policy_fingerprint,
                 );
 
-                let entry = grouped_runs
-                    .entry(key)
-                    .or_insert_with(|| ScheduledCheckRun {
-                        configured_check_id: check.id.clone(),
-                        source_path: check.source_path.clone(),
-                        execution: self.resolve_scheduled_execution(check),
-                        policy,
-                        config: check.config.clone(),
-                        changeset: ChangeSet {
-                            changed_files: Vec::new(),
-                            file_line_deltas: HashMap::new(),
-                            file_diffs: HashMap::new(),
-                            commit_description: changeset.commit_description.clone(),
-                            pr_description: changeset.pr_description.clone(),
-                            change_id: changeset.change_id.clone(),
-                            repository: changeset.repository.clone(),
-                        },
-                    });
+                let entry = grouped_runs.entry(key).or_insert_with(|| ScheduledCheckRun {
+                    configured_check_id: check.id.clone(),
+                    source_path: check.source_path.clone(),
+                    execution: self.resolve_scheduled_execution(check),
+                    policy,
+                    config: check.config.clone(),
+                    changeset: ChangeSet {
+                        changed_files: Vec::new(),
+                        file_line_deltas: HashMap::new(),
+                        file_diffs: HashMap::new(),
+                        commit_description: changeset.commit_description.clone(),
+                        pr_description: changeset.pr_description.clone(),
+                        change_id: changeset.change_id.clone(),
+                        repository: changeset.repository.clone(),
+                    },
+                });
 
                 let already_present = entry
                     .changeset
@@ -619,9 +579,7 @@ impl Runner {
                 Ok(configured) => ScheduledExecution::BuiltInConfigured { check: configured },
                 Err(err) => ScheduledExecution::Invalid {
                     message: err.to_string(),
-                    remediation: Some(
-                        "Fix this check's `config` block in the CHECKS file.".to_owned(),
-                    ),
+                    remediation: Some("Fix this check's `config` block in the CHECKS file.".to_owned()),
                 },
             };
         };
@@ -658,8 +616,7 @@ impl Runner {
                     check.id, check.check, package.id
                 ),
                 remediation: Some(
-                    "Set `check = ...` to match the external package `id` or update the package manifest."
-                        .to_owned(),
+                    "Set `check = ...` to match the external package `id` or update the package manifest.".to_owned(),
                 ),
             };
         }
@@ -745,15 +702,8 @@ fn apply_policy_to_result(
 
     if policy.allow_bypass {
         if let Some(reason) = changeset.bypass_reason(&policy.bypass_name) {
-            let location = result
-                .findings
-                .iter()
-                .find_map(|finding| finding.location.clone());
-            result.findings = vec![bypass_applied_finding(
-                &policy.bypass_name,
-                &reason,
-                location,
-            )];
+            let location = result.findings.iter().find_map(|finding| finding.location.clone());
+            result.findings = vec![bypass_applied_finding(&policy.bypass_name, &reason, location)];
             return result;
         }
 

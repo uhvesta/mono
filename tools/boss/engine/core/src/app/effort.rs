@@ -29,11 +29,7 @@ pub(super) async fn handle_audit_product_effort(ctx: Dispatch, req: FrontendRequ
         // are coordinator-emitted facts about that corpus.
         let result = build_effort_audit_report(&work_db, &product_id, window_days);
         match result {
-            Ok(report) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::EffortAuditReport { report },
-            ),
+            Ok(report) => send_response(&sink, &request_id, FrontendEvent::EffortAuditReport { report }),
             Err(err) => send_response(
                 &sink,
                 &request_id,
@@ -69,18 +65,8 @@ pub(super) async fn handle_record_effort_escalation(ctx: Dispatch, req: Frontend
         // is opaque diagnostic data and a forged event is
         // bounded to one false-positive in the audit
         // report.
-        match work_db.record_effort_escalation(
-            &work_item_id,
-            original_level,
-            new_level,
-            &markers,
-            rule_id.as_deref(),
-        ) {
-            Ok(event) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::EffortEscalationRecorded { event },
-            ),
+        match work_db.record_effort_escalation(&work_item_id, original_level, new_level, &markers, rule_id.as_deref()) {
+            Ok(event) => send_response(&sink, &request_id, FrontendEvent::EffortEscalationRecorded { event }),
             Err(err) => send_response(
                 &sink,
                 &request_id,

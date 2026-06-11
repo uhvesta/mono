@@ -39,12 +39,15 @@ impl TestEngine {
             .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
         let socket_for_serve = socket_path.clone();
-        let join =
-            tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
+        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
             return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
-        Ok(Self { socket_path, _temp: temp, join })
+        Ok(Self {
+            socket_path,
+            _temp: temp,
+            join,
+        })
     }
 
     fn socket_str(&self) -> &str {
@@ -60,7 +63,9 @@ impl Drop for TestEngine {
 
 async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
     match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
-        FrontendEvent::WorkItemCreated { item: WorkItem::Product(p) } => Ok(p),
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => Ok(p),
         other => Err(anyhow!("unexpected event for product create: {other:?}")),
     }
 }
@@ -253,8 +258,7 @@ async fn editorial_show_returns_empty_initially() -> Result<()> {
     )
     .await?;
 
-    let result =
-        run_boss(engine.socket_str(), &["editorial", "show", &product.id])?;
+    let result = run_boss(engine.socket_str(), &["editorial", "show", &product.id])?;
     assert_eq!(
         result["actions"].as_array().map(Vec::len),
         Some(0),

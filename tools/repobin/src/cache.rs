@@ -92,10 +92,7 @@ pub enum EnsureOutcome {
 impl EnsureOutcome {
     pub fn head(&self) -> &str {
         match self {
-            Self::Cloned { head }
-            | Self::Updated { head }
-            | Self::Cached { head, .. }
-            | Self::Pinned { head } => head,
+            Self::Cloned { head } | Self::Updated { head } | Self::Cached { head, .. } | Self::Pinned { head } => head,
         }
     }
 
@@ -104,9 +101,7 @@ impl EnsureOutcome {
             Self::Cloned { .. } => "cloned",
             Self::Updated { .. } => "updated",
             Self::Cached { refreshed: true, .. } => "up to date",
-            Self::Cached {
-                refreshed: false, ..
-            } => "cached",
+            Self::Cached { refreshed: false, .. } => "cached",
             Self::Pinned { .. } => "pinned",
         }
     }
@@ -165,15 +160,14 @@ impl RepoCacheLock {
         // Reuse existing pinned checkout if it is already at the requested SHA.
         if pinned_checkout.join(".git").is_dir() {
             if let Ok(current) = read_head(&pinned_checkout)
-                && sha_matches(&current, sha) {
-                    return Ok(EnsureOutcome::Pinned { head: current });
-                }
+                && sha_matches(&current, sha)
+            {
+                return Ok(EnsureOutcome::Pinned { head: current });
+            }
             // Wrong SHA or unreadable — remove and reclone.
-            fs::remove_dir_all(&pinned_checkout).map_err(|source| {
-                RepobinError::WriteCacheMetadata {
-                    path: pinned_checkout.clone(),
-                    source,
-                }
+            fs::remove_dir_all(&pinned_checkout).map_err(|source| RepobinError::WriteCacheMetadata {
+                path: pinned_checkout.clone(),
+                source,
             })?;
         }
 
@@ -219,11 +213,9 @@ impl RepoCacheLock {
 
     fn clone_initial(&self) -> Result<(), RepobinError> {
         if self.cache.checkout.exists() {
-            fs::remove_dir_all(&self.cache.checkout).map_err(|source| {
-                RepobinError::WriteCacheMetadata {
-                    path: self.cache.checkout.clone(),
-                    source,
-                }
+            fs::remove_dir_all(&self.cache.checkout).map_err(|source| RepobinError::WriteCacheMetadata {
+                path: self.cache.checkout.clone(),
+                source,
             })?;
         }
         let output = Command::new("git")
@@ -248,12 +240,8 @@ impl RepoCacheLock {
             });
         }
         let url_path = self.cache.dir.join("url");
-        fs::write(&url_path, &self.cache.url).map_err(|source| {
-            RepobinError::WriteCacheMetadata {
-                path: url_path,
-                source,
-            }
-        })?;
+        fs::write(&url_path, &self.cache.url)
+            .map_err(|source| RepobinError::WriteCacheMetadata { path: url_path, source })?;
         Ok(())
     }
 
@@ -270,18 +258,13 @@ impl RepoCacheLock {
         let Ok(modified) = metadata.modified() else {
             return Ok(false);
         };
-        let elapsed = SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or(Duration::ZERO);
+        let elapsed = SystemTime::now().duration_since(modified).unwrap_or(Duration::ZERO);
         Ok(elapsed < ttl)
     }
 
     fn update_fetch_stamp(&self) -> Result<(), RepobinError> {
         let stamp = self.cache.dir.join("fetch_stamp");
-        File::create(&stamp).map_err(|source| RepobinError::WriteCacheMetadata {
-            path: stamp,
-            source,
-        })?;
+        File::create(&stamp).map_err(|source| RepobinError::WriteCacheMetadata { path: stamp, source })?;
         Ok(())
     }
 }
@@ -439,19 +422,12 @@ fn repo_dir_name(url: &str) -> String {
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     let slug = url_slug(url);
-    if slug.is_empty() {
-        hex
-    } else {
-        format!("{slug}-{hex}")
-    }
+    if slug.is_empty() { hex } else { format!("{slug}-{hex}") }
 }
 
 fn url_slug(url: &str) -> String {
     let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    let last = trimmed
-        .rsplit(|c| matches!(c, '/' | ':'))
-        .next()
-        .unwrap_or("");
+    let last = trimmed.rsplit(|c| matches!(c, '/' | ':')).next().unwrap_or("");
     last.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(40)
@@ -644,11 +620,7 @@ mod tests {
                 .current_dir(&work)
                 .output()
                 .unwrap();
-            shas.push(
-                String::from_utf8_lossy(&sha_out.stdout)
-                    .trim()
-                    .to_string(),
-            );
+            shas.push(String::from_utf8_lossy(&sha_out.stdout).trim().to_string());
             Command::new("git")
                 .args(["push", "origin", "HEAD:main"])
                 .current_dir(&work)
@@ -728,7 +700,10 @@ mod tests {
         let _ = std::fs::remove_file(&stamp);
         let outcome = lock.ensure_up_to_date().unwrap();
         assert!(
-            matches!(outcome, EnsureOutcome::Cloned { .. } | EnsureOutcome::Cached { .. } | EnsureOutcome::Updated { .. }),
+            matches!(
+                outcome,
+                EnsureOutcome::Cloned { .. } | EnsureOutcome::Cached { .. } | EnsureOutcome::Updated { .. }
+            ),
             "unexpected outcome: {outcome:?}"
         );
         let head_sha = super::read_head(&lock.cache().checkout).unwrap();

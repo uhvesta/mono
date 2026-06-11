@@ -6,8 +6,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::Parser;
 use git_changelog::{
-    derive_paths_from_project, extract_changelog, repo_slug_from_remote, ChangelogRenderer,
-    ExtractionConfig, GithubMarkdownRenderer,
+    ChangelogRenderer, ExtractionConfig, GithubMarkdownRenderer, derive_paths_from_project, extract_changelog,
+    repo_slug_from_remote,
 };
 
 #[derive(Debug, Parser)]
@@ -53,10 +53,8 @@ fn run(cli: Cli) -> Result<()> {
     let mut globs = cli.paths;
 
     if let Some(paths_file) = cli.paths_file {
-        let content =
-            fs::read_to_string(&paths_file).with_context(|| {
-                format!("could not read --paths-file {}", paths_file.display())
-            })?;
+        let content = fs::read_to_string(&paths_file)
+            .with_context(|| format!("could not read --paths-file {}", paths_file.display()))?;
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {

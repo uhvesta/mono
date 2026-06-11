@@ -99,7 +99,13 @@ pub fn remote_events_socket_path(run_id: &str) -> String {
 fn sanitize_run_id(run_id: &str) -> String {
     run_id
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -170,10 +176,7 @@ pub fn build_remote_command(plan: &RemoteSpawnPlan) -> Vec<String> {
 pub fn parse_remote_pid(stderr: &str) -> Option<i64> {
     for line in stderr.lines() {
         if let Some(idx) = line.find("pid=") {
-            let digits: String = line[idx + 4..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let digits: String = line[idx + 4..].chars().take_while(|c| c.is_ascii_digit()).collect();
             if !digits.is_empty() {
                 return digits.parse().ok();
             }
@@ -194,17 +197,9 @@ pub trait SshExec: Send + Sync {
     /// Run a command on the remote over the master, capturing output.
     async fn run(&self, argv: &[&str]) -> Result<SshOutput>;
     /// `ssh -O forward -R remote:local` over the master.
-    async fn add_reverse_unix_forward(
-        &self,
-        remote_socket: &str,
-        local_socket: &str,
-    ) -> Result<SshOutput>;
+    async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput>;
     /// `ssh -O cancel -R remote:local` over the master.
-    async fn cancel_reverse_unix_forward(
-        &self,
-        remote_socket: &str,
-        local_socket: &str,
-    ) -> Result<SshOutput>;
+    async fn cancel_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput>;
 }
 
 #[async_trait]
@@ -215,18 +210,10 @@ impl SshExec for SshTransport {
     async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
         SshTransport::run(self, argv).await
     }
-    async fn add_reverse_unix_forward(
-        &self,
-        remote_socket: &str,
-        local_socket: &str,
-    ) -> Result<SshOutput> {
+    async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput> {
         SshTransport::add_reverse_unix_forward(self, remote_socket, local_socket).await
     }
-    async fn cancel_reverse_unix_forward(
-        &self,
-        remote_socket: &str,
-        local_socket: &str,
-    ) -> Result<SshOutput> {
+    async fn cancel_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput> {
         SshTransport::cancel_reverse_unix_forward(self, remote_socket, local_socket).await
     }
 }
@@ -268,9 +255,7 @@ pub async fn perform_remote_launch(
     engine_events_socket: &str,
 ) -> Result<RemoteLaunchOutcome> {
     // 1. Clear any stale remote socket from a previous run / crash.
-    let _ = exec
-        .run(&["rm", "-f", plan.events_socket_path.as_str()])
-        .await?;
+    let _ = exec.run(&["rm", "-f", plan.events_socket_path.as_str()]).await?;
 
     // 2. Establish the events forward over the master.
     let fwd = exec
@@ -398,18 +383,9 @@ mod tests {
             classify_wrapper_exit(78),
             WrapperLaunch::Failed(REASON_WRAPPER_MISCONFIGURED)
         );
-        assert_eq!(
-            classify_wrapper_exit(79),
-            WrapperLaunch::Failed(REASON_MISSING_CLAUDE)
-        );
-        assert_eq!(
-            classify_wrapper_exit(80),
-            WrapperLaunch::Failed(REASON_MISSING_CUBE)
-        );
-        assert_eq!(
-            classify_wrapper_exit(81),
-            WrapperLaunch::Failed(REASON_MISSING_GH)
-        );
+        assert_eq!(classify_wrapper_exit(79), WrapperLaunch::Failed(REASON_MISSING_CLAUDE));
+        assert_eq!(classify_wrapper_exit(80), WrapperLaunch::Failed(REASON_MISSING_CUBE));
+        assert_eq!(classify_wrapper_exit(81), WrapperLaunch::Failed(REASON_MISSING_GH));
         assert_eq!(
             classify_wrapper_exit(1),
             WrapperLaunch::Failed(REASON_WORKER_LAUNCH_FAILED)
@@ -439,12 +415,8 @@ mod tests {
         assert!(argv.contains(&"BOSS_LEASE_ID=lease-1".to_owned()));
         assert!(argv.contains(&"BOSS_WORKSPACE=/ws/mono-agent-007".to_owned()));
         assert!(argv.contains(&"BOSS_REPO_REMOTE_URL=git@example.com:me/mono.git".to_owned()));
-        assert!(argv.contains(
-            &"BOSS_INITIAL_INPUT_FILE=/ws/mono-agent-007/.boss/initial-input.txt".to_owned()
-        ));
-        assert!(argv.contains(
-            &"BOSS_SETTINGS_FILE=/ws/mono-agent-007/.boss/settings.json".to_owned()
-        ));
+        assert!(argv.contains(&"BOSS_INITIAL_INPUT_FILE=/ws/mono-agent-007/.boss/initial-input.txt".to_owned()));
+        assert!(argv.contains(&"BOSS_SETTINGS_FILE=/ws/mono-agent-007/.boss/settings.json".to_owned()));
         // The wrapper path is always the final token.
         assert_eq!(argv.last().unwrap(), "~/.boss-remote/bin/boss-remote-run");
     }
@@ -533,11 +505,7 @@ mod tests {
                 })
             }
         }
-        async fn add_reverse_unix_forward(
-            &self,
-            remote_socket: &str,
-            local_socket: &str,
-        ) -> Result<SshOutput> {
+        async fn add_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::AddForward {
                 remote: remote_socket.to_owned(),
                 local: local_socket.to_owned(),
@@ -552,11 +520,7 @@ mod tests {
                 },
             })
         }
-        async fn cancel_reverse_unix_forward(
-            &self,
-            remote_socket: &str,
-            local_socket: &str,
-        ) -> Result<SshOutput> {
+        async fn cancel_reverse_unix_forward(&self, remote_socket: &str, local_socket: &str) -> Result<SshOutput> {
             self.calls.lock().unwrap().push(Call::CancelForward {
                 remote: remote_socket.to_owned(),
                 local: local_socket.to_owned(),
@@ -584,14 +548,9 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_clears_socket_opens_forward_then_launches() {
-        let exec = FakeExec::new(
-            0,
-            "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n",
-        );
+        let exec = FakeExec::new(0, "boss-remote-run: starting run_id=run-1 version=eng-x pid=4242\n");
         let engine_sock = "/Users/me/Library/Application Support/Boss/events.sock";
-        let outcome = perform_remote_launch(&exec, &sample_plan(), engine_sock)
-            .await
-            .unwrap();
+        let outcome = perform_remote_launch(&exec, &sample_plan(), engine_sock).await.unwrap();
 
         assert!(outcome.launched);
         assert_eq!(outcome.failure_reason, None);
@@ -601,11 +560,7 @@ mod tests {
         // Order matters: stale-socket cleanup → forward → wrapper launch.
         assert_eq!(
             calls[0],
-            Call::Run(vec![
-                "rm".into(),
-                "-f".into(),
-                "/tmp/boss-events-run-1.sock".into(),
-            ])
+            Call::Run(vec!["rm".into(), "-f".into(), "/tmp/boss-events-run-1.sock".into(),])
         );
         assert_eq!(
             calls[1],
@@ -618,9 +573,7 @@ mod tests {
             Call::Run(argv) => {
                 assert_eq!(argv[0], "env");
                 assert!(argv.contains(&"BOSS_RUN_ID=run-1".to_owned()));
-                assert!(argv.contains(
-                    &"BOSS_EVENTS_SOCKET=/tmp/boss-events-run-1.sock".to_owned()
-                ));
+                assert!(argv.contains(&"BOSS_EVENTS_SOCKET=/tmp/boss-events-run-1.sock".to_owned()));
             }
             other => panic!("expected wrapper launch run, got {other:?}"),
         }
@@ -641,10 +594,7 @@ mod tests {
         assert!(outcome.detail.unwrap().contains("claude"));
 
         // The forward we opened before the failed launch is torn down.
-        assert!(exec
-            .calls()
-            .iter()
-            .any(|c| matches!(c, Call::CancelForward { .. })));
+        assert!(exec.calls().iter().any(|c| matches!(c, Call::CancelForward { .. })));
     }
 
     #[tokio::test]
@@ -681,10 +631,7 @@ mod tests {
         assert_eq!(outcome.failure_reason, None);
 
         let calls = exec.calls();
-        assert_eq!(
-            calls[0],
-            Call::Run(vec!["rm".into(), "-f".into(), remote_sock.clone()])
-        );
+        assert_eq!(calls[0], Call::Run(vec!["rm".into(), "-f".into(), remote_sock.clone()]));
         assert_eq!(
             calls[1],
             Call::AddForward {
@@ -705,10 +652,9 @@ mod tests {
     async fn reestablish_forward_reports_failure_when_forward_rejected() {
         let mut exec = FakeExec::new(0, "");
         exec.fail_forward = true;
-        let outcome =
-            reestablish_events_forward(&exec, &remote_events_socket_path("exec-9"), "/engine.sock")
-                .await
-                .unwrap();
+        let outcome = reestablish_events_forward(&exec, &remote_events_socket_path("exec-9"), "/engine.sock")
+            .await
+            .unwrap();
         assert!(!outcome.launched);
         assert_eq!(outcome.failure_reason, Some(REASON_WORKER_LAUNCH_FAILED));
         assert!(outcome.detail.unwrap().contains("forwarding request failed"));

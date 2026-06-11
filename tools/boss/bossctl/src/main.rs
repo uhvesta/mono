@@ -26,9 +26,8 @@ mod logs;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState,
-    MetricLiveEntry, RequestExecutionInput, ROSTER, WorkExecution, WorkItem, WorkRun,
-    WorkspacePoolEntry,
+    FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry,
+    ROSTER, RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -547,9 +546,7 @@ fn main() -> ExitCode {
     // Intercept --version/-V before Cli::parse() so we print the
     // canonical version string.
     let argv: Vec<String> = std::env::args().collect();
-    if argv.get(1).map(|s| s.as_str()) == Some("--version")
-        || argv.get(1).map(|s| s.as_str()) == Some("-V")
-    {
+    if argv.get(1).map(|s| s.as_str()) == Some("--version") || argv.get(1).map(|s| s.as_str()) == Some("-V") {
         println!("{}", bossctl_version_string());
         return ExitCode::SUCCESS;
     }
@@ -573,9 +570,7 @@ fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Probe { agent, text, urgent } => {
-            probe_run(&cli.socket_path, cli.json, agent, text, urgent).await
-        }
+        Command::Probe { agent, text, urgent } => probe_run(&cli.socket_path, cli.json, agent, text, urgent).await,
         Command::Agents {
             action: AgentsAction::Status { agent },
         } => agents_status(&cli.socket_path, cli.json, agent).await,
@@ -595,7 +590,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Interrupt { agent },
         } => agents_interrupt(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
-            action: AgentsAction::Transcript { agent, lines, format, no_tools },
+            action:
+                AgentsAction::Transcript {
+                    agent,
+                    lines,
+                    format,
+                    no_tools,
+                },
         } => agents_transcript(&cli.socket_path, cli.json, agent, lines, format, no_tools).await,
         Command::Agents {
             action: AgentsAction::Reap { run_id },
@@ -606,13 +607,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     work_item_id,
                     preferred_workspace_id,
                 },
-        } => agents_launch(
-            &cli.socket_path,
-            cli.json,
-            work_item_id,
-            preferred_workspace_id,
-        )
-        .await,
+        } => agents_launch(&cli.socket_path, cli.json, work_item_id, preferred_workspace_id).await,
         Command::Work {
             action:
                 WorkAction::Start {
@@ -620,14 +615,16 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     priority,
                     preferred_workspace_id,
                 },
-        } => work_start(
-            &cli.socket_path,
-            cli.json,
-            work_item_id,
-            priority,
-            preferred_workspace_id,
-        )
-        .await,
+        } => {
+            work_start(
+                &cli.socket_path,
+                cli.json,
+                work_item_id,
+                priority,
+                preferred_workspace_id,
+            )
+            .await
+        }
         Command::Work {
             action: WorkAction::Cancel { execution_id },
         } => work_cancel(&cli.socket_path, cli.json, execution_id).await,
@@ -647,11 +644,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 },
         } => dispatch_tail(cli.json, state_root, n, stage, outcome),
         Command::Dispatch {
-            action:
-                DispatchAction::Diagnose {
-                    execution_id,
-                    state_root,
-                },
+            action: DispatchAction::Diagnose {
+                execution_id,
+                state_root,
+            },
         } => dispatch_diagnose(cli.json, state_root, &execution_id),
         Command::Dispatch {
             action:
@@ -698,18 +694,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     skip_wrapper_push,
                     state_root,
                 },
-        } => {
-            hosts_add(
-                cli.json,
-                state_root,
-                id,
-                ssh_target,
-                pool_size,
-                tags,
-                skip_wrapper_push,
-            )
-            .await
-        }
+        } => hosts_add(cli.json, state_root, id, ssh_target, pool_size, tags, skip_wrapper_push).await,
         Command::Hosts {
             action: HostsAction::List { enabled, state_root },
         } => hosts_list(cli.json, state_root, enabled),
@@ -759,9 +744,7 @@ pub(crate) fn resolve_state_root(explicit: Option<PathBuf>) -> Result<PathBuf> {
         return Ok(path);
     }
     dispatch_reader::default_state_root().ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot resolve Boss state root: HOME is unset and no --state-root was provided"
-        )
+        anyhow::anyhow!("cannot resolve Boss state root: HOME is unset and no --state-root was provided")
     })
 }
 
@@ -850,12 +833,7 @@ fn dispatch_ghost_active(
             let work_item = entry.work_item_id.as_deref().unwrap_or("-");
             println!(
                 "{}  last={}/{}  elapsed={}s  work_item={}{}",
-                entry.execution_id,
-                entry.last_stage,
-                entry.last_outcome,
-                elapsed_s,
-                work_item,
-                stalled_tag,
+                entry.execution_id, entry.last_stage, entry.last_outcome, elapsed_s, work_item, stalled_tag,
             );
         }
     }
@@ -961,21 +939,14 @@ fn build_tail_json(slice: Vec<&DispatchEvent>) -> serde_json::Value {
     })
 }
 
-fn build_diagnose_json(
-    execution_id: &str,
-    events: &[DispatchEvent],
-    durations: &[u128],
-) -> serde_json::Value {
+fn build_diagnose_json(execution_id: &str, events: &[DispatchEvent], durations: &[u128]) -> serde_json::Value {
     let detailed: Vec<serde_json::Value> = events
         .iter()
         .zip(durations.iter())
         .map(|(event, dur)| {
             let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
             if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "stage_duration_ms".into(),
-                    serde_json::Value::from(*dur as u64),
-                );
+                obj.insert("stage_duration_ms".into(), serde_json::Value::from(*dur as u64));
             }
             value
         })
@@ -1026,11 +997,8 @@ fn print_dispatch_event_detailed(event: &DispatchEvent, stage_duration_ms: u128)
 }
 
 async fn connect(socket_path: &Option<String>) -> Result<BossClient> {
-    let discovery = Discovery::from_env(socket_path.as_deref())
-        .context("resolving engine discovery profile")?;
-    BossClient::connect(&discovery)
-        .await
-        .context("connecting to engine")
+    let discovery = Discovery::from_env(socket_path.as_deref()).context("resolving engine discovery profile")?;
+    BossClient::connect(&discovery).await.context("connecting to engine")
 }
 
 /// Resolve a positional `agent` argument to a live worker entry.
@@ -1043,18 +1011,13 @@ async fn connect(socket_path: &Option<String>) -> Result<BossClient> {
 /// Names resolve only over currently-live slots — historical run
 /// ids stay run-id-only on purpose, so a typo'd crew name doesn't
 /// silently match a closed run.
-fn resolve_agent_ref<'a>(
-    reference: &str,
-    states: &'a [LiveWorkerState],
-) -> Result<&'a LiveWorkerState> {
-    let by_run: Vec<&LiveWorkerState> =
-        states.iter().filter(|s| s.run_id == reference).collect();
+fn resolve_agent_ref<'a>(reference: &str, states: &'a [LiveWorkerState]) -> Result<&'a LiveWorkerState> {
+    let by_run: Vec<&LiveWorkerState> = states.iter().filter(|s| s.run_id == reference).collect();
     if !by_run.is_empty() {
         return pick_unique(reference, by_run, states);
     }
     if let Ok(slot) = reference.parse::<u8>() {
-        let by_slot: Vec<&LiveWorkerState> =
-            states.iter().filter(|s| s.slot_id == slot).collect();
+        let by_slot: Vec<&LiveWorkerState> = states.iter().filter(|s| s.slot_id == slot).collect();
         if !by_slot.is_empty() {
             return pick_unique(reference, by_slot, states);
         }
@@ -1112,9 +1075,7 @@ fn looks_like_name_or_slot(reference: &str) -> bool {
     if reference.parse::<u8>().is_ok() {
         return true;
     }
-    ROSTER
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(reference))
+    ROSTER.iter().any(|name| name.eq_ignore_ascii_case(reference))
 }
 
 /// If `selector` looks like a friendly work-item id (`T42`, `t42`, `P7`,
@@ -1163,10 +1124,7 @@ async fn resolve_tnnn_to_live_worker<'a>(
             WorkItem::Project(p) => p.id.as_str(),
             WorkItem::Task(t) | WorkItem::Chore(t) => t.id.as_str(),
         };
-        if let Some(state) = states
-            .iter()
-            .find(|s| s.work_item_id.as_deref() == Some(primary_id))
-        {
+        if let Some(state) = states.iter().find(|s| s.work_item_id.as_deref() == Some(primary_id)) {
             return Ok(Some(state));
         }
     }
@@ -1206,13 +1164,7 @@ async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<LiveWorkerStat
     }
 }
 
-async fn probe_run(
-    socket_path: &Option<String>,
-    json: bool,
-    agent: String,
-    text: String,
-    urgent: bool,
-) -> Result<()> {
+async fn probe_run(socket_path: &Option<String>, json: bool, agent: String, text: String, urgent: bool) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
     let run_id = resolve_agent_ref(&agent, &states)?.run_id.clone();
@@ -1225,7 +1177,11 @@ async fn probe_run(
         .await
         .context("sending ProbeRun")?;
     match response {
-        FrontendEvent::ProbeQueued { run_id: returned, probe_id, urgent: is_urgent } => {
+        FrontendEvent::ProbeQueued {
+            run_id: returned,
+            probe_id,
+            urgent: is_urgent,
+        } => {
             if json {
                 println!(
                     "{}",
@@ -1323,9 +1279,7 @@ async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) ->
     let states = fetch_live_states(&mut client).await?;
     let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
-        .send_request(&FrontendRequest::StopRun {
-            run_id: run_id.clone(),
-        })
+        .send_request(&FrontendRequest::StopRun { run_id: run_id.clone() })
         .await
         .context("sending StopRun")?;
     match response {
@@ -1355,9 +1309,7 @@ async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -
     let states = fetch_live_states(&mut client).await?;
     let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
-        .send_request(&FrontendRequest::FocusWorkerPane {
-            run_id: run_id.clone(),
-        })
+        .send_request(&FrontendRequest::FocusWorkerPane { run_id: run_id.clone() })
         .await
         .context("sending FocusWorkerPane")?;
     match response {
@@ -1386,11 +1338,7 @@ async fn agents_focus(socket_path: &Option<String>, json: bool, agent: String) -
     }
 }
 
-async fn reveal_work_item(
-    socket_path: &Option<String>,
-    json: bool,
-    id: String,
-) -> Result<()> {
+async fn reveal_work_item(socket_path: &Option<String>, json: bool, id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::RevealWorkItem { id: id.clone() })
@@ -1427,12 +1375,7 @@ async fn reveal_work_item(
 /// would treat it as Enter; it does not (the `\n` lands as a literal
 /// newline character in the input field), so the writer owns
 /// submission now and the CLI ships the text verbatim.
-async fn agents_send(
-    socket_path: &Option<String>,
-    json: bool,
-    agent: String,
-    text: String,
-) -> Result<()> {
+async fn agents_send(socket_path: &Option<String>, json: bool, agent: String, text: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
     let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
@@ -1472,18 +1415,12 @@ async fn agents_send(
 /// Interrupt the worker referenced by `agent` — equivalent to the
 /// human pressing Esc inside that worker's pane. Cancels the
 /// in-flight turn without killing the run.
-async fn agents_interrupt(
-    socket_path: &Option<String>,
-    json: bool,
-    agent: String,
-) -> Result<()> {
+async fn agents_interrupt(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
     let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
     let response = client
-        .send_request(&FrontendRequest::InterruptWorkerPane {
-            run_id: run_id.clone(),
-        })
+        .send_request(&FrontendRequest::InterruptWorkerPane { run_id: run_id.clone() })
         .await
         .context("sending InterruptWorkerPane")?;
     match response {
@@ -1581,11 +1518,7 @@ async fn work_start(
     }
 }
 
-async fn work_cancel(
-    socket_path: &Option<String>,
-    json: bool,
-    execution_id: String,
-) -> Result<()> {
+async fn work_cancel(socket_path: &Option<String>, json: bool, execution_id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
@@ -1637,9 +1570,7 @@ async fn agents_transcript(
         Ok(state) => state.run_id.clone(),
         Err(err) if looks_like_name_or_slot(&agent) => return Err(err),
         Err(_) => {
-            if let Some(state) =
-                resolve_tnnn_to_live_worker(&mut client, &agent, &states).await?
-            {
+            if let Some(state) = resolve_tnnn_to_live_worker(&mut client, &agent, &states).await? {
                 state.run_id.clone()
             } else {
                 agent.clone()
@@ -1667,13 +1598,9 @@ async fn agents_transcript(
             };
             if format == TranscriptFormat::Text || format == TranscriptFormat::Markdown {
                 let joined = tail.join("\n");
-                let events =
-                    boss_engine::transcript_markdown::parse_transcript(&joined);
+                let events = boss_engine::transcript_markdown::parse_transcript(&joined);
                 let rendered = if format == TranscriptFormat::Markdown {
-                    let segments = boss_engine::transcript_markdown::events_to_segments(
-                        &events,
-                        &render_opts,
-                    );
+                    let segments = boss_engine::transcript_markdown::events_to_segments(&events, &render_opts);
                     boss_engine::transcript_markdown::segments_to_markdown(&segments)
                 } else {
                     boss_engine::transcript_markdown::render_text(&events, &render_opts)
@@ -1734,16 +1661,10 @@ async fn agents_transcript(
     }
 }
 
-async fn agents_reap(
-    socket_path: &Option<String>,
-    json: bool,
-    run_id: String,
-) -> Result<()> {
+async fn agents_reap(socket_path: &Option<String>, json: bool, run_id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
-        .send_request(&FrontendRequest::ReapRun {
-            run_id: run_id.clone(),
-        })
+        .send_request(&FrontendRequest::ReapRun { run_id: run_id.clone() })
         .await
         .context("sending ReapRun")?;
     match response {
@@ -1855,10 +1776,7 @@ fn print_run_short(run: &WorkRun) {
 
 fn print_live_state(json: bool, state: &LiveWorkerState) {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(state).expect("LiveWorkerState serializes")
-        );
+        println!("{}", serde_json::to_string(state).expect("LiveWorkerState serializes"));
         return;
     }
     println!("slot {} ({})", state.slot_id, state.name);
@@ -1932,9 +1850,8 @@ fn resolve_db_path(state_root: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BOSS_DB_PATH") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        anyhow::anyhow!("cannot resolve Boss state.db: HOME is unset; pass --state-root")
-    })?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve Boss state.db: HOME is unset; pass --state-root"))?;
     Ok(PathBuf::from(home).join("Library/Application Support/Boss/state.db"))
 }
 
@@ -2085,7 +2002,11 @@ fn metrics_show(json: bool, state_root: Option<PathBuf>, name: &str) -> Result<(
                     })
                 );
             } else {
-                let stale_tag = if r.stale { "  [stale: not registered by current engine]" } else { "" };
+                let stale_tag = if r.stale {
+                    "  [stale: not registered by current engine]"
+                } else {
+                    ""
+                };
                 println!("{}{}", r.name, stale_tag);
                 println!("  description:   {}", r.description);
                 println!("  kind:          {}", r.kind);
@@ -2097,11 +2018,7 @@ fn metrics_show(json: bool, state_root: Option<PathBuf>, name: &str) -> Result<(
     Ok(())
 }
 
-async fn metrics_show_live(
-    socket_path: &Option<String>,
-    json: bool,
-    name: String,
-) -> Result<()> {
+async fn metrics_show_live(socket_path: &Option<String>, json: bool, name: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::MetricsShowLive { name: name.clone() })
@@ -2148,8 +2065,11 @@ fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntr
                     })
                 );
             } else {
-                let stale_tag =
-                    if e.stale { "  [stale: not registered by current engine]" } else { "" };
+                let stale_tag = if e.stale {
+                    "  [stale: not registered by current engine]"
+                } else {
+                    ""
+                };
                 println!("{}{}", e.name, stale_tag);
                 println!("  description:   {}", e.description);
                 println!("  kind:          {}  (live — read from in-memory atomic)", e.kind);
@@ -2160,18 +2080,18 @@ fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntr
     }
 }
 
-async fn metrics_reset(
-    socket_path: &Option<String>,
-    json: bool,
-    name: Option<String>,
-) -> Result<()> {
+async fn metrics_reset(socket_path: &Option<String>, json: bool, name: Option<String>) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::MetricsReset { name: name.clone() })
         .await
         .context("sending MetricsReset")?;
     match response {
-        FrontendEvent::MetricsResetDone { name: returned_name, counters_reset, gauges_reset } => {
+        FrontendEvent::MetricsResetDone {
+            name: returned_name,
+            counters_reset,
+            gauges_reset,
+        } => {
             if json {
                 println!(
                     "{}",
@@ -2242,17 +2162,15 @@ fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
     println!("live-status pipeline debug");
     println!("  engine_build_sha:           {}", report.engine_build_sha);
     println!("  engine_build_time:          {}", report.engine_build_time);
-    println!(
-        "  engine_binary_fingerprint:  {}",
-        report.engine_binary_fingerprint,
-    );
-    println!(
-        "  engine_process_started_at:  {}",
-        report.engine_process_started_at,
-    );
+    println!("  engine_binary_fingerprint:  {}", report.engine_binary_fingerprint,);
+    println!("  engine_process_started_at:  {}", report.engine_process_started_at,);
     println!(
         "  anthropic_api_key_present:  {}",
-        if report.anthropic_api_key_present { "yes" } else { "NO (summarizer cannot succeed)" },
+        if report.anthropic_api_key_present {
+            "yes"
+        } else {
+            "NO (summarizer cannot succeed)"
+        },
     );
     println!("  tracked_slots:              {}", report.tracked_slot_count);
     println!("  disabled_slots:             {}", report.disabled_slot_count);
@@ -2270,7 +2188,10 @@ fn print_live_status_debug_human(report: &LiveStatusDebugReport) {
 
 fn print_dispatcher_stats(stats: &boss_protocol::DispatcherStatsReport) {
     println!("dispatcher stats");
-    println!("  hook_events_total:                          {}", stats.hook_events_total);
+    println!(
+        "  hook_events_total:                          {}",
+        stats.hook_events_total
+    );
     println!(
         "  hook_events_dropped_missing_run_id:         {}",
         stats.hook_events_dropped_missing_run_id,
@@ -2319,15 +2240,18 @@ fn print_live_status_slot_debug(slot: &LiveStatusSlotDebug) {
     println!("slot {}", slot.slot_id);
     println!(
         "  task_running:        {}",
-        if slot.task_running { "yes" } else { "no (notifies will drop)" },
+        if slot.task_running {
+            "yes"
+        } else {
+            "no (notifies will drop)"
+        },
     );
-    println!(
-        "  disabled:            {}",
-        if slot.disabled { "yes" } else { "no" },
-    );
+    println!("  disabled:            {}", if slot.disabled { "yes" } else { "no" },);
     println!(
         "  transcript_path:     {}",
-        slot.transcript_path.as_deref().unwrap_or("(unset — work_runs.transcript_path is NULL)"),
+        slot.transcript_path
+            .as_deref()
+            .unwrap_or("(unset — work_runs.transcript_path is NULL)"),
     );
     match (&slot.last_trigger_kind, &slot.last_trigger_at) {
         (Some(kind), Some(at)) => {
@@ -2396,15 +2320,12 @@ async fn hosts_add(
         Some(eager_push_wrapper(&db, &host.id, &ssh_target).await)
     };
 
-    let host = db
-        .get_host(&host.id)?
-        .context("host disappeared after registration")?;
+    let host = db.get_host(&host.id)?.context("host disappeared after registration")?;
     let caps = db.list_host_capabilities(&host.id)?;
     if json {
         let mut obj = host_to_json(&host, &caps);
         if let Some(outcome) = push_outcome.as_ref() {
-            obj["wrapper_push"] = serde_json::to_value(outcome)
-                .unwrap_or(serde_json::Value::Null);
+            obj["wrapper_push"] = serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null);
         }
         println!("{}", obj);
     } else {
@@ -2448,16 +2369,10 @@ enum EagerPushOutcome {
     },
 }
 
-async fn eager_push_wrapper(
-    db: &WorkDb,
-    host_id: &str,
-    ssh_target: &str,
-) -> EagerPushOutcome {
-    use boss_engine::ssh_transport::{
-        SshTransport, default_control_socket_dir,
-    };
-    use boss_engine::wrapper_distribution::{push_wrapper, subclass_label};
+async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> EagerPushOutcome {
     use boss_engine::remote_wrapper::expected_version;
+    use boss_engine::ssh_transport::{SshTransport, default_control_socket_dir};
+    use boss_engine::wrapper_distribution::{push_wrapper, subclass_label};
 
     let Some(socket_dir) = default_control_socket_dir() else {
         return EagerPushOutcome::Skipped {
@@ -2548,12 +2463,7 @@ fn hosts_show(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()>
     Ok(())
 }
 
-fn hosts_tag_add(
-    json: bool,
-    state_root: Option<PathBuf>,
-    id: String,
-    tags: Vec<String>,
-) -> Result<()> {
+fn hosts_tag_add(json: bool, state_root: Option<PathBuf>, id: String, tags: Vec<String>) -> Result<()> {
     let db = open_hosts_db(state_root)?;
     for tag in &tags {
         db.add_user_host_capability(&id, tag)?;
@@ -2569,12 +2479,7 @@ fn hosts_tag_add(
     Ok(())
 }
 
-fn hosts_tag_remove(
-    json: bool,
-    state_root: Option<PathBuf>,
-    id: String,
-    tags: Vec<String>,
-) -> Result<()> {
+fn hosts_tag_remove(json: bool, state_root: Option<PathBuf>, id: String, tags: Vec<String>) -> Result<()> {
     let db = open_hosts_db(state_root)?;
     for tag in &tags {
         db.remove_user_host_capability(&id, tag)?;
@@ -2590,12 +2495,7 @@ fn hosts_tag_remove(
     Ok(())
 }
 
-fn hosts_set_enabled(
-    json: bool,
-    state_root: Option<PathBuf>,
-    id: String,
-    enabled: bool,
-) -> Result<()> {
+fn hosts_set_enabled(json: bool, state_root: Option<PathBuf>, id: String, enabled: bool) -> Result<()> {
     let db = open_hosts_db(state_root)?;
     db.set_host_enabled(&id, enabled)?;
     let host = db.get_host(&id)?.context("host disappeared after enable/disable")?;
@@ -2892,5 +2792,4 @@ mod tests {
             "missing live_status_at key in single-state serialization: {single}"
         );
     }
-
 }

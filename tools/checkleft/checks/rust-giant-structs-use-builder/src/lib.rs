@@ -101,12 +101,7 @@ export_checks!(giant_structs_check);
 /// Recursively walk `items` and return the name of each struct that violates
 /// the rule (more than `max_fields` named fields, no required builder derive,
 /// not in a test context, not clap-derived).
-fn collect_violations(
-    items: &[syn::Item],
-    in_test_mod: bool,
-    use_bon: bool,
-    max_fields: usize,
-) -> Vec<String> {
+fn collect_violations(items: &[syn::Item], in_test_mod: bool, use_bon: bool, max_fields: usize) -> Vec<String> {
     let mut result = Vec::new();
     for item in items {
         match item {
@@ -152,9 +147,7 @@ fn find_struct_line(source: &str, struct_name: &str) -> u32 {
     for (i, line) in source.lines().enumerate() {
         let candidate = strip_visibility(line.trim_start());
         if let Some(after) = candidate.strip_prefix(&search) {
-            if after.is_empty()
-                || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '('))
-            {
+            if after.is_empty() || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '(')) {
                 return (i + 1) as u32;
             }
         }
@@ -179,11 +172,7 @@ fn strip_visibility(line: &str) -> &str {
 
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
-            && attr
-                .parse_args::<syn::Ident>()
-                .ok()
-                .map_or(false, |id| id == "test")
+        attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().ok().map_or(false, |id| id == "test")
     })
 }
 
@@ -193,9 +182,9 @@ fn has_clap_derive(attrs: &[syn::Attribute]) -> bool {
         if !attr.path().is_ident("derive") {
             continue;
         }
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) else {
+        let Ok(nested) =
+            attr.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+        else {
             continue;
         };
         for path in &nested {
@@ -203,10 +192,9 @@ fn has_clap_derive(attrs: &[syn::Attribute]) -> bool {
             match segs.as_slice() {
                 [seg] if CLAP_TRAITS.contains(&seg.ident.to_string().as_str()) => return true,
                 [krate, trait_seg]
-                    if krate.ident == "clap"
-                        && CLAP_TRAITS.contains(&trait_seg.ident.to_string().as_str()) =>
+                    if krate.ident == "clap" && CLAP_TRAITS.contains(&trait_seg.ident.to_string().as_str()) =>
                 {
-                    return true
+                    return true;
                 }
                 _ => {}
             }
@@ -220,9 +208,9 @@ fn has_required_builder(attrs: &[syn::Attribute], use_bon: bool) -> bool {
         if !attr.path().is_ident("derive") {
             continue;
         }
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) else {
+        let Ok(nested) =
+            attr.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+        else {
             continue;
         };
         for path in &nested {
@@ -232,10 +220,7 @@ fn has_required_builder(attrs: &[syn::Attribute], use_bon: bool) -> bool {
                     return true;
                 }
             } else {
-                if segs.len() == 2
-                    && segs[0].ident == "derive_builder"
-                    && segs[1].ident == "Builder"
-                {
+                if segs.len() == 2 && segs[0].ident == "derive_builder" && segs[1].ident == "Builder" {
                     return true;
                 }
                 if segs.len() == 1 && segs[0].ident == "Builder" {

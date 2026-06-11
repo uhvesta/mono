@@ -349,8 +349,7 @@ mod tests {
 
     #[test]
     fn focus_request_round_trips() {
-        let original =
-            EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 4 });
+        let original = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id: 4 });
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("focus_worker_pane"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
@@ -379,8 +378,7 @@ mod tests {
 
     #[test]
     fn interrupt_request_round_trips() {
-        let original =
-            EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id: 7 });
+        let original = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id: 7 });
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("interrupt_worker_pane"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();

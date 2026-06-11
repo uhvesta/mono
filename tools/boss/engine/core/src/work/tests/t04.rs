@@ -196,10 +196,7 @@ fn conflict_resolution_round_trip() {
             head_sha_before: Some("def456".into()),
         })
         .unwrap();
-    assert!(
-        second.is_none(),
-        "second insert on same key must be a no-op"
-    );
+    assert!(second.is_none(), "second insert on same key must be a no-op");
 
     // Active-attempt lookup returns the pending row.
     let active = db
@@ -233,26 +230,16 @@ fn conflict_resolution_round_trip() {
         .unwrap()
         .expect("failure flip returns updated row");
     assert_eq!(failed.status, "failed");
-    assert_eq!(
-        failed.failure_reason.as_deref(),
-        Some("obsolescence_suspected"),
-    );
+    assert_eq!(failed.failure_reason.as_deref(), Some("obsolescence_suspected"),);
     assert!(failed.finished_at.is_some());
 
     // mark_failed is idempotent on terminal rows — second call
     // matches no rows and returns Ok(None).
-    let again = db
-        .mark_conflict_resolution_failed(&attempt.id, "redundant")
-        .unwrap();
-    assert!(
-        again.is_none(),
-        "second mark-failed on terminal row must be a no-op",
-    );
+    let again = db.mark_conflict_resolution_failed(&attempt.id, "redundant").unwrap();
+    assert!(again.is_none(), "second mark-failed on terminal row must be a no-op",);
 
     // Unknown attempt id → Ok(None).
-    let missing = db
-        .mark_conflict_resolution_failed("crz_does_not_exist", "x")
-        .unwrap();
+    let missing = db.mark_conflict_resolution_failed("crz_does_not_exist", "x").unwrap();
     assert!(missing.is_none());
 
     let _ = std::fs::remove_file(path);
@@ -424,11 +411,9 @@ fn migration_backfills_blocked_reason_for_active_prereqs() {
     let db = WorkDb::open(path.clone()).unwrap();
     let conn = db.connect().unwrap();
     let reason_for = |id: &str| -> Option<String> {
-        conn.query_row(
-            "SELECT blocked_reason FROM tasks WHERE id = ?1",
-            [id],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        conn.query_row("SELECT blocked_reason FROM tasks WHERE id = ?1", [id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .unwrap()
     };
     assert_eq!(
@@ -473,11 +458,7 @@ fn fresh_init_includes_ci_phase7_schema() {
     let path = temp_db_path("ci-p7-fresh");
     let db = WorkDb::open(path.clone()).unwrap();
     let conn = db.connect().unwrap();
-    for table in [
-        "task_blocked_signals",
-        "ci_remediations",
-        "ci_failure_suppressions",
-    ] {
+    for table in ["task_blocked_signals", "ci_remediations", "ci_failure_suppressions"] {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
@@ -605,9 +586,7 @@ fn record_and_list_effort_escalations_round_trip() {
     assert_eq!(recorded.rule_id.as_deref(), Some("rule-5"));
     assert!(recorded.id.starts_with("esc_"));
 
-    let listed = db
-        .list_effort_escalations_for_product(&product.id, None)
-        .unwrap();
+    let listed = db.list_effort_escalations_for_product(&product.id, None).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, recorded.id);
     assert_eq!(listed[0].markers, vec!["rename", "cursor"]);
@@ -659,11 +638,9 @@ fn fresh_init_includes_external_tracker_schema() {
         assert_eq!(exists, 1, "index {idx} should exist after fresh init");
     }
     let version: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
     let _ = std::fs::remove_file(path);
@@ -737,10 +714,7 @@ fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
                      'github', 'spinyfin/mono#1')",
         [],
     );
-    assert!(
-        dup.is_err(),
-        "duplicate bound canonical_id must violate unique index",
-    );
+    assert!(dup.is_err(), "duplicate bound canonical_id must violate unique index",);
 
     // The same canonical_id is allowed when one row is unbound.
     conn.execute(
@@ -758,11 +732,9 @@ fn migration_adds_external_tracker_columns_and_unique_index_enforced() {
     .unwrap();
 
     let version: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
     let _ = std::fs::remove_file(path);
@@ -802,9 +774,7 @@ fn set_external_ref_replaces_existing_binding() {
         .unwrap();
 
     assert!(
-        db.find_by_external_ref("github", "spinyfin/mono#1")
-            .unwrap()
-            .is_none(),
+        db.find_by_external_ref("github", "spinyfin/mono#1").unwrap().is_none(),
         "old canonical_id must no longer match"
     );
     let task = db
@@ -824,13 +794,8 @@ fn clear_external_ref_hides_from_find() {
         .unwrap();
     db.clear_external_ref(&chore_id).unwrap();
 
-    let found = db
-        .find_by_external_ref("github", "spinyfin/mono#10")
-        .unwrap();
-    assert!(
-        found.is_none(),
-        "cleared row must not appear in find_by_external_ref"
-    );
+    let found = db.find_by_external_ref("github", "spinyfin/mono#10").unwrap();
+    assert!(found.is_none(), "cleared row must not appear in find_by_external_ref");
 }
 
 /// After clear, set_external_ref on the same row (rebind from unbound
@@ -927,25 +892,11 @@ fn list_external_refs_includes_unbound_rows() {
     assert!(ids.contains(&chore_id.as_str()));
     assert!(ids.contains(&chore2.id.as_str()));
 
-    let unbound = refs
-        .iter()
-        .find(|(id, _)| id == &chore_id)
-        .map(|(_, r)| r)
-        .unwrap();
-    assert!(
-        unbound.unbound_at.is_some(),
-        "cleared row must have unbound_at set"
-    );
+    let unbound = refs.iter().find(|(id, _)| id == &chore_id).map(|(_, r)| r).unwrap();
+    assert!(unbound.unbound_at.is_some(), "cleared row must have unbound_at set");
 
-    let bound = refs
-        .iter()
-        .find(|(id, _)| id == &chore2.id)
-        .map(|(_, r)| r)
-        .unwrap();
-    assert!(
-        bound.unbound_at.is_none(),
-        "active row must have no unbound_at"
-    );
+    let bound = refs.iter().find(|(id, _)| id == &chore2.id).map(|(_, r)| r).unwrap();
+    assert!(bound.unbound_at.is_none(), "active row must have no unbound_at");
 }
 
 /// import_chore_with_external_ref creates the chore and binds the
@@ -960,9 +911,7 @@ fn import_chore_with_external_ref_is_atomic_and_findable() {
             CreateChoreInput {
                 product_id: product_id.clone(),
                 name: "Imported issue".into(),
-                description: Some(
-                    "> Imported from https://github.com/example/repo/issues/42\n\nBody text".into(),
-                ),
+                description: Some("> Imported from https://github.com/example/repo/issues/42\n\nBody text".into()),
                 autostart: false,
                 priority: None,
                 created_via: Some(boss_protocol::CREATED_VIA_EXTERNAL_TRACKER_SYNC.to_owned()),
@@ -994,10 +943,7 @@ fn import_chore_with_external_ref_is_atomic_and_findable() {
     assert_eq!(ext.raw["issue_number"], 42);
 
     // synced_at must be set within the same transaction.
-    assert!(
-        ext.synced_at.is_some(),
-        "synced_at must be set after import"
-    );
+    assert!(ext.synced_at.is_some(), "synced_at must be set after import");
 }
 
 /// get_work_tree populates external_ref on chores so the kanban card
@@ -1134,11 +1080,7 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
     let conn = db.connect().unwrap();
 
     // New tables exist.
-    for table in [
-        "task_blocked_signals",
-        "ci_remediations",
-        "ci_failure_suppressions",
-    ] {
+    for table in ["task_blocked_signals", "ci_remediations", "ci_failure_suppressions"] {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master \
@@ -1209,17 +1151,13 @@ fn migration_from_phase1_adds_ci_phase7_schema_and_backfills_signals() {
     let db2 = WorkDb::open(path.clone()).unwrap();
     let conn2 = db2.connect().unwrap();
     let again: i64 = conn2
-        .query_row("SELECT COUNT(*) FROM task_blocked_signals", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM task_blocked_signals", [], |row| row.get(0))
         .unwrap();
     assert_eq!(again, 2);
     let version: String = conn2
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
 
@@ -1281,10 +1219,7 @@ fn ci_remediations_unique_key_enforced() {
     insert("ci_1", "abc123", "fix").unwrap();
     // Same triplet → unique-key violation.
     let dup = insert("ci_2", "abc123", "fix");
-    assert!(
-        dup.is_err(),
-        "duplicate (item, head_sha, kind) must be rejected",
-    );
+    assert!(dup.is_err(), "duplicate (item, head_sha, kind) must be rejected",);
     // A retrigger attempt on the same head sha is a *separate*
     // row because `attempt_kind` discriminates.
     insert("ci_3", "abc123", "retrigger").unwrap();
@@ -1413,8 +1348,7 @@ fn manual_override_writes_ci_failure_suppression() {
         before_commit_sha: None,
     })
     .unwrap();
-    db.mark_chore_blocked_ci_failure(&chore.id, &pr_url, None)
-        .unwrap();
+    db.mark_chore_blocked_ci_failure(&chore.id, &pr_url, None).unwrap();
     db.increment_ci_attempts_used(&chore.id).unwrap();
     assert!(db.get_ci_attempts_used(&chore.id).unwrap() >= 1);
 
@@ -1496,8 +1430,7 @@ fn manual_override_from_exhausted_writes_suppression() {
         before_commit_sha: None,
     })
     .unwrap();
-    db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url)
-        .unwrap();
+    db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url).unwrap();
 
     db.update_work_item(
         &chore.id,
@@ -1678,14 +1611,9 @@ fn manual_move_unrelated_to_ci_does_not_write_suppression() {
     .unwrap();
     let conn = rusqlite::Connection::open(&path).unwrap();
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM ci_failure_suppressions", [], |row| {
-            row.get(0)
-        })
+        .query_row("SELECT COUNT(*) FROM ci_failure_suppressions", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(
-        n, 0,
-        "non-CI moves must not write to ci_failure_suppressions"
-    );
+    assert_eq!(n, 0, "non-CI moves must not write to ci_failure_suppressions");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1726,10 +1654,7 @@ fn set_project_design_doc_rejects_dotdot_segments() {
     let (_product, project) = seed_project_for_design_doc(&db);
 
     let err = db
-        .set_project_design_doc(set_design_doc_input(
-            &project.id,
-            "tools/../../../etc/passwd.md",
-        ))
+        .set_project_design_doc(set_design_doc_input(&project.id, "tools/../../../etc/passwd.md"))
         .unwrap_err()
         .to_string();
     assert!(err.contains("`..`"), "got: {err}");
@@ -1769,20 +1694,14 @@ fn set_project_design_doc_rejects_bad_extension() {
     let (_product, project) = seed_project_for_design_doc(&db);
 
     let err = db
-        .set_project_design_doc(set_design_doc_input(
-            &project.id,
-            "tools/boss/docs/designs/foo.html",
-        ))
+        .set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/foo.html"))
         .unwrap_err()
         .to_string();
     assert!(err.contains("markdown"), "got: {err}");
 
     // And `.md` / `.markdown` both pass.
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/foo.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/foo.md"))
+        .unwrap();
     db.set_project_design_doc(set_design_doc_input(
         &project.id,
         "tools/boss/docs/designs/foo.markdown",
@@ -1864,16 +1783,10 @@ fn set_project_design_doc_is_last_writer_wins() {
     let db = WorkDb::open(path.clone()).unwrap();
     let (_product, project) = seed_project_for_design_doc(&db);
 
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/first.md",
-    ))
-    .unwrap();
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/second.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/first.md"))
+        .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/second.md"))
+        .unwrap();
     let after_set = db.get_project(&project.id).unwrap();
     assert_eq!(
         after_set.design_doc_path.as_deref(),
@@ -1889,24 +1802,13 @@ fn set_project_design_doc_is_last_writer_wins() {
         unset: true,
     })
     .unwrap();
-    assert!(
-        db.get_project(&project.id)
-            .unwrap()
-            .design_doc_path
-            .is_none()
-    );
+    assert!(db.get_project(&project.id).unwrap().design_doc_path.is_none());
 
     // Then set again — clears the cleared state, no residue.
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/third.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/third.md"))
+        .unwrap();
     assert_eq!(
-        db.get_project(&project.id)
-            .unwrap()
-            .design_doc_path
-            .as_deref(),
+        db.get_project(&project.id).unwrap().design_doc_path.as_deref(),
         Some("tools/boss/docs/designs/third.md"),
     );
 
@@ -1953,9 +1855,7 @@ fn resolve_project_design_doc_returns_not_set_when_path_null() {
     let db = WorkDb::open(path.clone()).unwrap();
     let (_product, project) = seed_project_for_design_doc(&db);
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
     assert_eq!(resolved.project_id, project.id);
     assert!(matches!(resolved.state, ProjectDesignDocState::NotSet));
 
@@ -1968,11 +1868,8 @@ fn resolve_project_design_doc_same_product_inherits_repo_and_default_branch() {
     let db = WorkDb::open(path.clone()).unwrap();
     let (product, project) = seed_project_for_design_doc(&db);
 
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/foo.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/foo.md"))
+        .unwrap();
 
     let resolved = db
         .resolve_project_design_doc(&project.id, |_| Some("/tmp/mono-agent-007".to_owned()))
@@ -2004,9 +1901,7 @@ fn resolve_project_design_doc_same_product_inherits_repo_and_default_branch() {
     );
     assert_eq!(
         raw_content_url.as_deref(),
-        Some(
-            "https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=main"
-        ),
+        Some("https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=main"),
     );
 
     let _ = std::fs::remove_file(path);
@@ -2039,9 +1934,7 @@ fn resolve_project_design_doc_classifies_other_product() {
     })
     .unwrap();
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
     let ProjectDesignDocState::Resolved {
         resolved,
         workspace_path,
@@ -2059,10 +1952,7 @@ fn resolve_project_design_doc_classifies_other_product() {
         }
     );
     assert!(workspace_path.is_none());
-    assert_eq!(
-        web_url,
-        "https://github.com/myorg/wiki/blob/docs/designs/foo.md",
-    );
+    assert_eq!(web_url, "https://github.com/myorg/wiki/blob/docs/designs/foo.md",);
     assert_eq!(
         raw_content_url.as_deref(),
         Some("https://raw.githubusercontent.com/myorg/wiki/designs/foo.md?ref=docs"),
@@ -2086,9 +1976,7 @@ fn resolve_project_design_doc_classifies_external() {
     })
     .unwrap();
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
     let ProjectDesignDocState::Resolved { resolved, .. } = resolved.state else {
         panic!("expected Resolved state");
     };
@@ -2119,9 +2007,7 @@ fn resolve_project_design_doc_raw_content_url_built_for_ssh_remote_on_pr_branch(
     })
     .unwrap();
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
     let ProjectDesignDocState::Resolved {
         raw_content_url,
         web_url,
@@ -2167,13 +2053,8 @@ fn resolve_project_design_doc_raw_content_url_encodes_slashed_branch() {
     })
     .unwrap();
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
-    let ProjectDesignDocState::Resolved {
-        raw_content_url, ..
-    } = resolved.state
-    else {
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
+    let ProjectDesignDocState::Resolved { raw_content_url, .. } = resolved.state else {
         panic!("expected Resolved, got {:?}", resolved.state);
     };
 
@@ -2219,9 +2100,7 @@ fn resolve_project_design_doc_surfaces_broken_when_no_repo() {
     db.set_project_design_doc(set_design_doc_input(&project.id, "designs/foo.md"))
         .unwrap();
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
     match resolved.state {
         ProjectDesignDocState::Broken { reason } => {
             assert!(
@@ -2264,16 +2143,12 @@ fn resolve_project_design_doc_returns_pr_head_branch_for_non_boss_product_path()
         project_id: project.id.clone(),
         design_doc_repo_remote_url: None,
         design_doc_branch: Some("boss/exec_18b3fffb232a8060_ec".to_owned()),
-        design_doc_path: Some(
-            "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md".to_owned(),
-        ),
+        design_doc_path: Some("tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md".to_owned()),
         unset: false,
     })
     .unwrap();
 
-    let resolved = db
-        .resolve_project_design_doc(&project.id, |_| None)
-        .unwrap();
+    let resolved = db.resolve_project_design_doc(&project.id, |_| None).unwrap();
     let ProjectDesignDocState::Resolved {
         resolved,
         raw_content_url,
@@ -2380,16 +2255,11 @@ fn migration_adds_editorial_controls_columns() {
 
     // Pre-existing product row must read back as NULL (no behaviour change).
     let editorial_rules: Option<String> = conn
-        .query_row(
-            "SELECT editorial_rules FROM products WHERE id = 'prod_e'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT editorial_rules FROM products WHERE id = 'prod_e'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
-    assert!(
-        editorial_rules.is_none(),
-        "existing row must have NULL editorial_rules",
-    );
+    assert!(editorial_rules.is_none(), "existing row must have NULL editorial_rules",);
 
     // Idempotency: a second open must not fail.
     drop(conn);

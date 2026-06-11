@@ -198,11 +198,7 @@ pub fn extract_worker_error(lines: &[Value]) -> Option<String> {
         }
     }
     match last_error {
-        Some((error_idx, text))
-            if last_progress.is_none_or(|progress_idx| progress_idx < error_idx) =>
-        {
-            Some(text)
-        }
+        Some((error_idx, text)) if last_progress.is_none_or(|progress_idx| progress_idx < error_idx) => Some(text),
         _ => None,
     }
 }
@@ -219,15 +215,9 @@ fn entry_api_error_text(line: &Value) -> Option<String> {
     if entry_type != "assistant" && entry_type != "system" {
         return None;
     }
-    let flagged = line
-        .get("isApiErrorMessage")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let flagged = line.get("isApiErrorMessage").and_then(Value::as_bool).unwrap_or(false);
     let text = entry_text(line);
-    let looks_like_error = text
-        .trim_start()
-        .to_lowercase()
-        .starts_with("api error");
+    let looks_like_error = text.trim_start().to_lowercase().starts_with("api error");
     if flagged || looks_like_error {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -247,19 +237,21 @@ fn entry_api_error_text(line: &Value) -> Option<String> {
 /// by [`entry_api_error_text`] first).
 fn is_progress_entry(line: &Value) -> bool {
     match line.get("type").and_then(Value::as_str) {
-        Some("assistant") | Some("user") => !entry_text(line).trim().is_empty()
-            || line
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks.iter().any(|b| {
-                        matches!(
-                            b.get("type").and_then(Value::as_str),
-                            Some("tool_use") | Some("tool_result")
-                        )
+        Some("assistant") | Some("user") => {
+            !entry_text(line).trim().is_empty()
+                || line
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|b| {
+                            matches!(
+                                b.get("type").and_then(Value::as_str),
+                                Some("tool_use") | Some("tool_result")
+                            )
+                        })
                     })
-                }),
+        }
         _ => false,
     }
 }
@@ -596,9 +588,7 @@ mod tests {
         let policy = RecoveryPolicy::default();
         let mut prev = Duration::ZERO;
         for attempts in 0..policy.max_attempts() {
-            if let RecoveryDecision::Resume { backoff, .. } =
-                policy.decide(ErrorClass::Transient, attempts)
-            {
+            if let RecoveryDecision::Resume { backoff, .. } = policy.decide(ErrorClass::Transient, attempts) {
                 assert!(backoff >= prev, "backoff must not shrink");
                 prev = backoff;
             } else {

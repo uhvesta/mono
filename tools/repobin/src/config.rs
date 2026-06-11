@@ -30,9 +30,7 @@ pub struct ToolConfig {
 impl Config {
     pub fn validate(&self) -> Result<(), RepobinError> {
         if self.version != SUPPORTED_VERSION {
-            return Err(RepobinError::UnsupportedConfigVersion {
-                version: self.version,
-            });
+            return Err(RepobinError::UnsupportedConfigVersion { version: self.version });
         }
 
         if self.tools.is_empty() {
@@ -94,9 +92,7 @@ pub fn find_config_path(start_dir: &Path) -> Option<PathBuf> {
 
 fn validate_tool_name(name: &str) -> Result<(), RepobinError> {
     if name.is_empty() {
-        return Err(RepobinError::InvalidConfig(
-            "tool names must not be empty".to_string(),
-        ));
+        return Err(RepobinError::InvalidConfig("tool names must not be empty".to_string()));
     }
     if name == "." || name == ".." {
         return Err(RepobinError::InvalidConfig(format!(
@@ -158,17 +154,9 @@ mod tests {
     fn load_repo_config_rejects_reserved_tool_name() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join(CONFIG_FILE_NAME);
-        fs::write(
-            &path,
-            "version = 1\n[tools.repobin]\ntarget = \"//:tool\"\n",
-        )
-        .expect("write config");
+        fs::write(&path, "version = 1\n[tools.repobin]\ntarget = \"//:tool\"\n").expect("write config");
 
         let error = load_repo_config(temp.path()).expect_err("reserved name should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("tool name `repobin` is reserved")
-        );
+        assert!(error.to_string().contains("tool name `repobin` is reserved"));
     }
 }

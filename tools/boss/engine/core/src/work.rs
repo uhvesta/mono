@@ -64,28 +64,22 @@ pub const CI_CHURN_WINDOW_SECS: i64 = 60 * 60;
 pub const CI_CHURN_LIMIT: i64 = 5;
 
 pub use boss_protocol::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
-    AutomationTrigger, BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE,
-    COMMENT_STATUS_DISMISSED, COMMENT_STATUS_DISPATCHED, COMMENT_STATUS_ORPHANED,
-    COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX,
-    CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_UNKNOWN,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentResolution,
-    ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput,
-    CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
-    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter,
-    EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
-    ExecutionReconcileResult, ExecutionStatus,
-    ListDependenciesInput, MagicWandDispatch, MAGIC_WAND_STATUS_APPLIED,
-    MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT, MAGIC_WAND_STATUS_DISCARDED,
-    MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
-    PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
-    ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind, TaskRuntime,
-    TaskStatus,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, AutomationTrigger,
+    BlockedSignal, BranchNaming, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_DISPATCHED,
+    COMMENT_STATUS_ORPHANED, COMMENT_STATUS_RESOLVED, CREATED_VIA_ATTENTION, CREATED_VIA_CI_FIX_PREFIX,
+    CREATED_VIA_ENGINE_AUTO, CREATED_VIA_MERGE_CONFLICT_PREFIX, CREATED_VIA_UNKNOWN, CiBudgetSnapshot, CiRemediation,
+    CommentAnchor, CommentResolution, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
+    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
+    DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules, EffortLevel,
+    EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, ListDependenciesInput,
+    MAGIC_WAND_STATUS_APPLIED, MAGIC_WAND_STATUS_CHORE_CREATED, MAGIC_WAND_STATUS_CONFLICT,
+    MAGIC_WAND_STATUS_DISCARDED, MAGIC_WAND_STATUS_FAILED, MAGIC_WAND_STATUS_IN_FLIGHT, MAGIC_WAND_STATUS_RETURNED,
+    MagicWandDispatch, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT,
+    RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, SetProjectDesignDocInput,
+    Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
     WorkTree, is_known_created_via,
 };
 
@@ -170,7 +164,6 @@ impl Clone for WorkDb {
 // ---- module tree (see PR description for the split rationale) ----
 mod attentions;
 mod audit_misc;
-mod editorial;
 mod automations;
 mod blocking;
 mod chain_helpers;
@@ -180,6 +173,7 @@ mod create_entities;
 mod dep_helpers;
 mod dispatch;
 mod dispatch_helpers;
+mod editorial;
 mod exec_status_helpers;
 mod exec_tail;
 mod executions_runs;
@@ -207,10 +201,10 @@ pub(crate) use chain_helpers::*;
 pub(crate) use dep_helpers::*;
 pub(crate) use dispatch_helpers::*;
 pub(crate) use exec_status_helpers::*;
+pub(crate) use exec_tail::content_checksum;
 pub(crate) use insert_helpers::*;
 pub(crate) use mappers::*;
 pub(crate) use migrations_a::*;
-pub(crate) use exec_tail::content_checksum;
 pub(crate) use migrations_b::*;
 pub(crate) use query_ensure::*;
 pub(crate) use revision_helpers::*;
@@ -218,15 +212,13 @@ pub(crate) use revision_helpers::*;
 pub use attentions::ActionedAttentionGroup;
 pub use audit_misc::AUDIT_ACTOR_DESIGN_DETECTOR;
 pub use audit_misc::AUDIT_ACTOR_HUMAN;
-pub use automations::AutomationFireRecord;
 pub use audit_misc::ProjectPropertyAuditEntry;
 pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;
+pub use automations::AutomationFireRecord;
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
-pub use planner_runs::ClaimPlannerRunInput;
-pub use planner_runs::PlannerRunPatch;
 pub use metrics_types::MetricsCounterRow;
 pub use metrics_types::MetricsGaugeRow;
 pub use output_types::LatePrCandidate;
@@ -237,6 +229,8 @@ pub use output_types::StoredExternalRef;
 pub use output_types::StrandedCiRemediationAttempt;
 pub use output_types::WorkerPrCompletion;
 pub use output_types::WorkerPrCompletionTarget;
+pub use planner_runs::ClaimPlannerRunInput;
+pub use planner_runs::PlannerRunPatch;
 #[cfg(test)]
 pub use pr_state::FakePrStateChecker;
 pub use pr_state::GhPrStateChecker;

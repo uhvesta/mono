@@ -31,11 +31,7 @@ pub fn read_file_lines(path: &Path, grep: Option<&str>) -> Result<Vec<String>> {
 /// Collect the last `tail_n` lines across the live file and all rotated
 /// segments of `base_path`. Segments are read oldest-first (see
 /// [`segments_with_live`]) so the returned slice is in chronological order.
-pub fn collect_tail_lines(
-    base_path: &Path,
-    tail_n: usize,
-    grep: Option<&str>,
-) -> Result<Vec<String>> {
+pub fn collect_tail_lines(base_path: &Path, tail_n: usize, grep: Option<&str>) -> Result<Vec<String>> {
     let mut all_lines: Vec<String> = Vec::new();
     for seg in segments_with_live(base_path) {
         all_lines.extend(read_file_lines(&seg, grep)?);
@@ -48,11 +44,7 @@ pub fn collect_tail_lines(
 /// lines and the byte offset of the end of the last complete line consumed.
 /// A partial trailing line (no newline yet) is left for the next poll so a
 /// half-written JSON record is never emitted.
-pub fn read_new_content(
-    path: &Path,
-    from_pos: u64,
-    grep: Option<&str>,
-) -> Result<(Vec<String>, u64)> {
+pub fn read_new_content(path: &Path, from_pos: u64, grep: Option<&str>) -> Result<(Vec<String>, u64)> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(from_pos))?;
     let mut buf = Vec::new();

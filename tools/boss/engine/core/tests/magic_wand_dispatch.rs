@@ -12,8 +12,8 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    COMMENT_STATUS_DISPATCHED, CommentAnchor, CreateCommentInput, CreateProductInput,
-    FrontendEvent, FrontendRequest, MAGIC_WAND_STATUS_CHORE_CREATED, WorkComment, WorkItem,
+    COMMENT_STATUS_DISPATCHED, CommentAnchor, CreateCommentInput, CreateProductInput, FrontendEvent, FrontendRequest,
+    MAGIC_WAND_STATUS_CHORE_CREATED, WorkComment, WorkItem,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,11 +28,13 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(PathBuf::from(":memory:")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(PathBuf::from(":memory:"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
         let socket_for_serve = socket_path.clone();
-        let join =
-            tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
+        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
             return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
@@ -227,10 +229,7 @@ async fn magic_wand_apply_unknown_id_returns_error() -> Result<()> {
 
 // ── Phase-4: PR-backed doc → Boss chore worker ────────────────────────────────
 
-async fn create_product_with_repo(
-    client: &mut BossClient,
-    repo_url: &str,
-) -> Result<boss_protocol::WorkItem> {
+async fn create_product_with_repo(client: &mut BossClient, repo_url: &str) -> Result<boss_protocol::WorkItem> {
     match client
         .send_request(&FrontendRequest::CreateProduct {
             input: CreateProductInput {
@@ -324,8 +323,7 @@ async fn magic_wand_pr_doc_creates_chore_and_dispatches_comment() -> Result<()> 
 
     // The dispatch row must be `chore_created` with a non-null chore_id.
     assert_eq!(
-        dispatch.status,
-        MAGIC_WAND_STATUS_CHORE_CREATED,
+        dispatch.status, MAGIC_WAND_STATUS_CHORE_CREATED,
         "dispatch status should be chore_created"
     );
     let chore_id = dispatch
@@ -363,8 +361,7 @@ async fn magic_wand_pr_doc_creates_chore_and_dispatches_comment() -> Result<()> 
         .find(|c| c.id == comment.id)
         .ok_or_else(|| anyhow!("comment not found in list"))?;
     assert_eq!(
-        updated_comment.status,
-        COMMENT_STATUS_DISPATCHED,
+        updated_comment.status, COMMENT_STATUS_DISPATCHED,
         "comment status should be dispatched after magic-wand"
     );
 
@@ -373,7 +370,9 @@ async fn magic_wand_pr_doc_creates_chore_and_dispatches_comment() -> Result<()> 
         .send_request(&FrontendRequest::GetWorkItem { id: chore_id.clone() })
         .await?;
     let chore_task = match chore_event {
-        FrontendEvent::WorkItemResult { item: WorkItem::Chore(t) } => t,
+        FrontendEvent::WorkItemResult {
+            item: WorkItem::Chore(t),
+        } => t,
         other => {
             return Err(anyhow!(
                 "expected Chore WorkItemResult, got: {}",
@@ -382,18 +381,12 @@ async fn magic_wand_pr_doc_creates_chore_and_dispatches_comment() -> Result<()> 
         }
     };
     assert_eq!(chore_task.product_id, product_id);
-    assert_eq!(
-        chore_task.created_via,
-        format!("comment_dispatch:{}", comment.id)
-    );
+    assert_eq!(chore_task.created_via, format!("comment_dispatch:{}", comment.id));
     // repo_remote_url on the chore is None — it's inherited from the product.
     assert!(chore_task.repo_remote_url.is_none());
     // The chore description must mention the branch and the comment body.
     let desc = chore_task.description;
-    assert!(
-        desc.contains(branch),
-        "chore description must mention branch {branch}"
-    );
+    assert!(desc.contains(branch), "chore description must mention branch {branch}");
     assert!(
         desc.contains("Please clarify this paragraph with a concrete example."),
         "chore description must include the comment body"
@@ -414,8 +407,7 @@ async fn magic_wand_pr_doc_unknown_repo_returns_error() -> Result<()> {
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
     // No product created → no matching repo.
-    let artifact_id =
-        "pr_doc:https://github.com/nobody/nowhere.git:boss/exec_x_a0:design.md".to_owned();
+    let artifact_id = "pr_doc:https://github.com/nobody/nowhere.git:boss/exec_x_a0:design.md".to_owned();
     let comment = match client
         .send_request(&FrontendRequest::CommentsCreate {
             input: CreateCommentInput {

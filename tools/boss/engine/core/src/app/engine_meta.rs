@@ -98,9 +98,7 @@ pub(super) async fn handle_workspace_pool_summary(ctx: Dispatch, req: FrontendRe
 }
 
 pub(super) async fn handle_get_engine_version(ctx: Dispatch, req: FrontendRequest) {
-    let Dispatch {
-        sink, request_id, ..
-    } = ctx;
+    let Dispatch { sink, request_id, .. } = ctx;
     let FrontendRequest::GetEngineVersion = req else {
         unreachable!()
     };
@@ -129,11 +127,7 @@ pub(super) async fn handle_get_engine_health(ctx: Dispatch, req: FrontendRequest
     };
     {
         let report = build_engine_health_report(&server_state);
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::EngineHealthResult { report },
-        );
+        send_response(&sink, &request_id, FrontendEvent::EngineHealthResult { report });
     }
 }
 
@@ -160,11 +154,7 @@ pub(super) async fn handle_list_feature_flags(ctx: Dispatch, req: FrontendReques
                 enabled: snap.enabled,
             })
             .collect();
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::FeatureFlagsList { flags },
-        );
+        send_response(&sink, &request_id, FrontendEvent::FeatureFlagsList { flags });
     }
 }
 
@@ -186,11 +176,7 @@ pub(super) async fn handle_set_feature_flag(ctx: Dispatch, req: FrontendRequest)
                     enabled,
                     "feature-flags: toggled via macOS debug pane",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::FeatureFlagSet { name, enabled },
-                );
+                send_response(&sink, &request_id, FrontendEvent::FeatureFlagSet { name, enabled });
             }
             Err(err) => send_response(
                 &sink,
@@ -247,11 +233,7 @@ pub(super) async fn handle_set_setting(ctx: Dispatch, req: FrontendRequest) {
                     enabled,
                     "settings: toggled via macOS Settings window",
                 );
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::SettingSet { key, enabled },
-                );
+                send_response(&sink, &request_id, FrontendEvent::SettingSet { key, enabled });
             }
             Err(err) => send_response(
                 &sink,
@@ -277,11 +259,7 @@ pub(super) async fn handle_kick_pr_reconcilers(ctx: Dispatch, req: FrontendReque
     {
         server_state.pr_reconciler_kick.notify_one();
         tracing::debug!("merge poller: activation kick received from app");
-        send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::PrReconcilersKicked { kicked: true },
-        );
+        send_response(&sink, &request_id, FrontendEvent::PrReconcilersKicked { kicked: true });
     }
 }
 
@@ -322,12 +300,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         let db_result = if paused {
             work_db
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
-                .and_then(|()| {
-                    work_db.set_metadata(
-                        METADATA_KEY_DISPATCH_PAUSED_SINCE,
-                        &now_epoch_s.to_string(),
-                    )
-                })
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_epoch_s.to_string()))
         } else {
             work_db
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")

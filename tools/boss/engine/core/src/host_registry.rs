@@ -66,16 +66,10 @@ pub(crate) fn migrate_host_registry_tables(conn: &Connection) -> Result<()> {
 pub(crate) fn migrate_work_executions_host_columns(conn: &Connection) -> Result<()> {
     let cols = pragma_columns(conn, "work_executions")?;
     if !cols.contains(&"pinned_host_id".to_owned()) {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN pinned_host_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_executions ADD COLUMN pinned_host_id TEXT", [])?;
     }
     if !cols.contains(&"host_id".to_owned()) {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN host_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_executions ADD COLUMN host_id TEXT", [])?;
     }
     Ok(())
 }
@@ -96,16 +90,10 @@ pub(crate) fn migrate_work_runs_host_columns(conn: &Connection) -> Result<()> {
         )?;
     }
     if !cols.contains(&"cube_workspace_id".to_owned()) {
-        conn.execute(
-            "ALTER TABLE work_runs ADD COLUMN cube_workspace_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_runs ADD COLUMN cube_workspace_id TEXT", [])?;
     }
     if !cols.contains(&"remote_pid".to_owned()) {
-        conn.execute(
-            "ALTER TABLE work_runs ADD COLUMN remote_pid INTEGER",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_runs ADD COLUMN remote_pid INTEGER", [])?;
     }
     Ok(())
 }
@@ -237,26 +225,22 @@ impl WorkDb {
 
     /// Insert a new non-local host. Returns an error if the id is `"local"` or
     /// already exists. User-provided `tags` are stored with `source = 'user'`.
-    pub fn add_host(
-        &self,
-        id: &str,
-        ssh_target: &str,
-        pool_size: i64,
-        tags: &[String],
-    ) -> Result<Host> {
+    pub fn add_host(&self, id: &str, ssh_target: &str, pool_size: i64, tags: &[String]) -> Result<Host> {
         if id == "local" {
             bail!("'local' is a reserved host id; use `bossctl hosts list` to see it");
         }
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
 
-        if tx.query_row(
-            "SELECT COUNT(*) FROM hosts WHERE id = ?1",
-            params![id],
-            |r| r.get::<_, i64>(0),
-        )? > 0
+        if tx.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![id], |r| {
+            r.get::<_, i64>(0)
+        })? > 0
         {
-            bail!("host '{}' already exists; use `bossctl hosts show {}` to inspect it", id, id);
+            bail!(
+                "host '{}' already exists; use `bossctl hosts show {}` to inspect it",
+                id,
+                id
+            );
         }
 
         let now = now_epoch_string();
@@ -304,10 +288,7 @@ impl WorkDb {
     /// UI can surface the cause without the user needing to check logs.
     pub fn set_host_last_error(&self, id: &str, text: Option<&str>) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
-            "UPDATE hosts SET last_error_text = ?1 WHERE id = ?2",
-            params![text, id],
-        )?;
+        conn.execute("UPDATE hosts SET last_error_text = ?1 WHERE id = ?2", params![text, id])?;
         Ok(())
     }
 
@@ -347,11 +328,9 @@ impl WorkDb {
     /// a capability with the same key already exists (regardless of prior source).
     pub fn add_user_host_capability(&self, host_id: &str, capability: &str) -> Result<()> {
         let conn = self.connect()?;
-        if conn.query_row(
-            "SELECT COUNT(*) FROM hosts WHERE id = ?1",
-            params![host_id],
-            |r| r.get::<_, i64>(0),
-        )? == 0
+        if conn.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![host_id], |r| {
+            r.get::<_, i64>(0)
+        })? == 0
         {
             bail!("host '{}' not found", host_id);
         }
@@ -413,11 +392,7 @@ impl WorkDb {
     /// Pin an execution to a specific host (or clear the pin with
     /// `None`). When set, [`crate::host_scheduling::select_host`] bypasses
     /// the capability filter and routes the execution only to that host.
-    pub fn set_execution_pinned_host(
-        &self,
-        execution_id: &str,
-        host_id: Option<&str>,
-    ) -> Result<()> {
+    pub fn set_execution_pinned_host(&self, execution_id: &str, host_id: Option<&str>) -> Result<()> {
         let conn = self.connect()?;
         let affected = conn.execute(
             "UPDATE work_executions SET pinned_host_id = ?2 WHERE id = ?1",
@@ -433,11 +408,9 @@ impl WorkDb {
     /// (later) the host-badge surface to confirm where a run executed.
     pub fn run_host(&self, run_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
-        conn.query_row(
-            "SELECT host_id FROM work_runs WHERE id = ?1",
-            params![run_id],
-            |r| r.get::<_, String>(0),
-        )
+        conn.query_row("SELECT host_id FROM work_runs WHERE id = ?1", params![run_id], |r| {
+            r.get::<_, String>(0)
+        })
         .optional()
         .context("run_host query")
     }
@@ -449,9 +422,8 @@ impl WorkDb {
     /// concurrency), so the coordinator overrides its slot to free.
     pub fn active_runs_per_host(&self) -> Result<HashMap<String, i64>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
-            "SELECT host_id, COUNT(*) FROM work_runs WHERE status = 'active' GROUP BY host_id",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT host_id, COUNT(*) FROM work_runs WHERE status = 'active' GROUP BY host_id")?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         let mut out = HashMap::new();
         for row in rows {
@@ -466,10 +438,7 @@ impl WorkDb {
     /// globally unique across kinds, so the lookup matches on id alone.
     /// Empty when nothing has been tagged — the common case today, which
     /// leaves every enabled host capability-eligible.
-    pub fn required_capabilities_for_subject_ids(
-        &self,
-        subject_ids: &[&str],
-    ) -> Result<BTreeSet<String>> {
+    pub fn required_capabilities_for_subject_ids(&self, subject_ids: &[&str]) -> Result<BTreeSet<String>> {
         if subject_ids.is_empty() {
             return Ok(BTreeSet::new());
         }
@@ -480,9 +449,7 @@ impl WorkDb {
              WHERE subject_id IN ({placeholders})"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(subject_ids.iter()), |r| {
-            r.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(params_from_iter(subject_ids.iter()), |r| r.get::<_, String>(0))?;
         let mut out = BTreeSet::new();
         for row in rows {
             out.insert(row?);
@@ -505,9 +472,7 @@ fn map_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<Host> {
     })
 }
 
-fn collect_rows<T>(
-    rows: impl Iterator<Item = rusqlite::Result<T>>,
-) -> Result<Vec<T>> {
+fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
     rows.collect::<rusqlite::Result<Vec<T>>>()
         .context("host_registry row collection")
 }
@@ -668,8 +633,7 @@ mod tests {
     #[test]
     fn remove_host_deletes_host_and_cascades_capabilities() {
         let db = open_db();
-        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()])
-            .unwrap();
+        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()]).unwrap();
         assert!(db.get_host("zakalwe").unwrap().is_some());
         assert_eq!(db.list_host_capabilities("zakalwe").unwrap().len(), 1);
 
@@ -713,10 +677,7 @@ mod tests {
     #[test]
     fn local_host_present_after_open() {
         let db = open_db();
-        let local = db
-            .get_host("local")
-            .unwrap()
-            .expect("local host seeded on open");
+        let local = db.get_host("local").unwrap().expect("local host seeded on open");
         assert_eq!(local.id, "local");
         assert!(local.enabled);
         assert!(db.list_hosts().unwrap().iter().any(|h| h.id == "local"));
@@ -753,9 +714,7 @@ mod tests {
     #[test]
     fn add_user_capability_errors_when_host_missing() {
         let db = open_db();
-        let err = db
-            .add_user_host_capability("ghost", "os=macos")
-            .unwrap_err();
+        let err = db.add_user_host_capability("ghost", "os=macos").unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
@@ -783,11 +742,9 @@ mod tests {
     #[test]
     fn remove_user_capability_removes_user_sourced() {
         let db = open_db();
-        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()])
-            .unwrap();
+        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()]).unwrap();
 
-        db.remove_user_host_capability("zakalwe", "os=macos")
-            .unwrap();
+        db.remove_user_host_capability("zakalwe", "os=macos").unwrap();
 
         assert!(
             db.list_host_capabilities("zakalwe")
@@ -803,9 +760,7 @@ mod tests {
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
         insert_capability(&db, "zakalwe", "arch=arm64", "auto");
 
-        let err = db
-            .remove_user_host_capability("zakalwe", "arch=arm64")
-            .unwrap_err();
+        let err = db.remove_user_host_capability("zakalwe", "arch=arm64").unwrap_err();
         assert!(err.to_string().contains("auto-discovered"), "got: {err}");
 
         // The auto row is left in place.
@@ -822,9 +777,7 @@ mod tests {
         let db = open_db();
         db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
 
-        let err = db
-            .remove_user_host_capability("zakalwe", "nope=1")
-            .unwrap_err();
+        let err = db.remove_user_host_capability("zakalwe", "nope=1").unwrap_err();
         let msg = err.to_string();
         // Distinct from the auto-discovered branch.
         assert!(msg.contains("not found"), "got: {msg}");
@@ -869,12 +822,8 @@ mod tests {
         // Unpinned to start.
         assert!(db.execution_pinned_host("exec-1").unwrap().is_none());
 
-        db.set_execution_pinned_host("exec-1", Some("zakalwe"))
-            .unwrap();
-        assert_eq!(
-            db.execution_pinned_host("exec-1").unwrap().as_deref(),
-            Some("zakalwe")
-        );
+        db.set_execution_pinned_host("exec-1", Some("zakalwe")).unwrap();
+        assert_eq!(db.execution_pinned_host("exec-1").unwrap().as_deref(), Some("zakalwe"));
 
         // Clearing with None resets to None.
         db.set_execution_pinned_host("exec-1", None).unwrap();
@@ -884,9 +833,7 @@ mod tests {
     #[test]
     fn set_execution_pinned_host_errors_on_unknown_execution() {
         let db = open_db();
-        let err = db
-            .set_execution_pinned_host("nope", Some("zakalwe"))
-            .unwrap_err();
+        let err = db.set_execution_pinned_host("nope", Some("zakalwe")).unwrap_err();
         assert!(err.to_string().contains("unknown execution"), "got: {err}");
     }
 
@@ -923,11 +870,7 @@ mod tests {
     #[test]
     fn required_capabilities_empty_for_empty_input() {
         let db = open_db();
-        assert!(
-            db.required_capabilities_for_subject_ids(&[])
-                .unwrap()
-                .is_empty()
-        );
+        assert!(db.required_capabilities_for_subject_ids(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -959,12 +902,7 @@ mod tests {
         ensure_local_host(&conn).unwrap();
         ensure_local_host(&conn).unwrap();
 
-        let locals = db
-            .list_hosts()
-            .unwrap()
-            .into_iter()
-            .filter(|h| h.id == "local")
-            .count();
+        let locals = db.list_hosts().unwrap().into_iter().filter(|h| h.id == "local").count();
         assert_eq!(locals, 1);
     }
 
@@ -980,10 +918,7 @@ mod tests {
 
         let caps = db.list_host_capabilities("local").unwrap();
         // The user-sourced row survives the refresh.
-        assert!(
-            caps.iter()
-                .any(|c| c.capability == "team=infra" && c.source == "user")
-        );
+        assert!(caps.iter().any(|c| c.capability == "team=infra" && c.source == "user"));
         // The stale auto row is replaced by the fresh probe set.
         assert!(!caps.iter().any(|c| c.capability == "stale=auto"));
     }

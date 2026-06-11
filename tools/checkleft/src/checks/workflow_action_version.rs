@@ -53,17 +53,14 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                 Err(error) => {
                     findings.push(Finding {
                         severity: Severity::Error,
-                        message: format!(
-                            "failed to parse workflow YAML while enforcing action versions: {error}"
-                        ),
+                        message: format!("failed to parse workflow YAML while enforcing action versions: {error}"),
                         location: Some(Location {
                             path: changed_file.path.clone(),
                             line: None,
                             column: None,
                         }),
                         remediations: vec![
-                            "Fix YAML syntax so checks can validate `uses:` action versions."
-                                .to_owned(),
+                            "Fix YAML syntax so checks can validate `uses:` action versions.".to_owned(),
                         ],
                         suggested_fix: None,
                     });
@@ -144,9 +141,9 @@ fn parse_config(config: &toml::Value) -> Result<CompiledWorkflowActionVersionCon
     Ok(CompiledWorkflowActionVersionConfig {
         rules: parsed.rules,
         severity: Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error),
-        remediation: parsed.remediation.unwrap_or_else(|| {
-            "Pin GitHub Actions `uses:` references to the configured version.".to_owned()
-        }),
+        remediation: parsed
+            .remediation
+            .unwrap_or_else(|| "Pin GitHub Actions `uses:` references to the configured version.".to_owned()),
     })
 }
 

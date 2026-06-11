@@ -5,9 +5,7 @@ use std::process::Command;
 
 use crate::app::RepobinError;
 use crate::config::RepoConfig;
-use crate::defaults::{
-    DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, load_defaults_at, write_defaults,
-};
+use crate::defaults::{DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, load_defaults_at, write_defaults};
 use crate::shell::{ShellFragment, bin_dir_on_path, path_update_fragment};
 
 #[derive(Debug, Clone)]
@@ -94,11 +92,7 @@ pub fn install(
     })
 }
 
-fn merge_defaults(
-    existing: &DefaultsConfig,
-    repo_config: &RepoConfig,
-    repo_url: &str,
-) -> DefaultsConfig {
+fn merge_defaults(existing: &DefaultsConfig, repo_config: &RepoConfig, repo_url: &str) -> DefaultsConfig {
     let mut merged = existing.clone();
     for name in repo_config.config.tools.keys() {
         merged.tools.insert(
@@ -127,11 +121,7 @@ fn discover_remote_url(repo_root: &Path) -> Option<String> {
     if raw.is_empty() { None } else { Some(raw) }
 }
 
-pub fn resolve_bin_dir(
-    requested: Option<&Path>,
-    cwd: &Path,
-    home_dir: Option<&Path>,
-) -> Result<PathBuf, RepobinError> {
+pub fn resolve_bin_dir(requested: Option<&Path>, cwd: &Path, home_dir: Option<&Path>) -> Result<PathBuf, RepobinError> {
     let path = if let Some(requested) = requested {
         expand_user_path(requested, home_dir)?
     } else {
@@ -176,19 +166,15 @@ fn install_binary(current_executable: &Path, bin_dir: &Path) -> Result<PathBuf, 
     let destination = bin_dir.join("repobin");
     let temp_destination = temporary_path(bin_dir, ".repobin");
 
-    std::fs::copy(current_executable, &temp_destination).map_err(|source| {
-        RepobinError::CopyInstalledBinary {
-            from: current_executable.to_path_buf(),
-            to: destination.clone(),
-            source,
-        }
+    std::fs::copy(current_executable, &temp_destination).map_err(|source| RepobinError::CopyInstalledBinary {
+        from: current_executable.to_path_buf(),
+        to: destination.clone(),
+        source,
     })?;
 
-    let permissions = std::fs::metadata(current_executable).map_err(|source| {
-        RepobinError::ReadInstalledBinary {
-            path: current_executable.to_path_buf(),
-            source,
-        }
+    let permissions = std::fs::metadata(current_executable).map_err(|source| RepobinError::ReadInstalledBinary {
+        path: current_executable.to_path_buf(),
+        source,
     })?;
     std::fs::set_permissions(&temp_destination, permissions.permissions()).map_err(|source| {
         RepobinError::WriteInstalledBinary {
@@ -197,11 +183,9 @@ fn install_binary(current_executable: &Path, bin_dir: &Path) -> Result<PathBuf, 
         }
     })?;
 
-    std::fs::rename(&temp_destination, &destination).map_err(|source| {
-        RepobinError::WriteInstalledBinary {
-            path: destination.clone(),
-            source,
-        }
+    std::fs::rename(&temp_destination, &destination).map_err(|source| RepobinError::WriteInstalledBinary {
+        path: destination.clone(),
+        source,
     })?;
 
     Ok(destination)
@@ -212,18 +196,14 @@ fn install_tool_link(bin_dir: &Path, tool_name: &str) -> Result<(), RepobinError
     let temp_destination = temporary_path(bin_dir, &format!(".{tool_name}"));
 
     let _ = std::fs::remove_file(&temp_destination);
-    std::os::unix::fs::symlink("repobin", &temp_destination).map_err(|source| {
-        RepobinError::CreateToolSymlink {
-            path: destination.clone(),
-            source,
-        }
+    std::os::unix::fs::symlink("repobin", &temp_destination).map_err(|source| RepobinError::CreateToolSymlink {
+        path: destination.clone(),
+        source,
     })?;
 
-    std::fs::rename(&temp_destination, &destination).map_err(|source| {
-        RepobinError::CreateToolSymlink {
-            path: destination.clone(),
-            source,
-        }
+    std::fs::rename(&temp_destination, &destination).map_err(|source| RepobinError::CreateToolSymlink {
+        path: destination.clone(),
+        source,
     })?;
 
     Ok(())
@@ -284,17 +264,12 @@ mod tests {
     #[test]
     fn resolve_bin_dir_expands_tilde_and_relative_paths() {
         let cwd = Path::new("/repo");
-        let tilde = resolve_bin_dir(
-            Some(Path::new("~/custom/bin")),
-            cwd,
-            Some(Path::new("/Users/test")),
-        )
-        .expect("tilde path");
+        let tilde =
+            resolve_bin_dir(Some(Path::new("~/custom/bin")), cwd, Some(Path::new("/Users/test"))).expect("tilde path");
         assert_eq!(tilde, Path::new("/Users/test/custom/bin"));
 
         let relative =
-            resolve_bin_dir(Some(Path::new(".bin")), cwd, Some(Path::new("/Users/test")))
-                .expect("relative path");
+            resolve_bin_dir(Some(Path::new(".bin")), cwd, Some(Path::new("/Users/test"))).expect("relative path");
         assert_eq!(relative, Path::new("/repo/.bin"));
     }
 
@@ -304,8 +279,7 @@ mod tests {
         let repo = sample_repo_config(temp.path());
         let source_binary = temp.path().join("repobin-source");
         fs::write(&source_binary, b"#!/bin/sh\nexit 0\n").expect("write source binary");
-        fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755))
-            .expect("chmod source binary");
+        fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755)).expect("chmod source binary");
 
         let bin_dir = temp.path().join("bin");
         let path_var = OsString::from("/usr/bin");
@@ -321,10 +295,7 @@ mod tests {
         )
         .expect("install");
 
-        assert_eq!(
-            report.installed_tools,
-            vec!["boss".to_string(), "cube".to_string()]
-        );
+        assert_eq!(report.installed_tools, vec!["boss".to_string(), "cube".to_string()]);
         assert_eq!(
             fs::read(bin_dir.join("repobin")).expect("read installed binary"),
             b"#!/bin/sh\nexit 0\n"
@@ -346,8 +317,7 @@ mod tests {
         let repo = sample_repo_config(temp.path());
         let source_binary = temp.path().join("repobin-source");
         fs::write(&source_binary, b"#!/bin/sh\nexit 0\n").expect("write source binary");
-        fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755))
-            .expect("chmod source binary");
+        fs::set_permissions(&source_binary, fs::Permissions::from_mode(0o755)).expect("chmod source binary");
 
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).expect("mkdir bin");

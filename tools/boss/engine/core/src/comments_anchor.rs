@@ -66,8 +66,7 @@ impl CommentFuzzyConfig {
     pub fn from_env() -> Self {
         let default = Self::default();
         Self {
-            score_threshold: read_unit_env("BOSS_COMMENT_FUZZY_SCORE")
-                .unwrap_or(default.score_threshold),
+            score_threshold: read_unit_env("BOSS_COMMENT_FUZZY_SCORE").unwrap_or(default.score_threshold),
             second_best_threshold: read_unit_env("BOSS_COMMENT_FUZZY_SECOND_BEST")
                 .unwrap_or(default.second_best_threshold),
         }
@@ -89,11 +88,7 @@ pub enum AnchorResolution {
     Exact { start: usize, length: usize },
     /// A unique high-scoring fuzzy window. `start` / `length` locate the
     /// best-effort `exact` span within it.
-    Fuzzy {
-        start: usize,
-        length: usize,
-        score: f64,
-    },
+    Fuzzy { start: usize, length: usize, score: f64 },
     /// No confident anchor.
     Orphan,
 }
@@ -112,11 +107,7 @@ impl AnchorResolution {
 /// Resolve `anchor` against `plain_text`. See the module docs for the
 /// algorithm. An anchor with an empty `exact` is always an orphan (there is
 /// nothing to locate).
-pub fn resolve_anchor(
-    plain_text: &str,
-    anchor: &CommentAnchor,
-    config: &CommentFuzzyConfig,
-) -> AnchorResolution {
+pub fn resolve_anchor(plain_text: &str, anchor: &CommentAnchor, config: &CommentFuzzyConfig) -> AnchorResolution {
     let exact: Vec<char> = anchor.exact.chars().collect();
     if exact.is_empty() {
         return AnchorResolution::Orphan;
@@ -146,8 +137,7 @@ pub fn resolve_anchor(
     let target_bigrams = bigram_counts(&context);
     let target_total: i64 = target_bigrams.values().sum();
 
-    let (best_start, best_score, second_best) =
-        scan_windows(&haystack, tlen, &target_bigrams, target_total);
+    let (best_start, best_score, second_best) = scan_windows(&haystack, tlen, &target_bigrams, target_total);
 
     if best_score >= config.score_threshold && second_best < config.second_best_threshold {
         // Locate the `exact` span within the best window, clamped to the
@@ -314,11 +304,7 @@ mod tests {
         );
         let res = resolve_anchor(&edited, &a, &CommentFuzzyConfig::default());
         match res {
-            AnchorResolution::Fuzzy {
-                start,
-                length,
-                score,
-            } => {
+            AnchorResolution::Fuzzy { start, length, score } => {
                 assert!(score >= 0.8, "score {score} should clear threshold");
                 let resolved: String = edited.chars().skip(start).take(length).collect();
                 // The recovered span overlaps the real exact text heavily.
@@ -354,11 +340,7 @@ mod tests {
         // verbatim, so the exact phase fails; both score high in the fuzzy
         // phase, so the runner-up clears the uniqueness bar → ambiguous →
         // orphan, even though the best window scores well above threshold.
-        let a = anchor(
-            "configure the primary widget alpha for the main dashboard view",
-            "",
-            "",
-        );
+        let a = anchor("configure the primary widget alpha for the main dashboard view", "", "");
         let doc = "configure the primary widget alpha for the main dashboard panel. \
                    --- some unrelated filler text sits in between the two regions --- \
                    configure the primary widget alpha for the main dashboard screen.";

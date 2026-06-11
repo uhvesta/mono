@@ -78,8 +78,7 @@ pub struct FeatureFlagSpec {
 pub const REGISTRY: &[FeatureFlagSpec] = &[
     FeatureFlagSpec {
         name: "detect_pr_cold_fallback",
-        description:
-            "Run the `detect_pr` cold-path fallback (gh pr list --head) when the worker-hook \
+        description: "Run the `detect_pr` cold-path fallback (gh pr list --head) when the worker-hook \
              staging cache is empty on Stop. Disable to make empty-staging fall straight to \
              'no PR pushed' without consulting GitHub — recommended when the merge poller is \
              producing mis-binds.",
@@ -88,8 +87,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     },
     FeatureFlagSpec {
         name: "editorial_controls",
-        description:
-            "Enable editorial controls for agent-authored PRs and GitHub comments: injects the \
+        description: "Enable editorial controls for agent-authored PRs and GitHub comments: injects the \
              [editorial-rules] block into worker prompts (T945), activates the PreToolUse hook \
              on gh pr|issue calls (T946), and enables editorial_actions audit writes (T947). \
              DEFAULT OFF — set to true to opt in. Kill switch: set to false to make every \
@@ -99,8 +97,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     },
     FeatureFlagSpec {
         name: "attentions_questions_backstop",
-        description:
-            "Extraction backstop for the attentions questions pipeline (design: attentions.md). \
+        description: "Extraction backstop for the attentions questions pipeline (design: attentions.md). \
              When a design-doc PR ships no `<slug>.attentions.json` manifest, scan the doc's \
              'Risks / open questions' section and synthesise `prompt`-type attentions flagged \
              `confidence_source = extracted`. DEFAULT OFF — lower-trust path, enable once the \
@@ -110,8 +107,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     },
     FeatureFlagSpec {
         name: "attentions_followups_backstop",
-        description:
-            "Extraction backstop for the attentions followups pipeline (design: attentions.md). \
+        description: "Extraction backstop for the attentions followups pipeline (design: attentions.md). \
              When a completing worker emits no structured `FOLLOWUPS:` block, run a lightweight \
              supervisor LLM pass over the transcript tail to extract candidate followups flagged \
              `confidence_source = extracted`. DEFAULT OFF — requires an Anthropic API key and \
@@ -189,12 +185,11 @@ impl FeatureFlagsStore {
                 return Ok(());
             }
             Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("read feature flags file: {}", self.path.display()));
+                return Err(err).with_context(|| format!("read feature flags file: {}", self.path.display()));
             }
         };
-        let parsed: FileShape = toml::from_str(&contents)
-            .with_context(|| format!("parse feature flags file: {}", self.path.display()))?;
+        let parsed: FileShape =
+            toml::from_str(&contents).with_context(|| format!("parse feature flags file: {}", self.path.display()))?;
         let mut guard = self.state.lock().expect("feature-flags lock poisoned");
         guard.clear();
         for (key, value) in parsed.flags {
@@ -251,10 +246,7 @@ impl FeatureFlagsStore {
                 description: spec.description.to_owned(),
                 category: spec.category.to_owned(),
                 default_enabled: spec.default_enabled,
-                enabled: guard
-                    .get(spec.name)
-                    .copied()
-                    .unwrap_or(spec.default_enabled),
+                enabled: guard.get(spec.name).copied().unwrap_or(spec.default_enabled),
             })
             .collect()
     }
@@ -262,18 +254,15 @@ impl FeatureFlagsStore {
     fn write_to_disk(&self) -> Result<()> {
         let serialized = {
             let guard = self.state.lock().expect("feature-flags lock poisoned");
-            let shape = FileShape {
-                flags: guard.clone(),
-            };
+            let shape = FileShape { flags: guard.clone() };
             toml::to_string_pretty(&shape).context("serialize feature flags to TOML")?
         };
 
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create feature-flags parent dir: {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create feature-flags parent dir: {}", parent.display()))?;
         }
 
         // Temp-then-rename: a concurrent reader either sees the old
@@ -284,13 +273,8 @@ impl FeatureFlagsStore {
         let tmp = self.path.with_extension("toml.tmp");
         std::fs::write(&tmp, serialized)
             .with_context(|| format!("write feature-flags temp file: {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path).with_context(|| {
-            format!(
-                "rename {} → {}",
-                tmp.display(),
-                self.path.display()
-            )
-        })?;
+        std::fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), self.path.display()))?;
         Ok(())
     }
 }
@@ -350,10 +334,7 @@ mod tests {
         let snap = store.snapshot_all();
         assert_eq!(snap.len(), REGISTRY.len());
         // detect_pr_cold_fallback is the first entry and defaults ON.
-        let detect = snap
-            .iter()
-            .find(|s| s.name == "detect_pr_cold_fallback")
-            .unwrap();
+        let detect = snap.iter().find(|s| s.name == "detect_pr_cold_fallback").unwrap();
         assert!(detect.default_enabled);
         assert!(detect.enabled);
         assert_eq!(detect.category, "completion");
@@ -375,8 +356,14 @@ mod tests {
             .iter()
             .find(|s| s.name == "editorial_controls")
             .expect("editorial_controls must be in registry");
-        assert!(!editorial.default_enabled, "editorial_controls default_enabled must be false");
-        assert!(!editorial.enabled, "editorial_controls enabled must be false with no override");
+        assert!(
+            !editorial.default_enabled,
+            "editorial_controls default_enabled must be false"
+        );
+        assert!(
+            !editorial.enabled,
+            "editorial_controls enabled must be false with no override"
+        );
         assert_eq!(editorial.category, "editorial");
     }
 

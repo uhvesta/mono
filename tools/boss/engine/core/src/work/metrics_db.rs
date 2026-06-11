@@ -6,8 +6,7 @@ impl WorkDb {
     /// (the caller is `metrics::seed_from_db`, which doesn't care).
     pub fn metrics_load_all(&self) -> Result<(Vec<MetricsCounterRow>, Vec<MetricsGaugeRow>)> {
         let conn = self.connect()?;
-        let mut counter_stmt =
-            conn.prepare("SELECT name, value, updated_at_ms, description FROM metrics_counter")?;
+        let mut counter_stmt = conn.prepare("SELECT name, value, updated_at_ms, description FROM metrics_counter")?;
         let counters: Vec<MetricsCounterRow> = counter_stmt
             .query_map([], |row| {
                 let value_i64: i64 = row.get(1)?;
@@ -24,8 +23,7 @@ impl WorkDb {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut gauge_stmt =
-            conn.prepare("SELECT name, value, observed_at_ms, description FROM metrics_gauge")?;
+        let mut gauge_stmt = conn.prepare("SELECT name, value, observed_at_ms, description FROM metrics_gauge")?;
         let gauges: Vec<MetricsGaugeRow> = gauge_stmt
             .query_map([], |row| {
                 Ok(MetricsGaugeRow {
@@ -47,11 +45,7 @@ impl WorkDb {
     /// any registered handle) are skipped — the existing row stays
     /// in the table untouched so historical answers remain
     /// queryable (design §"Risks / open questions" item 3).
-    pub fn metrics_flush(
-        &self,
-        counters: &[MetricsCounterRow],
-        gauges: &[MetricsGaugeRow],
-    ) -> Result<()> {
+    pub fn metrics_flush(&self, counters: &[MetricsCounterRow], gauges: &[MetricsGaugeRow]) -> Result<()> {
         if counters.is_empty() && gauges.is_empty() {
             return Ok(());
         }

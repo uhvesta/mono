@@ -37,10 +37,7 @@ pub(crate) fn is_bazelrc_root_candidate(path: &Path) -> bool {
     name == ".bazelrc" || name.ends_with(".bazelrc")
 }
 
-pub(crate) fn parse_bazelrc_closure(
-    path: &Path,
-    tree: &dyn SourceTree,
-) -> Result<ParsedBazelrcClosure> {
+pub(crate) fn parse_bazelrc_closure(path: &Path, tree: &dyn SourceTree) -> Result<ParsedBazelrcClosure> {
     let mut entries = Vec::new();
     let mut visited = HashSet::new();
     let mut pending = vec![path.to_path_buf()];
@@ -57,14 +54,12 @@ pub(crate) fn parse_bazelrc_closure(
 
         let parsed_entries = parse_bazelrc_file(&next_path, &contents)?;
         for entry in &parsed_entries {
-            if matches!(
-                entry.kind,
-                BazelrcEntryKind::Import | BazelrcEntryKind::TryImport
-            )
+            if matches!(entry.kind, BazelrcEntryKind::Import | BazelrcEntryKind::TryImport)
                 && let Some(import_path) = &entry.import_path
-                    && tree.exists(import_path) {
-                        pending.push(import_path.clone());
-                    }
+                && tree.exists(import_path)
+            {
+                pending.push(import_path.clone());
+            }
         }
         entries.extend(parsed_entries);
     }
@@ -81,13 +76,8 @@ fn parse_bazelrc_file(path: &Path, contents: &str) -> Result<Vec<BazelrcEntry>> 
             continue;
         }
 
-        let tokens = shell_split(trimmed).with_context(|| {
-            format!(
-                "failed to tokenize bazelrc line {} in {}",
-                line_number,
-                path.display()
-            )
-        })?;
+        let tokens = shell_split(trimmed)
+            .with_context(|| format!("failed to tokenize bazelrc line {} in {}", line_number, path.display()))?;
         if tokens.is_empty() {
             continue;
         }
@@ -275,10 +265,11 @@ fn extract_flag_entries(
         let mut value = inline_value;
         if value.is_none()
             && let Some(next) = tokens.get(index + 1)
-                && !next.starts_with('-') {
-                    value = Some(next.clone());
-                    index += 1;
-                }
+            && !next.starts_with('-')
+        {
+            value = Some(next.clone());
+            index += 1;
+        }
 
         let column = line.find(token).map(|col| (col + 1) as u32).unwrap_or(1);
         entries.push(BazelrcEntry {

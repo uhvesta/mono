@@ -16,16 +16,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boss_protocol::{CreateChoreInput, CREATED_VIA_EXTERNAL_TRACKER_SYNC};
+use boss_protocol::{CREATED_VIA_EXTERNAL_TRACKER_SYNC, CreateChoreInput};
 use tracing::{info, warn};
 
-use super::{
-    CloseReason, ExternalTracker, TrackerContext, TrackerCredential, TrackerError, TrackerRegistry,
-    UpstreamItem, UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
-};
 use super::credentials::{TrackerCredentialError, TrackerCredentialResolver};
+use super::{
+    CloseReason, ExternalTracker, TrackerContext, TrackerCredential, TrackerError, TrackerRegistry, UpstreamItem,
+    UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
+};
 use crate::metrics::Registry;
-use crate::work::{TaskStatus, content_checksum, WorkDb};
+use crate::work::{TaskStatus, WorkDb, content_checksum};
 
 // ── Work-invalidation publisher ───────────────────────────────────────────────
 
@@ -37,12 +37,7 @@ use crate::work::{TaskStatus, content_checksum, WorkDb};
 /// `NoopWorkInvalidationPublisher` is used in tests and CLI single-pass paths.
 #[async_trait]
 pub trait WorkInvalidationPublisher: Send + Sync {
-    async fn publish_work_item_invalidated(
-        &self,
-        product_id: &str,
-        work_item_id: &str,
-        reason: &str,
-    );
+    async fn publish_work_item_invalidated(&self, product_id: &str, work_item_id: &str, reason: &str);
 }
 
 /// No-op implementation; used in tests and CLI paths where live UI
@@ -236,8 +231,7 @@ pub async fn run_one_pass(
 
     let mut outcome = PassOutcome::default();
     for product in products {
-        let (kind, config) = match (product.external_tracker_kind, product.external_tracker_config)
-        {
+        let (kind, config) = match (product.external_tracker_kind, product.external_tracker_config) {
             (Some(k), Some(c)) => (k, c),
             _ => continue,
         };
@@ -275,8 +269,7 @@ pub async fn run_one_pass(
             credential,
         };
 
-        process_product(work_db, &*tracker, &product.id, &ctx, &mut outcome, metrics, publisher)
-            .await;
+        process_product(work_db, &*tracker, &product.id, &ctx, &mut outcome, metrics, publisher).await;
         outcome.products_processed += 1;
     }
 
@@ -449,8 +442,10 @@ async fn process_product(
     publisher: &dyn WorkInvalidationPublisher,
 ) {
     let reverse_close = ctx.config["reverse_close"].as_bool().unwrap_or(false);
-    let in_progress_column =
-        ctx.config["in_progress_column"].as_str().unwrap_or("In Progress").to_owned();
+    let in_progress_column = ctx.config["in_progress_column"]
+        .as_str()
+        .unwrap_or("In Progress")
+        .to_owned();
 
     // ── 1. Fetch upstream items ───────────────────────────────────────────────
     let upstream_items = match tracker.fetch_items(ctx).await {
@@ -477,12 +472,9 @@ async fn process_product(
                 "Boss received HTTP 401 from GitHub — the stored OAuth token has been revoked or expired: {msg}\n\n\
                  Please reconnect via Settings → Issue Sync → Connect to authorize a new token."
             );
-            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
-                product_id,
-                "external_tracker_token_revoked",
-                &title,
-                &body,
-            ) {
+            if let Err(attn_err) =
+                work_db.upsert_external_tracker_attention(product_id, "external_tracker_token_revoked", &title, &body)
+            {
                 warn!(product_id, error = %attn_err,
                     "upsert_external_tracker_attention (token_revoked) failed");
             }
@@ -497,12 +489,9 @@ async fn process_product(
                  This may indicate an org approval or SSO authorization is needed. \
                  Check your GitHub org settings, or run `gh auth login` to refresh credentials."
             );
-            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
-                product_id,
-                "external_tracker_auth_failed",
-                &title,
-                &body,
-            ) {
+            if let Err(attn_err) =
+                work_db.upsert_external_tracker_attention(product_id, "external_tracker_auth_failed", &title, &body)
+            {
                 warn!(product_id, error = %attn_err,
                     "upsert_external_tracker_attention (auth_failed) failed");
             }
@@ -553,8 +542,7 @@ async fn process_product(
     };
 
     // Canonical-ids already known in Boss (active OR previously unbound).
-    let known_canonical_ids: HashSet<&str> =
-        existing.iter().map(|(_, r)| r.canonical_id.as_str()).collect();
+    let known_canonical_ids: HashSet<&str> = existing.iter().map(|(_, r)| r.canonical_id.as_str()).collect();
 
     let mut close_candidates: Vec<CloseCandidate> = Vec::new();
     let mut in_progress_candidates: Vec<InProgressCandidate> = Vec::new();
@@ -602,10 +590,7 @@ async fn process_product(
                             continue;
                         }
                         // Now the row is active; reconcile normally.
-                        match work_db.find_by_external_ref(
-                            &stored_ref.kind,
-                            &stored_ref.canonical_id,
-                        ) {
+                        match work_db.find_by_external_ref(&stored_ref.kind, &stored_ref.canonical_id) {
                             Ok(Some(task)) => {
                                 reconcile_existing(
                                     work_db,
@@ -630,10 +615,7 @@ async fn process_product(
                         }
                     }
                 } else {
-                    import_new(
-                        work_db, tracker, ctx, product_id, item, outcome, metrics, publisher,
-                    )
-                    .await;
+                    import_new(work_db, tracker, ctx, product_id, item, outcome, metrics, publisher).await;
                 }
             }
             Err(e) => {
@@ -660,10 +642,7 @@ async fn process_product(
                     publisher
                         .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
                         .await;
-                    let title = format!(
-                        "Upstream binding for {} cleared",
-                        stored_ref.canonical_id
-                    );
+                    let title = format!("Upstream binding for {} cleared", stored_ref.canonical_id);
                     let body = format!(
                         "`{}` was bound to upstream `{}` which is no longer in the configured \
                          project. The link has been cleared; re-bind manually with \
@@ -920,10 +899,7 @@ async fn reconcile_existing(
                     Ok(true) => {
                         CLOSED.inc(metrics);
                         outcome.items_closed += 1;
-                        info!(
-                            work_item_id,
-                            "Behavior 2: close-mirror — upstream Closed → boss done"
-                        );
+                        info!(work_item_id, "Behavior 2: close-mirror — upstream Closed → boss done");
                         publisher
                             .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
                             .await;
@@ -946,10 +922,7 @@ async fn reconcile_existing(
                 match work_db.reconciler_close_work_item(work_item_id) {
                     Ok(true) => {
                         outcome.items_closed += 1;
-                        info!(
-                            work_item_id,
-                            "Behavior 5: merged PR detected → boss row → done"
-                        );
+                        info!(work_item_id, "Behavior 5: merged PR detected → boss row → done");
                         publisher
                             .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
                             .await;
@@ -994,8 +967,7 @@ async fn reconcile_existing(
             // a regression if the user has manually advanced the item to a
             // later column while the task is still in progress.
             if task.status == TaskStatus::Active {
-                let already_at_target =
-                    upstream.project_status.as_deref() == Some(in_progress_column);
+                let already_at_target = upstream.project_status.as_deref() == Some(in_progress_column);
                 if !already_at_target {
                     in_progress_candidates.push(InProgressCandidate {
                         work_item_id: work_item_id.clone(),
@@ -1060,10 +1032,7 @@ async fn reconcile_existing(
                 if !boss_changed {
                     // Only the upstream changed → auto-sync name and description.
                     let new_name = upstream.title.clone();
-                    let new_desc = format!(
-                        "> Imported from {}\n\n{}",
-                        upstream.upstream_url, upstream.body
-                    );
+                    let new_desc = format!("> Imported from {}\n\n{}", upstream.upstream_url, upstream.body);
                     match work_db.reconciler_update_name_and_description(
                         work_item_id,
                         &new_name,
@@ -1080,11 +1049,7 @@ async fn reconcile_existing(
                                 "Behavior 8: upstream title/body changed → boss row auto-synced"
                             );
                             publisher
-                                .publish_work_item_invalidated(
-                                    product_id,
-                                    work_item_id,
-                                    "chore_updated",
-                                )
+                                .publish_work_item_invalidated(product_id, work_item_id, "chore_updated")
                                 .await;
                         }
                         Ok(false) => {}
@@ -1144,10 +1109,7 @@ async fn import_new(
         return;
     }
 
-    let description = format!(
-        "> Imported from {}\n\n{}",
-        upstream.upstream_url, upstream.body
-    );
+    let description = format!("> Imported from {}\n\n{}", upstream.upstream_url, upstream.body);
 
     let input = CreateChoreInput {
         product_id: product_id.to_owned(),
@@ -1261,8 +1223,8 @@ mod tests {
 
     use super::*;
     use crate::external_tracker::{
-        CloseReason, ExternalTracker, TrackerConfigError, TrackerContext, TrackerError,
-        TrackerRegistry, UpstreamItem, UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
+        CloseReason, ExternalTracker, TrackerConfigError, TrackerContext, TrackerError, TrackerRegistry, UpstreamItem,
+        UpstreamPrAssociation, UpstreamRef, UpstreamStatus,
     };
     use crate::metrics::Registry;
     use crate::work::WorkDb;
@@ -1306,17 +1268,11 @@ mod tests {
 
     #[async_trait]
     impl WorkInvalidationPublisher for RecordingPublisher {
-        async fn publish_work_item_invalidated(
-            &self,
-            product_id: &str,
-            work_item_id: &str,
-            reason: &str,
-        ) {
-            self.calls.lock().unwrap().push((
-                product_id.to_owned(),
-                work_item_id.to_owned(),
-                reason.to_owned(),
-            ));
+        async fn publish_work_item_invalidated(&self, product_id: &str, work_item_id: &str, reason: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
         }
     }
 
@@ -1437,17 +1393,11 @@ mod tests {
             "spy"
         }
 
-        fn validate_config(
-            &self,
-            _config: &serde_json::Value,
-        ) -> std::result::Result<(), TrackerConfigError> {
+        fn validate_config(&self, _config: &serde_json::Value) -> std::result::Result<(), TrackerConfigError> {
             Ok(())
         }
 
-        async fn fetch_items(
-            &self,
-            _ctx: &TrackerContext,
-        ) -> crate::external_tracker::Result<Vec<UpstreamItem>> {
+        async fn fetch_items(&self, _ctx: &TrackerContext) -> crate::external_tracker::Result<Vec<UpstreamItem>> {
             if let Some(next) = self.fetch_errors.lock().unwrap().pop_front() {
                 return next;
             }
@@ -1468,10 +1418,7 @@ mod tests {
             ref_: &UpstreamRef,
             _reason: CloseReason,
         ) -> crate::external_tracker::Result<()> {
-            self.close_calls
-                .lock()
-                .unwrap()
-                .push(ref_.canonical_id.clone());
+            self.close_calls.lock().unwrap().push(ref_.canonical_id.clone());
             let next = self.close_responses.lock().unwrap().pop_front();
             next.unwrap_or(Ok(()))
         }
@@ -1585,13 +1532,8 @@ mod tests {
                 worker_branch_prefix: None,
             })
             .expect("create product");
-        db.set_product_external_tracker(
-            &product.id,
-            Some("spy"),
-            Some(&spy_config()),
-            false,
-        )
-        .expect("set external tracker");
+        db.set_product_external_tracker(&product.id, Some("spy"), Some(&spy_config()), false)
+            .expect("set external tracker");
         product
     }
 
@@ -1606,13 +1548,8 @@ mod tests {
                 worker_branch_prefix: None,
             })
             .expect("create product");
-        db.set_product_external_tracker(
-            &product.id,
-            Some("spy"),
-            Some(&spy_config_reverse_close()),
-            false,
-        )
-        .expect("set external tracker with reverse_close");
+        db.set_product_external_tracker(&product.id, Some("spy"), Some(&spy_config_reverse_close()), false)
+            .expect("set external tracker with reverse_close");
         product
     }
 
@@ -1787,8 +1724,10 @@ mod tests {
 
         let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
-        assert_eq!(outcome.tracked_label_attach_succeeded, 1,
-            "reconcile should attach tracked label when it is missing");
+        assert_eq!(
+            outcome.tracked_label_attach_succeeded, 1,
+            "reconcile should attach tracked label when it is missing"
+        );
         assert_eq!(
             tracker.add_label_calls(),
             vec![("spy#54".to_owned(), "tracked".to_owned())],
@@ -1875,13 +1814,8 @@ mod tests {
                 force_duplicate: false,
             })
             .expect("create chore");
-        db.set_external_ref(
-            &chore.id,
-            "spy",
-            "spy#3",
-            &json!({ "issue_number": 3 }),
-        )
-        .expect("set_external_ref");
+        db.set_external_ref(&chore.id, "spy", "spy#3", &json!({ "issue_number": 3 }))
+            .expect("set_external_ref");
 
         // Upstream now shows issue as closed.
         let tracker = SpyTracker::new(vec![closed_item(3)]);
@@ -1972,10 +1906,7 @@ mod tests {
         db.set_external_ref(&chore.id, "spy", "spy#5", &json!({ "issue_number": 5 }))
             .expect("set_external_ref");
 
-        let tracker = SpyTracker::new(vec![item_with_merged_pr(
-            5,
-            "https://github.com/example/repo/pull/101",
-        )]);
+        let tracker = SpyTracker::new(vec![item_with_merged_pr(5, "https://github.com/example/repo/pull/101")]);
         tracker.push_ok();
         let registry = spy_registry(Arc::clone(&tracker));
         let metrics = Registry::new();
@@ -2031,10 +1962,10 @@ mod tests {
         assert_eq!(outcome.items_unbound, 1, "one item should be unbound");
 
         // The row should still exist but the ref should be unbound.
-        let refs = db
-            .list_external_refs_for_product(&product.id)
-            .expect("list ok");
-        let (_, stored) = refs.iter().find(|(_, r)| r.canonical_id == "spy#6")
+        let refs = db.list_external_refs_for_product(&product.id).expect("list ok");
+        let (_, stored) = refs
+            .iter()
+            .find(|(_, r)| r.canonical_id == "spy#6")
             .expect("stored ref should still exist");
         assert!(stored.unbound_at.is_some(), "unbound_at should be set");
         assert!(stored.synced_at.is_none(), "synced_at should be cleared");
@@ -2165,9 +2096,7 @@ mod tests {
         assert_eq!(outcome_unbind.items_unbound, 1);
 
         // Verify unbound.
-        let refs = db
-            .list_external_refs_for_product(&product.id)
-            .expect("list ok");
+        let refs = db.list_external_refs_for_product(&product.id).expect("list ok");
         let (_, stored) = refs.iter().find(|(_, r)| r.canonical_id == "spy#9").unwrap();
         assert!(stored.unbound_at.is_some(), "should be unbound");
 
@@ -2205,13 +2134,8 @@ mod tests {
                 force_duplicate: false,
             })
             .expect("create chore");
-        db.set_external_ref(
-            &chore.id,
-            "spy",
-            canonical_id,
-            &json!({ "issue_number": issue_num }),
-        )
-        .expect("set_external_ref");
+        db.set_external_ref(&chore.id, "spy", canonical_id, &json!({ "issue_number": issue_num }))
+            .expect("set_external_ref");
         db.reconciler_close_work_item(&chore.id).expect("close work item");
         db.find_by_external_ref("spy", canonical_id)
             .expect("query ok")
@@ -2302,7 +2226,10 @@ mod tests {
         assert_eq!(outcome.close_issue_succeeded, 0, "Behavior 5 should not fire either");
 
         let calls = tracker.close_calls();
-        assert!(calls.is_empty(), "close_issue must not be called when reverse_close=false");
+        assert!(
+            calls.is_empty(),
+            "close_issue must not be called when reverse_close=false"
+        );
     }
 
     // ── E2E: import → done → reverse_close ───────────────────────────────────
@@ -2347,10 +2274,11 @@ mod tests {
         tracker.push_ok();
         let outcome2 = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
-        assert_eq!(outcome2.reverse_close_succeeded, 1,
-            "reverse_close must fire for an imported-then-done chore");
-        assert_eq!(outcome2.items_imported, 0,
-            "no duplicate import must occur");
+        assert_eq!(
+            outcome2.reverse_close_succeeded, 1,
+            "reverse_close must fire for an imported-then-done chore"
+        );
+        assert_eq!(outcome2.items_imported, 0, "no duplicate import must occur");
 
         let calls = tracker.close_calls();
         assert_eq!(calls, vec!["spy#30"], "close_issue called exactly once");
@@ -2475,11 +2403,13 @@ mod tests {
     // ── Attention item integration tests (chore 16) ───────────────────────────
 
     fn attention_items_for_product(db: &WorkDb, product_id: &str) -> Vec<boss_protocol::WorkAttentionItem> {
-        db.list_attention_items_for_work_item(product_id).expect("list attention items")
+        db.list_attention_items_for_work_item(product_id)
+            .expect("list attention items")
     }
 
     fn attention_items_for_work_item(db: &WorkDb, work_item_id: &str) -> Vec<boss_protocol::WorkAttentionItem> {
-        db.list_attention_items_for_work_item(work_item_id).expect("list attention items")
+        db.list_attention_items_for_work_item(work_item_id)
+            .expect("list attention items")
     }
 
     /// Reason 1: auth failure on `fetch_items` emits `external_tracker_auth_failed`
@@ -2497,10 +2427,15 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
-        let auth_items: Vec<_> = items.iter()
+        let auth_items: Vec<_> = items
+            .iter()
             .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
             .collect();
-        assert_eq!(auth_items.len(), 1, "should emit exactly one auth_failed attention item");
+        assert_eq!(
+            auth_items.len(),
+            1,
+            "should emit exactly one auth_failed attention item"
+        );
         assert!(
             auth_items[0].body_markdown.contains("gh auth login")
                 || auth_items[0].body_markdown.contains("org approval"),
@@ -2523,13 +2458,17 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
-        let revoked_items: Vec<_> = items.iter()
+        let revoked_items: Vec<_> = items
+            .iter()
             .filter(|i| i.kind == "external_tracker_token_revoked" && i.status == "open")
             .collect();
-        assert_eq!(revoked_items.len(), 1, "should emit exactly one token_revoked attention item");
+        assert_eq!(
+            revoked_items.len(),
+            1,
+            "should emit exactly one token_revoked attention item"
+        );
         assert!(
-            revoked_items[0].body_markdown.contains("401")
-                || revoked_items[0].body_markdown.contains("revoked"),
+            revoked_items[0].body_markdown.contains("401") || revoked_items[0].body_markdown.contains("revoked"),
             "body should mention token revocation; got: {}",
             revoked_items[0].body_markdown
         );
@@ -2550,11 +2489,15 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
-        let transient_items: Vec<_> = items.iter()
+        let transient_items: Vec<_> = items
+            .iter()
             .filter(|i| i.kind == "external_tracker_transient_errors" && i.status == "open")
             .collect();
-        assert_eq!(transient_items.len(), 1,
-            "should emit exactly one transient_errors attention item");
+        assert_eq!(
+            transient_items.len(),
+            1,
+            "should emit exactly one transient_errors attention item"
+        );
     }
 
     /// Reason 3: upstream item removed from project emits
@@ -2590,11 +2533,15 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_work_item(&db, &chore.id);
-        let unbound_items: Vec<_> = items.iter()
+        let unbound_items: Vec<_> = items
+            .iter()
             .filter(|i| i.kind == "external_tracker_removed_upstream" && i.status == "open")
             .collect();
-        assert_eq!(unbound_items.len(), 1,
-            "should emit exactly one removed_upstream attention item on the work item");
+        assert_eq!(
+            unbound_items.len(),
+            1,
+            "should emit exactly one removed_upstream attention item on the work item"
+        );
         assert!(
             unbound_items[0].body_markdown.contains("spy#20"),
             "body should reference the canonical_id; got: {}",
@@ -2639,11 +2586,15 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_work_item(&db, &chore.id);
-        let perm_items: Vec<_> = items.iter()
+        let perm_items: Vec<_> = items
+            .iter()
             .filter(|i| i.kind == "external_tracker_permission_denied" && i.status == "open")
             .collect();
-        assert_eq!(perm_items.len(), 1,
-            "should emit exactly one permission_denied attention item");
+        assert_eq!(
+            perm_items.len(),
+            1,
+            "should emit exactly one permission_denied attention item"
+        );
         assert!(
             perm_items[0].body_markdown.contains("issues:write"),
             "body should mention required scope; got: {}",
@@ -2668,11 +2619,15 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
         let items = attention_items_for_product(&db, &product.id);
-        let auth_items: Vec<_> = items.iter()
+        let auth_items: Vec<_> = items
+            .iter()
             .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
             .collect();
-        assert_eq!(auth_items.len(), 1,
-            "repeated auth failures must not pile up duplicate attention items");
+        assert_eq!(
+            auth_items.len(),
+            1,
+            "repeated auth failures must not pile up duplicate attention items"
+        );
     }
 
     /// Recovery: a successful fetch clears stale fetch-failure attention items.
@@ -2690,27 +2645,28 @@ mod tests {
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         let items = attention_items_for_product(&db, &product.id);
         assert!(
-            items.iter().any(|i| i.kind == "external_tracker_auth_failed" && i.status == "open"),
+            items
+                .iter()
+                .any(|i| i.kind == "external_tracker_auth_failed" && i.status == "open"),
             "attention item should exist after auth failure"
         );
 
         // Tick 2: fetch succeeds (no more queued error) → attention item resolved.
         run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
         let items2 = attention_items_for_product(&db, &product.id);
-        let still_open = items2.iter()
+        let still_open = items2
+            .iter()
             .filter(|i| i.kind == "external_tracker_auth_failed" && i.status == "open")
             .count();
-        assert_eq!(still_open, 0, "auth_failed attention item should be resolved after recovery");
+        assert_eq!(
+            still_open, 0,
+            "auth_failed attention item should be resolved after recovery"
+        );
     }
 
     // ── Behavior 6: set project status to "In progress" ──────────────────────
 
-    fn seed_active_chore(
-        db: &WorkDb,
-        product_id: &str,
-        canonical_id: &str,
-        issue_num: u64,
-    ) -> boss_protocol::Task {
+    fn seed_active_chore(db: &WorkDb, product_id: &str, canonical_id: &str, issue_num: u64) -> boss_protocol::Task {
         let chore = db
             .create_chore(CreateChoreInput {
                 product_id: product_id.to_owned(),
@@ -2725,13 +2681,8 @@ mod tests {
                 force_duplicate: false,
             })
             .expect("create chore");
-        db.set_external_ref(
-            &chore.id,
-            "spy",
-            canonical_id,
-            &json!({ "issue_number": issue_num }),
-        )
-        .expect("set_external_ref");
+        db.set_external_ref(&chore.id, "spy", canonical_id, &json!({ "issue_number": issue_num }))
+            .expect("set_external_ref");
         // Simulate the task being dragged to Doing (active) via direct SQL,
         // mirroring what the engine's update_task RPC does.
         let conn = db.connect().expect("connect for seed_active_chore");
@@ -2791,7 +2742,10 @@ mod tests {
 
         let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
 
-        assert_eq!(outcome.in_progress_set_succeeded, 0, "should not fire when already In progress");
+        assert_eq!(
+            outcome.in_progress_set_succeeded, 0,
+            "should not fire when already In progress"
+        );
         assert_eq!(outcome.in_progress_set_failed, 0);
         assert!(
             tracker.set_project_status_calls().is_empty(),
@@ -2917,7 +2871,10 @@ mod tests {
         register_metrics(&metrics);
 
         let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
-        assert_eq!(outcome.in_progress_set_succeeded, 1, "should fire when project_status is None");
+        assert_eq!(
+            outcome.in_progress_set_succeeded, 1,
+            "should fire when project_status is None"
+        );
         let calls = tracker.set_project_status_calls();
         assert_eq!(calls, vec!["spy#35"]);
     }

@@ -13,9 +13,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use boss_protocol::{
-    LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent,
-};
+use boss_protocol::{LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
 
 /// The model identifier the engine uses when no `SessionStart` hook
 /// has yet reported one — this is the model the launcher *asked* for,
@@ -134,10 +132,7 @@ impl LiveWorkerStateRegistry {
         guard
             .by_slot
             .values()
-            .find(|state| {
-                !is_terminal_activity(state.activity)
-                    && state.work_item_id.as_deref() == Some(work_item_id)
-            })
+            .find(|state| !is_terminal_activity(state.activity) && state.work_item_id.as_deref() == Some(work_item_id))
             .map(|state| state.run_id.clone())
     }
 
@@ -192,9 +187,7 @@ impl LiveWorkerStateRegistry {
                 // spawning fresh). For startup, leave the spawning →
                 // idle transition for the first Stop; SessionStart on
                 // its own only confirms the worker is alive.
-                if matches!(source, SessionStartSource::Startup)
-                    && state.activity == WorkerActivity::Spawning
-                {
+                if matches!(source, SessionStartSource::Startup) && state.activity == WorkerActivity::Spawning {
                     state.activity = WorkerActivity::Idle;
                 }
             }
@@ -220,9 +213,7 @@ impl LiveWorkerStateRegistry {
                 notification_pending.insert(slot_id, true);
             }
             WorkerEvent::Stop { .. } => {
-                let was_pending = notification_pending
-                    .remove(&slot_id)
-                    .unwrap_or(false);
+                let was_pending = notification_pending.remove(&slot_id).unwrap_or(false);
                 state.current_tool = None;
                 state.activity = if was_pending {
                     WorkerActivity::WaitingForInput
@@ -335,9 +326,7 @@ impl LiveWorkerStateRegistry {
     pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Inner {
-            by_slot,
-            spawned_at,
-            ..
+            by_slot, spawned_at, ..
         } = &mut *guard;
         let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
         let mut changed = Vec::new();
@@ -380,10 +369,7 @@ impl LiveWorkerStateRegistry {
 /// (`Spawning`, `Working`, `WaitingForInput`, `Idle`) all describe
 /// a live, slot-holding worker.
 fn is_terminal_activity(activity: WorkerActivity) -> bool {
-    matches!(
-        activity,
-        WorkerActivity::Terminated | WorkerActivity::Errored
-    )
+    matches!(activity, WorkerActivity::Terminated | WorkerActivity::Errored)
 }
 
 fn current_epoch_secs() -> i64 {
@@ -422,9 +408,7 @@ fn format_iso8601_utc(epoch_secs: i64) -> String {
     let minute = (seconds_in_day % 3_600) / 60;
     let second = seconds_in_day % 60;
     let (year, month, day) = ymd_from_days_since_1970(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 /// Convert days-since-1970 into (year, month, day). Adapted from the
@@ -523,10 +507,7 @@ mod tests {
             }),
         );
         let state = reg.get(2).unwrap();
-        assert_eq!(
-            state.work_item_id.as_deref(),
-            Some("task_18ad1b81532ac910_4")
-        );
+        assert_eq!(state.work_item_id.as_deref(), Some("task_18ad1b81532ac910_4"));
         assert_eq!(state.work_item_name.as_deref(), Some("Fix fencer scraping"));
         assert_eq!(state.execution_id.as_deref(), Some("exec-1"));
     }
@@ -664,14 +645,10 @@ mod tests {
     fn set_live_status_writes_text_and_stamps_timestamp() {
         let reg = LiveWorkerStateRegistry::new();
         reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
-        let changed =
-            reg.set_live_status(1, Some("running tests after the layout fix".into()));
+        let changed = reg.set_live_status(1, Some("running tests after the layout fix".into()));
         assert!(changed);
         let state = reg.get(1).unwrap();
-        assert_eq!(
-            state.live_status.as_deref(),
-            Some("running tests after the layout fix"),
-        );
+        assert_eq!(state.live_status.as_deref(), Some("running tests after the layout fix"),);
         assert!(state.live_status_at.is_some());
     }
 
@@ -769,10 +746,7 @@ mod tests {
                 execution_id: "exec-42".into(),
             }),
         );
-        assert_eq!(
-            reg.run_id_for_work_item("chore_abc").as_deref(),
-            Some("exec-42")
-        );
+        assert_eq!(reg.run_id_for_work_item("chore_abc").as_deref(), Some("exec-42"));
         assert!(reg.run_id_for_work_item("chore_other").is_none());
     }
 
@@ -923,9 +897,6 @@ mod tests {
 
         let second = reg.mark_stalled_spawns(now + 10, STALLED_SPAWN_THRESHOLD_SECS);
         assert!(second.is_empty(), "should not fire again after first transition");
-        assert_eq!(
-            reg.get(1).unwrap().activity,
-            WorkerActivity::WaitingForInput
-        );
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
     }
 }

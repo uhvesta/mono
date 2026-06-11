@@ -131,32 +131,34 @@ fn load_from_disk(workspace_path: &Path) -> PrTemplateSet {
     // Single-file form
     let single = github_dir.join("PULL_REQUEST_TEMPLATE.md");
     if single.is_file()
-        && let Some(tmpl) = load_file(&single, workspace_path) {
-            set.default_template = Some(tmpl);
-        }
+        && let Some(tmpl) = load_file(&single, workspace_path)
+    {
+        set.default_template = Some(tmpl);
+    }
 
     // Directory form
     let template_dir = github_dir.join("PULL_REQUEST_TEMPLATE");
     if template_dir.is_dir()
-        && let Ok(entries) = std::fs::read_dir(&template_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                if !path.is_file() {
-                    continue;
-                }
-                if let Some(tmpl) = load_file(&path, workspace_path) {
-                    let stem = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unnamed")
-                        .to_lowercase();
-                    set.named_templates.insert(stem, tmpl);
-                }
+        && let Ok(entries) = std::fs::read_dir(&template_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(tmpl) = load_file(&path, workspace_path) {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unnamed")
+                    .to_lowercase();
+                set.named_templates.insert(stem, tmpl);
             }
         }
+    }
 
     set
 }
@@ -164,10 +166,7 @@ fn load_from_disk(workspace_path: &Path) -> PrTemplateSet {
 fn load_file(path: &Path, workspace_root: &Path) -> Option<PrTemplate> {
     let text = std::fs::read_to_string(path).ok()?;
     let required_headings = parse_required_headings(&text);
-    let source_path = path
-        .strip_prefix(workspace_root)
-        .unwrap_or(path)
-        .to_path_buf();
+    let source_path = path.strip_prefix(workspace_root).unwrap_or(path).to_path_buf();
     Some(PrTemplate {
         text,
         required_headings,
@@ -203,11 +202,7 @@ fn parse_required_headings(text: &str) -> Vec<String> {
         // Opening fence: at least three ``` or ~~~ characters.
         if stripped.starts_with("```") || stripped.starts_with("~~~") {
             fence_char = stripped.chars().next().unwrap();
-            fence_min_len = stripped
-                .chars()
-                .take_while(|&c| c == fence_char)
-                .count()
-                .max(3);
+            fence_min_len = stripped.chars().take_while(|&c| c == fence_char).count().max(3);
             in_fence = true;
             continue;
         }
@@ -269,19 +264,13 @@ mod tests {
     #[test]
     fn parse_h2_headings() {
         let text = "## Summary\n\nSome text.\n\n## Test plan\n";
-        assert_eq!(
-            parse_required_headings(text),
-            vec!["Summary", "Test plan"]
-        );
+        assert_eq!(parse_required_headings(text), vec!["Summary", "Test plan"]);
     }
 
     #[test]
     fn parse_h3_headings() {
         let text = "## Summary\n\n### Details\n\nText.\n";
-        assert_eq!(
-            parse_required_headings(text),
-            vec!["Summary", "Details"]
-        );
+        assert_eq!(parse_required_headings(text), vec!["Summary", "Details"]);
     }
 
     #[test]
@@ -293,19 +282,13 @@ mod tests {
     #[test]
     fn skip_headings_in_fenced_code_block() {
         let text = "## Before\n\n```\n## Inside\n```\n\n## After\n";
-        assert_eq!(
-            parse_required_headings(text),
-            vec!["Before", "After"]
-        );
+        assert_eq!(parse_required_headings(text), vec!["Before", "After"]);
     }
 
     #[test]
     fn skip_headings_in_tilde_fence() {
         let text = "## Before\n\n~~~\n## Inside\n~~~\n\n## After\n";
-        assert_eq!(
-            parse_required_headings(text),
-            vec!["Before", "After"]
-        );
+        assert_eq!(parse_required_headings(text), vec!["Before", "After"]);
     }
 
     #[test]
@@ -342,11 +325,7 @@ mod tests {
         let tmp = make_workspace();
         let github = tmp.path().join(".github");
         fs::create_dir_all(&github).unwrap();
-        fs::write(
-            github.join("PULL_REQUEST_TEMPLATE.md"),
-            "## Summary\n\n## Test plan\n",
-        )
-        .unwrap();
+        fs::write(github.join("PULL_REQUEST_TEMPLATE.md"), "## Summary\n\n## Test plan\n").unwrap();
 
         let set = load_from_disk(tmp.path());
         assert!(!set.is_empty());
@@ -362,7 +341,11 @@ mod tests {
         let tmp = make_workspace();
         let tdir = tmp.path().join(".github").join("PULL_REQUEST_TEMPLATE");
         fs::create_dir_all(&tdir).unwrap();
-        fs::write(tdir.join("bug_report.md"), "## Bug description\n\n## Steps to reproduce\n").unwrap();
+        fs::write(
+            tdir.join("bug_report.md"),
+            "## Bug description\n\n## Steps to reproduce\n",
+        )
+        .unwrap();
         fs::write(tdir.join("feature_request.md"), "## Motivation\n\n## Proposal\n").unwrap();
 
         let set = load_from_disk(tmp.path());
@@ -371,7 +354,10 @@ mod tests {
 
         let bug = &set.named_templates["bug_report"];
         assert_eq!(bug.required_headings, vec!["Bug description", "Steps to reproduce"]);
-        assert_eq!(bug.source_path, Path::new(".github/PULL_REQUEST_TEMPLATE/bug_report.md"));
+        assert_eq!(
+            bug.source_path,
+            Path::new(".github/PULL_REQUEST_TEMPLATE/bug_report.md")
+        );
 
         let feat = &set.named_templates["feature_request"];
         assert_eq!(feat.required_headings, vec!["Motivation", "Proposal"]);
@@ -423,10 +409,7 @@ mod tests {
         fs::write(tdir.join("alpha.md"), "## Alpha\n").unwrap();
 
         let set = load_from_disk(tmp.path());
-        let names: Vec<&str> = set
-            .all_templates()
-            .map(|t| t.required_headings[0].as_str())
-            .collect();
+        let names: Vec<&str> = set.all_templates().map(|t| t.required_headings[0].as_str()).collect();
         // Default first, then named in sorted order (alpha < zebra).
         assert_eq!(names, vec!["Default", "Alpha", "Zebra"]);
     }

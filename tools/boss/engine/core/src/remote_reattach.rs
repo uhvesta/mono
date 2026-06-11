@@ -244,11 +244,7 @@ mod tests {
         ) -> Result<RunOutcome> {
             unimplemented!()
         }
-        async fn reattach_events_forward(
-            &self,
-            run_id: &str,
-            _engine_events_socket: &str,
-        ) -> Result<bool> {
+        async fn reattach_events_forward(&self, run_id: &str, _engine_events_socket: &str) -> Result<bool> {
             self.reattached.lock().unwrap().push(run_id.to_owned());
             match self.result {
                 Ok(v) => Ok(v),
@@ -311,11 +307,7 @@ mod tests {
     /// execution id. The run lands in `work_runs` with status `active`.
     fn start_run_on_host(db: &WorkDb, work_item_id: &str, host_id: &str) -> String {
         let execution = db
-            .request_execution(
-                RequestExecutionInput::builder()
-                    .work_item_id(work_item_id)
-                    .build(),
-            )
+            .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
             .unwrap();
         db.start_execution_run_on_host(
             &execution.id,
@@ -330,10 +322,7 @@ mod tests {
         execution.id
     }
 
-    fn recording_provider(
-        host_id: &str,
-        result: Result<bool, &'static str>,
-    ) -> (Arc<RecordingAdapter>, StubProvider) {
+    fn recording_provider(host_id: &str, result: Result<bool, &'static str>) -> (Arc<RecordingAdapter>, StubProvider) {
         let adapter = Arc::new(RecordingAdapter {
             host_id: host_id.to_owned(),
             reattached: Mutex::new(Vec::new()),
@@ -400,11 +389,7 @@ mod tests {
         // Start the run on a host, then the run row references "ghost"
         // which is not in the hosts table.
         let execution = db
-            .request_execution(
-                RequestExecutionInput::builder()
-                    .work_item_id(chore.clone())
-                    .build(),
-            )
+            .request_execution(RequestExecutionInput::builder().work_item_id(chore.clone()).build())
             .unwrap();
         db.start_execution_run_on_host(
             &execution.id,

@@ -115,10 +115,8 @@ pub struct GhInvocation {
 /// `(?:^|[\s;&|()])` anchor prevents `notgh pr create` style false
 /// positives — `gh` must begin a token.
 static GH_INVOCATION_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*gh\s+(pr|issue)\s+([a-z][a-z-]*)",
-    )
-    .expect("gh invocation regex compiles")
+    Regex::new(r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*gh\s+(pr|issue)\s+([a-z][a-z-]*)")
+        .expect("gh invocation regex compiles")
 });
 
 /// Classify a Bash command string as a `gh pr` / `gh issue` invocation.
@@ -150,10 +148,8 @@ pub fn classify(command: &str) -> Option<GhInvocation> {
 /// Matches `cube pr ensure` anywhere it would appear as a real command:
 /// at the start, after env-var assignments, or after a shell delimiter.
 static CUBE_PR_ENSURE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cube\s+pr\s+ensure\b",
-    )
-    .expect("cube pr ensure regex compiles")
+    Regex::new(r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cube\s+pr\s+ensure\b")
+        .expect("cube pr ensure regex compiles")
 });
 
 /// Returns `true` when `command` is a `cube pr ensure` invocation.
@@ -355,8 +351,7 @@ mod tests {
     #[test]
     fn gh_pr_create_still_matches_after_quoted_arg() {
         assert_eq!(
-            classify(r#"jj describe -m "msg" && gh pr create --title "x""#)
-                .map(|i| i.subcommand),
+            classify(r#"jj describe -m "msg" && gh pr create --title "x""#).map(|i| i.subcommand),
             Some("create".to_owned()),
             "gh pr create after a quoted arg must still be classified",
         );
@@ -383,10 +378,7 @@ mod tests {
     #[test]
     fn strip_handles_backslash_escape_in_double_quotes() {
         // `\"` inside a double-quoted string does not end the string.
-        assert_eq!(
-            strip_quoted_string_contents(r#"cmd "a\"b" rest"#),
-            r#"cmd "" rest"#,
-        );
+        assert_eq!(strip_quoted_string_contents(r#"cmd "a\"b" rest"#), r#"cmd "" rest"#,);
     }
 
     #[test]

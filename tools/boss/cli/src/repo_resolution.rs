@@ -37,10 +37,7 @@ pub enum ResolutionSource {
 /// without touching IO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainOutcome {
-    Resolved {
-        url: String,
-        source: ResolutionSource,
-    },
+    Resolved { url: String, source: ResolutionSource },
     AskOrFail,
 }
 
@@ -117,8 +114,7 @@ pub async fn resolve_repo_at_create_time(
                 "cannot set per-task repo override on product `{}`: \
                  product has its own repo (`{}`). \
                  Clear the product's repo first, or omit --repo to inherit.",
-                product.slug,
-                product_repo,
+                product.slug, product_repo,
             )));
         }
         return Ok(None);
@@ -135,13 +131,7 @@ pub async fn resolve_repo_at_create_time(
     let known_repos = collect_known_repos(None, &items);
     let recent_repo = recent_repo_for_product(&items);
 
-    match run_chain(
-        None,
-        prompt_text,
-        &known_repos,
-        recent_repo.as_deref(),
-        None,
-    ) {
+    match run_chain(None, prompt_text, &known_repos, recent_repo.as_deref(), None) {
         ChainOutcome::Resolved { url, .. } => Ok(Some(url)),
         ChainOutcome::AskOrFail => {
             if interactive {
@@ -165,10 +155,7 @@ pub fn unresolved_repo_error(product_slug: &str) -> CliError {
     ))
 }
 
-async fn list_all_work_items_for_product(
-    client: &mut BossClient,
-    product_id: &str,
-) -> Result<Vec<Task>, CliError> {
+async fn list_all_work_items_for_product(client: &mut BossClient, product_id: &str) -> Result<Vec<Task>, CliError> {
     let tasks = send_list_tasks(client, product_id).await?;
     let chores = send_list_chores(client, product_id).await?;
     let mut all = tasks;
@@ -198,10 +185,7 @@ async fn send_list_tasks(client: &mut BossClient, product_id: &str) -> Result<Ve
     }
 }
 
-async fn send_list_chores(
-    client: &mut BossClient,
-    product_id: &str,
-) -> Result<Vec<Task>, CliError> {
+async fn send_list_chores(client: &mut BossClient, product_id: &str) -> Result<Vec<Task>, CliError> {
     match client
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
@@ -286,9 +270,7 @@ fn match_known_repo_in_prompt(prompt_text: &str, known_repos: &[String]) -> Opti
             };
             let better = match best {
                 None => true,
-                Some((best_pos, best_len, _)) => {
-                    pos < best_pos || (pos == best_pos && lc_alias.len() > best_len)
-                }
+                Some((best_pos, best_len, _)) => pos < best_pos || (pos == best_pos && lc_alias.len() > best_len),
             };
             if better {
                 best = Some((pos, lc_alias.len(), url.as_str()));
@@ -345,15 +327,9 @@ fn owner_repo_for(url: &str) -> Option<String> {
         .map(|x| x.1)
         .unwrap_or(trimmed)
         .trim_start_matches('/');
-    let body = after_scheme
-        .splitn(2, ':')
-        .last()
-        .unwrap_or(after_scheme);
+    let body = after_scheme.splitn(2, ':').last().unwrap_or(after_scheme);
     // `body` is now e.g. `github.com/foo/bar` or `foo/bar`.
-    let parts: Vec<&str> = body
-        .split('/')
-        .filter(|seg| !seg.is_empty())
-        .collect();
+    let parts: Vec<&str> = body.split('/').filter(|seg| !seg.is_empty()).collect();
     if parts.len() < 2 {
         return None;
     }
@@ -370,19 +346,12 @@ fn owner_repo_for(url: &str) -> Option<String> {
 
 fn non_empty(value: &str) -> Option<&str> {
     let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
+    if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
 /// Show the known-repo list and read one selection. Returns `Ok(None)`
 /// when the user gives an empty answer (treated as "skip the prompt").
-fn interactive_ask(
-    known_repos: &[String],
-    product_slug: &str,
-) -> Result<Option<String>, CliError> {
+fn interactive_ask(known_repos: &[String], product_slug: &str) -> Result<Option<String>, CliError> {
     let mut stderr = io::stderr().lock();
     writeln!(
         stderr,
@@ -390,11 +359,7 @@ fn interactive_ask(
     )
     .map_err(CliError::internal)?;
     if known_repos.is_empty() {
-        writeln!(
-            stderr,
-            "  This product has no known repos yet; enter a full URL."
-        )
-        .map_err(CliError::internal)?;
+        writeln!(stderr, "  This product has no known repos yet; enter a full URL.").map_err(CliError::internal)?;
     } else {
         writeln!(stderr, "  Known repos for `{product_slug}`:").map_err(CliError::internal)?;
         for (idx, url) in known_repos.iter().enumerate() {
@@ -419,9 +384,7 @@ fn interactive_ask(
     stdout.flush().map_err(CliError::internal)?;
 
     let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .map_err(CliError::internal)?;
+    io::stdin().read_line(&mut input).map_err(CliError::internal)?;
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -465,10 +428,7 @@ mod tests {
     #[test]
     fn short_name_strips_dotgit_and_protocol() {
         assert_eq!(short_name_for("git@github.com:foo/nimbus.git"), "nimbus");
-        assert_eq!(
-            short_name_for("https://github.com/foo/nimbus.git"),
-            "nimbus"
-        );
+        assert_eq!(short_name_for("https://github.com/foo/nimbus.git"), "nimbus");
         assert_eq!(short_name_for("https://github.com/foo/nimbus"), "nimbus");
     }
 
@@ -483,18 +443,12 @@ mod tests {
 
     #[test]
     fn owner_repo_handles_ssh_and_https() {
-        assert_eq!(
-            owner_repo_for("git@github.com:foo/bar.git").as_deref(),
-            Some("foo/bar")
-        );
+        assert_eq!(owner_repo_for("git@github.com:foo/bar.git").as_deref(), Some("foo/bar"));
         assert_eq!(
             owner_repo_for("https://github.com/foo/bar.git").as_deref(),
             Some("foo/bar")
         );
-        assert_eq!(
-            owner_repo_for("https://github.com/foo/bar").as_deref(),
-            Some("foo/bar")
-        );
+        assert_eq!(owner_repo_for("https://github.com/foo/bar").as_deref(), Some("foo/bar"));
         // Not enough path components.
         assert_eq!(owner_repo_for("https://github.com/foo").as_deref(), None);
     }
@@ -522,10 +476,7 @@ mod tests {
         // `nimbus` and `nimbus-frontend` both match at the same position;
         // longer alias wins.
         let url = match_known_repo_in_prompt("fix the nimbus-frontend deploy", &known);
-        assert_eq!(
-            url.as_deref(),
-            Some("git@github.com:org/nimbus-frontend.git")
-        );
+        assert_eq!(url.as_deref(), Some("git@github.com:org/nimbus-frontend.git"));
     }
 
     #[test]
@@ -661,13 +612,7 @@ mod tests {
     /// whiff — the "ask-or-fail" branch is *not* entered.
     #[test]
     fn chain_default_overrides_ask_or_fail() {
-        let outcome = run_chain(
-            None,
-            "rewrite the docs",
-            &[],
-            None,
-            Some("git@github.com:foo/work.git"),
-        );
+        let outcome = run_chain(None, "rewrite the docs", &[], None, Some("git@github.com:foo/work.git"));
         assert_eq!(
             outcome,
             ChainOutcome::Resolved {

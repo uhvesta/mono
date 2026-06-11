@@ -4,9 +4,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::app::CubeError;
-use crate::metadata::{
-    ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceHealth, WorkspaceRecord, WorkspaceState,
-};
+use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::paths::database_path;
 
 pub struct Store {
@@ -179,8 +177,7 @@ impl Store {
             .query_map([], row_to_repo_record)
             .map_err(CubeError::Storage)?;
 
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(CubeError::Storage)
+        rows.collect::<Result<Vec<_>, _>>().map_err(CubeError::Storage)
     }
 
     pub fn list_workspaces_filtered(
@@ -219,9 +216,7 @@ impl Store {
         if let Some(effective) = filter.effective_state {
             match effective {
                 EffectiveState::Free => {
-                    sql.push_str(
-                        " AND state = ? AND (health_status IS NULL OR health_status = 'clean')",
-                    );
+                    sql.push_str(" AND state = ? AND (health_status IS NULL OR health_status = 'clean')");
                     bound.push(WorkspaceState::Free.as_str().to_string());
                 }
                 EffectiveState::FreeDirty => {
@@ -246,13 +241,9 @@ impl Store {
 
         let mut statement = self.connection.prepare(&sql).map_err(CubeError::Storage)?;
         let rows = statement
-            .query_map(
-                rusqlite::params_from_iter(bound.iter()),
-                row_to_workspace_record,
-            )
+            .query_map(rusqlite::params_from_iter(bound.iter()), row_to_workspace_record)
             .map_err(CubeError::Storage)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(CubeError::Storage)
+        rows.collect::<Result<Vec<_>, _>>().map_err(CubeError::Storage)
     }
 
     pub fn list_workspaces(&self, repo: &str) -> Result<Vec<WorkspaceRecord>, CubeError> {
@@ -284,15 +275,10 @@ impl Store {
             .query_map(params![repo], row_to_workspace_record)
             .map_err(CubeError::Storage)?;
 
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(CubeError::Storage)
+        rows.collect::<Result<Vec<_>, _>>().map_err(CubeError::Storage)
     }
 
-    pub fn sync_workspaces(
-        &mut self,
-        repo: &str,
-        candidates: &[WorkspaceCandidate],
-    ) -> Result<(), CubeError> {
+    pub fn sync_workspaces(&mut self, repo: &str, candidates: &[WorkspaceCandidate]) -> Result<(), CubeError> {
         let transaction = self.connection.transaction().map_err(CubeError::Storage)?;
         let candidate_ids = candidates
             .iter()
@@ -340,10 +326,7 @@ impl Store {
         drop(statement);
 
         for workspace_id in existing {
-            if candidate_ids
-                .iter()
-                .any(|candidate_id| *candidate_id == workspace_id)
-            {
+            if candidate_ids.iter().any(|candidate_id| *candidate_id == workspace_id) {
                 continue;
             }
             transaction
@@ -484,11 +467,7 @@ impl Store {
         Ok(Some(claimed))
     }
 
-    pub fn update_workspace_head_commit(
-        &self,
-        lease_id: &str,
-        head_commit: Option<&str>,
-    ) -> Result<(), CubeError> {
+    pub fn update_workspace_head_commit(&self, lease_id: &str, head_commit: Option<&str>) -> Result<(), CubeError> {
         self.connection
             .execute(
                 r#"
@@ -531,12 +510,7 @@ impl Store {
                     END
                 WHERE repo = ?1 AND workspace_id = ?2 AND state = ?4
                 "#,
-                params![
-                    repo,
-                    workspace_id,
-                    health.as_str(),
-                    WorkspaceState::Free.as_str(),
-                ],
+                params![repo, workspace_id, health.as_str(), WorkspaceState::Free.as_str(),],
             )
             .map_err(CubeError::Storage)?;
         Ok(())
@@ -546,11 +520,7 @@ impl Store {
     /// Clears both `health_status` and `unhealthy_since_epoch_s`, but only
     /// if the workspace is still free — if it was claimed mid-pass, this
     /// is a no-op (returns `false`). Returns `true` when the row was updated.
-    pub fn gc_clear_workspace_unhealthy_state(
-        &self,
-        repo: &str,
-        workspace_id: &str,
-    ) -> Result<bool, CubeError> {
+    pub fn gc_clear_workspace_unhealthy_state(&self, repo: &str, workspace_id: &str) -> Result<bool, CubeError> {
         let updated = self
             .connection
             .execute(
@@ -648,10 +618,7 @@ impl Store {
         Ok(Some(claimed))
     }
 
-    pub fn get_workspace_by_path(
-        &self,
-        workspace_path: &Path,
-    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+    pub fn get_workspace_by_path(&self, workspace_path: &Path) -> Result<Option<WorkspaceRecord>, CubeError> {
         self.connection
             .query_row(
                 r#"
@@ -679,10 +646,7 @@ impl Store {
             .map_err(CubeError::Storage)
     }
 
-    pub fn get_workspace_by_lease(
-        &self,
-        lease_id: &str,
-    ) -> Result<Option<WorkspaceRecord>, CubeError> {
+    pub fn get_workspace_by_lease(&self, lease_id: &str) -> Result<Option<WorkspaceRecord>, CubeError> {
         self.connection
             .query_row(
                 r#"
@@ -826,10 +790,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn upsert_workspace_setup_state(
-        &self,
-        state: &WorkspaceSetupState,
-    ) -> Result<(), CubeError> {
+    pub fn upsert_workspace_setup_state(&self, state: &WorkspaceSetupState) -> Result<(), CubeError> {
         self.connection
             .execute(
                 r#"
@@ -875,8 +836,7 @@ impl Store {
         let rows = statement
             .query_map(params![repo, workspace_id], row_to_workspace_setup_state)
             .map_err(CubeError::Storage)?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(CubeError::Storage)
+        rows.collect::<Result<Vec<_>, _>>().map_err(CubeError::Storage)
     }
 
     /// Force-release a lease without checking holder ownership. Used for
@@ -908,11 +868,7 @@ impl Store {
                 SET lease_expires_at_epoch_s = ?2
                 WHERE lease_id = ?1 AND state = ?3
                 "#,
-                params![
-                    lease_id,
-                    new_expires_at_epoch_s,
-                    WorkspaceState::Leased.as_str(),
-                ],
+                params![lease_id, new_expires_at_epoch_s, WorkspaceState::Leased.as_str(),],
             )
             .map_err(CubeError::Storage)?;
         if updated == 0 {
@@ -930,11 +886,7 @@ impl Store {
     /// it impossible for the lease handler to tell apart "claimed a
     /// genuinely free workspace" from "claimed a workspace that was
     /// just reclaimed out from under a still-active worker."
-    pub fn expire_stale_leases(
-        &self,
-        repo: &str,
-        now_epoch_s: i64,
-    ) -> Result<Vec<ExpiredLease>, CubeError> {
+    pub fn expire_stale_leases(&self, repo: &str, now_epoch_s: i64) -> Result<Vec<ExpiredLease>, CubeError> {
         let transaction = self.connection.unchecked_transaction().map_err(CubeError::Storage)?;
         let swept = {
             let mut statement = transaction
@@ -950,22 +902,18 @@ impl Store {
                 )
                 .map_err(CubeError::Storage)?;
             let rows = statement
-                .query_map(
-                    params![repo, WorkspaceState::Leased.as_str(), now_epoch_s],
-                    |row| {
-                        Ok(ExpiredLease {
-                            workspace_id: row.get(0)?,
-                            lease_id: row.get(1)?,
-                            holder: row.get(2)?,
-                            task: row.get(3)?,
-                            leased_at_epoch_s: row.get(4)?,
-                            lease_expires_at_epoch_s: row.get(5)?,
-                        })
-                    },
-                )
+                .query_map(params![repo, WorkspaceState::Leased.as_str(), now_epoch_s], |row| {
+                    Ok(ExpiredLease {
+                        workspace_id: row.get(0)?,
+                        lease_id: row.get(1)?,
+                        holder: row.get(2)?,
+                        task: row.get(3)?,
+                        leased_at_epoch_s: row.get(4)?,
+                        lease_expires_at_epoch_s: row.get(5)?,
+                    })
+                })
                 .map_err(CubeError::Storage)?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(CubeError::Storage)?
+            rows.collect::<Result<Vec<_>, _>>().map_err(CubeError::Storage)?
         };
         if swept.is_empty() {
             transaction.rollback().map_err(CubeError::Storage)?;
@@ -1143,18 +1091,12 @@ impl Store {
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN last_release_reason TEXT",
         )?;
-        try_add_column(
-            &self.connection,
-            "ALTER TABLE workspaces ADD COLUMN health_status TEXT",
-        )?;
+        try_add_column(&self.connection, "ALTER TABLE workspaces ADD COLUMN health_status TEXT")?;
         try_add_column(
             &self.connection,
             "ALTER TABLE workspaces ADD COLUMN unhealthy_since_epoch_s INTEGER",
         )?;
-        try_add_column(
-            &self.connection,
-            "ALTER TABLE repos ADD COLUMN clone_command TEXT",
-        )?;
+        try_add_column(&self.connection, "ALTER TABLE repos ADD COLUMN clone_command TEXT")?;
 
         Ok(())
     }
@@ -1163,11 +1105,7 @@ impl Store {
 fn try_add_column(connection: &Connection, sql: &str) -> Result<(), CubeError> {
     match connection.execute(sql, []) {
         Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
-            if msg.contains("duplicate column name") =>
-        {
-            Ok(())
-        }
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column name") => Ok(()),
         Err(e) => Err(CubeError::Storage(e)),
     }
 }
@@ -1181,9 +1119,7 @@ pub struct WorkspaceSetupState {
     pub last_run_epoch_s: i64,
 }
 
-fn row_to_workspace_setup_state(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<WorkspaceSetupState> {
+fn row_to_workspace_setup_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceSetupState> {
     Ok(WorkspaceSetupState {
         repo: row.get(0)?,
         workspace_id: row.get(1)?,
@@ -1220,9 +1156,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
             rusqlite::Error::FromSqlConversionFailure(
                 3,
                 rusqlite::types::Type::Text,
-                Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "invalid workspace state `{state_raw}`"
-                )),
+                Box::<dyn std::error::Error + Send + Sync>::from(format!("invalid workspace state `{state_raw}`")),
             )
         })?,
         lease_id: row.get(4)?,
@@ -1254,9 +1188,7 @@ fn row_to_change_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeRecor
 mod tests {
     use tempfile::TempDir;
 
-    use crate::metadata::{
-        ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState,
-    };
+    use crate::metadata::{ChangeRecord, RepoRecord, WorkspaceCandidate, WorkspaceRecord, WorkspaceState};
 
     use super::{EffectiveState, Store, WorkspaceListFilter};
 
@@ -1365,26 +1297,10 @@ mod tests {
 
         // lease one workspace in each repo with distinct holders
         store
-            .claim_workspace(
-                "mono",
-                "boss/worker-7",
-                "demo",
-                "lease-mono",
-                100,
-                Some(1900),
-                None,
-            )
+            .claim_workspace("mono", "boss/worker-7", "demo", "lease-mono", 100, Some(1900), None)
             .expect("claim mono");
         store
-            .claim_workspace(
-                "flunge",
-                "alice@host:42",
-                "fix",
-                "lease-flunge",
-                100,
-                Some(1900),
-                None,
-            )
+            .claim_workspace("flunge", "alice@host:42", "fix", "lease-flunge", 100, Some(1900), None)
             .expect("claim flunge");
 
         // unfiltered: 4 workspaces total, ordered by repo then id
@@ -1512,10 +1428,8 @@ mod tests {
                 ..Default::default()
             })
             .expect("list");
-        let by_id: std::collections::HashMap<&str, &WorkspaceRecord> = after
-            .iter()
-            .map(|r| (r.workspace_id.as_str(), r))
-            .collect();
+        let by_id: std::collections::HashMap<&str, &WorkspaceRecord> =
+            after.iter().map(|r| (r.workspace_id.as_str(), r)).collect();
 
         let a = by_id["mono-agent-001"];
         assert_eq!(a.state, WorkspaceState::Leased);

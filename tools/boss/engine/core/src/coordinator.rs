@@ -17,16 +17,12 @@ use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
-use crate::host_adapter::{
-    HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider,
-};
+use crate::host_adapter::{HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider};
 use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
 use crate::metrics::Registry;
 use crate::runner::{ExecutionRunner, RunOutcome, RunWaitState};
-use crate::work::{
-    CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun,
-};
+use crate::work::{CreateAttentionItemInput, PreStartFailureOutcome, WorkDb, WorkExecution, WorkItem, WorkRun};
 
 // Phase-3 counter handles for the cube workspace lease boundary.
 crate::register_counter!(
@@ -134,11 +130,8 @@ const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
 /// is the sleep before attempt N+2 (the first retry, the second retry, …).
 /// Three entries → up to 3 retries (4 total attempts) before a pre-start
 /// failure surfaces to the operator.
-const PRE_START_RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_secs(5),
-    Duration::from_secs(15),
-    Duration::from_secs(45),
-];
+const PRE_START_RETRY_DELAYS: [Duration; 3] =
+    [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(45)];
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
 /// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` is 30 minutes, so a
@@ -298,11 +291,7 @@ pub trait CubeClient: Send + Sync {
         allow_dirty: bool,
         resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease>;
-    async fn create_change(
-        &self,
-        workspace_path: &Path,
-        title: &str,
-    ) -> Result<CubeChangeHandle>;
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle>;
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()>;
@@ -387,11 +376,9 @@ impl CubeClient for CommandCubeClient {
             repo_id: String,
         }
 
-        let payload: RepoEnsurePayload = serde_json::from_value(
-            self.run_json(&crate::repo_slug::repo_ensure_args(origin))
-                .await?,
-        )
-        .context("failed to decode `cube repo ensure` payload")?;
+        let payload: RepoEnsurePayload =
+            serde_json::from_value(self.run_json(&crate::repo_slug::repo_ensure_args(origin)).await?)
+                .context("failed to decode `cube repo ensure` payload")?;
         Ok(CubeRepoHandle {
             repo_id: payload.repo_id,
         })
@@ -418,9 +405,7 @@ impl CubeClient for CommandCubeClient {
         }
 
         let resume_pr_str = resume_pr.map(|n| n.to_string());
-        let mut args: Vec<&str> = vec![
-            "--json", "workspace", "lease", repo_id, "--task", task,
-        ];
+        let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
         if let Some(prefer) = prefer_workspace_id {
             args.extend_from_slice(&["--prefer", prefer]);
         }
@@ -443,11 +428,7 @@ impl CubeClient for CommandCubeClient {
         })
     }
 
-    async fn create_change(
-        &self,
-        workspace_path: &Path,
-        title: &str,
-    ) -> Result<CubeChangeHandle> {
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
         #[derive(Deserialize)]
         struct ChangePayload {
             change: ChangeRecord,
@@ -556,10 +537,8 @@ impl CubeClient for CommandCubeClient {
             lease_expires_at_epoch_s: Option<i64>,
         }
 
-        let payload: ListPayload = serde_json::from_value(
-            self.run_json(&["--json", "workspace", "list"]).await?,
-        )
-        .context("failed to decode `cube workspace list` payload")?;
+        let payload: ListPayload = serde_json::from_value(self.run_json(&["--json", "workspace", "list"]).await?)
+            .context("failed to decode `cube workspace list` payload")?;
         Ok(payload
             .workspaces
             .into_iter()
@@ -593,9 +572,8 @@ impl CubeClient for CommandCubeClient {
             source: Option<PathBuf>,
         }
 
-        let payload: ListPayload =
-            serde_json::from_value(self.run_json(&["--json", "repo", "list"]).await?)
-                .context("failed to decode `cube repo list` payload")?;
+        let payload: ListPayload = serde_json::from_value(self.run_json(&["--json", "repo", "list"]).await?)
+            .context("failed to decode `cube repo list` payload")?;
         Ok(payload
             .repos
             .into_iter()
@@ -664,12 +642,7 @@ pub struct WorkerClaim {
 /// observable from the engine log (and let an operator reconstruct
 /// "which execution holds each claim" without instrumenting the pool).
 fn log_pool_claim(worker_id: &str, execution_id: &str, selection: &str) {
-    tracing::info!(
-        worker_id,
-        execution_id,
-        selection,
-        "worker_pool_claim worker claimed"
-    );
+    tracing::info!(worker_id, execution_id, selection, "worker_pool_claim worker claimed");
 }
 
 impl WorkerPool {
@@ -722,24 +695,21 @@ impl WorkerPool {
     /// that workspace, that worker is chosen. Otherwise a free slot is
     /// picked uniformly at random — a cosmetic spread so we don't always
     /// hammer slot 1.
-    pub async fn claim_worker(
-        &self,
-        execution_id: &str,
-        preferred_workspace_id: Option<&str>,
-    ) -> Option<String> {
+    pub async fn claim_worker(&self, execution_id: &str, preferred_workspace_id: Option<&str>) -> Option<String> {
         let mut inner = self.inner.lock().await;
 
         if let Some(target) = preferred_workspace_id
-            && let Some(idx) = inner.workers.iter().position(|w| {
-                w.execution_id.is_none()
-                    && w.last_workspace_id.as_deref() == Some(target)
-            }) {
-                let worker = &mut inner.workers[idx];
-                worker.execution_id = Some(execution_id.to_owned());
-                let worker_id = worker.worker_id.clone();
-                log_pool_claim(&worker_id, execution_id, "affinity");
-                return Some(worker_id);
-            }
+            && let Some(idx) = inner
+                .workers
+                .iter()
+                .position(|w| w.execution_id.is_none() && w.last_workspace_id.as_deref() == Some(target))
+        {
+            let worker = &mut inner.workers[idx];
+            worker.execution_id = Some(execution_id.to_owned());
+            let worker_id = worker.worker_id.clone();
+            log_pool_claim(&worker_id, execution_id, "affinity");
+            return Some(worker_id);
+        }
 
         let free: Vec<usize> = inner
             .workers
@@ -764,24 +734,21 @@ impl WorkerPool {
     /// at the hard cap with no idle slot — at that point there's no
     /// pane the macOS app could render anyway, so the launch is
     /// rejected rather than silently overcommitting.
-    pub async fn claim_worker_force(
-        &self,
-        execution_id: &str,
-        preferred_workspace_id: Option<&str>,
-    ) -> Option<String> {
+    pub async fn claim_worker_force(&self, execution_id: &str, preferred_workspace_id: Option<&str>) -> Option<String> {
         let mut inner = self.inner.lock().await;
 
         if let Some(target) = preferred_workspace_id
-            && let Some(idx) = inner.workers.iter().position(|w| {
-                w.execution_id.is_none()
-                    && w.last_workspace_id.as_deref() == Some(target)
-            }) {
-                let worker = &mut inner.workers[idx];
-                worker.execution_id = Some(execution_id.to_owned());
-                let worker_id = worker.worker_id.clone();
-                log_pool_claim(&worker_id, execution_id, "force-affinity");
-                return Some(worker_id);
-            }
+            && let Some(idx) = inner
+                .workers
+                .iter()
+                .position(|w| w.execution_id.is_none() && w.last_workspace_id.as_deref() == Some(target))
+        {
+            let worker = &mut inner.workers[idx];
+            worker.execution_id = Some(execution_id.to_owned());
+            let worker_id = worker.worker_id.clone();
+            log_pool_claim(&worker_id, execution_id, "force-affinity");
+            return Some(worker_id);
+        }
 
         let free: Vec<usize> = inner
             .workers
@@ -821,11 +788,7 @@ impl WorkerPool {
     /// preferred-workspace claims.
     pub async fn release_worker(&self, worker_id: &str, last_workspace_id: Option<&str>) {
         let mut inner = self.inner.lock().await;
-        if let Some(worker) = inner
-            .workers
-            .iter_mut()
-            .find(|worker| worker.worker_id == worker_id)
-        {
+        if let Some(worker) = inner.workers.iter_mut().find(|worker| worker.worker_id == worker_id) {
             let released_execution = worker.execution_id.take();
             if let Some(workspace_id) = last_workspace_id {
                 worker.last_workspace_id = Some(workspace_id.to_owned());
@@ -859,22 +822,20 @@ impl WorkerPool {
         last_workspace_id: Option<&str>,
     ) -> bool {
         let mut inner = self.inner.lock().await;
-        if let Some(worker) = inner
-            .workers
-            .iter_mut()
-            .find(|worker| worker.worker_id == worker_id)
-            && worker.execution_id.as_deref() == Some(execution_id) {
-                worker.execution_id = None;
-                if let Some(workspace_id) = last_workspace_id {
-                    worker.last_workspace_id = Some(workspace_id.to_owned());
-                }
-                tracing::info!(
-                    worker_id,
-                    execution_id,
-                    "worker_pool_release worker freed (compare-and-release)"
-                );
-                return true;
+        if let Some(worker) = inner.workers.iter_mut().find(|worker| worker.worker_id == worker_id)
+            && worker.execution_id.as_deref() == Some(execution_id)
+        {
+            worker.execution_id = None;
+            if let Some(workspace_id) = last_workspace_id {
+                worker.last_workspace_id = Some(workspace_id.to_owned());
             }
+            tracing::info!(
+                worker_id,
+                execution_id,
+                "worker_pool_release worker freed (compare-and-release)"
+            );
+            return true;
+        }
         false
     }
 
@@ -918,11 +879,7 @@ impl WorkerPool {
     /// even if its DB status is still non-terminal.
     pub async fn claimed_execution_ids(&self) -> std::collections::HashSet<String> {
         let inner = self.inner.lock().await;
-        inner
-            .workers
-            .iter()
-            .filter_map(|w| w.execution_id.clone())
-            .collect()
+        inner.workers.iter().filter_map(|w| w.execution_id.clone()).collect()
     }
 
     /// Format a worker id for slot `slot_id`. Inverse of
@@ -993,9 +950,7 @@ pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
 /// override mechanism." Returning a `'static str` avoids an allocation —
 /// callers pass this directly to [`crate::effort::resolve_spawn_config`].
 pub fn pool_model_override_for_worker_id(worker_id: &str) -> Option<&'static str> {
-    if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX)
-        || worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX)
-    {
+    if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX) || worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
         Some("opus")
     } else {
         None
@@ -1017,11 +972,7 @@ pub fn worker_id_for_slot(slot_id: u8) -> String {
     if slot <= MAX_WORKER_POOL_SIZE {
         format!("worker-{}", slot_id)
     } else if slot <= MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE {
-        format!(
-            "{}{}",
-            AUTOMATION_WORKER_ID_PREFIX,
-            slot - MAX_WORKER_POOL_SIZE
-        )
+        format!("{}{}", AUTOMATION_WORKER_ID_PREFIX, slot - MAX_WORKER_POOL_SIZE)
     } else {
         format!(
             "{}{}",
@@ -1035,36 +986,21 @@ pub fn worker_id_for_slot(slot_id: u8) -> String {
 /// to the topic broker; tests use a no-op or recording double.
 #[async_trait]
 pub trait ExecutionPublisher: Send + Sync {
-    async fn publish(
-        &self,
-        execution_id: &str,
-        work_item_id: &str,
-        status: &str,
-        reason: &str,
-    );
+    async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str);
 
     /// Publish a work-tree invalidation on the work item's product
     /// topic so subscribers (the kanban view) re-fetch and pick up
     /// status changes the coordinator drove from a non-request path
     /// — e.g., the auto-advance of `tasks.status` to `'active'` that
     /// happens inside `start_execution_run`.
-    async fn publish_work_item_changed(
-        &self,
-        product_id: &str,
-        work_item_id: &str,
-        reason: &str,
-    );
+    async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str);
 
     /// Push a typed [`FrontendEvent`] verbatim on the work item's
     /// product topic. Used for activity-feed events such as
     /// `ConflictResolutionStarted` / `Succeeded` / `Failed` /
     /// `Abandoned` (design Q8) where subscribers need the full
     /// payload, not just a "refetch" hint.
-    async fn publish_frontend_event_on_product(
-        &self,
-        product_id: &str,
-        event: FrontendEvent,
-    );
+    async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent);
 
     /// Nudge the execution scheduler to drain its ready queue. Called
     /// by the merge-poller's conflict-detection path after inserting a
@@ -1201,12 +1137,7 @@ impl ExecutionCoordinator {
         execution_runner: Arc<dyn ExecutionRunner>,
     ) -> Self {
         let host_adapter = Arc::new(LocalHostAdapter::new(cube_client, execution_runner));
-        Self::with_host_adapter_and_publisher(
-            work_db,
-            worker_pool,
-            host_adapter,
-            Arc::new(NoopExecutionPublisher),
-        )
+        Self::with_host_adapter_and_publisher(work_db, worker_pool, host_adapter, Arc::new(NoopExecutionPublisher))
     }
 
     /// Constructor that accepts a publisher alongside the cube/runner
@@ -1313,10 +1244,7 @@ impl ExecutionCoordinator {
     /// [`crate::remote_reattach::reattach_remote_runs`]; `app.rs` calls
     /// this once at startup so a remote worker that outlived the previous
     /// engine has its hook stream (and eventual completion) routed back.
-    pub async fn reattach_remote_runs(
-        &self,
-        engine_events_socket: &str,
-    ) -> crate::remote_reattach::ReattachSummary {
+    pub async fn reattach_remote_runs(&self, engine_events_socket: &str) -> crate::remote_reattach::ReattachSummary {
         crate::remote_reattach::reattach_remote_runs(
             &self.work_db,
             self.host_adapter_provider.as_ref(),
@@ -1343,7 +1271,6 @@ impl ExecutionCoordinator {
     pub fn review_worker_pool(&self) -> WorkerPool {
         self.review_pool.clone()
     }
-
 
     /// Wire the execution-started hook. Production installs the
     /// `WorkerCompletionHandler` here so it can snapshot the bound
@@ -1399,10 +1326,8 @@ impl ExecutionCoordinator {
     /// handler in `app/engine_meta.rs`.
     pub fn set_dispatch_paused(&self, paused: bool, paused_since_epoch_s: u64) {
         self.dispatch_paused.store(paused, Ordering::Release);
-        self.dispatch_paused_since_epoch_s.store(
-            if paused { paused_since_epoch_s } else { 0 },
-            Ordering::Release,
-        );
+        self.dispatch_paused_since_epoch_s
+            .store(if paused { paused_since_epoch_s } else { 0 }, Ordering::Release);
     }
 
     /// `true` when dispatch is globally paused.
@@ -1447,8 +1372,7 @@ impl ExecutionCoordinator {
             return true;
         }
         matches!(
-            self.work_db
-                .source_automation_id_for_work_item(&execution.work_item_id),
+            self.work_db.source_automation_id_for_work_item(&execution.work_item_id),
             Ok(Some(_))
         )
     }
@@ -1519,10 +1443,7 @@ impl ExecutionCoordinator {
     ///   handles the harder case where the execution row itself is
     ///   stale (worker dead, row claimed but not `ready`), which this
     ///   heartbeat does NOT address.
-    pub fn spawn_scheduler_heartbeat(
-        self: &Arc<Self>,
-        interval: Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn_scheduler_heartbeat(self: &Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         let coordinator = self.clone();
         tokio::spawn(async move {
             // Stagger startup so the first beat doesn't race the
@@ -1738,8 +1659,7 @@ impl ExecutionCoordinator {
             // the others) so a reviewer of an automation-produced task is
             // counted against the review pool, not the automation pool.
             let is_review = self.execution_targets_review_pool(&execution);
-            let is_automation =
-                !is_review && self.execution_targets_automation_pool(&execution);
+            let is_automation = !is_review && self.execution_targets_automation_pool(&execution);
             let is_main = !is_review && !is_automation;
             let pool_label = if is_review {
                 "review"
@@ -1799,10 +1719,7 @@ impl ExecutionCoordinator {
                 // Ghost-active invariant check (main pool only; automation and
                 // review executions are excluded from the normal kanban).
                 if is_main {
-                    let orphans = self
-                        .work_db
-                        .list_active_chores_without_live_run()
-                        .unwrap_or_default();
+                    let orphans = self.work_db.list_active_chores_without_live_run().unwrap_or_default();
                     if !orphans.is_empty() {
                         tracing::warn!(
                             ghost_active = ?orphans,
@@ -1816,17 +1733,13 @@ impl ExecutionCoordinator {
 
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::WorkerClaimed,
-                            DispatchOutcome::Skipped,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_details(serde_json::json!({
-                            "reason": "pool_exhausted",
-                            "pool": pool_label,
-                            "pool_capacity": pool_capacity,
-                        })),
+                        DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": "pool_exhausted",
+                                "pool": pool_label,
+                                "pool_capacity": pool_capacity,
+                            })),
                     )
                     .await;
 
@@ -1911,9 +1824,10 @@ impl ExecutionCoordinator {
     /// the synthetic fields never drive real task work.
     fn resolve_execution_work_item(&self, execution: &WorkExecution) -> Result<WorkItem> {
         if execution.kind == ExecutionKind::AutomationTriage
-            && let Some(item) = self.synthetic_triage_work_item(execution) {
-                return Ok(item);
-            }
+            && let Some(item) = self.synthetic_triage_work_item(execution)
+        {
+            return Ok(item);
+        }
         self.work_db.get_work_item(&execution.work_item_id)
     }
 
@@ -1922,11 +1836,7 @@ impl ExecutionCoordinator {
     /// gone (deleted mid-flight) — the caller then falls back to the normal
     /// `get_work_item`, which fails cleanly.
     fn synthetic_triage_work_item(&self, execution: &WorkExecution) -> Option<WorkItem> {
-        let automation = self
-            .work_db
-            .get_automation(&execution.work_item_id)
-            .ok()
-            .flatten()?;
+        let automation = self.work_db.get_automation(&execution.work_item_id).ok().flatten()?;
         let task = boss_protocol::Task::builder()
             .id(automation.id.clone())
             .product_id(automation.product_id.clone())
@@ -1956,22 +1866,15 @@ impl ExecutionCoordinator {
     /// Returns the selected [`Host`] or an error describing why nothing was
     /// eligible (consumed by the caller as a recoverable pre-start
     /// failure).
-    fn select_host_for_execution(
-        &self,
-        execution: &WorkExecution,
-        work_item: &WorkItem,
-    ) -> Result<Host> {
-        let pinned = self
-            .work_db
-            .execution_pinned_host(&execution.id)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    error = %format!("{err:#}"),
-                    "host-selection: failed to read pinned host; treating as unpinned",
-                );
-                None
-            });
+    fn select_host_for_execution(&self, execution: &WorkExecution, work_item: &WorkItem) -> Result<Host> {
+        let pinned = self.work_db.execution_pinned_host(&execution.id).unwrap_or_else(|err| {
+            tracing::warn!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "host-selection: failed to read pinned host; treating as unpinned",
+            );
+            None
+        });
 
         // Capability requirements union over the chore + its product +
         // its project. Empty today (no writer yet), which leaves every
@@ -1994,10 +1897,7 @@ impl ExecutionCoordinator {
                 BTreeSet::new()
             });
 
-        let hosts = self
-            .work_db
-            .list_hosts()
-            .context("host-selection: list hosts")?;
+        let hosts = self.work_db.list_hosts().context("host-selection: list hosts")?;
         let active = self.work_db.active_runs_per_host().unwrap_or_default();
 
         let slots: Vec<HostSlot> = hosts
@@ -2044,11 +1944,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    async fn schedule_execution(
-        self: &Arc<Self>,
-        execution: &WorkExecution,
-        worker_id: &str,
-    ) -> Result<()> {
+    async fn schedule_execution(self: &Arc<Self>, execution: &WorkExecution, worker_id: &str) -> Result<()> {
         // Double-spawn guard (Bug A): if another execution for this
         // work_item is already live (running or waiting_human), this
         // execution is a redundant duplicate created by the orphan sweep
@@ -2225,18 +2121,14 @@ impl ExecutionCoordinator {
         // subprocess instead of the (already-completed) worker claim.
         self.dispatch_events
             .emit(
-                DispatchEvent::new(
-                    Stage::CubeRepoEnsureAttempted,
-                    DispatchOutcome::Ok,
-                    &execution.id,
-                )
-                .with_work_item(&execution.work_item_id)
-                .with_worker(worker_id)
-                .with_cube_invocation(adapter.command_repr(&ensure_args))
-                .with_details(serde_json::json!({
-                    "repo_remote_url": execution.repo_remote_url,
-                    "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
-                })),
+                DispatchEvent::new(Stage::CubeRepoEnsureAttempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_invocation(adapter.command_repr(&ensure_args))
+                    .with_details(serde_json::json!({
+                        "repo_remote_url": execution.repo_remote_url,
+                        "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                    })),
             )
             .await;
         let repo = match tokio::time::timeout(
@@ -2250,15 +2142,11 @@ impl ExecutionCoordinator {
                 let ensure_repr = adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::CubeRepoEnsured,
-                            DispatchOutcome::Error,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_error(&err)
-                        .with_cube_invocation(ensure_repr),
+                        DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_cube_invocation(ensure_repr),
                     )
                     .await;
                 self.record_start_failure(
@@ -2280,19 +2168,15 @@ impl ExecutionCoordinator {
                 let ensure_repr = adapter.command_repr(&ensure_args);
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::CubeRepoEnsured,
-                            DispatchOutcome::Error,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_error(&err)
-                        .with_cube_invocation(ensure_repr)
-                        .with_details(serde_json::json!({
-                            "reason": "timeout",
-                            "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
-                        })),
+                        DispatchEvent::new(Stage::CubeRepoEnsured, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_error(&err)
+                            .with_cube_invocation(ensure_repr)
+                            .with_details(serde_json::json!({
+                                "reason": "timeout",
+                                "timeout_ms": CUBE_REPO_ENSURE_TIMEOUT.as_millis() as u64,
+                            })),
                     )
                     .await;
                 self.record_start_failure(
@@ -2364,24 +2248,25 @@ impl ExecutionCoordinator {
         };
         {
             let mut lease_args = vec![
-                "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task.as_str(),
+                "--json",
+                "workspace",
+                "lease",
+                repo.repo_id.as_str(),
+                "--task",
+                task.as_str(),
             ];
             if let Some(p) = execution.preferred_workspace_id.as_deref() {
                 lease_args.extend_from_slice(&["--prefer", p]);
             }
             self.dispatch_events
                 .emit(
-                    DispatchEvent::new(
-                        Stage::CubeWorkspaceLeased,
-                        DispatchOutcome::Ok,
-                        &execution.id,
-                    )
-                    .with_work_item(&execution.work_item_id)
-                    .with_worker(worker_id)
-                    .with_cube_repo(&repo.repo_id)
-                    .with_cube_lease(&lease.lease_id)
-                    .with_cube_workspace(&lease.workspace_id)
-                    .with_cube_invocation(adapter.command_repr(&lease_args)),
+                    DispatchEvent::new(Stage::CubeWorkspaceLeased, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_cube_lease(&lease.lease_id)
+                        .with_cube_workspace(&lease.workspace_id)
+                        .with_cube_invocation(adapter.command_repr(&lease_args)),
                 )
                 .await;
         }
@@ -2407,20 +2292,16 @@ impl ExecutionCoordinator {
             );
             self.dispatch_events
                 .emit(
-                    DispatchEvent::new(
-                        Stage::CubeChangeCreated,
-                        DispatchOutcome::Ok,
-                        &execution.id,
-                    )
-                    .with_work_item(&execution.work_item_id)
-                    .with_worker(worker_id)
-                    .with_cube_repo(&repo.repo_id)
-                    .with_cube_lease(&lease.lease_id)
-                    .with_cube_workspace(&lease.workspace_id)
-                    .with_details(serde_json::json!({
-                        "pr_positioned_by_lease": true,
-                        "kind": execution.kind.as_str(),
-                    })),
+                    DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Ok, &execution.id)
+                        .with_work_item(&execution.work_item_id)
+                        .with_worker(worker_id)
+                        .with_cube_repo(&repo.repo_id)
+                        .with_cube_lease(&lease.lease_id)
+                        .with_cube_workspace(&lease.workspace_id)
+                        .with_details(serde_json::json!({
+                            "pr_positioned_by_lease": true,
+                            "kind": execution.kind.as_str(),
+                        })),
                 )
                 .await;
             None
@@ -2438,28 +2319,21 @@ impl ExecutionCoordinator {
                 "--title",
                 &change_title,
             ]);
-            match adapter
-                .create_change(&lease.workspace_path, &change_title)
-                .await
-            {
+            match adapter.create_change(&lease.workspace_path, &change_title).await {
                 Ok(change) => {
                     self.dispatch_events
                         .emit(
-                            DispatchEvent::new(
-                                Stage::CubeChangeCreated,
-                                DispatchOutcome::Ok,
-                                &execution.id,
-                            )
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_cube_repo(&repo.repo_id)
-                            .with_cube_lease(&lease.lease_id)
-                            .with_cube_workspace(&lease.workspace_id)
-                            .with_cube_invocation(change_repr)
-                            .with_details(serde_json::json!({
-                                "change_id": change.change_id,
-                                "change_title": change_title,
-                            })),
+                            DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Ok, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_cube_repo(&repo.repo_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_cube_invocation(change_repr)
+                                .with_details(serde_json::json!({
+                                    "change_id": change.change_id,
+                                    "change_title": change_title,
+                                })),
                         )
                         .await;
                     Some(change)
@@ -2474,18 +2348,14 @@ impl ExecutionCoordinator {
                     }
                     self.dispatch_events
                         .emit(
-                            DispatchEvent::new(
-                                Stage::CubeChangeCreated,
-                                DispatchOutcome::Error,
-                                &execution.id,
-                            )
-                            .with_work_item(&execution.work_item_id)
-                            .with_worker(worker_id)
-                            .with_cube_repo(&repo.repo_id)
-                            .with_cube_lease(&lease.lease_id)
-                            .with_cube_workspace(&lease.workspace_id)
-                            .with_error(&err)
-                            .with_cube_invocation(change_repr.clone()),
+                            DispatchEvent::new(Stage::CubeChangeCreated, DispatchOutcome::Error, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_worker(worker_id)
+                                .with_cube_repo(&repo.repo_id)
+                                .with_cube_lease(&lease.lease_id)
+                                .with_cube_workspace(&lease.workspace_id)
+                                .with_error(&err)
+                                .with_cube_invocation(change_repr.clone()),
                         )
                         .await;
                     self.record_start_failure(
@@ -2565,16 +2435,14 @@ impl ExecutionCoordinator {
                 // agent is about to start. The completion handler will
                 // overwrite this with the terminal outcome.
                 if execution.kind == ExecutionKind::AutomationTriage
-                    && let Err(err) = self
-                        .work_db
-                        .mark_automation_run_triage_started(&execution.id)
-                    {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            ?err,
-                            "failed to mark automation run triage_running on start",
-                        );
-                    }
+                    && let Err(err) = self.work_db.mark_automation_run_triage_started(&execution.id)
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to mark automation run triage_running on start",
+                    );
+                }
                 // Resume-bounce SHA-delta gate: capture the bound
                 // chore PR's head SHA into the execution row BEFORE
                 // the worker spawns and starts pushing. The Stop
@@ -2585,21 +2453,11 @@ impl ExecutionCoordinator {
                 // failure), and the gate treats a missing snapshot
                 // as "inapplicable" — never noisier than the
                 // pre-change behaviour.
-                self.execution_started_hook
-                    .on_execution_started(&execution.id)
-                    .await;
+                self.execution_started_hook.on_execution_started(&execution.id).await;
                 let coordinator = self.clone();
                 tokio::spawn(async move {
                     coordinator
-                        .run_execution(
-                            execution,
-                            run,
-                            work_item,
-                            worker_id_owned,
-                            lease,
-                            change,
-                            adapter,
-                        )
+                        .run_execution(execution, run, work_item, worker_id_owned, lease, change, adapter)
                         .await;
                 });
                 Ok(())
@@ -2615,17 +2473,13 @@ impl ExecutionCoordinator {
                 }
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::RunStarted,
-                            DispatchOutcome::Error,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_cube_repo(&repo.repo_id)
-                        .with_cube_lease(&lease.lease_id)
-                        .with_cube_workspace(&lease.workspace_id)
-                        .with_error(&err),
+                        DispatchEvent::new(Stage::RunStarted, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err),
                     )
                     .await;
                 self.record_start_failure(
@@ -2655,11 +2509,7 @@ impl ExecutionCoordinator {
     /// error to the caller. A failed `list_repos` round-trip is logged
     /// at WARN and the URL is still marked seen so we don't retry the
     /// probe every dispatch — engine restart re-probes per R4.
-    async fn maybe_probe_cold_repo(
-        self: &Arc<Self>,
-        execution: &WorkExecution,
-        adapter: &Arc<dyn HostAdapter>,
-    ) {
+    async fn maybe_probe_cold_repo(self: &Arc<Self>, execution: &WorkExecution, adapter: &Arc<dyn HostAdapter>) {
         let origin = execution.repo_remote_url.clone();
         {
             let mut seen = self.repo_cold_probe_seen.lock().await;
@@ -2812,18 +2662,14 @@ impl ExecutionCoordinator {
                 );
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::CubeWorkspaceLeaseAttempted,
-                            DispatchOutcome::Ok,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_details(serde_json::json!({
-                            "step": "stale_lease_reclaim",
-                            "workspace_id": workspace_id,
-                            "reclaimed_lease_id": stale_lease_id.as_str(),
-                        })),
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "step": "stale_lease_reclaim",
+                                "workspace_id": workspace_id,
+                                "reclaimed_lease_id": stale_lease_id.as_str(),
+                            })),
                     )
                     .await;
             }
@@ -2910,9 +2756,7 @@ impl ExecutionCoordinator {
         // Build the lease args for attempt 1 so we can attach the
         // exact command to both the attempted and failed events.
         let resume_pr_str = resume_pr.map(|n| n.to_string());
-        let mut attempt1_args = vec![
-            "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task,
-        ];
+        let mut attempt1_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
         if let Some(p) = prefer {
             attempt1_args.extend_from_slice(&["--prefer", p]);
         }
@@ -2930,22 +2774,18 @@ impl ExecutionCoordinator {
         // when cube hangs and never returns.
         self.dispatch_events
             .emit(
-                DispatchEvent::new(
-                    Stage::CubeWorkspaceLeaseAttempted,
-                    DispatchOutcome::Ok,
-                    &execution.id,
-                )
-                .with_work_item(&execution.work_item_id)
-                .with_worker(worker_id)
-                .with_cube_repo(&repo.repo_id)
-                .with_cube_invocation(attempt1_repr.clone())
-                .with_details(serde_json::json!({
-                    "attempt": 1,
-                    "prefer_workspace_id": prefer,
-                    "fallback_policy": fallback_policy,
-                    "allow_dirty": allow_dirty,
-                    "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
-                })),
+                DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_invocation(attempt1_repr.clone())
+                    .with_details(serde_json::json!({
+                        "attempt": 1,
+                        "prefer_workspace_id": prefer,
+                        "fallback_policy": fallback_policy,
+                        "allow_dirty": allow_dirty,
+                        "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                    })),
             )
             .await;
 
@@ -2972,23 +2812,19 @@ impl ExecutionCoordinator {
                 );
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::CubeWorkspaceLeaseFailed,
-                            DispatchOutcome::Error,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_cube_repo(&repo.repo_id)
-                        .with_error(&err)
-                        .with_cube_invocation(attempt1_repr)
-                        .with_details(serde_json::json!({
-                            "attempt": 1,
-                            "prefer_workspace_id": prefer,
-                            "reason": reason,
-                            "fallback_policy": fallback_policy,
-                            "allow_dirty": allow_dirty,
-                        })),
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_error(&err)
+                            .with_cube_invocation(attempt1_repr)
+                            .with_details(serde_json::json!({
+                                "attempt": 1,
+                                "prefer_workspace_id": prefer,
+                                "reason": reason,
+                                "fallback_policy": fallback_policy,
+                                "allow_dirty": allow_dirty,
+                            })),
                     )
                     .await;
                 err
@@ -3011,9 +2847,7 @@ impl ExecutionCoordinator {
             return Err(first_err);
         }
 
-        let mut attempt2_args = vec![
-            "--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task,
-        ];
+        let mut attempt2_args = vec!["--json", "workspace", "lease", repo.repo_id.as_str(), "--task", task];
         if let Some(n) = resume_pr_str.as_deref() {
             attempt2_args.extend_from_slice(&["--resume-pr", n]);
         }
@@ -3021,22 +2855,18 @@ impl ExecutionCoordinator {
 
         self.dispatch_events
             .emit(
-                DispatchEvent::new(
-                    Stage::CubeWorkspaceLeaseAttempted,
-                    DispatchOutcome::Ok,
-                    &execution.id,
-                )
-                .with_work_item(&execution.work_item_id)
-                .with_worker(worker_id)
-                .with_cube_repo(&repo.repo_id)
-                .with_cube_invocation(attempt2_repr.clone())
-                .with_details(serde_json::json!({
-                    "attempt": 2,
-                    "prefer_workspace_id": serde_json::Value::Null,
-                    "fallback_policy": "none",
-                    "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
-                    "fallback_from_prefer": prefer,
-                })),
+                DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, DispatchOutcome::Ok, &execution.id)
+                    .with_work_item(&execution.work_item_id)
+                    .with_worker(worker_id)
+                    .with_cube_repo(&repo.repo_id)
+                    .with_cube_invocation(attempt2_repr.clone())
+                    .with_details(serde_json::json!({
+                        "attempt": 2,
+                        "prefer_workspace_id": serde_json::Value::Null,
+                        "fallback_policy": "none",
+                        "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                        "fallback_from_prefer": prefer,
+                    })),
             )
             .await;
 
@@ -3061,23 +2891,19 @@ impl ExecutionCoordinator {
                 );
                 self.dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::CubeWorkspaceLeaseFailed,
-                            DispatchOutcome::Error,
-                            &execution.id,
-                        )
-                        .with_work_item(&execution.work_item_id)
-                        .with_worker(worker_id)
-                        .with_cube_repo(&repo.repo_id)
-                        .with_error(&err)
-                        .with_cube_invocation(attempt2_repr)
-                        .with_details(serde_json::json!({
-                            "attempt": 2,
-                            "prefer_workspace_id": serde_json::Value::Null,
-                            "reason": reason,
-                            "fallback_policy": "none",
-                            "fallback_from_prefer": prefer,
-                        })),
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_error(&err)
+                            .with_cube_invocation(attempt2_repr)
+                            .with_details(serde_json::json!({
+                                "attempt": 2,
+                                "prefer_workspace_id": serde_json::Value::Null,
+                                "reason": reason,
+                                "fallback_policy": "none",
+                                "fallback_from_prefer": prefer,
+                            })),
                     )
                     .await;
                 CUBE_WORKSPACE_LEASE_FAILURE.inc(&self.metrics);
@@ -3102,13 +2928,7 @@ impl ExecutionCoordinator {
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
         match tokio::time::timeout(
             timeout,
-            adapter.lease_workspace(
-                &repo.repo_id,
-                task,
-                prefer_workspace_id,
-                allow_dirty,
-                resume_pr,
-            ),
+            adapter.lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty, resume_pr),
         )
         .await
         {
@@ -3194,13 +3014,14 @@ impl ExecutionCoordinator {
                             "triage pre-start failed permanently after {} attempt(s): {error}",
                             execution.pre_start_failure_count
                         )),
-                    ) {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            ?err,
-                            "failed to mark automation run failed_gave_up after permanent triage pre-start failure",
-                        );
-                    }
+                    )
+                {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "failed to mark automation run failed_gave_up after permanent triage pre-start failure",
+                    );
+                }
 
                 // Surface every permanent pre-start failure as a
                 // `WorkAttentionItem` so the failure is diagnosable in one
@@ -3215,17 +3036,15 @@ impl ExecutionCoordinator {
                     execution_id = execution.id,
                     attempts = execution.pre_start_failure_count,
                 );
-                if let Err(attention_err) =
-                    self.work_db.create_attention_item(CreateAttentionItemInput {
-                        execution_id: Some(execution.id.clone()),
-                        work_item_id: None,
-                        kind: attention_kind.to_owned(),
-                        status: None,
-                        title: attention_title.to_owned(),
-                        body_markdown: attention_body,
-                        resolved_at: None,
-                    })
-                {
+                if let Err(attention_err) = self.work_db.create_attention_item(CreateAttentionItemInput {
+                    execution_id: Some(execution.id.clone()),
+                    work_item_id: None,
+                    kind: attention_kind.to_owned(),
+                    status: None,
+                    title: attention_title.to_owned(),
+                    body_markdown: attention_body,
+                    resolved_at: None,
+                }) {
                     tracing::error!(
                         ?attention_err,
                         execution_id = %execution.id,
@@ -3250,20 +3069,11 @@ impl ExecutionCoordinator {
                 };
                 tokio::spawn(async move {
                     publisher
-                        .publish(
-                            &execution_id,
-                            &work_item_id,
-                            status_str,
-                            "execution_start_failed",
-                        )
+                        .publish(&execution_id, &work_item_id, status_str, "execution_start_failed")
                         .await;
                     if let Some(product_id) = product_id {
                         publisher
-                            .publish_work_item_changed(
-                                &product_id,
-                                &work_item_id,
-                                "execution_start_failed",
-                            )
+                            .publish_work_item_changed(&product_id, &work_item_id, "execution_start_failed")
                             .await;
                     }
                 });
@@ -3353,21 +3163,19 @@ impl ExecutionCoordinator {
                 // concurrent `force_release` and this branch can't issue
                 // a duplicate cube release against the same lease.
                 let released = match self.work_db.clear_execution_workspace(&execution.id) {
-                    Ok(Some(lease_id)) => {
-                        match adapter.release_workspace(&lease_id).await {
-                            Ok(()) => true,
-                            Err(err) => {
-                                tracing::error!(
-                                    ?err,
-                                    execution_id = %execution.id,
-                                    run_id = %run.id,
-                                    lease_id = %lease_id,
-                                    "failed to release deferred lease after mid-spawn cancel",
-                                );
-                                false
-                            }
+                    Ok(Some(lease_id)) => match adapter.release_workspace(&lease_id).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            tracing::error!(
+                                ?err,
+                                execution_id = %execution.id,
+                                run_id = %run.id,
+                                lease_id = %lease_id,
+                                "failed to release deferred lease after mid-spawn cancel",
+                            );
+                            false
                         }
-                    }
+                    },
                     // Already cleared by a racing force_release that saw
                     // the slot mapped and reaped + released itself.
                     Ok(None) => false,
@@ -3553,20 +3361,16 @@ impl ExecutionCoordinator {
                         );
                         self.dispatch_events
                             .emit(
-                                DispatchEvent::new(
-                                    Stage::PaneSpawned,
-                                    DispatchOutcome::Error,
-                                    &execution.id,
-                                )
-                                .with_work_item(&execution.work_item_id)
-                                .with_worker(&worker_id)
-                                .with_cube_lease(&lease.lease_id)
-                                .with_cube_workspace(&lease.workspace_id)
-                                .with_error(&err)
-                                .with_details(serde_json::json!({
-                                    "run_id": run.id,
-                                    "released_workspace": released,
-                                })),
+                                DispatchEvent::new(Stage::PaneSpawned, DispatchOutcome::Error, &execution.id)
+                                    .with_work_item(&execution.work_item_id)
+                                    .with_worker(&worker_id)
+                                    .with_cube_lease(&lease.lease_id)
+                                    .with_cube_workspace(&lease.workspace_id)
+                                    .with_error(&err)
+                                    .with_details(serde_json::json!({
+                                        "run_id": run.id,
+                                        "released_workspace": released,
+                                    })),
                             )
                             .await;
                         // Clear the card out of `active`. The run is
@@ -3588,10 +3392,7 @@ impl ExecutionCoordinator {
                         // task in place — the attention item already
                         // surfaces the failure for the operator.
                         if execution.kind != ExecutionKind::PrReview {
-                            match self
-                                .work_db
-                                .demote_active_work_item_to_todo(&execution.work_item_id)
-                            {
+                            match self.work_db.demote_active_work_item_to_todo(&execution.work_item_id) {
                                 Ok(true) => tracing::info!(
                                     execution_id = %execution.id,
                                     work_item_id = %execution.work_item_id,
@@ -3640,20 +3441,19 @@ impl ExecutionCoordinator {
                         // pane-spawn failure like an invalid worker_id format
                         // will not recover on its own).
                         if execution.kind == ExecutionKind::AutomationTriage
-                            && let Err(finalize_err) =
-                                self.work_db.finalize_automation_triage_run(
-                                    &execution.id,
-                                    boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-                                    None,
-                                    Some(&format!("pane spawn failed: {error_text}")),
-                                )
-                            {
-                                tracing::warn!(
-                                    execution_id = %execution.id,
-                                    ?finalize_err,
-                                    "failed to mark automation run failed_gave_up after pane-spawn failure",
-                                );
-                            }
+                            && let Err(finalize_err) = self.work_db.finalize_automation_triage_run(
+                                &execution.id,
+                                boss_protocol::AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                                None,
+                                Some(&format!("pane spawn failed: {error_text}")),
+                            )
+                        {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                ?finalize_err,
+                                "failed to mark automation run failed_gave_up after pane-spawn failure",
+                            );
+                        }
                     }
                     Err(record_err) => {
                         tracing::error!(
@@ -3692,9 +3492,7 @@ impl ExecutionCoordinator {
             WorkItem::Task(task) | WorkItem::Chore(task) => task.created_via.as_str(),
             _ => return,
         };
-        let Some(crz_id) =
-            created_via.strip_prefix(boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX)
-        else {
+        let Some(crz_id) = created_via.strip_prefix(boss_protocol::CREATED_VIA_MERGE_CONFLICT_PREFIX) else {
             return;
         };
         let attempt = match self.work_db.get_conflict_resolution(crz_id) {
@@ -3724,8 +3522,7 @@ impl ExecutionCoordinator {
             );
             return;
         }
-        self.collect_conflict_diagnosis_for_attempt(&attempt, lease)
-            .await;
+        self.collect_conflict_diagnosis_for_attempt(&attempt, lease).await;
     }
 
     /// Run `conflict_diagnosis::collect` in the leased workspace and persist
@@ -3747,13 +3544,7 @@ impl ExecutionCoordinator {
             return;
         }
 
-        let diagnosis = match conflict_diagnosis::collect(
-            &lease.workspace_path,
-            base_sha,
-            head_sha,
-        )
-        .await
-        {
+        let diagnosis = match conflict_diagnosis::collect(&lease.workspace_path, base_sha, head_sha).await {
             Ok(d) => d,
             Err(err) => {
                 tracing::warn!(
@@ -3762,11 +3553,7 @@ impl ExecutionCoordinator {
                     ?err,
                     "collect_conflict_diagnosis: git spawn failed; using errored diagnosis",
                 );
-                conflict_diagnosis::ConflictDiagnosis::errored(
-                    base_sha,
-                    head_sha,
-                    format!("git spawn failed: {err}"),
-                )
+                conflict_diagnosis::ConflictDiagnosis::errored(base_sha, head_sha, format!("git spawn failed: {err}"))
             }
         };
 
@@ -3778,10 +3565,7 @@ impl ExecutionCoordinator {
             }
         };
 
-        if let Err(err) = self
-            .work_db
-            .set_conflict_resolution_diagnosis(&attempt.id, &json)
-        {
+        if let Err(err) = self.work_db.set_conflict_resolution_diagnosis(&attempt.id, &json) {
             tracing::warn!(
                 attempt_id = %attempt.id,
                 ?err,
@@ -3803,11 +3587,7 @@ impl ExecutionCoordinator {
     /// agree on which slots are busy, so the WorkerPool free signal is
     /// paired with the libghostty pane teardown rather than firing as
     /// soon as the spawn RPC returns.
-    pub async fn release_worker_and_kick(
-        self: &Arc<Self>,
-        worker_id: &str,
-        last_workspace_id: Option<&str>,
-    ) {
+    pub async fn release_worker_and_kick(self: &Arc<Self>, worker_id: &str, last_workspace_id: Option<&str>) {
         self.pool_for_worker_id(worker_id)
             .release_worker(worker_id, last_workspace_id)
             .await;
@@ -3826,11 +3606,7 @@ impl ExecutionCoordinator {
     /// rescan + kick only fire on a real release so a no-op (already
     /// freed, or re-claimed by a live execution) doesn't churn the
     /// scheduler.
-    pub async fn release_pool_claim_if_execution(
-        self: &Arc<Self>,
-        worker_id: &str,
-        execution_id: &str,
-    ) -> bool {
+    pub async fn release_pool_claim_if_execution(self: &Arc<Self>, worker_id: &str, execution_id: &str) -> bool {
         let released = self
             .pool_for_worker_id(worker_id)
             .release_worker_if_execution(worker_id, execution_id, None)
@@ -3867,10 +3643,7 @@ impl ExecutionCoordinator {
             }
             Ok(_) => {}
             Err(err) => {
-                tracing::error!(
-                    ?err,
-                    "active-dispatch rescan failed after worker release; continuing",
-                );
+                tracing::error!(?err, "active-dispatch rescan failed after worker release; continuing",);
             }
         }
     }
@@ -4150,15 +3923,14 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
-    use boss_protocol::ExecutionStatus;
     use super::{
-        AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle,
-        CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW,
-        ExecutionCoordinator, ExecutionKind, ExecutionPublisher, FrontendEvent, Host, HostAdapter,
-        HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
+        AUTOMATION_WORKER_ID_PREFIX, CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
+        CubeWorkspaceStatus, EXECUTION_KIND_PR_REVIEW, ExecutionCoordinator, ExecutionKind, ExecutionPublisher,
+        FrontendEvent, Host, HostAdapter, HostAdapterProvider, MAX_AUTOMATION_POOL_SIZE, MAX_REVIEW_POOL_SIZE,
         MAX_WORKER_POOL_SIZE, REVIEW_WORKER_ID_PREFIX, WorkerPool, pick_worst_failing_check,
         pool_model_override_for_worker_id, slot_id_from_worker_id, worker_id_for_slot,
     };
+    use boss_protocol::ExecutionStatus;
 
     #[test]
     fn pick_worst_failing_check_prefers_failure() {
@@ -4191,8 +3963,8 @@ mod tests {
     }
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
-        CreateTaskInput, RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
+        RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
     };
 
     /// Recorded args for each `lease_workspace` call:
@@ -4294,9 +4066,7 @@ mod tests {
                 ));
             }
             if call_index < self.fail_first_n_leases {
-                return Err(anyhow!(
-                    "cube workspace lease failed: workspace has uncommitted work"
-                ));
+                return Err(anyhow!("cube workspace lease failed: workspace has uncommitted work"));
             }
             let workspace_id = self
                 .next_workspace_id
@@ -4312,11 +4082,7 @@ mod tests {
             })
         }
 
-        async fn create_change(
-            &self,
-            workspace_path: &std::path::Path,
-            title: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, workspace_path: &std::path::Path, title: &str) -> Result<CubeChangeHandle> {
             self.create_calls
                 .lock()
                 .await
@@ -4334,14 +4100,8 @@ mod tests {
             Ok(())
         }
 
-        async fn workspace_status(
-            &self,
-            workspace_path: &std::path::Path,
-        ) -> Result<CubeWorkspaceStatus> {
-            self.status_calls
-                .lock()
-                .await
-                .push(workspace_path.to_path_buf());
+        async fn workspace_status(&self, workspace_path: &std::path::Path) -> Result<CubeWorkspaceStatus> {
+            self.status_calls.lock().await.push(workspace_path.to_path_buf());
             Ok(CubeWorkspaceStatus::builder()
                 .workspace_id("mono-agent-001")
                 .workspace_path(workspace_path.to_path_buf())
@@ -4362,11 +4122,7 @@ mod tests {
             Ok(())
         }
 
-        async fn force_release_lease(
-            &self,
-            lease_id: &str,
-            reason: Option<&str>,
-        ) -> Result<()> {
+        async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
             self.force_release_calls
                 .lock()
                 .await
@@ -4493,13 +4249,7 @@ mod tests {
 
     #[async_trait]
     impl ExecutionPublisher for RecordingPublisher {
-        async fn publish(
-            &self,
-            execution_id: &str,
-            work_item_id: &str,
-            status: &str,
-            reason: &str,
-        ) {
+        async fn publish(&self, execution_id: &str, work_item_id: &str, status: &str, reason: &str) {
             self.events.lock().await.push((
                 execution_id.to_owned(),
                 work_item_id.to_owned(),
@@ -4508,12 +4258,7 @@ mod tests {
             ));
         }
 
-        async fn publish_work_item_changed(
-            &self,
-            product_id: &str,
-            work_item_id: &str,
-            reason: &str,
-        ) {
+        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
             self.work_item_events.lock().await.push((
                 product_id.to_owned(),
                 work_item_id.to_owned(),
@@ -4521,19 +4266,10 @@ mod tests {
             ));
         }
 
-        async fn publish_frontend_event_on_product(
-            &self,
-            _product_id: &str,
-            _event: FrontendEvent,
-        ) {
-        }
+        async fn publish_frontend_event_on_product(&self, _product_id: &str, _event: FrontendEvent) {}
     }
 
-    async fn wait_for_execution_status(
-        db: &WorkDb,
-        execution_id: &str,
-        expected: ExecutionStatus,
-    ) {
+    async fn wait_for_execution_status(db: &WorkDb, execution_id: &str, expected: ExecutionStatus) {
         for _ in 0..100 {
             let execution = db.get_execution(execution_id).unwrap();
             if execution.status == expected {
@@ -4703,20 +4439,15 @@ mod tests {
 
         // Pin the ready execution to the remote host.
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        db.set_execution_pinned_host(&execution.id, Some("zakalwe"))
-            .unwrap();
+        db.set_execution_pinned_host(&execution.id, Some("zakalwe")).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner {
             pending: true,
             ..FakeExecutionRunner::default()
         });
-        let mut coordinator_inner = ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            runner.clone(),
-        );
+        let mut coordinator_inner =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
         let provider = Arc::new(RecordingHostAdapterProvider {
             inner: coordinator_inner.host_adapter(),
             requested: Mutex::new(Vec::new()),
@@ -4786,8 +4517,7 @@ mod tests {
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        db.set_execution_pinned_host(&execution.id, Some("zakalwe"))
-            .unwrap();
+        db.set_execution_pinned_host(&execution.id, Some("zakalwe")).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner {
@@ -4862,8 +4592,7 @@ mod tests {
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
-        db.set_execution_pinned_host(&execution.id, Some("zakalwe"))
-            .unwrap();
+        db.set_execution_pinned_host(&execution.id, Some("zakalwe")).unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner {
@@ -4895,10 +4624,7 @@ mod tests {
             "no_eligible_host must surface as host_selected:error",
         );
         assert_eq!(
-            host_selected
-                .details
-                .get("reason")
-                .and_then(|v| v.as_str()),
+            host_selected.details.get("reason").and_then(|v| v.as_str()),
             Some("no_eligible_host"),
             "host_selected:error must name the blocker reason",
         );
@@ -4999,9 +4725,7 @@ mod tests {
             workspace_prefix: "mono-agent-".to_owned(),
             source: None,
         };
-        let cube = Arc::new(
-            FakeCubeClient::default().with_repos(vec![default_repo]),
-        );
+        let cube = Arc::new(FakeCubeClient::default().with_repos(vec![default_repo]));
         // Pool size 2 so both executions can dispatch concurrently.
         let coordinator = Arc::new(ExecutionCoordinator::new(
             db.clone(),
@@ -5045,7 +4769,8 @@ mod tests {
         let item = cold_items[0];
         assert_eq!(item.status, "open");
         assert!(
-            item.body_markdown.contains("cube repo ensure --origin git@github.com:spinyfin/mono.git"),
+            item.body_markdown
+                .contains("cube repo ensure --origin git@github.com:spinyfin/mono.git"),
             "body should name the override command verbatim; got: {}",
             item.body_markdown,
         );
@@ -5100,9 +4825,7 @@ mod tests {
             workspace_prefix: "mono-agent-".to_owned(),
             source: None,
         };
-        let cube = Arc::new(
-            FakeCubeClient::default().with_repos(vec![custom_repo]),
-        );
+        let cube = Arc::new(FakeCubeClient::default().with_repos(vec![custom_repo]));
         let coordinator = Arc::new(ExecutionCoordinator::new(
             db.clone(),
             WorkerPool::new(1),
@@ -5127,7 +4850,7 @@ mod tests {
 
     #[test]
     fn repo_has_default_pool_config_recognises_defaults_only() {
-        use super::{repo_has_default_pool_config, CubeRepoSummary};
+        use super::{CubeRepoSummary, repo_has_default_pool_config};
         // A repo whose every field matches the auto-provisioned
         // defaults — the case the probe should flag.
         let default_root = cube_default_workspace_root_for_test();
@@ -5210,12 +4933,7 @@ mod tests {
             slot_id: Some(5),
             ..FakeExecutionRunner::default()
         });
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube,
-            runner,
-        ));
+        let coordinator = Arc::new(ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner));
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
@@ -5269,12 +4987,7 @@ mod tests {
             slot_id: Some(1),
             ..FakeExecutionRunner::default()
         });
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube,
-            runner,
-        ));
+        let coordinator = Arc::new(ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner));
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
@@ -5313,9 +5026,7 @@ mod tests {
             .expect("pool has free slots");
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
 
-        coordinator
-            .release_worker_and_kick(&claimed, Some("ws-1"))
-            .await;
+        coordinator.release_worker_and_kick(&claimed, Some("ws-1")).await;
 
         assert_eq!(
             coordinator.worker_pool().idle_count().await,
@@ -5325,9 +5036,7 @@ mod tests {
         // Idempotent: a second release on the same already-idle slot
         // is a no-op (the pane-spawn lifecycle can racily re-enter
         // this path from completion + chore-done).
-        coordinator
-            .release_worker_and_kick(&claimed, Some("ws-1"))
-            .await;
+        coordinator.release_worker_and_kick(&claimed, Some("ws-1")).await;
         assert_eq!(coordinator.worker_pool().idle_count().await, 2);
     }
 
@@ -5366,12 +5075,7 @@ mod tests {
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner::default());
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube,
-            runner,
-        ));
+        let coordinator = Arc::new(ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner));
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
@@ -5413,12 +5117,7 @@ mod tests {
 
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner::default());
-        let coordinator = Arc::new(ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube,
-            runner,
-        ));
+        let coordinator = Arc::new(ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube, runner));
         coordinator.kick();
 
         let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
@@ -5488,10 +5187,7 @@ mod tests {
         assert_eq!(execution.status, ExecutionStatus::Failed);
         let run = db.list_runs(&execution.id).unwrap().pop().unwrap();
         assert_eq!(run.status, "failed");
-        assert_eq!(
-            run.error_text.as_deref(),
-            Some("cube workspace lease failed")
-        );
+        assert_eq!(run.error_text.as_deref(), Some("cube workspace lease failed"));
         assert_eq!(coordinator.worker_pool().idle_count().await, 1);
     }
 
@@ -5558,12 +5254,8 @@ mod tests {
         // Slice out only the bytes written after the test started so
         // we don't trip over events emitted by other parallel tests
         // sharing the same global subscriber.
-        let captured =
-            String::from_utf8_lossy(&buffer.lock()[starting_offset..]).to_string();
-        let our_lines: Vec<&str> = captured
-            .lines()
-            .filter(|line| line.contains(&execution_id))
-            .collect();
+        let captured = String::from_utf8_lossy(&buffer.lock()[starting_offset..]).to_string();
+        let our_lines: Vec<&str> = captured.lines().filter(|line| line.contains(&execution_id)).collect();
         assert!(
             !our_lines.is_empty(),
             "expected captured log lines for execution {execution_id}, got nothing.\n\
@@ -5572,10 +5264,7 @@ mod tests {
 
         let error_idx = our_lines
             .iter()
-            .position(|line| {
-                line.contains("ERROR")
-                    && line.contains("cube workspace lease attempt failed")
-            })
+            .position(|line| line.contains("ERROR") && line.contains("cube workspace lease attempt failed"))
             .unwrap_or_else(|| {
                 panic!(
                     "expected a tracing::error! log for the cube lease failure;\n\
@@ -5594,9 +5283,7 @@ mod tests {
 
         let warn_idx = our_lines
             .iter()
-            .position(|line| {
-                line.contains("WARN") && line.contains("recorded execution start failure")
-            })
+            .position(|line| line.contains("WARN") && line.contains("recorded execution start failure"))
             .unwrap_or_else(|| {
                 panic!(
                     "expected a tracing::warn! log from record_start_failure;\n\
@@ -5754,13 +5441,7 @@ mod tests {
         // The lease is released after the pane-spawn failure — before
         // the fix, this release was the *only* observable signal that
         // anything went wrong.
-        assert!(
-            cube.release_calls
-                .lock()
-                .await
-                .iter()
-                .any(|id| id == "lease-1")
-        );
+        assert!(cube.release_calls.lock().await.iter().any(|id| id == "lease-1"));
 
         // Loud signal #1: the WorkAttentionItem is what surfaces in
         // the kanban "Attention" lane and through `ListAttentionItems`.
@@ -5796,9 +5477,7 @@ mod tests {
         let pane_event = events
             .iter()
             .find(|event| event.stage == "pane_spawned" && event.outcome == "error")
-            .unwrap_or_else(|| {
-                panic!("expected a pane_spawned:error event for {execution_id}; got {events:#?}")
-            });
+            .unwrap_or_else(|| panic!("expected a pane_spawned:error event for {execution_id}; got {events:#?}"));
         assert!(
             pane_event
                 .error_message
@@ -5840,7 +5519,7 @@ mod tests {
     #[tokio::test]
     async fn pane_spawn_failure_finalises_automation_run_to_failed_gave_up() {
         use crate::work::{AutomationFireRecord, CreateAutomationInput};
-        use boss_protocol::{AutomationTrigger, AUTOMATION_OUTCOME_FAILED_GAVE_UP};
+        use boss_protocol::{AUTOMATION_OUTCOME_FAILED_GAVE_UP, AutomationTrigger};
 
         let dir = tempdir().unwrap();
         let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
@@ -5873,10 +5552,7 @@ mod tests {
 
         // Create the triage execution that the scheduler would normally create.
         let triage_exec = db
-            .create_automation_triage_execution(
-                &automation.id,
-                "git@github.com:spinyfin/mono.git",
-            )
+            .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
             .unwrap();
 
         // Record the automation run at the pessimistic `failed_will_retry`
@@ -5908,12 +5584,7 @@ mod tests {
             fail: true,
             ..FakeExecutionRunner::default()
         });
-        let mut coord = ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            runner.clone(),
-        );
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
         // Wire in a 1-slot automation pool so the triage execution gets
         // dispatched (it targets the automation pool, not the main pool).
         coord.set_automation_pool(WorkerPool::new_automation(1));
@@ -6081,9 +5752,8 @@ mod tests {
         let cube = Arc::new(FakeCubeClient::default());
         let runner = Arc::new(FakeExecutionRunner::default());
         let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-        let mut coord =
-            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
-                .with_dispatch_events(recording.clone());
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone());
         // Wire a 1-slot automation pool so the triage execution (which
         // targets the automation pool, not the main pool) is dispatched.
         coord.set_automation_pool(WorkerPool::new_automation(1));
@@ -6096,10 +5766,7 @@ mod tests {
         let mut reached_lease = false;
         for _ in 0..200 {
             let events = recording.events_for(&triage_exec.id).await;
-            if events
-                .iter()
-                .any(|e| e.stage == "cube_workspace_lease_attempted")
-            {
+            if events.iter().any(|e| e.stage == "cube_workspace_lease_attempted") {
                 reached_lease = true;
                 break;
             }
@@ -6143,7 +5810,6 @@ mod tests {
             "automation execution must not stall; got {stages:?}",
         );
     }
-
 
     /// The `pane_spawned: ok` event must carry the resolved spawn
     /// knobs (effort level, claude effort value, model) so
@@ -6207,18 +5873,13 @@ mod tests {
         let pane_event = events
             .iter()
             .find(|event| event.stage == "pane_spawned" && event.outcome == "ok")
-            .unwrap_or_else(|| {
-                panic!("expected pane_spawned:ok event for {execution_id}; got {events:#?}")
-            });
-        let spawn = pane_event
-            .details
-            .get("spawn_config")
-            .unwrap_or_else(|| {
-                panic!(
-                    "pane_spawned event missing spawn_config in details: {:?}",
-                    pane_event.details
-                )
-            });
+            .unwrap_or_else(|| panic!("expected pane_spawned:ok event for {execution_id}; got {events:#?}"));
+        let spawn = pane_event.details.get("spawn_config").unwrap_or_else(|| {
+            panic!(
+                "pane_spawned event missing spawn_config in details: {:?}",
+                pane_event.details
+            )
+        });
         assert_eq!(spawn["effort_level"], "trivial");
         assert_eq!(spawn["claude_effort"], "low");
         assert_eq!(spawn["model"], "sonnet");
@@ -6287,9 +5948,7 @@ mod tests {
             "cube lease failure must raise exactly one attention item",
         );
         assert_eq!(attention_items[0].kind, "cube_workspace_lease_failed");
-        assert!(attention_items[0]
-            .body_markdown
-            .contains("cube workspace lease failed"));
+        assert!(attention_items[0].body_markdown.contains("cube workspace lease failed"));
 
         let events = recording.events_for(&execution_id).await;
         // The lease attempt event is emitted before the call, so the
@@ -6560,10 +6219,12 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .preferred_workspace_id("mono-agent-003")
-            .build())
+        db.request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .preferred_workspace_id("mono-agent-003")
+                .build(),
+        )
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient {
@@ -6676,10 +6337,8 @@ mod tests {
         db.reconcile_product_executions(&product.id).unwrap();
         // autostart=false means reconcile won't auto-create an execution;
         // request one explicitly to seed the dead-predecessor record.
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .build())
-        .unwrap();
+        db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+            .unwrap();
 
         // Dead predecessor: started a run on mono-agent-003 with
         // lease-dead, then orphaned (lease columns preserved).
@@ -6697,10 +6356,12 @@ mod tests {
 
         // Resume execution: hard prefer back onto mono-agent-003.
         let resume = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .preferred_workspace_id("mono-agent-003")
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .preferred_workspace_id("mono-agent-003")
+                    .build(),
+            )
             .unwrap();
 
         // Cube reports mono-agent-003 still leased to the dead lease.
@@ -6726,14 +6387,7 @@ mod tests {
         };
 
         let result = coordinator
-            .lease_workspace_with_fallback(
-                &resume,
-                "worker-resume",
-                &repo,
-                "task",
-                None,
-                &coordinator.host_adapter,
-            )
+            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", None, &coordinator.host_adapter)
             .await;
         assert!(result.is_ok(), "resume lease should succeed after reclaim");
 
@@ -6784,10 +6438,12 @@ mod tests {
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
         let resume = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .preferred_workspace_id("mono-agent-007")
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .preferred_workspace_id("mono-agent-007")
+                    .build(),
+            )
             .unwrap();
 
         // Cube reports the workspace leased to a lease the engine has no
@@ -6814,23 +6470,12 @@ mod tests {
         };
 
         let _ = coordinator
-            .lease_workspace_with_fallback(
-                &resume,
-                "worker-resume",
-                &repo,
-                "task",
-                None,
-                &coordinator.host_adapter,
-            )
+            .lease_workspace_with_fallback(&resume, "worker-resume", &repo, "task", None, &coordinator.host_adapter)
             .await;
 
         let releases = cube.force_release_calls.lock().await;
-        assert!(
-            releases.is_empty(),
-            "must not reclaim a lease the engine doesn't own",
-        );
+        assert!(releases.is_empty(), "must not reclaim a lease the engine doesn't own",);
     }
-
 
     /// When `preferred_workspace_id=null` and cube fails the first workspace
     /// (e.g. because it has uncommitted work from a prior crashed lease),
@@ -6866,10 +6511,8 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .build())
-        .unwrap();
+        db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+            .unwrap();
 
         // First lease call fails (simulating a workspace with uncommitted
         // work refusing the reset); second call succeeds on a different
@@ -7001,10 +6644,8 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .build())
-        .unwrap();
+        db.request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+            .unwrap();
 
         let cube = Arc::new(FakeCubeClient {
             fail_lease: true,
@@ -7173,7 +6814,8 @@ mod tests {
 
         let execution = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            execution.status, ExecutionStatus::Cancelled,
+            execution.status,
+            ExecutionStatus::Cancelled,
             "the row stays cancelled — the coordinator must not move it to waiting_human",
         );
         // The deferred lease must have been released exactly once, and
@@ -7273,8 +6915,7 @@ mod tests {
         // Review pool: slots 12..=14 → "review-M" → back to the same slot.
         for slot in 12u8..=14 {
             let wid = worker_id_for_slot(slot);
-            let expected_ordinal =
-                slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
+            let expected_ordinal = slot as usize - MAX_WORKER_POOL_SIZE - MAX_AUTOMATION_POOL_SIZE;
             assert_eq!(wid, format!("review-{expected_ordinal}"));
             assert_eq!(slot_id_from_worker_id(&wid), Some(slot));
         }
@@ -7287,8 +6928,7 @@ mod tests {
         // from every other pool.
         for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
             let review_worker_id = format!("review-{ordinal}");
-            let expected_slot =
-                ordinal + MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
+            let expected_slot = ordinal + MAX_WORKER_POOL_SIZE as u8 + MAX_AUTOMATION_POOL_SIZE as u8;
             assert_eq!(
                 slot_id_from_worker_id(&review_worker_id),
                 Some(expected_slot),
@@ -7392,15 +7032,8 @@ mod tests {
         let pool = WorkerPool::new(pool_size);
         let mut hits = vec![0usize; pool_size];
         for i in 0..trials {
-            let claimed = pool
-                .claim_worker(&format!("exec-{i}"), None)
-                .await
-                .unwrap();
-            let slot: usize = claimed
-                .strip_prefix("worker-")
-                .unwrap()
-                .parse()
-                .unwrap();
+            let claimed = pool.claim_worker(&format!("exec-{i}"), None).await.unwrap();
+            let slot: usize = claimed.strip_prefix("worker-").unwrap().parse().unwrap();
             hits[slot - 1] += 1;
             pool.release_worker(&claimed, None).await;
         }
@@ -7459,10 +7092,12 @@ mod tests {
 
         // Bump the later chore's priority — it should run first despite
         // the older one being in the queue first.
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(late.id.clone())
-            .priority(10)
-            .build())
+        db.request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(late.id.clone())
+                .priority(10)
+                .build(),
+        )
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -7490,21 +7125,13 @@ mod tests {
         let calls = runner.calls.lock().await;
         assert!(!calls.is_empty(), "scheduler did not start any run");
         let started_execution_id = &calls[0].1;
-        let late_execution = db
-            .list_executions(Some(&late.id))
-            .unwrap()
-            .pop()
-            .unwrap();
+        let late_execution = db.list_executions(Some(&late.id)).unwrap().pop().unwrap();
         assert_eq!(
             started_execution_id, &late_execution.id,
             "expected the higher-priority chore to run first"
         );
         // Old chore should still be queued (and was NOT picked).
-        let early_execution = db
-            .list_executions(Some(&early.id))
-            .unwrap()
-            .pop()
-            .unwrap();
+        let early_execution = db.list_executions(Some(&early.id)).unwrap().pop().unwrap();
         assert_eq!(early_execution.status, ExecutionStatus::Ready);
     }
 
@@ -7537,10 +7164,12 @@ mod tests {
             })
             .unwrap();
         db.reconcile_product_executions(&product.id).unwrap();
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .preferred_workspace_id("mono-agent-007")
-            .build())
+        db.request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .preferred_workspace_id("mono-agent-007")
+                .build(),
+        )
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default().with_next_workspace_id("mono-agent-007"));
@@ -7562,16 +7191,9 @@ mod tests {
         drop(calls);
 
         let execution = db.get_execution(&execution.id).unwrap();
+        assert_eq!(execution.cube_workspace_id.as_deref(), Some("mono-agent-007"));
         assert_eq!(
-            execution.cube_workspace_id.as_deref(),
-            Some("mono-agent-007")
-        );
-        assert_eq!(
-            coordinator
-                .worker_pool()
-                .worker_affinity("worker-1")
-                .await
-                .as_deref(),
+            coordinator.worker_pool().worker_affinity("worker-1").await.as_deref(),
             Some("mono-agent-007")
         );
     }
@@ -7621,10 +7243,7 @@ mod tests {
         wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::WaitingHuman).await;
 
         let events = publisher.events.lock().await;
-        let reasons: Vec<&str> = events
-            .iter()
-            .map(|(_, _, _, reason)| reason.as_str())
-            .collect();
+        let reasons: Vec<&str> = events.iter().map(|(_, _, _, reason)| reason.as_str()).collect();
         assert!(reasons.contains(&"execution_started"));
         assert!(reasons.contains(&"execution_run_completed"));
         let last_status = events
@@ -7641,9 +7260,9 @@ mod tests {
         // too — not just on execution-start auto-advance.
         let work_item_events = publisher.work_item_events.lock().await;
         assert!(
-            work_item_events.iter().any(|(_, _, reason)| {
-                reason == "execution_run_completed"
-            }),
+            work_item_events
+                .iter()
+                .any(|(_, _, reason)| { reason == "execution_run_completed" }),
             "expected execution_run_completed work-item invalidation, got: {:?}",
             *work_item_events,
         );
@@ -7706,9 +7325,7 @@ mod tests {
         let work_item_events = publisher.work_item_events.lock().await;
         assert!(
             work_item_events.iter().any(|(product_id, work_item_id, reason)| {
-                product_id == &product.id
-                    && work_item_id == &chore.id
-                    && reason == "execution_started_auto_advance"
+                product_id == &product.id && work_item_id == &chore.id && reason == "execution_started_auto_advance"
             }),
             "expected execution_started_auto_advance event for chore {} on product {}, got: {:?}",
             chore.id,
@@ -8039,9 +7656,11 @@ mod tests {
             },
         )
         .unwrap();
-        db.request_execution(RequestExecutionInput::builder()
-            .work_item_id(ghost_b.id.clone())
-            .build())
+        db.request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(ghost_b.id.clone())
+                .build(),
+        )
         .unwrap();
 
         // Real worker: started a run before the engine restarted,
@@ -8062,12 +7681,14 @@ mod tests {
             })
             .unwrap();
         let real_exec = db
-            .create_execution(CreateExecutionInput::builder()
-                .work_item_id(real.id.clone())
-                .kind(ExecutionKind::ChoreImplementation)
-                .status(ExecutionStatus::Ready)
-                .repo_remote_url("git@github.com:spinyfin/mono.git")
-                .build())
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(real.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
             .unwrap();
         db.start_execution_run(
             &real_exec.id,
@@ -8080,8 +7701,7 @@ mod tests {
         .unwrap();
 
         let healed = db.heal_ghost_active_chores().unwrap();
-        let mut healed_ids: Vec<String> =
-            healed.iter().map(|h| h.work_item_id.clone()).collect();
+        let mut healed_ids: Vec<String> = healed.iter().map(|h| h.work_item_id.clone()).collect();
         healed_ids.sort();
         let mut expected = vec![ghost_a.id.clone(), ghost_b.id.clone()];
         expected.sort();
@@ -8089,10 +7709,7 @@ mod tests {
         // product_id rides along so the caller can publish a
         // work-item-changed event on the product's kanban topic.
         for h in &healed {
-            assert_eq!(
-                h.product_id, product.id,
-                "healed row should carry its product_id"
-            );
+            assert_eq!(h.product_id, product.id, "healed row should carry its product_id");
         }
 
         // Demoted ghosts now sit in `todo` and are stamped as engine-
@@ -8294,10 +7911,12 @@ mod tests {
         // then call the same coordinator entry point that `app.rs`
         // hits when `force = true`.
         let queued_exec = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(queued.id.clone())
-                .force(true)
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(queued.id.clone())
+                    .force(true)
+                    .build(),
+            )
             .unwrap();
         let worker_id = coordinator
             .force_dispatch(&queued_exec.id)
@@ -8309,24 +7928,17 @@ mod tests {
         );
 
         for _ in 0..200 {
-            let queued_after = db
-                .list_executions(Some(&queued.id))
-                .unwrap()
-                .pop()
-                .unwrap();
+            let queued_after = db.list_executions(Some(&queued.id)).unwrap().pop().unwrap();
             if queued_after.status == ExecutionStatus::Running {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
 
-        let queued_after = db
-            .list_executions(Some(&queued.id))
-            .unwrap()
-            .pop()
-            .unwrap();
+        let queued_after = db.list_executions(Some(&queued.id)).unwrap().pop().unwrap();
         assert_eq!(
-            queued_after.status, ExecutionStatus::Running,
+            queued_after.status,
+            ExecutionStatus::Running,
             "force-launched execution should be dispatched immediately",
         );
         assert_eq!(
@@ -8408,12 +8020,14 @@ mod tests {
             },
         )
         .unwrap();
-        db.create_execution(CreateExecutionInput::builder()
-            .work_item_id(stuck.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Failed)
-            .repo_remote_url("git@github.com:spinyfin/mono.git")
-            .build())
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(stuck.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Failed)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -8430,10 +8044,7 @@ mod tests {
         // the post-release `kick()` claimed it.
         for _ in 0..400 {
             let executions = db.list_executions(Some(&stuck.id)).unwrap();
-            if executions
-                .iter()
-                .any(|exec| exec.status.is_live())
-            {
+            if executions.iter().any(|exec| exec.status.is_live()) {
                 return;
             }
             sleep(Duration::from_millis(10)).await;
@@ -8504,12 +8115,14 @@ mod tests {
             },
         )
         .unwrap();
-        db.create_execution(CreateExecutionInput::builder()
-            .work_item_id(parked.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Failed)
-            .repo_remote_url("git@github.com:spinyfin/mono.git")
-            .build())
+        db.create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(parked.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Failed)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
         .unwrap();
 
         let cube = Arc::new(FakeCubeClient::default());
@@ -8590,12 +8203,8 @@ mod tests {
         ));
 
         // Simulate "another scheduler is already running".
-        coordinator
-            .scheduling_active
-            .store(true, Ordering::Release);
-        coordinator
-            .scheduling_pending
-            .store(false, Ordering::Release);
+        coordinator.scheduling_active.store(true, Ordering::Release);
+        coordinator.scheduling_pending.store(false, Ordering::Release);
 
         coordinator.kick();
 
@@ -8660,21 +8269,15 @@ mod tests {
         //      returns, and the (now-exiting) scheduler drops the
         //      guard without re-checking. New row stranded.
         //   3. With the fix: kick latches pending=true.
-        coordinator
-            .scheduling_active
-            .store(true, Ordering::Release);
-        coordinator
-            .scheduling_pending
-            .store(false, Ordering::Release);
+        coordinator.scheduling_active.store(true, Ordering::Release);
+        coordinator.scheduling_pending.store(false, Ordering::Release);
         coordinator.kick(); // noop on `active`, but latches pending
 
         // Now simulate the previous scheduler exiting: it must
         // honour the pending bit. Drop `active` and re-enter
         // `run_scheduler` exactly as the lossless-wakeup logic
         // would on the post-drain re-check path.
-        coordinator
-            .scheduling_active
-            .store(false, Ordering::Release);
+        coordinator.scheduling_active.store(false, Ordering::Release);
         assert!(
             coordinator.scheduling_pending.load(Ordering::Acquire),
             "post-drain re-check must see pending=true so the new row is not lost",
@@ -9094,8 +8697,7 @@ mod tests {
             pending: true,
             ..FakeExecutionRunner::default()
         });
-        let mut coord =
-            ExecutionCoordinator::new(db.clone(), WorkerPool::new(0), cube.clone(), runner.clone());
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(0), cube.clone(), runner.clone());
         coord.set_automation_pool(WorkerPool::new_automation(1));
         let coordinator = Arc::new(coord);
         coordinator.kick();
@@ -9246,10 +8848,7 @@ mod tests {
             "exactly 2 executions must be running (1 per pool); got {running}"
         );
         // The third execution (second auto chore) must remain ready — automation pool full.
-        let ready = executions
-            .iter()
-            .filter(|e| e.status == ExecutionStatus::Ready)
-            .count();
+        let ready = executions.iter().filter(|e| e.status == ExecutionStatus::Ready).count();
         assert_eq!(
             ready, 1,
             "the second auto chore must be deferred (automation pool full); got {ready} ready"
@@ -9423,10 +9022,7 @@ mod tests {
         let coordinator = Arc::new(coord);
 
         // Pre-occupy the review pool's only slot so the pr_review can't claim.
-        let occupied = coordinator
-            .review_worker_pool()
-            .claim_worker("occupied", None)
-            .await;
+        let occupied = coordinator.review_worker_pool().claim_worker("occupied", None).await;
         assert!(occupied.is_some(), "review pool slot must be claimable");
 
         coordinator.kick();
@@ -9470,10 +9066,7 @@ mod tests {
     /// Helper: create a product + chore pair and return their ids. When
     /// `pr_url` is `Some`, the chore's `pr_url` field is also set so that
     /// `schedule_execution` picks it up for the reviewer positioning path.
-    fn make_pr_review_fixture(
-        db: &WorkDb,
-        pr_url: Option<&str>,
-    ) -> (String, String) {
+    fn make_pr_review_fixture(db: &WorkDb, pr_url: Option<&str>) -> (String, String) {
         let product = db
             .create_product(CreateProductInput {
                 name: "TestProduct".to_owned(),
@@ -9539,12 +9132,7 @@ mod tests {
             ..FakeExecutionRunner::default()
         });
 
-        let mut coord = ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            runner.clone(),
-        );
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
         coord.set_review_pool(WorkerPool::new_review(1));
         let coordinator = Arc::new(coord);
 
@@ -9554,9 +9142,7 @@ mod tests {
             .await
             .expect("review pool slot available");
 
-        let result = coordinator
-            .schedule_execution(&execution, &worker_id)
-            .await;
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
         // lease_workspace was called with resume_pr = Some(42) for PR #42.
@@ -9606,12 +9192,7 @@ mod tests {
         });
         let runner = Arc::new(FakeExecutionRunner::default());
 
-        let mut coord = ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            runner.clone(),
-        );
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
         coord.set_review_pool(WorkerPool::new_review(1));
         // Disable retries so the pre-start failure is terminal immediately.
         let coordinator = Arc::new(coord.with_pre_start_retry_delays(Vec::new()));
@@ -9622,9 +9203,7 @@ mod tests {
             .await
             .expect("review pool slot available");
 
-        let result = coordinator
-            .schedule_execution(&execution, &worker_id)
-            .await;
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(
             result.is_err(),
             "schedule_execution must fail when the lease (including --resume_pr) fails"
@@ -9671,12 +9250,7 @@ mod tests {
             ..FakeExecutionRunner::default()
         });
 
-        let mut coord = ExecutionCoordinator::new(
-            db.clone(),
-            WorkerPool::new(1),
-            cube.clone(),
-            runner.clone(),
-        );
+        let mut coord = ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
         coord.set_review_pool(WorkerPool::new_review(1));
         let coordinator = Arc::new(coord);
 
@@ -9686,9 +9260,7 @@ mod tests {
             .await
             .expect("review pool slot available");
 
-        let result = coordinator
-            .schedule_execution(&execution, &worker_id)
-            .await;
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(
             result.is_ok(),
             "schedule_execution must succeed on the create_change path: {result:?}"
@@ -9699,8 +9271,7 @@ mod tests {
         let calls = cube.lease_calls.lock().await;
         assert_eq!(calls.len(), 1, "lease_workspace must be called exactly once");
         assert_eq!(
-            calls[0].4,
-            None,
+            calls[0].4, None,
             "lease_workspace must NOT receive resume_pr when pr_url is absent"
         );
         drop(calls);
@@ -9755,9 +9326,7 @@ mod tests {
             .await
             .expect("worker pool slot available");
 
-        let result = coordinator
-            .schedule_execution(&execution, &worker_id)
-            .await;
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
 
         // lease_workspace was called with resume_pr = Some(99) for PR #99.
@@ -9809,13 +9378,8 @@ mod tests {
         let runner = Arc::new(FakeExecutionRunner::default());
 
         let coordinator = Arc::new(
-            ExecutionCoordinator::new(
-                db.clone(),
-                WorkerPool::new(1),
-                cube.clone(),
-                runner.clone(),
-            )
-            .with_pre_start_retry_delays(Vec::new()),
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
         );
 
         let worker_id = coordinator
@@ -9824,9 +9388,7 @@ mod tests {
             .await
             .expect("worker pool slot available");
 
-        let result = coordinator
-            .schedule_execution(&execution, &worker_id)
-            .await;
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
         assert!(
             result.is_err(),
             "schedule_execution must fail when the lease (including --resume_pr) fails"

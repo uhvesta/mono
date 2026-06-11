@@ -8,7 +8,7 @@
 //! `modified-only` access scope — and reports a warning for any file whose
 //! path contains the string "do_not_submit".
 
-use checkleft_check_sdk::{check, export_checks, CheckInput, Finding};
+use checkleft_check_sdk::{CheckInput, Finding, check, export_checks};
 use serde::Deserialize;
 
 /// Optional per-check configuration. Keys match the CHECKS.yaml config block
@@ -38,11 +38,8 @@ fn trivial_check(input: CheckInput) -> Vec<Finding> {
         for pattern in &patterns {
             if file.path.contains(pattern.as_str()) {
                 findings.push(
-                    Finding::error(format!(
-                        "File path contains `{}` marker: {}",
-                        pattern, file.path
-                    ))
-                    .with_remediation("Remove or rename the file before submitting."),
+                    Finding::error(format!("File path contains `{}` marker: {}", pattern, file.path))
+                        .with_remediation("Remove or rename the file before submitting."),
                 );
             }
         }

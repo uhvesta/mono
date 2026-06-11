@@ -54,8 +54,7 @@ impl ConfiguredCheck for RustTestRuleCoverageCheck {
                     column: None,
                 }),
                 remediations: vec![
-                    "Add a Bazel `rust_test(...)` target in the nearest BUILD/BUILD.bazel package."
-                        .to_owned(),
+                    "Add a Bazel `rust_test(...)` target in the nearest BUILD/BUILD.bazel package.".to_owned(),
                 ],
                 suggested_fix: None,
             });
@@ -73,10 +72,7 @@ fn is_rust_source_file(path: &Path) -> bool {
 }
 
 fn looks_like_test_file(path: &Path, tree: &dyn SourceTree) -> bool {
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "tests")
-    {
+    if path.components().any(|component| component.as_os_str() == "tests") {
         return true;
     }
     if path
@@ -156,11 +152,7 @@ mod tests {
             "#[test]\nfn it_works() {}\n",
         )
         .expect("write test");
-        fs::write(
-            temp.path().join("backend/foo/BUILD"),
-            "rust_library(name = \"foo\")\n",
-        )
-        .expect("write build");
+        fs::write(temp.path().join("backend/foo/BUILD"), "rust_library(name = \"foo\")\n").expect("write build");
 
         let check = RustTestRuleCoverageCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");

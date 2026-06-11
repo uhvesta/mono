@@ -110,7 +110,10 @@ impl CompiledRules {
             let re = Regex::new(&r.pattern)?;
             compiled.push((re, r.replacement.clone(), r.kind.clone()));
         }
-        Ok(Self { source: rules, compiled })
+        Ok(Self {
+            source: rules,
+            compiled,
+        })
     }
 }
 
@@ -126,85 +129,43 @@ macro_rules! lazy_re {
 }
 
 fn baked_in_rewrite_patterns() -> &'static [(&'static str, &'static LazyLock<Regex>)] {
-    static PATTERNS: LazyLock<Vec<(&'static str, &'static LazyLock<Regex>)>> =
-        LazyLock::new(|| {
-            vec![
-                // Execution ids
-                (
-                    "exec_… identifier",
-                    lazy_re!(r"exec_[0-9a-f]{16}_[A-Za-z0-9]+"),
-                ),
-                // Project ids
-                (
-                    "proj_… identifier",
-                    lazy_re!(r"proj_[0-9a-f]{16}_[A-Za-z0-9]+"),
-                ),
-                // Task ids
-                (
-                    "task_… identifier",
-                    lazy_re!(r"task_[0-9a-f]{16}_[A-Za-z0-9]+"),
-                ),
-                // Chore / change ids
-                ("chg_… identifier", lazy_re!(r"chg_[0-9a-f]{32}")),
-                // boss/exec_… branch-name substrings
-                (
-                    "boss/exec_… branch name",
-                    lazy_re!(r"boss/exec_[A-Za-z0-9_/-]+"),
-                ),
-            ]
-        });
+    static PATTERNS: LazyLock<Vec<(&'static str, &'static LazyLock<Regex>)>> = LazyLock::new(|| {
+        vec![
+            // Execution ids
+            ("exec_… identifier", lazy_re!(r"exec_[0-9a-f]{16}_[A-Za-z0-9]+")),
+            // Project ids
+            ("proj_… identifier", lazy_re!(r"proj_[0-9a-f]{16}_[A-Za-z0-9]+")),
+            // Task ids
+            ("task_… identifier", lazy_re!(r"task_[0-9a-f]{16}_[A-Za-z0-9]+")),
+            // Chore / change ids
+            ("chg_… identifier", lazy_re!(r"chg_[0-9a-f]{32}")),
+            // boss/exec_… branch-name substrings
+            ("boss/exec_… branch name", lazy_re!(r"boss/exec_[A-Za-z0-9_/-]+")),
+        ]
+    });
     &PATTERNS
 }
 
 fn baked_in_block_patterns() -> &'static [(&'static str, &'static LazyLock<Regex>)] {
-    static PATTERNS: LazyLock<Vec<(&'static str, &'static LazyLock<Regex>)>> =
-        LazyLock::new(|| {
-            vec![
-                (
-                    "\"Boss worker\"",
-                    lazy_re!(r"(?i)\bBoss\s+worker\b"),
-                ),
-                (
-                    "\"the engine\"",
-                    lazy_re!(r"(?i)\bthe\s+engine\b"),
-                ),
-                (
-                    "\"the coordinator\"",
-                    lazy_re!(r"(?i)\bthe\s+coordinator\b"),
-                ),
-                (
-                    "\"cube workspace\"",
-                    lazy_re!(r"(?i)\bcube\s+workspace\b"),
-                ),
-                (
-                    "\"cube lease\"",
-                    lazy_re!(r"(?i)\bcube\s+lease\b"),
-                ),
-                (
-                    "\"work item\"",
-                    lazy_re!(r"(?i)\bwork\s+item\b"),
-                ),
-                (
-                    "\"execution id\"",
-                    lazy_re!(r"(?i)\bexecution\s+id\b"),
-                ),
-                (
-                    "\"PostToolUse\"",
-                    lazy_re!(r"\bPostToolUse\b"),
-                ),
-                (
-                    "\"PreToolUse\"",
-                    lazy_re!(r"\bPreToolUse\b"),
-                ),
-            ]
-        });
+    static PATTERNS: LazyLock<Vec<(&'static str, &'static LazyLock<Regex>)>> = LazyLock::new(|| {
+        vec![
+            ("\"Boss worker\"", lazy_re!(r"(?i)\bBoss\s+worker\b")),
+            ("\"the engine\"", lazy_re!(r"(?i)\bthe\s+engine\b")),
+            ("\"the coordinator\"", lazy_re!(r"(?i)\bthe\s+coordinator\b")),
+            ("\"cube workspace\"", lazy_re!(r"(?i)\bcube\s+workspace\b")),
+            ("\"cube lease\"", lazy_re!(r"(?i)\bcube\s+lease\b")),
+            ("\"work item\"", lazy_re!(r"(?i)\bwork\s+item\b")),
+            ("\"execution id\"", lazy_re!(r"(?i)\bexecution\s+id\b")),
+            ("\"PostToolUse\"", lazy_re!(r"\bPostToolUse\b")),
+            ("\"PreToolUse\"", lazy_re!(r"\bPreToolUse\b")),
+        ]
+    });
     &PATTERNS
 }
 
 // UUID pattern: standard lowercase hex form.
-static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").expect("uuid re")
-});
+static UUID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").expect("uuid re"));
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -220,20 +181,15 @@ static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// The function never panics on well-formed inputs. Regex errors from
 /// `rules.compiled` patterns are already caught at `CompiledRules::compile`
 /// time.
-pub fn evaluate(
-    body: &str,
-    title: &str,
-    rules: &CompiledRules,
-    template_body: Option<&str>,
-) -> EditorialDecision {
+pub fn evaluate(body: &str, title: &str, rules: &CompiledRules, template_body: Option<&str>) -> EditorialDecision {
     let mut findings: Vec<Finding> = Vec::new();
     let new_body = apply_redactions(body, rules, &mut findings);
     let new_title = apply_redactions_to_title(title, rules, &mut findings);
     apply_template_check(&new_body, rules, template_body, &mut findings);
 
-    let has_block = findings.iter().any(|f| {
-        matches!(f.kind, FindingKind::Block | FindingKind::Template)
-    });
+    let has_block = findings
+        .iter()
+        .any(|f| matches!(f.kind, FindingKind::Block | FindingKind::Template));
 
     if findings.is_empty() {
         EditorialDecision::Allow
@@ -256,11 +212,7 @@ pub fn evaluate(
 /// Apply all baked-in + user redaction rules to `text`, respecting markdown
 /// code-fence and inline-code semantics. Populates `findings` for every
 /// distinct named pattern that fired. Returns the rewritten text.
-fn apply_redactions(
-    text: &str,
-    rules: &CompiledRules,
-    findings: &mut Vec<Finding>,
-) -> String {
+fn apply_redactions(text: &str, rules: &CompiledRules, findings: &mut Vec<Finding>) -> String {
     let segments = split_markdown_segments(text);
     let mut out = String::with_capacity(text.len());
 
@@ -273,9 +225,11 @@ fn apply_redactions(
                 let content = inner_backtick_content(s);
                 let mut replaced = false;
                 for (name, re) in baked_in_rewrite_patterns() {
-                    if re.is_match(content) && re.find(content).is_some_and(|m| {
-                        m.start() == 0 && m.end() == content.len()
-                    }) {
+                    if re.is_match(content)
+                        && re
+                            .find(content)
+                            .is_some_and(|m| m.start() == 0 && m.end() == content.len())
+                    {
                         // Replace the whole inline-code span with empty.
                         record_finding(findings, FindingKind::Redact, name);
                         // Collapse: skip the span entirely (empty replacement).
@@ -288,14 +242,14 @@ fn apply_redactions(
                     for (re, replacement, kind) in &rules.compiled {
                         if *kind == RedactionKind::Rewrite
                             && re.is_match(content)
-                            && re.find(content).is_some_and(|m| {
-                                m.start() == 0 && m.end() == content.len()
-                            })
+                            && re
+                                .find(content)
+                                .is_some_and(|m| m.start() == 0 && m.end() == content.len())
                         {
                             record_finding(findings, FindingKind::Redact, "user redaction rule");
                             if replacement.is_empty() {
                                 replaced = true;
-                    } else {
+                            } else {
                                 out.push('`');
                                 out.push_str(replacement);
                                 out.push('`');
@@ -348,11 +302,7 @@ fn apply_redactions(
     out
 }
 
-fn apply_redactions_to_title(
-    title: &str,
-    rules: &CompiledRules,
-    findings: &mut Vec<Finding>,
-) -> Option<String> {
+fn apply_redactions_to_title(title: &str, rules: &CompiledRules, findings: &mut Vec<Finding>) -> Option<String> {
     if title.is_empty() {
         return None;
     }
@@ -389,12 +339,7 @@ fn apply_redactions_to_title(
 // Internal: template conformance check
 // ---------------------------------------------------------------------------
 
-fn apply_template_check(
-    body: &str,
-    rules: &CompiledRules,
-    template_body: Option<&str>,
-    findings: &mut Vec<Finding>,
-) {
+fn apply_template_check(body: &str, rules: &CompiledRules, template_body: Option<&str>, findings: &mut Vec<Finding>) {
     if rules.source.template_policy != TemplatePolicy::Enforce {
         return;
     }
@@ -569,7 +514,6 @@ fn find_closing_ticks(text: &str, closing: &[u8]) -> Option<usize> {
 /// Return the inner content of an inline code span (strips leading/trailing
 /// backticks).
 fn inner_backtick_content(span: &str) -> &str {
-    
     (span.trim_start_matches('`').trim_end_matches('`')) as _
 }
 
@@ -615,8 +559,7 @@ fn redact_uuids_near_lease_cube(text: &str, findings: &mut Vec<Finding>) -> Stri
 /// Collapse sequences of two or more spaces (or space+newline artefacts left
 /// by id-stripping) into a single space.
 fn collapse_whitespace(s: &str) -> String {
-    static MULTI_SPACE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"  +").expect("multi-space re"));
+    static MULTI_SPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"  +").expect("multi-space re"));
     static LEADING_SPACE_AFTER_NL: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\n +\n").expect("space-between-nl re"));
 
@@ -654,7 +597,6 @@ mod tests {
         evaluate(body, "", &no_rules(), None)
     }
 
-
     // -----------------------------------------------------------------------
     // Baked-in identifier redactions
     // -----------------------------------------------------------------------
@@ -663,7 +605,11 @@ mod tests {
     fn exec_id_in_body_is_redacted() {
         let body = "Fixes the bug introduced in exec_18b07a506d2518d0_1b.";
         match evaluate_simple(body) {
-            EditorialDecision::Rewrite { body: new_body, findings, .. } => {
+            EditorialDecision::Rewrite {
+                body: new_body,
+                findings,
+                ..
+            } => {
                 assert!(!new_body.contains("exec_18b07a506d2518d0_1b"), "id must be removed");
                 assert!(findings.iter().any(|f| f.description.contains("exec_")));
             }
@@ -887,7 +833,9 @@ mod tests {
     fn exec_id_in_title_is_redacted() {
         let title = "fix: close task exec_18b07a506d2518d0_1b";
         match evaluate("", title, &no_rules(), None) {
-            EditorialDecision::Rewrite { title: Some(new_title), .. } => {
+            EditorialDecision::Rewrite {
+                title: Some(new_title), ..
+            } => {
                 assert!(!new_title.contains("exec_18b07a506d2518d0_1b"));
             }
             other => panic!("expected Rewrite with title, got {other:?}"),
@@ -919,9 +867,11 @@ mod tests {
         let rules = enforce_rules();
         match evaluate(body, "", &rules, Some(template)) {
             EditorialDecision::Block { findings } => {
-                assert!(findings.iter().any(|f| {
-                    f.kind == FindingKind::Template && f.description.contains("test plan")
-                }));
+                assert!(
+                    findings
+                        .iter()
+                        .any(|f| { f.kind == FindingKind::Template && f.description.contains("test plan") })
+                );
             }
             other => panic!("expected Block, got {other:?}"),
         }
@@ -953,14 +903,20 @@ mod tests {
         let template = "## Summary\n\n## Test Plan\n";
         let body = "Prose with no headings.";
         // Default policy is Off.
-        assert_eq!(evaluate(body, "", &no_rules(), Some(template)), EditorialDecision::Allow);
+        assert_eq!(
+            evaluate(body, "", &no_rules(), Some(template)),
+            EditorialDecision::Allow
+        );
     }
 
     #[test]
     fn template_enforce_no_template_body_is_no_op() {
         // Policy = Enforce but no template supplied → no check, no findings.
         let rules = enforce_rules();
-        assert_eq!(evaluate("## Summary\n\nOK.", "", &rules, None), EditorialDecision::Allow);
+        assert_eq!(
+            evaluate("## Summary\n\nOK.", "", &rules, None),
+            EditorialDecision::Allow
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -971,14 +927,20 @@ mod tests {
     fn empty_rules_still_fires_baked_in_exec_redaction() {
         let rules = CompiledRules::compile(EditorialRules::default()).unwrap();
         let body = "Trace: exec_18b07a506d2518d0_1b";
-        assert!(matches!(evaluate(body, "", &rules, None), EditorialDecision::Rewrite { .. }));
+        assert!(matches!(
+            evaluate(body, "", &rules, None),
+            EditorialDecision::Rewrite { .. }
+        ));
     }
 
     #[test]
     fn empty_rules_still_fires_baked_in_phrase_block() {
         let rules = CompiledRules::compile(EditorialRules::default()).unwrap();
         let body = "The engine did the work.";
-        assert!(matches!(evaluate(body, "", &rules, None), EditorialDecision::Block { .. }));
+        assert!(matches!(
+            evaluate(body, "", &rules, None),
+            EditorialDecision::Block { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------

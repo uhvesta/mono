@@ -27,11 +27,7 @@ pub(super) async fn handle_classify_ci_remediation(ctx: Dispatch, req: FrontendR
         // authority gate — a forged attempt id has no row to
         // clobber.
         match work_db.set_ci_remediation_triage_class(&attempt_id, &triage_class) {
-            Ok(Some(attempt)) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::CiRemediationClassified { attempt },
-            ),
+            Ok(Some(attempt)) => send_response(&sink, &request_id, FrontendEvent::CiRemediationClassified { attempt }),
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -84,19 +80,13 @@ pub(super) async fn handle_mark_ci_remediation_failed(ctx: Dispatch, req: Fronte
                         },
                     )
                     .await;
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::CiRemediationMarkedFailed { attempt },
-                );
+                send_response(&sink, &request_id, FrontendEvent::CiRemediationMarkedFailed { attempt });
             }
             Ok(None) => send_response(
                 &sink,
                 &request_id,
                 FrontendEvent::WorkError {
-                    message: format!(
-                        "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
-                    ),
+                    message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
                 },
             ),
             Err(err) => send_response(
@@ -156,10 +146,7 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
                 send_response(
                     &sink,
                     &request_id,
-                    FrontendEvent::CiRemediationRetriggered {
-                        attempt,
-                        new_id,
-                    },
+                    FrontendEvent::CiRemediationRetriggered { attempt, new_id },
                 );
             }
             // Already terminal (idempotent re-marker) or unknown id.
@@ -205,10 +192,7 @@ pub(super) async fn handle_mark_ci_remediation_retriggered(ctx: Dispatch, req: F
     }
 }
 
-pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(
-    ctx: Dispatch,
-    req: FrontendRequest,
-) {
+pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
         work_db,
@@ -226,10 +210,7 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(
         let pre = work_db.get_ci_remediation(&attempt_id).ok().flatten();
         match work_db.mark_ci_remediation_succeeded_via_rebase(&attempt_id) {
             Ok(Some(attempt)) => {
-                let budget_refunded = pre
-                    .as_ref()
-                    .map(|p| p.consumes_budget != 0)
-                    .unwrap_or(false);
+                let budget_refunded = pre.as_ref().map(|p| p.consumes_budget != 0).unwrap_or(false);
                 tracing::info!(
                     attempt_id = %attempt.id,
                     work_item_id = %attempt.work_item_id,
@@ -261,9 +242,7 @@ pub(super) async fn handle_mark_ci_remediation_succeeded_via_rebase(
                 &sink,
                 &request_id,
                 FrontendEvent::WorkError {
-                    message: format!(
-                        "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
-                    ),
+                    message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
                 },
             ),
             Err(err) => send_response(
@@ -297,17 +276,8 @@ pub(super) async fn handle_list_ci_remediations(ctx: Dispatch, req: FrontendRequ
         // Read-only listing surface for `boss engine ci list`
         // (design Phase 11 #35). Mirror of
         // `ListConflictResolutions`.
-        match work_db.list_ci_remediations(
-            product_id.as_deref(),
-            &status,
-            work_item_id.as_deref(),
-            limit,
-        ) {
-            Ok(attempts) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::CiRemediationsList { attempts },
-            ),
+        match work_db.list_ci_remediations(product_id.as_deref(), &status, work_item_id.as_deref(), limit) {
+            Ok(attempts) => send_response(&sink, &request_id, FrontendEvent::CiRemediationsList { attempts }),
             Err(err) => send_response(
                 &sink,
                 &request_id,
@@ -331,9 +301,7 @@ pub(super) async fn handle_get_ci_remediation(ctx: Dispatch, req: FrontendReques
     };
     {
         match work_db.get_ci_remediation(&attempt_id) {
-            Ok(Some(attempt)) => {
-                send_response(&sink, &request_id, FrontendEvent::CiRemediation { attempt })
-            }
+            Ok(Some(attempt)) => send_response(&sink, &request_id, FrontendEvent::CiRemediation { attempt }),
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -378,40 +346,38 @@ pub(super) async fn handle_retry_ci_remediation(ctx: Dispatch, req: FrontendRequ
             Ok(Some(selector.clone()))
         };
         match resolved {
-            Ok(Some(work_item_id)) => {
-                match work_db.retry_ci_remediation_for_work_item(&work_item_id) {
-                    Ok(Some((budget, was_exhausted))) => {
-                        tracing::warn!(
-                            %work_item_id,
+            Ok(Some(work_item_id)) => match work_db.retry_ci_remediation_for_work_item(&work_item_id) {
+                Ok(Some((budget, was_exhausted))) => {
+                    tracing::warn!(
+                        %work_item_id,
+                        was_exhausted,
+                        "retry_ci_remediation: budget reset, parent unblocked={was_exhausted}",
+                    );
+                    send_response(
+                        &sink,
+                        &request_id,
+                        FrontendEvent::CiRemediationRetryDone {
+                            work_item_id,
+                            budget,
                             was_exhausted,
-                            "retry_ci_remediation: budget reset, parent unblocked={was_exhausted}",
-                        );
-                        send_response(
-                            &sink,
-                            &request_id,
-                            FrontendEvent::CiRemediationRetryDone {
-                                work_item_id,
-                                budget,
-                                was_exhausted,
-                            },
-                        );
-                    }
-                    Ok(None) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: format!("work item {work_item_id:?} is unknown",),
                         },
-                    ),
-                    Err(err) => send_response(
-                        &sink,
-                        &request_id,
-                        FrontendEvent::WorkError {
-                            message: err.to_string(),
-                        },
-                    ),
+                    );
                 }
-            }
+                Ok(None) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: format!("work item {work_item_id:?} is unknown",),
+                    },
+                ),
+                Err(err) => send_response(
+                    &sink,
+                    &request_id,
+                    FrontendEvent::WorkError {
+                        message: err.to_string(),
+                    },
+                ),
+            },
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -474,9 +440,7 @@ pub(super) async fn handle_abandon_ci_remediation(ctx: Dispatch, req: FrontendRe
                 &sink,
                 &request_id,
                 FrontendEvent::WorkError {
-                    message: format!(
-                        "ci_remediation attempt {attempt_id:?} is unknown or already terminal",
-                    ),
+                    message: format!("ci_remediation attempt {attempt_id:?} is unknown or already terminal",),
                 },
             ),
             Err(err) => send_response(
@@ -502,9 +466,7 @@ pub(super) async fn handle_get_ci_budget(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         match work_db.ci_budget_snapshot(&work_item_id) {
-            Ok(Some(budget)) => {
-                send_response(&sink, &request_id, FrontendEvent::CiBudget { budget })
-            }
+            Ok(Some(budget)) => send_response(&sink, &request_id, FrontendEvent::CiBudget { budget }),
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -530,20 +492,14 @@ pub(super) async fn handle_set_ci_budget(ctx: Dispatch, req: FrontendRequest) {
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::SetCiBudget {
-        work_item_id,
-        budget,
-    } = req
-    else {
+    let FrontendRequest::SetCiBudget { work_item_id, budget } = req else {
         unreachable!()
     };
     {
         match work_db.set_ci_attempt_budget(&work_item_id, budget) {
-            Ok(Some(snapshot)) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::CiBudgetUpdated { budget: snapshot },
-            ),
+            Ok(Some(snapshot)) => {
+                send_response(&sink, &request_id, FrontendEvent::CiBudgetUpdated { budget: snapshot })
+            }
             Ok(None) => send_response(
                 &sink,
                 &request_id,

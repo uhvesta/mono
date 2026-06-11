@@ -39,20 +39,19 @@ impl TestEngine {
         let socket_path = temp.path().join("engine.sock");
         let db_path = temp.path().join("state.db");
         let token_path = temp.path().join("engine-control.token");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path.clone()).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(db_path.clone())
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let token_for_serve = token_path.clone();
-        let join = tokio::spawn(async move {
-            serve(cfg, socket_for_serve, None, None, Some(token_for_serve), None).await
-        });
+        let join =
+            tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, Some(token_for_serve), None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
 
         Ok(Self {
@@ -89,10 +88,7 @@ async fn shutdown_with_correct_token_is_accepted() -> Result<()> {
         .read_token()
         .map_err(|e| anyhow!("failed to read token file: {e}"))?;
     assert_eq!(parsed.token.len(), 64, "token should be 64 hex chars");
-    assert_eq!(
-        parsed.socket_path,
-        engine.socket_path.display().to_string()
-    );
+    assert_eq!(parsed.socket_path, engine.socket_path.display().to_string());
 
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
     let response = client
@@ -145,9 +141,7 @@ async fn shutdown_with_wrong_token_is_rejected() -> Result<()> {
 
     // The engine must still be alive — a second request should
     // succeed.
-    let v = client
-        .send_request(&FrontendRequest::GetEngineVersion)
-        .await?;
+    let v = client.send_request(&FrontendRequest::GetEngineVersion).await?;
     match v {
         FrontendEvent::EngineVersionResult { .. } => Ok(()),
         other => Err(anyhow!(

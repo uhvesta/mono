@@ -12,10 +12,9 @@ use crate::output::Severity;
 use crate::source_tree::LocalSourceTree;
 
 use super::{
-    BASE_COMPONENT_TIMEOUT_MS, DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER,
-    ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState, MemoryLimiter,
-    PER_FILE_COMPONENT_TIMEOUT_MS, build_wasmtime_engine, is_interrupt_error,
-    resolve_component_limits,
+    BASE_COMPONENT_TIMEOUT_MS, DefaultExternalCheckExecutor, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor,
+    HOST_CEILING_TIMEOUT_MS, HostState, MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, build_wasmtime_engine,
+    is_interrupt_error, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -89,8 +88,7 @@ fn component_v1_digest_mismatch_is_rejected() {
         api_version: EXTERNAL_CHECK_API_V1.to_owned(),
         implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
             artifact_path: "check.wasm".to_owned(),
-            artifact_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                .to_owned(),
+            artifact_sha256: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
             artifact_bytes: None,
             check_name: "example-check".to_owned(),
             limits: None,
@@ -234,8 +232,7 @@ fn lift_access_scope_whole_repo_variant() {
 #[test]
 fn lift_access_scope_globs_variant_preserves_patterns() {
     let patterns = vec!["**/*.rs".to_owned(), "**/Cargo.toml".to_owned()];
-    let scope =
-        super::lift_access_scope(Some(&super::wit_types::AccessScope::Globs(patterns.clone())));
+    let scope = super::lift_access_scope(Some(&super::wit_types::AccessScope::Globs(patterns.clone())));
     match scope {
         crate::external::sandbox::AccessScope::Globs(got) => assert_eq!(got, patterns),
         other => panic!("expected Globs, got {other:?}"),
@@ -292,8 +289,7 @@ fn sandbox_is_populated_only_with_changeset_files_for_modified_only_scope() {
 
     let dir = tempdir().expect("temp dir");
     let ceiling = HostCeiling::new(dir.path());
-    let sandbox = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &ceiling)
-        .expect("create sandbox");
+    let sandbox = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &ceiling).expect("create sandbox");
 
     assert!(
         sandbox.root.path().join("changed.rs").exists(),
@@ -309,9 +305,9 @@ fn sandbox_is_populated_only_with_changeset_files_for_modified_only_scope() {
 fn sandbox_grant_includes_glob_matched_files() {
     use crate::external::sandbox::{AccessScope, HostCeiling, create_sandbox};
     use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
+    use globset::{Glob, GlobSetBuilder};
     use std::collections::HashMap;
     use std::path::Path;
-    use globset::{Glob, GlobSetBuilder};
 
     struct GlobTree(HashMap<PathBuf, Vec<u8>>);
     impl SourceTree for GlobTree {
@@ -331,12 +327,7 @@ fn sandbox_grant_includes_glob_matched_files() {
             let mut builder = GlobSetBuilder::new();
             builder.add(Glob::new(pattern)?);
             let set = builder.build()?;
-            let mut hits: Vec<PathBuf> = self
-                .0
-                .keys()
-                .filter(|p| set.is_match(p.as_path()))
-                .cloned()
-                .collect();
+            let mut hits: Vec<PathBuf> = self.0.keys().filter(|p| set.is_match(p.as_path())).cloned().collect();
             hits.sort();
             Ok(hits)
         }
@@ -370,9 +361,18 @@ fn sandbox_grant_includes_glob_matched_files() {
     .expect("create sandbox");
 
     // Changeset file + both Cargo.toml matches
-    assert!(sandbox.root.path().join("src/main.rs").exists(), "changeset file must be granted");
-    assert!(sandbox.root.path().join("Cargo.toml").exists(), "root Cargo.toml must be granted");
-    assert!(sandbox.root.path().join("lib/Cargo.toml").exists(), "lib Cargo.toml must be granted");
+    assert!(
+        sandbox.root.path().join("src/main.rs").exists(),
+        "changeset file must be granted"
+    );
+    assert!(
+        sandbox.root.path().join("Cargo.toml").exists(),
+        "root Cargo.toml must be granted"
+    );
+    assert!(
+        sandbox.root.path().join("lib/Cargo.toml").exists(),
+        "lib Cargo.toml must be granted"
+    );
 }
 
 #[test]
@@ -473,9 +473,7 @@ fn host_state_with_empty_wasi_does_not_panic() {
 fn host_state_with_sandbox_root_preopens_the_directory() {
     let dir = tempdir().expect("temp dir");
     fs::write(dir.path().join("probe.txt"), b"hello").expect("write probe file");
-    let state =
-        super::HostState::with_sandbox_root(dir.path(), usize::MAX)
-            .expect("build HostState with sandbox root");
+    let state = super::HostState::with_sandbox_root(dir.path(), usize::MAX).expect("build HostState with sandbox root");
     // The HostState was created — the preopened_dir call did not fail.
     // (Runtime behavior is verified by the full component integration path once a
     // test component binary is available.)
@@ -489,10 +487,7 @@ fn resolve_limits_uses_proportional_default_when_none() {
     // No limits, 0 files → BASE only
     let (timeout_ms, max_bytes) = resolve_component_limits(None, 0);
     assert_eq!(timeout_ms, BASE_COMPONENT_TIMEOUT_MS);
-    assert_eq!(
-        max_bytes,
-        super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024
-    );
+    assert_eq!(max_bytes, super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024);
 }
 
 #[test]
@@ -551,10 +546,7 @@ fn resolve_limits_clamps_to_host_ceiling() {
     };
     let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits), 0);
     assert_eq!(timeout_ms, HOST_CEILING_TIMEOUT_MS);
-    assert_eq!(
-        max_bytes,
-        super::HOST_CEILING_MAX_MEMORY_MB as usize * 1024 * 1024
-    );
+    assert_eq!(max_bytes, super::HOST_CEILING_MAX_MEMORY_MB as usize * 1024 * 1024);
 }
 
 #[test]
@@ -565,10 +557,7 @@ fn resolve_limits_partial_override_timeout_only() {
     };
     let (timeout_ms, max_bytes) = resolve_component_limits(Some(&limits), 0);
     assert_eq!(timeout_ms, 1_000);
-    assert_eq!(
-        max_bytes,
-        super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024
-    );
+    assert_eq!(max_bytes, super::DEFAULT_COMPONENT_MAX_MEMORY_MB as usize * 1024 * 1024);
 }
 
 #[test]
@@ -588,9 +577,7 @@ fn resolve_limits_partial_override_memory_only() {
 
 #[test]
 fn memory_limiter_allows_growth_within_cap() {
-    let mut limiter = MemoryLimiter {
-        max_bytes: 1024 * 1024,
-    };
+    let mut limiter = MemoryLimiter { max_bytes: 1024 * 1024 };
     assert!(
         wasmtime::ResourceLimiter::memory_growing(&mut limiter, 0, 512 * 1024, None).unwrap(),
         "growth within cap should be allowed"
@@ -599,9 +586,7 @@ fn memory_limiter_allows_growth_within_cap() {
 
 #[test]
 fn memory_limiter_allows_growth_exactly_at_cap() {
-    let mut limiter = MemoryLimiter {
-        max_bytes: 1024 * 1024,
-    };
+    let mut limiter = MemoryLimiter { max_bytes: 1024 * 1024 };
     assert!(
         wasmtime::ResourceLimiter::memory_growing(&mut limiter, 0, 1024 * 1024, None).unwrap(),
         "growth exactly at cap should be allowed"
@@ -610,9 +595,7 @@ fn memory_limiter_allows_growth_exactly_at_cap() {
 
 #[test]
 fn memory_limiter_rejects_growth_beyond_cap() {
-    let mut limiter = MemoryLimiter {
-        max_bytes: 512 * 1024,
-    };
+    let mut limiter = MemoryLimiter { max_bytes: 512 * 1024 };
     assert!(
         !wasmtime::ResourceLimiter::memory_growing(&mut limiter, 0, 1024 * 1024, None).unwrap(),
         "growth beyond cap should be rejected"
@@ -639,17 +622,13 @@ fn epoch_deadline_interrupts_spin_loop() {
     engine.increment_epoch();
 
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let spin: wasmtime::TypedFunc<(), ()> =
-        instance.get_typed_func(&mut store, "spin").unwrap();
+    let spin: wasmtime::TypedFunc<(), ()> = instance.get_typed_func(&mut store, "spin").unwrap();
     let err = spin
         .call(&mut store, ())
         .map_err(anyhow::Error::from)
         .expect_err("execution should be interrupted by epoch deadline");
 
-    assert!(
-        is_interrupt_error(&err),
-        "expected epoch Trap::Interrupt, got: {err:#}"
-    );
+    assert!(is_interrupt_error(&err), "expected epoch Trap::Interrupt, got: {err:#}");
 }
 
 /// Verifies that the `ResourceLimiter` causes `memory.grow` to return -1 when
@@ -681,17 +660,11 @@ fn memory_cap_trip_via_resource_limiter() {
     .unwrap();
     let module = Module::new(&engine, &wasm).unwrap();
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let try_grow: wasmtime::TypedFunc<(), i32> =
-        instance.get_typed_func(&mut store, "try_grow").unwrap();
+    let try_grow: wasmtime::TypedFunc<(), i32> = instance.get_typed_func(&mut store, "try_grow").unwrap();
 
     // memory.grow returns -1 (as i32) when the ResourceLimiter rejects growth.
-    let result = try_grow
-        .call(&mut store, ())
-        .expect("call itself should succeed");
-    assert_eq!(
-        result, -1,
-        "memory.grow must return -1 when the cap is exceeded"
-    );
+    let result = try_grow.call(&mut store, ()).expect("call itself should succeed");
+    assert_eq!(result, -1, "memory.grow must return -1 when the cap is exceeded");
 }
 
 // --- T10: rust-giant-structs-use-builder end-to-end test ---
@@ -704,8 +677,7 @@ fn memory_cap_trip_via_resource_limiter() {
 #[test]
 fn bundled_giant_structs_check_finds_violation_in_rs_file() {
     use crate::external::{
-        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef,
-        ExternalCheckPackageProvider as _,
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
     };
     use std::path::Path;
 
@@ -743,12 +715,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
     // Run through the full component-v1 host with modified-only sandbox (the default).
     let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
     let result = executor
-        .execute(
-            &package,
-            &changeset,
-            &tree,
-            &toml::Value::Table(Default::default()),
-        )
+        .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
         .expect("execute");
 
     assert_eq!(result.check_id, "rust-giant-structs-use-builder");
@@ -775,8 +742,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
 #[test]
 fn bundled_giant_structs_check_skips_files_not_in_changeset() {
     use crate::external::{
-        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef,
-        ExternalCheckPackageProvider as _,
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
     };
 
     const VIOLATION_SOURCE: &str = r#"pub struct GiantStruct {
@@ -807,12 +773,7 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
 
     let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
     let result = executor
-        .execute(
-            &package,
-            &changeset,
-            &tree,
-            &toml::Value::Table(Default::default()),
-        )
+        .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
         .expect("execute");
 
     assert!(
@@ -830,8 +791,7 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
 #[test]
 fn bundled_giant_structs_check_handles_large_rs_file() {
     use crate::external::{
-        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef,
-        ExternalCheckPackageProvider as _,
+        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
     };
     use std::path::Path;
 
@@ -865,12 +825,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
 
     let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
     let result = executor
-        .execute(
-            &package,
-            &changeset,
-            &tree,
-            &toml::Value::Table(Default::default()),
-        )
+        .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
         .expect("check must complete without fuel exhaustion or timeout on a large file");
 
     assert_eq!(result.check_id, "rust-giant-structs-use-builder");
@@ -879,7 +834,10 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
         1,
         "expected exactly one finding for the violating struct at the end of the large file"
     );
-    let loc = result.findings[0].location.as_ref().expect("finding must have location");
+    let loc = result.findings[0]
+        .location
+        .as_ref()
+        .expect("finding must have location");
     assert_eq!(loc.path, Path::new("large.rs"));
 }
 

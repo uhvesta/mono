@@ -57,13 +57,7 @@ pub(crate) struct PrScanResult {
 /// [`WorkDb::sync_project_design_doc_from_detector`] is used for the
 /// initial (pointer-is-NULL) case; it is a no-op when the path is already
 /// set, at which point only `design_doc_branch` is updated.
-pub async fn on_design_pr_detected(
-    work_db: &WorkDb,
-    task_id: &str,
-    product_id: &str,
-    project_id: &str,
-    pr_url: &str,
-) {
+pub async fn on_design_pr_detected(work_db: &WorkDb, task_id: &str, product_id: &str, project_id: &str, pr_url: &str) {
     let scan = match scan_pr(task_id, pr_url).await {
         Some(s) => s,
         None => return,
@@ -83,12 +77,7 @@ pub async fn on_design_pr_detected(
     let migration_branch = head_ref_name.clone();
     let migration_repo = repo_remote_url.clone();
     let migration_path = path.clone();
-    match work_db.sync_project_design_doc_from_detector(
-        project_id,
-        repo_remote_url.as_deref(),
-        branch,
-        &path,
-    ) {
+    match work_db.sync_project_design_doc_from_detector(project_id, repo_remote_url.as_deref(), branch, &path) {
         Ok(true) => {
             tracing::info!(
                 task_id,
@@ -261,9 +250,7 @@ pub async fn on_design_pr_merged(
         return;
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
-    let effective_branch = base_ref_name
-        .or(scan.base_ref_name.as_deref())
-        .map(str::to_owned);
+    let effective_branch = base_ref_name.or(scan.base_ref_name.as_deref()).map(str::to_owned);
 
     let input = SetProjectDesignDocInput {
         project_id: project_id.to_owned(),
@@ -329,12 +316,7 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
     match do_scan_pr(pr_url).await {
         Ok(result) => Some(result),
         Err(err) => {
-            tracing::warn!(
-                task_id,
-                pr_url,
-                ?err,
-                "design detector: failed to scan PR files"
-            );
+            tracing::warn!(task_id, pr_url, ?err, "design detector: failed to scan PR files");
             None
         }
     }
@@ -342,13 +324,7 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
 
 async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "files,headRefName,baseRefName",
-        ])
+        .args(["pr", "view", pr_url, "--json", "files,headRefName,baseRefName"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -366,8 +342,8 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let root: serde_json::Value = serde_json::from_str(&stdout)
-        .with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))?;
+    let root: serde_json::Value =
+        serde_json::from_str(&stdout).with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))?;
 
     Ok(parse_pr_scan(&root))
 }
@@ -460,22 +436,16 @@ mod tests {
     #[test]
     fn design_doc_path_matches_direct_child() {
         // Boss product directory.
-        assert!(is_design_doc_path(
-            "tools/boss/docs/designs/my-feature.md"
-        ));
+        assert!(is_design_doc_path("tools/boss/docs/designs/my-feature.md"));
         assert!(is_design_doc_path(
             "tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirroring-flunge.md"
         ));
-        assert!(is_design_doc_path(
-            "tools/boss/docs/designs/x.markdown"
-        ));
+        assert!(is_design_doc_path("tools/boss/docs/designs/x.markdown"));
         // Non-boss product directories are also accepted (regression for P844).
         assert!(is_design_doc_path(
             "tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md"
         ));
-        assert!(is_design_doc_path(
-            "tools/flunge/docs/designs/flunge-auth.md"
-        ));
+        assert!(is_design_doc_path("tools/flunge/docs/designs/flunge-auth.md"));
         // Root-level docs/designs/ (no product prefix).
         assert!(is_design_doc_path("docs/designs/top-level.md"));
     }
@@ -483,12 +453,8 @@ mod tests {
     #[test]
     fn design_doc_path_rejects_subdirectory() {
         // Only direct children of designs/ are matched.
-        assert!(!is_design_doc_path(
-            "tools/boss/docs/designs/sub/doc.md"
-        ));
-        assert!(!is_design_doc_path(
-            "tools/checkleft/docs/designs/sub/doc.md"
-        ));
+        assert!(!is_design_doc_path("tools/boss/docs/designs/sub/doc.md"));
+        assert!(!is_design_doc_path("tools/checkleft/docs/designs/sub/doc.md"));
     }
 
     #[test]
@@ -504,20 +470,13 @@ mod tests {
     fn design_doc_path_rejects_non_markdown() {
         assert!(!is_design_doc_path("tools/boss/docs/designs/doc.txt"));
         assert!(!is_design_doc_path("tools/boss/docs/designs/doc.rs"));
-        assert!(!is_design_doc_path(
-            "tools/checkleft/docs/designs/doc.txt"
-        ));
+        assert!(!is_design_doc_path("tools/checkleft/docs/designs/doc.txt"));
     }
 
     /// Build a `files` array value from a list of paths, shaped like
     /// `gh pr view --json files` output (`[{"path": "..."}, ...]`).
     fn files_json(paths: &[&str]) -> serde_json::Value {
-        serde_json::Value::Array(
-            paths
-                .iter()
-                .map(|p| serde_json::json!({ "path": p }))
-                .collect(),
-        )
+        serde_json::Value::Array(paths.iter().map(|p| serde_json::json!({ "path": p })).collect())
     }
 
     #[test]
@@ -530,10 +489,7 @@ mod tests {
             ]),
         });
         let scan = parse_pr_scan(&root);
-        assert_eq!(
-            scan.doc_path.as_deref(),
-            Some("tools/boss/docs/designs/my-feature.md")
-        );
+        assert_eq!(scan.doc_path.as_deref(), Some("tools/boss/docs/designs/my-feature.md"));
     }
 
     #[test]
@@ -574,10 +530,7 @@ mod tests {
             ]),
         });
         let scan = parse_pr_scan(&root);
-        assert_eq!(
-            scan.doc_path.as_deref(),
-            Some("tools/boss/docs/designs/real-doc.md")
-        );
+        assert_eq!(scan.doc_path.as_deref(), Some("tools/boss/docs/designs/real-doc.md"));
     }
 
     #[test]
@@ -602,10 +555,7 @@ mod tests {
             "baseRefName": "main",
         });
         let scan = parse_pr_scan(&root);
-        assert_eq!(
-            scan.head_ref_name.as_deref(),
-            Some("boss/exec_18b07a506d2518d0_1b")
-        );
+        assert_eq!(scan.head_ref_name.as_deref(), Some("boss/exec_18b07a506d2518d0_1b"));
         assert_eq!(scan.base_ref_name.as_deref(), Some("main"));
     }
 

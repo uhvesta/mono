@@ -26,21 +26,13 @@ pub(super) async fn handle_create_product(ctx: Dispatch, req: FrontendRequest) {
                 &server_state,
                 &session_id,
                 &request_id,
-                vec![
-                    TOPIC_WORK_PRODUCTS.to_owned(),
-                    work_product_topic(&work_item_id(&item)),
-                ],
+                vec![TOPIC_WORK_PRODUCTS.to_owned(), work_product_topic(&work_item_id(&item))],
                 "product_created",
                 Some(work_item_product_id(&item)),
                 vec![work_item_id(&item)],
             )
             .await;
-            send_response_with_revision(
-                &sink,
-                &request_id,
-                revision,
-                FrontendEvent::WorkItemCreated { item },
-            );
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
         }
         Err(err) => {
             send_response(
@@ -113,12 +105,7 @@ pub(super) async fn handle_set_product_default_model(ctx: Dispatch, req: Fronten
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_response(
                 &sink,
@@ -158,12 +145,7 @@ pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: Front
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_response(
                 &sink,
@@ -243,11 +225,9 @@ pub(super) async fn handle_evaluate_editorial_rules(ctx: Dispatch, req: Frontend
             findings.iter().map(|f| f.description.clone()).collect(),
             Some(new_body),
         ),
-        boss_editorial::EditorialDecision::Block { findings } => (
-            "deny",
-            findings.iter().map(|f| f.description.clone()).collect(),
-            None,
-        ),
+        boss_editorial::EditorialDecision::Block { findings } => {
+            ("deny", findings.iter().map(|f| f.description.clone()).collect(), None)
+        }
     };
 
     send_response(

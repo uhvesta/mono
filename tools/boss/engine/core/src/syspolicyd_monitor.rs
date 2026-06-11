@@ -285,13 +285,24 @@ mod tests {
         // First (SATURATION_SAMPLES_TO_ALERT - 1) saturated samples must
         // NOT trip the alert, but must start tracking the run.
         for i in 0..(SATURATION_SAMPLES_TO_ALERT - 1) {
-            let status =
-                health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 99.0 }, 1000 + i as i64);
+            let status = health.record_sample(
+                SyspolicydSample {
+                    pid: 520,
+                    cpu_pct: 99.0,
+                },
+                1000 + i as i64,
+            );
             assert!(!status.wedged, "must not alert before sustained threshold");
             assert_eq!(status.saturated_since_epoch, Some(1000));
         }
         // The Nth consecutive saturated sample flips wedged.
-        let status = health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 100.0 }, 2000);
+        let status = health.record_sample(
+            SyspolicydSample {
+                pid: 520,
+                cpu_pct: 100.0,
+            },
+            2000,
+        );
         assert!(status.wedged, "must alert once sustained");
         assert_eq!(status.pid, Some(520));
         // Run-start timestamp is the FIRST saturated sample, not the one
@@ -303,7 +314,13 @@ mod tests {
     fn recovery_clears_wedged_flag() {
         let health = SyspolicydHealth::new();
         for i in 0..SATURATION_SAMPLES_TO_ALERT {
-            health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 99.0 }, i as i64);
+            health.record_sample(
+                SyspolicydSample {
+                    pid: 520,
+                    cpu_pct: 99.0,
+                },
+                i as i64,
+            );
         }
         assert!(health.snapshot().wedged);
 
@@ -317,12 +334,36 @@ mod tests {
     #[test]
     fn saturation_run_must_be_consecutive() {
         let health = SyspolicydHealth::new();
-        health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 99.0 }, 1);
-        health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 99.0 }, 2);
+        health.record_sample(
+            SyspolicydSample {
+                pid: 520,
+                cpu_pct: 99.0,
+            },
+            1,
+        );
+        health.record_sample(
+            SyspolicydSample {
+                pid: 520,
+                cpu_pct: 99.0,
+            },
+            2,
+        );
         // Dip below threshold resets the counter…
-        health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 10.0 }, 3);
+        health.record_sample(
+            SyspolicydSample {
+                pid: 520,
+                cpu_pct: 10.0,
+            },
+            3,
+        );
         // …so this fresh saturated sample is only the first of a new run.
-        let status = health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 99.0 }, 4);
+        let status = health.record_sample(
+            SyspolicydSample {
+                pid: 520,
+                cpu_pct: 99.0,
+            },
+            4,
+        );
         assert!(!status.wedged);
         assert_eq!(status.saturated_since_epoch, Some(4));
     }
@@ -331,7 +372,13 @@ mod tests {
     fn absent_clears_state() {
         let health = SyspolicydHealth::new();
         for i in 0..SATURATION_SAMPLES_TO_ALERT {
-            health.record_sample(SyspolicydSample { pid: 520, cpu_pct: 99.0 }, i as i64);
+            health.record_sample(
+                SyspolicydSample {
+                    pid: 520,
+                    cpu_pct: 99.0,
+                },
+                i as i64,
+            );
         }
         assert!(health.snapshot().wedged);
         health.record_absent();

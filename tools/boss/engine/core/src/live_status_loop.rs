@@ -119,10 +119,7 @@ impl LiveStatusDebugStore {
     }
 
     pub fn snapshot_all(&self) -> HashMap<u8, SlotDebugSnapshot> {
-        self.inner
-            .lock()
-            .expect("debug store mutex poisoned")
-            .clone()
+        self.inner.lock().expect("debug store mutex poisoned").clone()
     }
 
     fn update<F: FnOnce(&mut SlotDebugSnapshot)>(&self, slot_id: u8, f: F) {
@@ -132,10 +129,7 @@ impl LiveStatusDebugStore {
     }
 
     fn forget(&self, slot_id: u8) {
-        self.inner
-            .lock()
-            .expect("debug store mutex poisoned")
-            .remove(&slot_id);
+        self.inner.lock().expect("debug store mutex poisoned").remove(&slot_id);
     }
 }
 
@@ -283,10 +277,7 @@ impl DispatcherStats {
     }
 
     pub fn last_hook(&self) -> Option<LastHookSnapshot> {
-        self.last_hook
-            .lock()
-            .expect("last_hook mutex poisoned")
-            .clone()
+        self.last_hook.lock().expect("last_hook mutex poisoned").clone()
     }
 
     /// Read-only snapshot of every counter as plain `u64`. Populated
@@ -408,10 +399,7 @@ impl TranscriptPathCache {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("transcript path cache poisoned")
-            .len()
+        self.inner.lock().expect("transcript path cache poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -512,10 +500,7 @@ pub struct DisabledSlots(StdMutex<HashSet<u8>>);
 
 impl DisabledSlots {
     pub fn is_disabled(&self, slot_id: u8) -> bool {
-        self.0
-            .lock()
-            .expect("disabled-slots mutex poisoned")
-            .contains(&slot_id)
+        self.0.lock().expect("disabled-slots mutex poisoned").contains(&slot_id)
     }
 
     fn set(&self, slot_id: u8, disabled: bool) -> bool {
@@ -671,10 +656,13 @@ impl LiveStatusManager {
         };
         let join = tokio::spawn(run_slot_loop(cfg, receiver));
         let mut guard = self.slots.lock().expect("manager mutex poisoned");
-        guard.insert(slot_id, SlotHandle {
-            sender,
-            join: Some(join),
-        });
+        guard.insert(
+            slot_id,
+            SlotHandle {
+                sender,
+                join: Some(join),
+            },
+        );
     }
 
     /// Send `Shutdown` to the slot's task (if any). The task will
@@ -682,11 +670,7 @@ impl LiveStatusManager {
     /// the JoinHandle is dropped on the floor so a stuck summarizer
     /// HTTP call cannot block `release_worker_pane`.
     pub fn stop_slot(&self, slot_id: u8) {
-        let handle = self
-            .slots
-            .lock()
-            .expect("manager mutex poisoned")
-            .remove(&slot_id);
+        let handle = self.slots.lock().expect("manager mutex poisoned").remove(&slot_id);
         if let Some(mut h) = handle {
             tracing::info!(slot_id, "live_status: stop_slot — tearing down per-slot task");
             // Best-effort: send Shutdown, then drop the sender so the
@@ -820,9 +804,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 };
                 match new_activity {
                     WorkerActivity::Errored => {
-                        if registry
-                            .set_live_status(slot_id, Some(live_status::ERRORED_LITERAL.to_owned()))
-                        {
+                        if registry.set_live_status(slot_id, Some(live_status::ERRORED_LITERAL.to_owned())) {
                             broadcaster.broadcast_live_worker_states().await;
                         }
                         continue;
@@ -833,12 +815,10 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                         // card is not misleading.
                         let prior = registry.get(slot_id).and_then(|s| s.live_status);
                         if prior.is_none()
-                            && registry.set_live_status(
-                                slot_id,
-                                Some(live_status::AWAITING_INPUT_LITERAL.to_owned()),
-                            ) {
-                                broadcaster.broadcast_live_worker_states().await;
-                            }
+                            && registry.set_live_status(slot_id, Some(live_status::AWAITING_INPUT_LITERAL.to_owned()))
+                        {
+                            broadcaster.broadcast_live_worker_states().await;
+                        }
                         continue;
                     }
                     WorkerActivity::Spawning | WorkerActivity::Terminated => {
@@ -863,10 +843,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         }
 
         // Quiet states never refresh.
-        if matches!(
-            last_activity,
-            WorkerActivity::Spawning | WorkerActivity::Terminated
-        ) {
+        if matches!(last_activity, WorkerActivity::Spawning | WorkerActivity::Terminated) {
             tracing::debug!(
                 slot_id,
                 activity = last_activity.as_str(),
@@ -885,10 +862,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             snap.disabled = disabled_now;
         });
         if disabled_now {
-            tracing::info!(
-                slot_id,
-                "live_status: skip — slot disabled by per-slot toggle",
-            );
+            tracing::info!(slot_id, "live_status: skip — slot disabled by per-slot toggle",);
             if registry.set_live_status(slot_id, None) {
                 broadcaster.broadcast_live_worker_states().await;
             }
@@ -899,20 +873,21 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // and a prior `live_status` is still set, drop it.
         if last_activity == WorkerActivity::Idle
             && let Some(idle_at) = idle_since
-                && idle_at.elapsed() >= IDLE_CLEAR_AFTER {
-                    tracing::info!(
-                        slot_id,
-                        idle_for_s = idle_at.elapsed().as_secs(),
-                        "live_status: clearing live_status — idle grace expired",
-                    );
-                    if registry.set_live_status(slot_id, None) {
-                        broadcaster.broadcast_live_worker_states().await;
-                    }
-                    idle_since = None;
-                    continue;
-                }
-            // Within the 30s grace — fall through and let the summary
-            // path describe the last action before settling.
+            && idle_at.elapsed() >= IDLE_CLEAR_AFTER
+        {
+            tracing::info!(
+                slot_id,
+                idle_for_s = idle_at.elapsed().as_secs(),
+                "live_status: clearing live_status — idle grace expired",
+            );
+            if registry.set_live_status(slot_id, None) {
+                broadcaster.broadcast_live_worker_states().await;
+            }
+            idle_since = None;
+            continue;
+        }
+        // Within the 30s grace — fall through and let the summary
+        // path describe the last action before settling.
 
         // Rate limit. The single-task design ensures only one
         // summarize call is outstanding at a time — the channel
@@ -923,8 +898,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             if elapsed < SUCCESS_COOLDOWN {
                 tracing::debug!(
                     slot_id,
-                    cooldown_remaining_ms =
-                        SUCCESS_COOLDOWN.saturating_sub(elapsed).as_millis() as u64,
+                    cooldown_remaining_ms = SUCCESS_COOLDOWN.saturating_sub(elapsed).as_millis() as u64,
                     "live_status: skip — within success cooldown",
                 );
                 continue;
@@ -974,10 +948,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             transcript_buffer.drain(0..drop_n);
         }
         if transcript_buffer.is_empty() {
-            tracing::debug!(
-                slot_id,
-                "live_status: skip — transcript buffer empty after poll",
-            );
+            tracing::debug!(slot_id, "live_status: skip — transcript buffer empty after poll",);
             continue;
         }
 
@@ -985,8 +956,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         // — we'd rather pay this cost twice on the rare diagnostic
         // path than thread the byte count out of the summarizer's
         // private helper.
-        let redacted_bytes =
-            live_status::redact_and_assemble(&transcript_buffer).len();
+        let redacted_bytes = live_status::redact_and_assemble(&transcript_buffer).len();
         debug_store.update(slot_id, |snap| {
             snap.last_redacted_bytes = Some(redacted_bytes);
         });
@@ -998,8 +968,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             "live_status: calling summarizer",
         );
 
-        let outcome =
-            live_status::summarize_transcript(api_key.as_deref(), &transcript_buffer).await;
+        let outcome = live_status::summarize_transcript(api_key.as_deref(), &transcript_buffer).await;
 
         // Always update the debug store with the outcome so the
         // verb can show "last attempt" even when the loop keeps
@@ -1076,11 +1045,15 @@ fn compute_timer_delay(
     match activity {
         WorkerActivity::Working => {
             let elapsed = last_success_at.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-            WORKING_TIMER_FLOOR.saturating_sub(elapsed).max(Duration::from_millis(50))
+            WORKING_TIMER_FLOOR
+                .saturating_sub(elapsed)
+                .max(Duration::from_millis(50))
         }
         WorkerActivity::Idle => {
             if let Some(t) = idle_since {
-                IDLE_CLEAR_AFTER.saturating_sub(t.elapsed()).max(Duration::from_millis(50))
+                IDLE_CLEAR_AFTER
+                    .saturating_sub(t.elapsed())
+                    .max(Duration::from_millis(50))
             } else {
                 Duration::from_secs(3_600)
             }
@@ -1139,8 +1112,7 @@ mod tests {
             let mgr = LiveStatusManager::new();
             let registry = Arc::new(LiveWorkerStateRegistry::new());
             registry.register_spawn(3, "run-a", "claude-opus-4-7", 0, None);
-            let bc: Arc<dyn LiveStatusBroadcaster> =
-                Arc::new(CountingBroadcaster::default());
+            let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
             let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
             mgr.start_slot(3, "run-a".into(), None, registry.clone(), bc.clone(), res.clone());
             assert!(mgr.has_slot(3));
@@ -1170,10 +1142,7 @@ mod tests {
         // Let the task pick up the trigger and write the literal.
         tokio::time::sleep(Duration::from_millis(50)).await;
         let state = registry.get(1).unwrap();
-        assert_eq!(
-            state.live_status.as_deref(),
-            Some(live_status::ERRORED_LITERAL),
-        );
+        assert_eq!(state.live_status.as_deref(), Some(live_status::ERRORED_LITERAL),);
         assert!(bc.calls.load(Ordering::Relaxed) >= 1);
         mgr.stop_slot(1);
     }
@@ -1213,8 +1182,7 @@ mod tests {
         let mgr = LiveStatusManager::new();
         let registry = Arc::new(LiveWorkerStateRegistry::new());
         registry.register_spawn(4, "run-4", "claude-opus-4-7", 0, None);
-        let bc: Arc<dyn LiveStatusBroadcaster> =
-            Arc::new(CountingBroadcaster::default());
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
         let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
         mgr.start_slot(4, "run-4".into(), None, registry, bc, res);
         assert!(mgr.has_slot(4));
@@ -1322,8 +1290,7 @@ mod tests {
         let mgr = LiveStatusManager::new();
         let registry = Arc::new(LiveWorkerStateRegistry::new());
         registry.register_spawn(7, "run-7", "claude-opus-4-7", 0, None);
-        let bc: Arc<dyn LiveStatusBroadcaster> =
-            Arc::new(CountingBroadcaster::default());
+        let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
         let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
         mgr.start_slot(7, "run-7".into(), None, registry, bc, res);
         mgr.notify(7, Trigger::Stop);
@@ -1346,8 +1313,7 @@ mod tests {
             let mgr = LiveStatusManager::new();
             let registry = Arc::new(LiveWorkerStateRegistry::new());
             registry.register_spawn(8, "run-8", "claude-opus-4-7", 0, None);
-            let bc: Arc<dyn LiveStatusBroadcaster> =
-                Arc::new(CountingBroadcaster::default());
+            let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
             let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
             mgr.start_slot(8, "run-8".into(), None, registry, bc, res);
             mgr.notify(8, Trigger::Stop);

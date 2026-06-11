@@ -70,10 +70,7 @@ impl WorkDb {
         Ok(cancelled)
     }
 
-    pub fn cancel_running_execution_and_demote_task(
-        &self,
-        execution_id: &str,
-    ) -> Result<(bool, bool)> {
+    pub fn cancel_running_execution_and_demote_task(&self, execution_id: &str) -> Result<(bool, bool)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -153,8 +150,7 @@ impl WorkDb {
             .with_context(|| format!("unknown work item: {work_item_id}"))?;
         let id = next_id("esc");
         let now = now_string();
-        let markers_json =
-            serde_json::to_string(markers).context("serialise effort escalation markers")?;
+        let markers_json = serde_json::to_string(markers).context("serialise effort escalation markers")?;
         tx.execute(
             "INSERT INTO effort_escalations
                  (id, product_id, work_item_id, original_level, new_level, markers, rule_id, created_at)
@@ -205,10 +201,7 @@ impl WorkDb {
         }
         sql.push_str(" ORDER BY created_at DESC, id DESC");
         let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
-            .collect();
+        let refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
         let rows = stmt.query_map(refs.as_slice(), map_effort_escalation)?;
         let mut out = Vec::new();
         for row in rows {
@@ -222,10 +215,7 @@ impl WorkDb {
     /// per-marker `matches` denominator. Excludes deleted rows and
     /// non-chore kinds — the audit is a per-product chore-corpus
     /// snapshot, not a cross-kind scan.
-    pub fn list_chores_for_audit(
-        &self,
-        product_id: &str,
-    ) -> Result<Vec<crate::audit_effort::ChoreForAudit>> {
+    pub fn list_chores_for_audit(&self, product_id: &str) -> Result<Vec<crate::audit_effort::ChoreForAudit>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT name, description
@@ -249,10 +239,7 @@ impl WorkDb {
 
     /// Most-recent execution for `work_item_id`, ordered by creation.
     /// `Ok(None)` when the work item has never had an execution.
-    pub fn latest_execution_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<WorkExecution>> {
+    pub fn latest_execution_for_work_item(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
@@ -290,8 +277,8 @@ impl WorkDb {
         raw: &serde_json::Value,
     ) -> Result<()> {
         let conn = self.connect()?;
-        let raw_json = serde_json::to_string(raw)
-            .with_context(|| format!("failed to serialise raw blob for {work_item_id}"))?;
+        let raw_json =
+            serde_json::to_string(raw).with_context(|| format!("failed to serialise raw blob for {work_item_id}"))?;
         let n = conn.execute(
             "UPDATE tasks
              SET external_ref_kind         = ?2,
@@ -400,10 +387,7 @@ impl WorkDb {
     /// the canonical-id → work-item map for each reconcile pass.
     ///
     /// Soft-deleted tasks are excluded.
-    pub fn list_external_refs_for_product(
-        &self,
-        product_id: &str,
-    ) -> Result<Vec<(String, StoredExternalRef)>> {
+    pub fn list_external_refs_for_product(&self, product_id: &str) -> Result<Vec<(String, StoredExternalRef)>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, external_ref_kind, external_ref_canonical_id,
@@ -467,10 +451,7 @@ impl WorkDb {
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(false);
         };
-        if task.deleted_at.is_some()
-            || task.status == TaskStatus::Done
-            || task.status == TaskStatus::Archived
-        {
+        if task.deleted_at.is_some() || task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
             return Ok(false);
         }
         let now = now_string();
@@ -519,10 +500,7 @@ impl WorkDb {
     ///
     /// The tuple is `(upstream_checksum, boss_checksum)` where each is a
     /// SHA-256 hex string computed by [`content_checksum`].
-    pub fn reconciler_get_content_checksums(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<(String, String)>> {
+    pub fn reconciler_get_content_checksums(&self, work_item_id: &str) -> Result<Option<(String, String)>> {
         let conn = self.connect()?;
         let result = conn
             .query_row(
@@ -592,7 +570,14 @@ impl WorkDb {
                  updated_at                         = ?6
              WHERE id = ?1
                AND deleted_at IS NULL",
-            params![work_item_id, new_name, new_description, upstream_checksum, boss_checksum, now],
+            params![
+                work_item_id,
+                new_name,
+                new_description,
+                upstream_checksum,
+                boss_checksum,
+                now
+            ],
         )?;
         Ok(n > 0)
     }

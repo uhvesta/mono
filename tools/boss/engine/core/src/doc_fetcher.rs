@@ -57,18 +57,12 @@ pub enum DocFetchOutcome {
 /// from the merge poller (e.g. `"main"` or a commit sha). Slashed branch names
 /// like `boss/exec_*` are handled correctly by passing `ref` as a `-f` query
 /// field with `--method GET` so `gh` URL-encodes the `/` for us.
-pub async fn fetch_design_doc(
-    repo_remote_url: &str,
-    doc_path: &str,
-    ref_name: &str,
-) -> DocFetchOutcome {
+pub async fn fetch_design_doc(repo_remote_url: &str, doc_path: &str, ref_name: &str) -> DocFetchOutcome {
     let (owner, repo) = match git_utils::repo_slug::parse_github_owner_repo(repo_remote_url) {
         Ok(pair) => pair,
         Err(err) => {
             return DocFetchOutcome::FetchFailed {
-                reason: format!(
-                    "cannot derive owner/repo from repo_remote_url {repo_remote_url:?}: {err}"
-                ),
+                reason: format!("cannot derive owner/repo from repo_remote_url {repo_remote_url:?}: {err}"),
             };
         }
     };

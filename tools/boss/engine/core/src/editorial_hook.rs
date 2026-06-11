@@ -218,10 +218,7 @@ impl DenyTracker {
     /// command starts fresh.
     pub fn forget(&self, execution_id: &str, command: &str) {
         let key = Self::key(execution_id, command);
-        self.inner
-            .lock()
-            .expect("DenyTracker mutex poisoned")
-            .remove(&key);
+        self.inner.lock().expect("DenyTracker mutex poisoned").remove(&key);
     }
 
     fn key(execution_id: &str, command: &str) -> String {
@@ -333,11 +330,7 @@ pub fn evaluate_gh_pretooluse(
             deny_tracker.forget(execution_id, command);
             EditorialOutcome::allow()
         }
-        EditorialDecision::Rewrite {
-            body,
-            title,
-            findings,
-        } => {
+        EditorialDecision::Rewrite { body, title, findings } => {
             // Step 4 (rewrite branch): apply the redactions in place.
             deny_tracker.forget(execution_id, command);
             apply_rewrite(command, &args, &body_source, &body, title.as_deref(), findings)
@@ -461,11 +454,7 @@ fn resolve_body(args: &GhArgs, cwd: &Path) -> Option<(String, BodySource)> {
 /// verbatim; relative paths are joined onto `cwd` (R14).
 fn resolve_path(cwd: &Path, raw_path: &str) -> PathBuf {
     let p = Path::new(raw_path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    }
+    if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
 }
 
 /// Where the evaluated body came from, so a rewrite knows whether to edit
@@ -613,22 +602,21 @@ fn parse_gh_args(command: &str) -> GhArgs {
             raw.as_str(),
             "--body" | "-b" | "--body-file" | "-F" | "--title" | "-t" | "--message" | "-m"
         );
-        if takes_value
-            && let Some(next) = tokens.get(i + 1) {
-                let spanned = SpannedValue {
-                    value: next.value.clone(),
-                    span: (next.start, next.end),
-                };
-                match raw.as_str() {
-                    "--body" | "-b" => args.body = Some(spanned),
-                    "--body-file" | "-F" => args.body_file = Some(next.value.clone()),
-                    "--title" | "-t" => args.title = Some(spanned),
-                    "--message" | "-m" => args.message = Some(spanned),
-                    _ => {}
-                }
-                i += 2;
-                continue;
+        if takes_value && let Some(next) = tokens.get(i + 1) {
+            let spanned = SpannedValue {
+                value: next.value.clone(),
+                span: (next.start, next.end),
+            };
+            match raw.as_str() {
+                "--body" | "-b" => args.body = Some(spanned),
+                "--body-file" | "-F" => args.body_file = Some(next.value.clone()),
+                "--title" | "-t" => args.title = Some(spanned),
+                "--message" | "-m" => args.message = Some(spanned),
+                _ => {}
             }
+            i += 2;
+            continue;
+        }
 
         i += 1;
     }
@@ -690,10 +678,7 @@ fn tokenize(command: &str) -> Vec<Token> {
                 b'"' => {
                     i += 1;
                     while i < len && bytes[i] != b'"' {
-                        if bytes[i] == b'\\'
-                            && i + 1 < len
-                            && matches!(bytes[i + 1], b'"' | b'\\' | b'$' | b'`')
-                        {
+                        if bytes[i] == b'\\' && i + 1 < len && matches!(bytes[i + 1], b'"' | b'\\' | b'$' | b'`') {
                             buf.push(bytes[i + 1]);
                             i += 2;
                         } else {
@@ -733,11 +718,7 @@ fn dequote(raw: &str) -> String {
     // Reuse the tokenizer over a single-token slice. The value joins all
     // adjacent quoted/unquoted runs, which is exactly the shell behaviour
     // for `--body="a"'b'`.
-    tokenize(raw)
-        .into_iter()
-        .map(|t| t.value)
-        .collect::<Vec<_>>()
-        .join("")
+    tokenize(raw).into_iter().map(|t| t.value).collect::<Vec<_>>().join("")
 }
 
 /// Single-quote `s` for safe re-insertion into a shell command, escaping
@@ -864,7 +845,10 @@ mod tests {
                 updated_command: Some(new_cmd),
                 ..
             } => {
-                assert!(!new_cmd.contains("exec_18b07a506d2518d0_1b"), "id must be gone: {new_cmd}");
+                assert!(
+                    !new_cmd.contains("exec_18b07a506d2518d0_1b"),
+                    "id must be gone: {new_cmd}"
+                );
                 assert!(new_cmd.starts_with("gh pr create --title t --body "));
             }
             other => panic!("expected AllowWithRewrite, got {other:?}"),
@@ -902,9 +886,7 @@ mod tests {
             &DenyTracker::new(),
         );
         match &out.decision {
-            PreToolUseDecision::AllowWithRewrite {
-                updated_command, ..
-            } => {
+            PreToolUseDecision::AllowWithRewrite { updated_command, .. } => {
                 // A --body-file rewrite leaves the command unchanged.
                 assert!(updated_command.is_none(), "command should be unchanged");
             }
@@ -953,11 +935,20 @@ mod tests {
         let tracker = DenyTracker::new();
         let a = "gh pr create --title t --body 'the engine did it'";
         let b = "gh issue comment 1 --body 'the coordinator said so'";
-        assert!(matches!(run(a, tmp.path(), &tracker).decision, PreToolUseDecision::Deny { .. }));
-        assert!(matches!(run(b, tmp.path(), &tracker).decision, PreToolUseDecision::Deny { .. }));
+        assert!(matches!(
+            run(a, tmp.path(), &tracker).decision,
+            PreToolUseDecision::Deny { .. }
+        ));
+        assert!(matches!(
+            run(b, tmp.path(), &tracker).decision,
+            PreToolUseDecision::Deny { .. }
+        ));
         // `a` is still on its first deny, so a second `a` denies again
         // (not flipped).
-        assert!(matches!(run(a, tmp.path(), &tracker).decision, PreToolUseDecision::Deny { .. }));
+        assert!(matches!(
+            run(a, tmp.path(), &tracker).decision,
+            PreToolUseDecision::Deny { .. }
+        ));
     }
 
     #[test]

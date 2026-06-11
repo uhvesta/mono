@@ -21,21 +21,19 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::external::{
-    ExternalCheckPackageImplementation, parse_declarative_check_manifest,
-    parse_external_check_package_manifest,
+    ExternalCheckPackageImplementation, parse_declarative_check_manifest, parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::{Finding, Severity};
 
 use super::selector::Selector;
 use super::template::{RenderContext, Template};
-use super::{ExternalCheckDeclarativePackage, ExitOutcome, ExitSemantics, InvocationMode};
+use super::{ExitOutcome, ExitSemantics, ExternalCheckDeclarativePackage, InvocationMode};
 
 // The committed manifest — the single source of truth for the buildifier
 // declarative check definition. Tests source from this file so the test and the
 // shipped definition cannot drift.
-const BUILDIFIER_MANIFEST: &str =
-    include_str!("../../../checks/buildifier/check.yaml");
+const BUILDIFIER_MANIFEST: &str = include_str!("../../../checks/buildifier/check.yaml");
 
 // Real buildifier 7.3.1 `--mode=check --format=json` output for an unformatted file.
 const REAL_FORMAT_UNFORMATTED: &[u8] =
@@ -54,8 +52,7 @@ const REAL_LINT_CLEAN: &[u8] =
     br#"{"success":true,"files":[{"filename":"a/b/clean.bzl","formatted":true,"valid":true,"warnings":[]}]}"#;
 
 fn parse_package() -> ExternalCheckDeclarativePackage {
-    let package = parse_declarative_check_manifest(BUILDIFIER_MANIFEST)
-        .expect("spike manifest must parse");
+    let package = parse_declarative_check_manifest(BUILDIFIER_MANIFEST).expect("spike manifest must parse");
     assert_eq!(package.id, "buildifier");
     assert_eq!(package.runtime, "declarative-v1");
     match package.implementation {
@@ -76,18 +73,9 @@ fn manifest_parses_into_two_invocations() {
     assert_eq!(package.invocations[1].mode, InvocationMode::PerFile);
     assert!(package.needs.contains_key("buildifier"));
     // exit `0 -> findings`, everything else -> error.
-    assert_eq!(
-        package.invocations[0].exit.classify(Some(0)),
-        ExitOutcome::Findings
-    );
-    assert_eq!(
-        package.invocations[0].exit.classify(Some(1)),
-        ExitOutcome::Error
-    );
-    assert_eq!(
-        package.invocations[0].exit.classify(None),
-        ExitOutcome::Error
-    );
+    assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Findings);
+    assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Error);
+    assert_eq!(package.invocations[0].exit.classify(None), ExitOutcome::Error);
 }
 
 #[test]
@@ -104,10 +92,7 @@ fn manifest_rejects_unknown_transform_kind() {
 fn manifest_rejects_invocation_with_unknown_binary() {
     let manifest = BUILDIFIER_MANIFEST.replace("run: buildifier", "run: nonexistent");
     let err = parse_declarative_check_manifest(&manifest).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("unknown binary"),
-        "unexpected: {err:#}"
-    );
+    assert!(format!("{err:#}").contains("unknown binary"), "unexpected: {err:#}");
 }
 
 #[test]
@@ -168,10 +153,8 @@ kind = "passthrough"
 
 #[test]
 fn manifest_accepts_passthrough_transform() {
-    let package = parse_external_check_package_manifest(
-        &PASSTHROUGH_MANIFEST.replace("TOOL_PATH", "emit_findings"),
-    )
-    .expect("passthrough manifest must parse");
+    let package = parse_external_check_package_manifest(&PASSTHROUGH_MANIFEST.replace("TOOL_PATH", "emit_findings"))
+        .expect("passthrough manifest must parse");
     match package.implementation {
         ExternalCheckPackageImplementation::Declarative(declarative) => {
             assert_eq!(declarative.invocations.len(), 1);
@@ -299,18 +282,30 @@ fn selector_flattens_nested_warnings() {
 #[test]
 fn template_renders_item_and_context_refs() {
     let item: Value = serde_json::json!({"start": {"line": 11}, "category": "no-effect"});
-    let context = RenderContext { input_file: Some("x/y.bzl"), exit_code: Some(0) };
+    let context = RenderContext {
+        input_file: Some("x/y.bzl"),
+        exit_code: Some(0),
+    };
 
     assert_eq!(
-        Template::parse("{{item.start.line}}").unwrap().render(&item, context).unwrap(),
+        Template::parse("{{item.start.line}}")
+            .unwrap()
+            .render(&item, context)
+            .unwrap(),
         "11"
     );
     assert_eq!(
-        Template::parse("{{input.file}}").unwrap().render(&item, context).unwrap(),
+        Template::parse("{{input.file}}")
+            .unwrap()
+            .render(&item, context)
+            .unwrap(),
         "x/y.bzl"
     );
     assert_eq!(
-        Template::parse("{{item.category}}: hi").unwrap().render(&item, context).unwrap(),
+        Template::parse("{{item.category}}: hi")
+            .unwrap()
+            .render(&item, context)
+            .unwrap(),
         "no-effect: hi"
     );
 }
@@ -318,8 +313,14 @@ fn template_renders_item_and_context_refs() {
 #[test]
 fn template_input_file_unavailable_in_batch_errors() {
     let item: Value = serde_json::json!({});
-    let context = RenderContext { input_file: None, exit_code: Some(0) };
-    let err = Template::parse("{{input.file}}").unwrap().render(&item, context).unwrap_err();
+    let context = RenderContext {
+        input_file: None,
+        exit_code: Some(0),
+    };
+    let err = Template::parse("{{input.file}}")
+        .unwrap()
+        .render(&item, context)
+        .unwrap_err();
     assert!(format!("{err:#}").contains("per_file mode"));
 }
 
@@ -453,12 +454,13 @@ fn e2e_bazel_resolver_resolves_buildifier() {
     }
     // Exercises the framework-owned bazel resolver.
     let root = workspace_root();
-    let resolved = super::resolve::resolve_bazel_target_executable(
-        &root,
-        "@buildifier_prebuilt//:buildifier",
-    )
-    .expect("bazel must resolve buildifier");
-    assert!(resolved.exists(), "resolved buildifier path must exist: {}", resolved.display());
+    let resolved = super::resolve::resolve_bazel_target_executable(&root, "@buildifier_prebuilt//:buildifier")
+        .expect("bazel must resolve buildifier");
+    assert!(
+        resolved.exists(),
+        "resolved buildifier path must exist: {}",
+        resolved.display()
+    );
 }
 
 #[test]
@@ -469,11 +471,8 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
     // Full pipeline: file selection -> binary resolution (path override to the
     // bazel-resolved buildifier) -> invocations -> exit semantics -> transform.
     let root = workspace_root();
-    let buildifier = super::resolve::resolve_bazel_target_executable(
-        &root,
-        "@buildifier_prebuilt//:buildifier",
-    )
-    .expect("resolve buildifier");
+    let buildifier = super::resolve::resolve_bazel_target_executable(&root, "@buildifier_prebuilt//:buildifier")
+        .expect("resolve buildifier");
 
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(temp.path().join("a/b")).unwrap();
@@ -481,11 +480,8 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
     std::fs::write(temp.path().join("a/b/clean.bzl"), "\"\"\"clean.\"\"\"\n").unwrap();
 
     let package = parse_package();
-    let config: toml::Value = toml::from_str(&format!(
-        "[needs.buildifier]\npath = \"{}\"\n",
-        buildifier.display()
-    ))
-    .unwrap();
+    let config: toml::Value =
+        toml::from_str(&format!("[needs.buildifier]\npath = \"{}\"\n", buildifier.display())).unwrap();
 
     let changeset = ChangeSet::new(vec![
         ChangedFile {
@@ -500,14 +496,8 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
         },
     ]);
 
-    let result = super::run_declarative_check(
-        temp.path(),
-        "buildifier",
-        &package,
-        &changeset,
-        &config,
-    )
-    .expect("declarative run");
+    let result = super::run_declarative_check(temp.path(), "buildifier", &package, &changeset, &config)
+        .expect("declarative run");
 
     // The fixture is format-clean but has 3 lint warnings.
     let lint: Vec<&Finding> = result
@@ -518,9 +508,18 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
     assert_eq!(lint.len(), 3, "expected 3 lint findings, got {:#?}", result.findings);
 
     let messages: Vec<&str> = lint.iter().map(|f| f.message.as_str()).collect();
-    assert!(messages.iter().any(|m| m.contains("module-docstring")), "expected module-docstring; got {messages:?}");
-    assert!(messages.iter().any(|m| m.contains("unused-variable")), "expected unused-variable; got {messages:?}");
-    assert!(messages.iter().any(|m| m.contains("no-effect")), "expected no-effect; got {messages:?}");
+    assert!(
+        messages.iter().any(|m| m.contains("module-docstring")),
+        "expected module-docstring; got {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("unused-variable")),
+        "expected unused-variable; got {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("no-effect")),
+        "expected no-effect; got {messages:?}"
+    );
 }
 
 // ── jaq smoke test ─────────────────────────────────────────────────────────────
@@ -539,8 +538,7 @@ fn jaq_deps_compile_and_evaluate() {
     use jaq_interpret::{Ctx, FilterT as _, Native, ParseCtx, RcIter, Val};
     use serde_json::json;
 
-    let (stdlib_defs, errs) =
-        jaq_parse::parse("def select(f): if f then . else empty end;", jaq_parse::defs());
+    let (stdlib_defs, errs) = jaq_parse::parse("def select(f): if f then . else empty end;", jaq_parse::defs());
     assert!(errs.is_empty(), "stdlib parse errors: {errs:?}");
 
     let (f, errs) = jaq_parse::parse(".a | select(.b == 1)", jaq_parse::main());

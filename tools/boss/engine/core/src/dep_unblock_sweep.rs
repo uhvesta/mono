@@ -46,9 +46,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::metrics::Registry;
-use crate::work::WorkDb;
 #[cfg(test)]
 use crate::work::TaskStatus;
+use crate::work::WorkDb;
 
 /// Interval between sweep passes.
 pub const DEP_UNBLOCK_SWEEP_INTERVAL_SECS: u64 = 30;
@@ -186,8 +186,7 @@ mod tests {
 
     use super::*;
     use crate::work::{
-        AddDependencyInput, CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb,
-        WorkItemPatch,
+        AddDependencyInput, CreateChoreInput, CreateProductInput, ExecutionStatus, WorkDb, WorkItemPatch,
     };
 
     fn open_db() -> (TempDir, WorkDb) {
@@ -264,7 +263,9 @@ mod tests {
 
         // Verify auto-block.
         let dep_before = db.get_work_item(&dep_id).unwrap();
-        let boss_protocol::WorkItem::Chore(before) = dep_before else { panic!() };
+        let boss_protocol::WorkItem::Chore(before) = dep_before else {
+            panic!()
+        };
         assert_eq!(before.status, TaskStatus::Blocked);
         assert_eq!(before.blocked_reason.as_deref(), Some("dependency"));
 
@@ -273,7 +274,9 @@ mod tests {
 
         // Dependent still blocked — cascade didn't fire.
         let dep_still = db.get_work_item(&dep_id).unwrap();
-        let boss_protocol::WorkItem::Chore(still) = dep_still else { panic!() };
+        let boss_protocol::WorkItem::Chore(still) = dep_still else {
+            panic!()
+        };
         assert_eq!(still.status, TaskStatus::Blocked, "must still be blocked before sweep");
 
         // Sweep must recover it.
@@ -284,7 +287,9 @@ mod tests {
         assert_eq!(outcome.rows_unblocked, 1, "sweep must unblock the stale dependent");
 
         let dep_after = db.get_work_item(&dep_id).unwrap();
-        let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
+        let boss_protocol::WorkItem::Chore(after) = dep_after else {
+            panic!()
+        };
         assert_eq!(after.status, TaskStatus::Todo);
         assert!(after.blocked_reason.is_none(), "blocked_reason must be cleared");
     }
@@ -316,10 +321,15 @@ mod tests {
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
 
-        assert_eq!(outcome.rows_unblocked, 1, "sweep must unblock despite last_status_actor='human'");
+        assert_eq!(
+            outcome.rows_unblocked, 1,
+            "sweep must unblock despite last_status_actor='human'"
+        );
 
         let dep_after = db.get_work_item(&dep_id).unwrap();
-        let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
+        let boss_protocol::WorkItem::Chore(after) = dep_after else {
+            panic!()
+        };
         assert_eq!(after.status, TaskStatus::Todo);
         assert!(after.blocked_reason.is_none());
     }
@@ -356,7 +366,9 @@ mod tests {
 
         // With the new blocked_reason guard the cascade must now unblock directly.
         let dep_after = db.get_work_item(&dep_id).unwrap();
-        let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
+        let boss_protocol::WorkItem::Chore(after) = dep_after else {
+            panic!()
+        };
         assert_eq!(
             after.status,
             TaskStatus::Todo,
@@ -388,7 +400,9 @@ mod tests {
         assert_eq!(outcome.rows_unblocked, 0, "must not unblock when prereq is still todo");
 
         let dep_after = db.get_work_item(&dep_id).unwrap();
-        let boss_protocol::WorkItem::Chore(after) = dep_after else { panic!() };
+        let boss_protocol::WorkItem::Chore(after) = dep_after else {
+            panic!()
+        };
         assert_eq!(after.status, TaskStatus::Blocked);
     }
 
@@ -441,7 +455,10 @@ mod tests {
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
 
-        assert_eq!(outcome.rows_unblocked, 1, "outcome must record the unblock so spawn_loop can kick");
+        assert_eq!(
+            outcome.rows_unblocked, 1,
+            "outcome must record the unblock so spawn_loop can kick"
+        );
     }
 
     /// Part B recovery: a `todo, autostart=true` task with a `waiting_dependency`
@@ -476,11 +493,16 @@ mod tests {
 
         // dep should now be `todo` with a `ready` execution (post-fix normal path).
         // Simulate the pre-fix stuck state: dep is `todo`, execution is `waiting_dependency`.
-        db.force_execution_status_for_test(&dep_id, ExecutionStatus::WaitingDependency).unwrap();
+        db.force_execution_status_for_test(&dep_id, ExecutionStatus::WaitingDependency)
+            .unwrap();
 
         let executions_before = db.list_executions(Some(&dep_id)).unwrap();
         assert_eq!(executions_before.len(), 1);
-        assert_eq!(executions_before[0].status, ExecutionStatus::WaitingDependency, "setup check");
+        assert_eq!(
+            executions_before[0].status,
+            ExecutionStatus::WaitingDependency,
+            "setup check"
+        );
 
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
@@ -489,7 +511,11 @@ mod tests {
 
         let executions_after = db.list_executions(Some(&dep_id)).unwrap();
         assert_eq!(executions_after.len(), 1);
-        assert_eq!(executions_after[0].status, ExecutionStatus::Ready, "execution must be promoted to ready");
+        assert_eq!(
+            executions_after[0].status,
+            ExecutionStatus::Ready,
+            "execution must be promoted to ready"
+        );
     }
 
     /// Part B: sweep must NOT promote a `todo` task that still has gating prereqs.
@@ -519,6 +545,9 @@ mod tests {
         let db = Arc::new(db);
         let outcome = run_one_pass(db.as_ref()).await;
 
-        assert_eq!(outcome.rows_stuck_promoted, 0, "must not promote while prereq is still todo");
+        assert_eq!(
+            outcome.rows_stuck_promoted, 0,
+            "must not promote while prereq is still todo"
+        );
     }
 }

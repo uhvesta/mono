@@ -123,7 +123,9 @@ pub struct TrackerConfigError {
 
 impl TrackerConfigError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into() }
+        Self {
+            message: message.into(),
+        }
     }
 }
 
@@ -183,11 +185,7 @@ pub trait ExternalTracker: Send + Sync {
     async fn fetch_items(&self, ctx: &TrackerContext) -> Result<Vec<UpstreamItem>>;
 
     /// Fetch a single upstream item by stable id.
-    async fn fetch_item(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-    ) -> Result<Option<UpstreamItem>>;
+    async fn fetch_item(&self, ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<Option<UpstreamItem>>;
 
     /// Close an upstream issue.
     ///
@@ -195,12 +193,7 @@ pub trait ExternalTracker: Send + Sync {
     /// is success.  Error classification drives reconciler retry behavior:
     /// `Transient` → retry; `PermissionDenied` → surface attention item;
     /// `NotFound` → treat as already-closed.
-    async fn close_issue(
-        &self,
-        ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-        reason: CloseReason,
-    ) -> Result<()>;
+    async fn close_issue(&self, ctx: &TrackerContext, ref_: &UpstreamRef, reason: CloseReason) -> Result<()>;
 
     /// Set the project-board status for an upstream item to the tracker's
     /// configured "in progress" column.
@@ -214,11 +207,7 @@ pub trait ExternalTracker: Send + Sync {
     /// trackers that do not have a project-board concept.
     ///
     /// Error classification: same as `close_issue`.
-    async fn set_project_status(
-        &self,
-        _ctx: &TrackerContext,
-        _ref_: &UpstreamRef,
-    ) -> Result<()> {
+    async fn set_project_status(&self, _ctx: &TrackerContext, _ref_: &UpstreamRef) -> Result<()> {
         Ok(())
     }
 
@@ -233,12 +222,7 @@ pub trait ExternalTracker: Send + Sync {
     /// label is success.
     ///
     /// Error classification: same as `close_issue`.
-    async fn add_label(
-        &self,
-        _ctx: &TrackerContext,
-        _ref_: &UpstreamRef,
-        _label: &str,
-    ) -> Result<()> {
+    async fn add_label(&self, _ctx: &TrackerContext, _ref_: &UpstreamRef, _label: &str) -> Result<()> {
         Ok(())
     }
 
@@ -257,12 +241,7 @@ pub trait ExternalTracker: Send + Sync {
     /// Error classification: same as `close_issue`.  A failure here is
     /// non-fatal: the issue is already closed; only the linkage comment is
     /// missing.
-    async fn post_closing_pr_comment(
-        &self,
-        _ctx: &TrackerContext,
-        _ref_: &UpstreamRef,
-        _pr_url: &str,
-    ) -> Result<()> {
+    async fn post_closing_pr_comment(&self, _ctx: &TrackerContext, _ref_: &UpstreamRef, _pr_url: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -290,10 +269,7 @@ impl TrackerRegistry {
     }
 
     /// Register a tracker.  Returns `Err` if the `kind` is already registered.
-    pub fn register(
-        &mut self,
-        tracker: Arc<dyn ExternalTracker>,
-    ) -> std::result::Result<(), RegistryError> {
+    pub fn register(&mut self, tracker: Arc<dyn ExternalTracker>) -> std::result::Result<(), RegistryError> {
         let kind = tracker.kind();
         if self.trackers.contains_key(kind) {
             return Err(RegistryError::AlreadyRegistered(kind));
@@ -344,20 +320,11 @@ impl ExternalTracker for EchoTracker {
         Ok(self.items.clone())
     }
 
-    async fn fetch_item(
-        &self,
-        _ctx: &TrackerContext,
-        ref_: &UpstreamRef,
-    ) -> Result<Option<UpstreamItem>> {
+    async fn fetch_item(&self, _ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<Option<UpstreamItem>> {
         Ok(self.items.iter().find(|i| i.upstream_ref == *ref_).cloned())
     }
 
-    async fn close_issue(
-        &self,
-        _ctx: &TrackerContext,
-        _ref_: &UpstreamRef,
-        _reason: CloseReason,
-    ) -> Result<()> {
+    async fn close_issue(&self, _ctx: &TrackerContext, _ref_: &UpstreamRef, _reason: CloseReason) -> Result<()> {
         Ok(())
     }
 }

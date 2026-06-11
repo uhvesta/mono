@@ -37,10 +37,7 @@ impl WorkDb {
 /// starting from direct children of `root_id`.  Depth is capped at 64 by
 /// the CTE's `UNION ALL` termination condition (no infinite loop in
 /// well-formed data; the engine never creates cycles).
-pub(crate) fn find_latest_active_revision_in_chain(
-    conn: &Connection,
-    root_id: &str,
-) -> Result<Option<String>> {
+pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &str) -> Result<Option<String>> {
     let id: Option<String> = conn
         .query_row(
             "WITH RECURSIVE chain(id) AS (
@@ -87,8 +84,7 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // ── 1. Resolve parent and chain root ────────────────────────────────────
     let parent_id = resolve_task_id_from_selector(conn, &input.parent_task_id)?;
     let root_id = chain_root(conn, &parent_id)?;
-    let root =
-        query_task(conn, &root_id)?.with_context(|| format!("chain root {root_id} not found"))?;
+    let root = query_task(conn, &root_id)?.with_context(|| format!("chain root {root_id} not found"))?;
 
     // ── 2. No PR → reject ───────────────────────────────────────────────────
     let pr_url = match &root.pr_url {
@@ -98,22 +94,16 @@ pub(crate) fn assert_parent_revisable_and_insert(
 
     // ── 3. Cached: task done → PR merged ────────────────────────────────────
     if root.status == TaskStatus::Done {
-        return Err(anyhow::Error::new(RevisionGateError::merged(
-            &root, &pr_url,
-        )));
+        return Err(anyhow::Error::new(RevisionGateError::merged(&root, &pr_url)));
     }
 
     // ── 4. Live probe for Open vs ClosedUnmerged ────────────────────────────
     match pr_checker.check(&pr_url)? {
         PrOpenState::Merged => {
-            return Err(anyhow::Error::new(RevisionGateError::merged(
-                &root, &pr_url,
-            )));
+            return Err(anyhow::Error::new(RevisionGateError::merged(&root, &pr_url)));
         }
         PrOpenState::ClosedUnmerged => {
-            return Err(anyhow::Error::new(RevisionGateError::closed(
-                &root, &pr_url,
-            )));
+            return Err(anyhow::Error::new(RevisionGateError::closed(&root, &pr_url)));
         }
         PrOpenState::Open => {}
     }
@@ -226,16 +216,16 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 
     // Group revision indices by root_id, sorted by created_at.
     // Key: root_id → Vec<(created_at, index)> sorted by created_at.
-    let mut by_root: std::collections::HashMap<String, Vec<(String, usize)>> =
-        std::collections::HashMap::new();
+    let mut by_root: std::collections::HashMap<String, Vec<(String, usize)>> = std::collections::HashMap::new();
     for (idx, t) in tasks.iter().enumerate() {
         if t.kind == TaskKind::Revision
-            && let Some((root_id, _)) = &root_info[idx] {
-                by_root
-                    .entry(root_id.clone())
-                    .or_default()
-                    .push((t.created_at.clone(), idx));
-            }
+            && let Some((root_id, _)) = &root_info[idx]
+        {
+            by_root
+                .entry(root_id.clone())
+                .or_default()
+                .push((t.created_at.clone(), idx));
+        }
     }
     for entries in by_root.values_mut() {
         entries.sort_by(|a, b| a.0.cmp(&b.0)); // stable sort by created_at
@@ -279,8 +269,7 @@ pub(crate) fn attach_revision_projections(mut tasks: Vec<Task>, chores: &[Task])
 /// the flag.
 pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut [Task]) {
     // Build a compact lookup: id → (kind, parent_task_id) for chain walking.
-    let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> =
-        std::collections::HashMap::new();
+    let mut lookup: std::collections::HashMap<String, (TaskKind, Option<String>)> = std::collections::HashMap::new();
     for t in tasks.iter().chain(chores.iter()) {
         lookup.insert(t.id.clone(), (t.kind.clone(), t.parent_task_id.clone()));
     }
@@ -303,13 +292,14 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
     }
 
     // Collect all root ids that have at least one in-progress revision.
-    let mut in_progress_roots: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut in_progress_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in tasks.iter() {
-        if t.kind == TaskKind::Revision && (t.status == TaskStatus::Todo || t.status == TaskStatus::Active)
-            && let Some(root_id) = walk_to_root(&t.id, &lookup) {
-                in_progress_roots.insert(root_id);
-            }
+        if t.kind == TaskKind::Revision
+            && (t.status == TaskStatus::Todo || t.status == TaskStatus::Active)
+            && let Some(root_id) = walk_to_root(&t.id, &lookup)
+        {
+            in_progress_roots.insert(root_id);
+        }
     }
 
     if in_progress_roots.is_empty() {
@@ -384,10 +374,7 @@ pub(crate) fn attach_ai_reviewing_flag(
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = candidate_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
+    let params: Vec<&dyn rusqlite::ToSql> = candidate_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
     let reviewing: std::collections::HashSet<String> = stmt
         .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
@@ -580,11 +567,7 @@ pub(crate) fn insert_design_task_for_project_in_tx(
 /// stored verbatim but logged so we can spot undocumented sources
 /// sneaking in. `id_for_log` and `kind_for_log` exist only to make
 /// the warning useful — they don't affect the stored value.
-pub(crate) fn canonicalize_created_via(
-    raw: Option<&str>,
-    id_for_log: &str,
-    kind_for_log: &str,
-) -> String {
+pub(crate) fn canonicalize_created_via(raw: Option<&str>, id_for_log: &str, kind_for_log: &str) -> String {
     let value = raw
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -618,10 +601,7 @@ pub fn normalize_priority(value: Option<&str>) -> Result<String> {
     }
 }
 
-pub(crate) fn insert_execution(
-    conn: &Connection,
-    input: CreateExecutionInput,
-) -> Result<WorkExecution> {
+pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -> Result<WorkExecution> {
     let repo_remote_url = resolve_execution_repo_remote_url(
         conn,
         &input.work_item_id,
@@ -692,10 +672,7 @@ mod tests {
     #[test]
     fn revision_name_skips_leading_blank_and_whitespace_lines() {
         let desc = "\n   \n\t\nFix the flaky retry loop\nmore detail";
-        assert_eq!(
-            revision_name_from_description(desc),
-            "Fix the flaky retry loop"
-        );
+        assert_eq!(revision_name_from_description(desc), "Fix the flaky retry loop");
     }
 
     #[test]
@@ -772,10 +749,7 @@ mod tests {
     #[test]
     fn normalize_priority_rejects_unknown_value() {
         let err = normalize_priority(Some("urgent")).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid priority"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("invalid priority"), "unexpected error: {err}");
     }
 
     // ── normalize_model_override ────────────────────────────────────────────

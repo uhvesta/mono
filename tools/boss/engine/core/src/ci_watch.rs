@@ -34,17 +34,20 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent};
 #[cfg(test)]
 use boss_protocol::TaskKind;
+use boss_protocol::{
+    CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, ExecutionKind, ExecutionStatus,
+    FrontendEvent,
+};
 use serde::Serialize;
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::ExecutionPublisher;
 use crate::merge_poller::{PrLifecycleProbe, RequiredCheckFailure, parse_pr_number, pr_labels_opt_out};
 use crate::work::{
-    CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck,
-    PrStateChecker, StrandedCiRemediationAttempt, WorkDb,
+    CiRemediation, CiRemediationInsertInput, CreateExecutionInput, PendingMergeCheck, PrStateChecker,
+    StrandedCiRemediationAttempt, WorkDb,
 };
 
 /// Pre-spawn classification (design §Q4 "pre-triage"): if every failure
@@ -83,11 +86,7 @@ const NEVER_STARTS_ALERT_THRESHOLD_SECS: i64 = 2 * 60 * 60;
 /// Unified opt-out gate. Mirrors `conflict_watch::auto_pr_maintenance_disabled`;
 /// the design (Phase 6 #18 / §Q7) requires both auto-remediation
 /// paths to honour the same per-product flag and per-PR label.
-fn auto_pr_maintenance_disabled(
-    work_db: &WorkDb,
-    candidate: &PendingMergeCheck,
-    labels: &[String],
-) -> bool {
+fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck, labels: &[String]) -> bool {
     if pr_labels_opt_out(labels) {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
@@ -184,10 +183,7 @@ async fn emit_exhausted_attention(
     }) {
         Ok(item) => {
             publisher
-                .publish_frontend_event_on_product(
-                    product_id,
-                    FrontendEvent::AttentionItemCreated { item },
-                )
+                .publish_frontend_event_on_product(product_id, FrontendEvent::AttentionItemCreated { item })
                 .await;
         }
         Err(err) => {
@@ -293,38 +289,34 @@ pub async fn on_ci_failure_detected(
     // Re-arm the side-table signal and either reconcile a still-`blocked` parent
     // back to `in_review` or no-op for an already-`in_review` parent, without
     // churning the flip / insert / budget path on every sweep.
-    if let Ok(Some(active)) =
-        work_db.active_ci_remediation_for_work_item(&candidate.work_item_id)
-        && active.revision_task_id.is_some() {
-            if work_db
-                .rearm_blocked_ci_failure_signal(&candidate.work_item_id)
-                .unwrap_or(false)
-            {
-                // Parent is still `blocked: ci_failure` with an active revision —
-                // reconcile it back to `in_review`; the revision card in Doing is
-                // the user-visible signal.
-                let reconciled = blocking_signal::reconcile_blocked_parent_with_revision(
-                    work_db,
-                    SignalKind::CiFailure,
-                    candidate,
-                    &active.id,
-                );
-                if reconciled {
-                    publisher
-                        .publish_work_item_changed(
-                            &candidate.product_id,
-                            &candidate.work_item_id,
-                            "ci_revision_in_flight",
-                        )
-                        .await;
-                }
-                return reconciled;
+    if let Ok(Some(active)) = work_db.active_ci_remediation_for_work_item(&candidate.work_item_id)
+        && active.revision_task_id.is_some()
+    {
+        if work_db
+            .rearm_blocked_ci_failure_signal(&candidate.work_item_id)
+            .unwrap_or(false)
+        {
+            // Parent is still `blocked: ci_failure` with an active revision —
+            // reconcile it back to `in_review`; the revision card in Doing is
+            // the user-visible signal.
+            let reconciled = blocking_signal::reconcile_blocked_parent_with_revision(
+                work_db,
+                SignalKind::CiFailure,
+                candidate,
+                &active.id,
+            );
+            if reconciled {
+                publisher
+                    .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_revision_in_flight")
+                    .await;
             }
-            // Parent is `in_review` (or human-moved): idempotent probe. Keep the
-            // in-flight signal armed so `maybe_clear_blocked` fires on green.
-            let _ = work_db.record_ci_failure_in_flight(&candidate.work_item_id, &active.id);
-            return false;
+            return reconciled;
         }
+        // Parent is `in_review` (or human-moved): idempotent probe. Keep the
+        // in-flight signal armed so `maybe_clear_blocked` fires on green.
+        let _ = work_db.record_ci_failure_in_flight(&candidate.work_item_id, &active.id);
+        return false;
+    }
 
     // Secondary pre-flight: gate on any ci-fix revision that is still
     // in flight (status `todo`, `active`, or `blocked`). The primary gate
@@ -403,13 +395,9 @@ pub async fn on_ci_failure_detected(
     // `ci_failure_exhausted` and emit the typed event, but do not
     // insert an attempt row.
     let used = work_db.get_ci_attempts_used(&candidate.work_item_id).unwrap_or(0);
-    let budget = work_db
-        .effective_ci_budget(&candidate.work_item_id)
-        .unwrap_or(3);
+    let budget = work_db.effective_ci_budget(&candidate.work_item_id).unwrap_or(3);
     if used >= budget {
-        match work_db
-            .mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url)
-        {
+        match work_db.mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url) {
             Ok(Some(_)) => {
                 publisher
                     .publish_work_item_changed(
@@ -430,8 +418,7 @@ pub async fn on_ci_failure_detected(
                         },
                     )
                     .await;
-                let check_names: Vec<&str> =
-                    failures.iter().map(|f| f.name.as_str()).collect();
+                let check_names: Vec<&str> = failures.iter().map(|f| f.name.as_str()).collect();
                 emit_exhausted_attention(
                     work_db,
                     publisher,
@@ -528,11 +515,8 @@ pub async fn on_ci_failure_detected(
         );
     }
 
-    let task_result = work_db.mark_chore_blocked_ci_failure(
-        &candidate.work_item_id,
-        &candidate.pr_url,
-        attempt_id.as_deref(),
-    );
+    let task_result =
+        work_db.mark_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url, attempt_id.as_deref());
     let task_transitioned = match task_result {
         Ok(Some(_)) => true,
         Ok(None) => {
@@ -575,19 +559,17 @@ pub async fn on_ci_failure_detected(
     // revision runs in Doing.
     let mut task_unblocked_for_revision = false;
     if let Some(ref a) = attempt
-        && a.attempt_kind == "fix" && a.status == "pending" && a.revision_task_id.is_none()
-            && maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await
-            {
-                task_unblocked_for_revision = blocking_signal::unblock_for_revision(
-                    work_db,
-                    SignalKind::CiFailure,
-                    candidate,
-                    &a.id,
-                );
-            }
-            // If the spawn was refused (create_revision gate), the attempt is
-            // abandoned and the parent stays `blocked: ci_failure` — the
-            // human-attention terminal.
+        && a.attempt_kind == "fix"
+        && a.status == "pending"
+        && a.revision_task_id.is_none()
+        && maybe_spawn_ci_revision(work_db, publisher, pr_checker, candidate, failures, a).await
+    {
+        task_unblocked_for_revision =
+            blocking_signal::unblock_for_revision(work_db, SignalKind::CiFailure, candidate, &a.id);
+    }
+    // If the spawn was refused (create_revision gate), the attempt is
+    // abandoned and the parent stays `blocked: ci_failure` — the
+    // human-attention terminal.
 
     // (The "parent already blocked with an active revision" reconcile case is
     // handled by the pre-flight early-exit above; here `task_unblocked_for_revision`
@@ -600,14 +582,16 @@ pub async fn on_ci_failure_detected(
         // been cleared back to `in_review` for an in-flight revision, but a fix
         // attempt still progressed, so the bump is keyed off the attempt, not
         // the parent's terminal status.
-        if attempt.is_some() && attempt_kind == "fix"
-            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
-                tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    ?err,
-                    "ci_watch: failed to increment ci_attempts_used",
-                );
-            }
+        if attempt.is_some()
+            && attempt_kind == "fix"
+            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id)
+        {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "ci_watch: failed to increment ci_attempts_used",
+            );
+        }
         // Parent stays in Review while the revision runs
         // (`ci_revision_in_flight`); it surfaces in Blocked
         // (`blocked_ci_failure`) only when there is no fix vehicle.
@@ -617,11 +601,7 @@ pub async fn on_ci_failure_detected(
             "blocked_ci_failure"
         };
         publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                change_reason,
-            )
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, change_reason)
             .await;
         if let Some(attempt) = attempt.as_ref() {
             // `retrigger` attempts produce no commit, so they stay on the
@@ -632,11 +612,13 @@ pub async fn on_ci_failure_detected(
             // us, so a second probe with the same triplet sees
             // `attempt = None` and skips this branch entirely.
             if attempt.attempt_kind == "retrigger" {
-                match work_db.create_execution(CreateExecutionInput::builder()
-                    .work_item_id(candidate.work_item_id.clone())
-                    .kind(ExecutionKind::CiRemediation)
-                    .status(ExecutionStatus::Ready)
-                    .build()) {
+                match work_db.create_execution(
+                    CreateExecutionInput::builder()
+                        .work_item_id(candidate.work_item_id.clone())
+                        .kind(ExecutionKind::CiRemediation)
+                        .status(ExecutionStatus::Ready)
+                        .build(),
+                ) {
                     Ok(_) => publisher.kick_scheduler(),
                     Err(err) => {
                         tracing::warn!(
@@ -746,9 +728,7 @@ async fn maybe_spawn_ci_revision(
                 error = %format!("{err:#}"),
                 "ci_watch: create_revision failed (parent likely no longer revisable); abandoning attempt",
             );
-            if let Err(abandon_err) =
-                work_db.mark_ci_remediation_abandoned(&attempt.id, "revision_create_failed")
-            {
+            if let Err(abandon_err) = work_db.mark_ci_remediation_abandoned(&attempt.id, "revision_create_failed") {
                 tracing::warn!(
                     attempt_id = %attempt.id,
                     ?abandon_err,
@@ -890,13 +870,9 @@ pub async fn on_merge_queue_rebounce_detected(
     }
 
     let used = work_db.get_ci_attempts_used(&candidate.work_item_id).unwrap_or(0);
-    let budget = work_db
-        .effective_ci_budget(&candidate.work_item_id)
-        .unwrap_or(3);
+    let budget = work_db.effective_ci_budget(&candidate.work_item_id).unwrap_or(3);
     if used >= budget {
-        match work_db
-            .mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url)
-        {
+        match work_db.mark_chore_blocked_ci_failure_exhausted(&candidate.work_item_id, &candidate.pr_url) {
             Ok(Some(_)) => {
                 publisher
                     .publish_work_item_changed(
@@ -998,11 +974,8 @@ pub async fn on_merge_queue_rebounce_detected(
 
     let attempt_id = attempt.as_ref().map(|a| a.id.clone());
 
-    let task_result = work_db.mark_chore_blocked_ci_failure(
-        &candidate.work_item_id,
-        &candidate.pr_url,
-        attempt_id.as_deref(),
-    );
+    let task_result =
+        work_db.mark_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url, attempt_id.as_deref());
     let task_transitioned = match task_result {
         Ok(Some(_)) => true,
         Ok(None) => {
@@ -1032,33 +1005,32 @@ pub async fn on_merge_queue_rebounce_detected(
     // known-open at this point (it was in the merge queue), so a static checker
     // is correct here and avoids a redundant `gh pr view` round-trip.
     if let Some(ref a) = attempt
-        && a.status == "pending" && a.revision_task_id.is_none() {
-            maybe_spawn_ci_revision(
-                work_db,
-                publisher,
-                &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
-                candidate,
-                &[], // no per-check failures for rebounce; directive uses failure_kind
-                a,
-            )
-            .await;
-        }
+        && a.status == "pending"
+        && a.revision_task_id.is_none()
+    {
+        maybe_spawn_ci_revision(
+            work_db,
+            publisher,
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+            candidate,
+            &[], // no per-check failures for rebounce; directive uses failure_kind
+            a,
+        )
+        .await;
+    }
 
     if task_transitioned {
         if attempt.is_some()
-            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id) {
-                tracing::warn!(
-                    work_item_id = %candidate.work_item_id,
-                    ?err,
-                    "ci_watch: failed to increment ci_attempts_used (rebounce)",
-                );
-            }
+            && let Err(err) = work_db.increment_ci_attempts_used(&candidate.work_item_id)
+        {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                ?err,
+                "ci_watch: failed to increment ci_attempts_used (rebounce)",
+            );
+        }
         publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "blocked_ci_failure",
-            )
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "blocked_ci_failure")
             .await;
         if let Some(attempt) = attempt.as_ref() {
             publisher
@@ -1146,9 +1118,7 @@ pub async fn on_ci_in_flight(
     // observation already recorded `warn` — that's the upgrade case.
     // The DB-level guard accepts `none → warn`, `none → alert`, and
     // `warn → alert` and rejects everything else.
-    if let Err(err) =
-        work_db.mark_ci_inflight_alert_level(&candidate.work_item_id, head_sha, target_bucket)
-    {
+    if let Err(err) = work_db.mark_ci_inflight_alert_level(&candidate.work_item_id, head_sha, target_bucket) {
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
@@ -1285,9 +1255,7 @@ pub async fn on_ci_in_flight_supersedes_failure(
                     "ci_watch: active remediation is for an old head SHA; \
                      abandoning stale row and superseding with current InFlight run",
                 );
-                if let Err(err) =
-                    work_db.mark_ci_remediation_abandoned(&active.id, "new_head_sha_inflight")
-                {
+                if let Err(err) = work_db.mark_ci_remediation_abandoned(&active.id, "new_head_sha_inflight") {
                     tracing::warn!(
                         work_item_id = %candidate.work_item_id,
                         attempt_id = %active.id,
@@ -1319,9 +1287,7 @@ pub async fn on_ci_in_flight_supersedes_failure(
         }
     }
 
-    let task_transitioned = match work_db
-        .clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url)
-    {
+    let task_transitioned = match work_db.clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url) {
         Ok(Some(_)) => true,
         // Common path: the chore is already `in_review` (no stale failure
         // to supersede). Cheap WHERE-guard no-op.
@@ -1422,11 +1388,7 @@ pub async fn on_ci_resolved(
     // The block is released only when the ci_remediation worker marks the attempt
     // succeeded (at which point `active_ci_remediation_for_work_item` returns None
     // and this guard doesn't fire).
-    if attempt
-        .as_ref()
-        .and_then(|a| a.failure_kind.as_deref())
-        == Some("merge_queue_rebounce")
-    {
+    if attempt.as_ref().and_then(|a| a.failure_kind.as_deref()) == Some("merge_queue_rebounce") {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
@@ -1436,8 +1398,7 @@ pub async fn on_ci_resolved(
         return false;
     }
 
-    let task_result = work_db
-        .clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url);
+    let task_result = work_db.clear_chore_blocked_ci_failure(&candidate.work_item_id, &candidate.pr_url);
     let task_transitioned = match task_result {
         Ok(Some(_)) => true,
         Ok(None) => false,
@@ -1467,15 +1428,14 @@ pub async fn on_ci_resolved(
             Ok(Some(succeeded)) => {
                 attempt_transitioned = true;
                 if parent_in_review_with_revision
-                    && let Err(err) =
-                        work_db.clear_ci_failure_signal_only(&candidate.work_item_id)
-                    {
-                        tracing::warn!(
-                            work_item_id = %candidate.work_item_id,
-                            ?err,
-                            "ci_watch: failed to clear in-flight signal after retire",
-                        );
-                    }
+                    && let Err(err) = work_db.clear_ci_failure_signal_only(&candidate.work_item_id)
+                {
+                    tracing::warn!(
+                        work_item_id = %candidate.work_item_id,
+                        ?err,
+                        "ci_watch: failed to clear in-flight signal after retire",
+                    );
+                }
                 publisher
                     .publish_frontend_event_on_product(
                         &candidate.product_id,
@@ -1533,14 +1493,13 @@ pub async fn on_ci_resolved(
             return false;
         }
         if let Err(err) = work_db.reset_ci_attempts_used(&candidate.work_item_id) {
-            tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used after stale signal clear");
+            tracing::debug!(
+                ?err,
+                "ci_watch: failed to reset ci_attempts_used after stale signal clear"
+            );
         }
         publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "ci_failure_resolved",
-            )
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
             .await;
         publisher
             .publish_frontend_event_on_product(
@@ -1570,11 +1529,7 @@ pub async fn on_ci_resolved(
             tracing::debug!(?err, "ci_watch: failed to reset ci_attempts_used");
         }
         publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "ci_failure_resolved",
-            )
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "ci_failure_resolved")
             .await;
         // When the task transitions back to `in_review` but no active
         // remediation attempt was found (the prior attempt was already
@@ -1654,11 +1609,13 @@ pub async fn rescue_stranded_ci_remediation_attempt(
     publisher: &dyn ExecutionPublisher,
     attempt: &StrandedCiRemediationAttempt,
 ) -> bool {
-    match work_db.create_execution(CreateExecutionInput::builder()
-        .work_item_id(attempt.work_item_id.clone())
-        .kind(ExecutionKind::CiRemediation)
-        .status(ExecutionStatus::Ready)
-        .build()) {
+    match work_db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(attempt.work_item_id.clone())
+            .kind(ExecutionKind::CiRemediation)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    ) {
         Ok(_) => {
             publisher.kick_scheduler();
             tracing::info!(
@@ -1690,11 +1647,7 @@ pub async fn rescue_stranded_ci_remediation_attempt(
 /// this cleanup, the `pending` row causes `sendListCiRemediations` to
 /// re-set the "ci failing" badge on every app restart, even after the
 /// task is `done`.
-pub async fn on_pr_merged(
-    work_db: &WorkDb,
-    publisher: &dyn ExecutionPublisher,
-    candidate: &PendingMergeCheck,
-) {
+pub async fn on_pr_merged(work_db: &WorkDb, publisher: &dyn ExecutionPublisher, candidate: &PendingMergeCheck) {
     let count = match work_db.abandon_active_ci_remediations_for_work_item(&candidate.work_item_id) {
         Ok(n) => n,
         Err(err) => {
@@ -1726,7 +1679,6 @@ pub async fn on_pr_merged(
         );
     }
 }
-
 
 #[cfg(test)]
 #[path = "ci_watch_tests.rs"]

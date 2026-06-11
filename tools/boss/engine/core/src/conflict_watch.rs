@@ -33,9 +33,9 @@ use boss_protocol::{ExecutionKind, TaskKind};
 use crate::blocking_signal::{self, SignalKind};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
-use crate::work::{ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb};
 #[cfg(test)]
 use crate::work::TaskStatus;
+use crate::work::{ConflictResolutionInsertInput, PendingMergeCheck, PrStateChecker, WorkDb};
 
 /// Decide whether the unified `auto_pr_maintenance_enabled` opt-out
 /// (per-product flag or per-PR label) suppresses this conflict-watch
@@ -46,11 +46,7 @@ use crate::work::TaskStatus;
 ///
 /// Phase 6 #18 / design Q7: both gates fire on either the conflict
 /// flip or the retire path; "opted out" means leave the row alone.
-fn auto_pr_maintenance_disabled(
-    work_db: &WorkDb,
-    candidate: &PendingMergeCheck,
-    labels: &[String],
-) -> bool {
+fn auto_pr_maintenance_disabled(work_db: &WorkDb, candidate: &PendingMergeCheck, labels: &[String]) -> bool {
     if pr_labels_opt_out(labels) {
         tracing::debug!(
             work_item_id = %candidate.work_item_id,
@@ -160,10 +156,7 @@ pub async fn on_conflict_detected(
                     // Parent is in_review (or human-moved): idempotent probe.
                     // Re-arm the signal so maybe_clear_blocked continues to fire
                     // when the PR becomes clean, then return false (no net change).
-                    let _ = work_db.record_merge_conflict_in_flight(
-                        &candidate.work_item_id,
-                        &active_crz.id,
-                    );
+                    let _ = work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id);
                     tracing::debug!(
                         work_item_id = %candidate.work_item_id,
                         attempt_id = %active_crz.id,
@@ -198,9 +191,7 @@ pub async fn on_conflict_detected(
             //     fix vehicle and reconcile if found (post-revision-unification
             //     catch-up for rows that were blocked before this model shipped),
             //     or dispatch a fresh attempt for the stale-base scenario.
-            let is_blocked = match work_db
-                .rearm_blocked_merge_conflict_signal(&candidate.work_item_id)
-            {
+            let is_blocked = match work_db.rearm_blocked_merge_conflict_signal(&candidate.work_item_id) {
                 Ok(v) => v,
                 Err(err) => {
                     tracing::warn!(
@@ -245,10 +236,9 @@ pub async fn on_conflict_detected(
                             revision_task_id = %active_crz.revision_task_id.as_deref().unwrap_or(""),
                             "conflict_watch: active revision in flight but parent blocked; reconciling to in_review",
                         );
-                        let reconciled = match work_db.clear_chore_blocked_merge_conflict(
-                            &candidate.work_item_id,
-                            &candidate.pr_url,
-                        ) {
+                        let reconciled = match work_db
+                            .clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
+                        {
                             Ok(Some(_)) => true,
                             Ok(None) => false,
                             Err(err) => {
@@ -261,10 +251,9 @@ pub async fn on_conflict_detected(
                             }
                         };
                         if reconciled {
-                            if let Err(err) = work_db.record_merge_conflict_in_flight(
-                                &candidate.work_item_id,
-                                &active_crz.id,
-                            ) {
+                            if let Err(err) =
+                                work_db.record_merge_conflict_in_flight(&candidate.work_item_id, &active_crz.id)
+                            {
                                 tracing::warn!(
                                     work_item_id = %candidate.work_item_id,
                                     ?err,
@@ -308,8 +297,7 @@ pub async fn on_conflict_detected(
                 Ok(None) => {
                     // No active crz. Check the most recent crz status to
                     // decide whether to re-arm.
-                    let latest_status = match work_db
-                        .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
+                    let latest_status = match work_db.latest_conflict_resolution_for_work_item(&candidate.work_item_id)
                     {
                         Ok(Some(crz)) => crz.status,
                         Ok(None) => {
@@ -434,16 +422,10 @@ pub async fn on_conflict_detected(
     if let Some(ref a) = attempt {
         if a.status == "pending" && a.revision_task_id.is_none() {
             // Fresh attempt — try to spawn a revision.
-            let spawned =
-                maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a)
-                    .await;
+            let spawned = maybe_spawn_conflict_revision(work_db, publisher, pr_checker, candidate, probe, a).await;
             if spawned {
-                task_unblocked_for_revision = blocking_signal::unblock_for_revision(
-                    work_db,
-                    SignalKind::MergeConflict,
-                    candidate,
-                    &a.id,
-                );
+                task_unblocked_for_revision =
+                    blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &a.id);
             }
             // If !spawned: attempt abandoned (revision_create_failed). Parent
             // stays `blocked: merge_conflict`.
@@ -451,12 +433,8 @@ pub async fn on_conflict_detected(
             // UNIQUE collision: existing revision in flight (repeat probe at
             // same base sha). The upfront flip to blocked was premature — clear
             // it back so the parent stays in Review while the fix continues.
-            task_unblocked_for_revision = blocking_signal::unblock_for_revision(
-                work_db,
-                SignalKind::MergeConflict,
-                candidate,
-                &a.id,
-            );
+            task_unblocked_for_revision =
+                blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &a.id);
         }
         // a.status == "abandoned" (churn guard) with no revision_task_id:
         // parent stays blocked — this is the human-attention terminal.
@@ -478,11 +456,7 @@ pub async fn on_conflict_detected(
             .await;
     } else if task_flipped_to_blocked {
         publisher
-            .publish_work_item_changed(
-                &candidate.product_id,
-                &candidate.work_item_id,
-                "blocked_merge_conflict",
-            )
+            .publish_work_item_changed(&candidate.product_id, &candidate.work_item_id, "blocked_merge_conflict")
             .await;
     }
 
@@ -570,8 +544,7 @@ async fn maybe_spawn_conflict_revision(
                 error = %format!("{err:#}"),
                 "conflict_watch: create_revision failed (parent likely no longer revisable); abandoning attempt",
             );
-            if let Err(abandon_err) =
-                work_db.mark_conflict_resolution_abandoned(&attempt.id, "revision_create_failed")
+            if let Err(abandon_err) = work_db.mark_conflict_resolution_abandoned(&attempt.id, "revision_create_failed")
             {
                 tracing::warn!(
                     attempt_id = %attempt.id,
@@ -656,9 +629,7 @@ pub async fn on_resolved(
     // the strict (attempt-id-guarded) retire path; otherwise fall back
     // to the relaxed pr_url-only WHERE clause so this module still
     // closes the loop when Phase 3 wiring hasn't shipped yet.
-    let attempt = match work_db
-        .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-    {
+    let attempt = match work_db.active_conflict_resolution_for_work_item(&candidate.work_item_id) {
         Ok(found) => found,
         Err(err) => {
             tracing::warn!(
@@ -672,11 +643,7 @@ pub async fn on_resolved(
     };
 
     let task_result = if let Some(attempt) = attempt.as_ref() {
-        work_db.clear_chore_blocked_merge_conflict_for_attempt(
-            &candidate.work_item_id,
-            &candidate.pr_url,
-            &attempt.id,
-        )
+        work_db.clear_chore_blocked_merge_conflict_for_attempt(&candidate.work_item_id, &candidate.pr_url, &attempt.id)
     } else {
         work_db.clear_chore_blocked_merge_conflict(&candidate.work_item_id, &candidate.pr_url)
     };
@@ -709,11 +676,9 @@ pub async fn on_resolved(
     //   (c) The attempt was already `running` (worker was active).
     let mut attempt_transitioned = false;
     if let Some(attempt) = attempt.as_ref() {
-        let parent_in_review_with_revision = !task_transitioned
-            && attempt.status == "pending"
-            && attempt.revision_task_id.is_some();
-        let should_succeed =
-            attempt.status == "running" || task_transitioned || parent_in_review_with_revision;
+        let parent_in_review_with_revision =
+            !task_transitioned && attempt.status == "pending" && attempt.revision_task_id.is_some();
+        let should_succeed = attempt.status == "running" || task_transitioned || parent_in_review_with_revision;
         if should_succeed {
             match work_db.mark_conflict_resolution_succeeded(&attempt.id, None) {
                 Ok(Some(succeeded)) => {
@@ -722,30 +687,29 @@ pub async fn on_resolved(
                     // `merge_conflict` signal so `maybe_clear_blocked` does not
                     // re-trigger on the next probe.
                     if parent_in_review_with_revision
-                        && let Err(err) =
-                            work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
-                        {
-                            tracing::warn!(
-                                work_item_id = %candidate.work_item_id,
-                                ?err,
-                                "conflict_watch: failed to clear in-flight signal after retire",
-                            );
-                        }
+                        && let Err(err) = work_db.clear_merge_conflict_signal_only(&candidate.work_item_id)
+                    {
+                        tracing::warn!(
+                            work_item_id = %candidate.work_item_id,
+                            ?err,
+                            "conflict_watch: failed to clear in-flight signal after retire",
+                        );
+                    }
                     // Release the cube workspace lease the attempt owned.
                     // Idempotent on the cube side — the lease may already
                     // have been released by the worker's on-Stop completion
                     // path, in which case cube returns a benign error that
                     // we log at debug.
-                    if let (Some(client), Some(lease_id)) =
-                        (cube_client, succeeded.cube_lease_id.as_deref())
-                        && let Err(err) = client.release_workspace(lease_id).await {
-                            tracing::debug!(
-                                attempt_id = %succeeded.id,
-                                lease_id,
-                                ?err,
-                                "conflict_watch: lease release on retire failed (likely already released)",
-                            );
-                        }
+                    if let (Some(client), Some(lease_id)) = (cube_client, succeeded.cube_lease_id.as_deref())
+                        && let Err(err) = client.release_workspace(lease_id).await
+                    {
+                        tracing::debug!(
+                            attempt_id = %succeeded.id,
+                            lease_id,
+                            ?err,
+                            "conflict_watch: lease release on retire failed (likely already released)",
+                        );
+                    }
                     publisher
                         .publish_frontend_event_on_product(
                             &candidate.product_id,
@@ -803,7 +767,6 @@ pub async fn on_resolved(
     true
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -815,9 +778,7 @@ mod tests {
     use super::*;
     use crate::coordinator::ExecutionPublisher;
     use crate::merge_poller::{OpenPrStatus, PrLifecycleProbe, PrLifecycleState};
-    use crate::work::{
-        CreateChoreInput, CreateProductInput, WorkDb, WorkItem, WorkItemPatch,
-    };
+    use crate::work::{CreateChoreInput, CreateProductInput, WorkDb, WorkItem, WorkItemPatch};
 
     #[derive(Default)]
     struct RecordingPublisher {
@@ -828,27 +789,14 @@ mod tests {
     #[async_trait]
     impl ExecutionPublisher for RecordingPublisher {
         async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-        async fn publish_work_item_changed(
-            &self,
-            product_id: &str,
-            work_item_id: &str,
-            reason: &str,
-        ) {
-            self.events.lock().await.push((
-                product_id.to_owned(),
-                work_item_id.to_owned(),
-                reason.to_owned(),
-            ));
-        }
-        async fn publish_frontend_event_on_product(
-            &self,
-            product_id: &str,
-            event: FrontendEvent,
-        ) {
-            self.typed_events
+        async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+            self.events
                 .lock()
                 .await
-                .push((product_id.to_owned(), event));
+                .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
+        }
+        async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
+            self.typed_events.lock().await.push((product_id.to_owned(), event));
         }
     }
 
@@ -926,11 +874,7 @@ mod tests {
         crate::work::FakePrStateChecker::always(crate::work::PrOpenState::Open)
     }
 
-    fn probe_with_labels(
-        pr_url: &str,
-        state: PrLifecycleState,
-        labels: &[&str],
-    ) -> PrLifecycleProbe {
+    fn probe_with_labels(pr_url: &str, state: PrLifecycleState, labels: &[&str]) -> PrLifecycleProbe {
         PrLifecycleProbe {
             url: pr_url.to_owned(),
             state,
@@ -998,8 +942,7 @@ mod tests {
         let pr = "https://github.com/foo/bar/pull/10b";
         let (product, chore) = make_in_review(&db, "C-detect-fail", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
-        let closed =
-            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        let closed = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
 
         let transitioned = on_conflict_detected(
             &db,
@@ -1021,15 +964,10 @@ mod tests {
         assert_eq!(events[0].2, "blocked_merge_conflict");
 
         // crz was abandoned (revision_create_failed).
-        let attempts = db
-            .list_conflict_resolutions(None, &[], Some(&chore), None)
-            .unwrap();
+        let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].status, "abandoned");
-        assert_eq!(
-            attempts[0].failure_reason.as_deref(),
-            Some("revision_create_failed"),
-        );
+        assert_eq!(attempts[0].failure_reason.as_deref(), Some("revision_create_failed"),);
     }
 
     #[tokio::test]
@@ -1066,10 +1004,12 @@ mod tests {
         // back — returns true again because task_unblocked_for_revision=true.
         // The important invariant: parent ends up in_review, exactly one crz.
         let (status, _) = chore_status(&db, &chore);
-        assert_eq!(status, TaskStatus::InReview, "parent must stay in_review after repeated probes");
-        let attempts = db
-            .list_conflict_resolutions(None, &[], Some(&chore), None)
-            .unwrap();
+        assert_eq!(
+            status,
+            TaskStatus::InReview,
+            "parent must stay in_review after repeated probes"
+        );
+        let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
         assert_eq!(attempts.len(), 1, "same base sha must not stack crz rows");
         // Exactly one ConflictResolutionStarted typed event per probe.
         let started_count = pub_
@@ -1082,13 +1022,7 @@ mod tests {
         assert!(started_count >= 1, "at least one ConflictResolutionStarted must fire");
         // At most two "conflict_revision_in_flight" events (one per probe), never
         // a "blocked_merge_conflict" since a fix vehicle is always in flight.
-        let reasons: Vec<String> = pub_
-            .events
-            .lock()
-            .await
-            .iter()
-            .map(|(_, _, r)| r.clone())
-            .collect();
+        let reasons: Vec<String> = pub_.events.lock().await.iter().map(|(_, _, r)| r.clone()).collect();
         assert!(
             reasons.iter().all(|r| r == "conflict_revision_in_flight"),
             "all work-item events must be conflict_revision_in_flight, got {reasons:?}",
@@ -1137,7 +1071,9 @@ mod tests {
         // ConflictResolutionSucceeded typed event must fire.
         let typed = pub_.typed_events.lock().await.clone();
         assert!(
-            typed.iter().any(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionSucceeded { .. })),
+            typed
+                .iter()
+                .any(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionSucceeded { .. })),
             "ConflictResolutionSucceeded must fire, got {typed:?}",
         );
     }
@@ -1152,8 +1088,7 @@ mod tests {
         let pr = "https://github.com/foo/bar/pull/12b";
         let (product, chore) = make_in_review(&db, "C-resolve-blocked", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
-        let closed =
-            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        let closed = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
 
         // Drive into blocked via create_revision failure.
         on_conflict_detected(
@@ -1265,13 +1200,7 @@ mod tests {
         assert_eq!(status, TaskStatus::Blocked);
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
 
-        let reasons: Vec<String> = pub_
-            .events
-            .lock()
-            .await
-            .iter()
-            .map(|(_, _, r)| r.clone())
-            .collect();
+        let reasons: Vec<String> = pub_.events.lock().await.iter().map(|(_, _, r)| r.clone()).collect();
         // 1st conflict → "conflict_revision_in_flight"
         // resolve    → no work-item event (parent was in_review)
         // 2nd conflict → "blocked_merge_conflict" (UNIQUE collision, no active crz)
@@ -1327,8 +1256,7 @@ mod tests {
         let pr = "https://github.com/foo/bar/pull/16";
         let (product, chore) = make_in_review(&db, "C-human-2", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
-        let closed =
-            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        let closed = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
         on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1338,7 +1266,11 @@ mod tests {
         )
         .await;
         let (status_before, _) = chore_status(&db, &chore);
-        assert_eq!(status_before, TaskStatus::Blocked, "sanity: closed_checker must cause blocked");
+        assert_eq!(
+            status_before,
+            TaskStatus::Blocked,
+            "sanity: closed_checker must cause blocked"
+        );
         // Human moves the blocked row to `active`.
         db.update_work_item(
             &chore,
@@ -1367,10 +1299,7 @@ mod tests {
 
     #[async_trait]
     impl crate::coordinator::CubeClient for RecordingCubeClient {
-        async fn ensure_repo(
-            &self,
-            _origin: &str,
-        ) -> anyhow::Result<crate::coordinator::CubeRepoHandle> {
+        async fn ensure_repo(&self, _origin: &str) -> anyhow::Result<crate::coordinator::CubeRepoHandle> {
             unreachable!("not used in conflict_watch tests")
         }
         async fn lease_workspace(
@@ -1392,10 +1321,7 @@ mod tests {
         }
         async fn release_workspace(&self, lease_id: &str) -> anyhow::Result<()> {
             self.releases.lock().await.push(lease_id.to_owned());
-            if self
-                .release_should_fail
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.release_should_fail.load(std::sync::atomic::Ordering::SeqCst) {
                 Err(anyhow::anyhow!("simulated lease release failure"))
             } else {
                 Ok(())
@@ -1410,21 +1336,13 @@ mod tests {
         async fn heartbeat_lease(&self, _: &str, _: Option<u64>) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn force_release_lease(
-            &self,
-            _: &str,
-            _: Option<&str>,
-        ) -> anyhow::Result<()> {
+        async fn force_release_lease(&self, _: &str, _: Option<&str>) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn list_workspaces(
-            &self,
-        ) -> anyhow::Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
+        async fn list_workspaces(&self) -> anyhow::Result<Vec<crate::coordinator::CubeWorkspaceStatus>> {
             Ok(Vec::new())
         }
-        async fn list_repos(
-            &self,
-        ) -> anyhow::Result<Vec<crate::coordinator::CubeRepoSummary>> {
+        async fn list_repos(&self) -> anyhow::Result<Vec<crate::coordinator::CubeRepoSummary>> {
             Ok(Vec::new())
         }
     }
@@ -1528,15 +1446,13 @@ mod tests {
         );
 
         let typed = pub_.typed_events.lock().await.clone();
-        let succeeded_event = typed
-            .iter()
-            .find(|(pid, ev)| {
-                pid == &product
-                    && matches!(
-                        ev,
-                        FrontendEvent::ConflictResolutionSucceeded { attempt_id: id, .. } if id == &attempt_id
-                    )
-            });
+        let succeeded_event = typed.iter().find(|(pid, ev)| {
+            pid == &product
+                && matches!(
+                    ev,
+                    FrontendEvent::ConflictResolutionSucceeded { attempt_id: id, .. } if id == &attempt_id
+                )
+        });
         assert!(
             succeeded_event.is_some(),
             "expected ConflictResolutionSucceeded event with attempt_id={attempt_id}, got {typed:?}",
@@ -1555,8 +1471,7 @@ mod tests {
         let pub_ = Arc::new(RecordingPublisher::default());
 
         // Use closed_checker to put parent in blocked state.
-        let closed =
-            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        let closed = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
         on_conflict_detected(
             &db,
             pub_.as_ref(),
@@ -1581,10 +1496,7 @@ mod tests {
         assert!(resolved);
         let (status, _) = chore_status(&db, &chore);
         assert_eq!(status, TaskStatus::InReview);
-        assert_eq!(
-            cube.releases.lock().await.as_slice(),
-            ["lease-42"],
-        );
+        assert_eq!(cube.releases.lock().await.as_slice(), ["lease-42"],);
         let work_events = pub_.events.lock().await.clone();
         assert!(
             work_events.iter().any(|(_, _, r)| r == "merge_conflict_resolved"),
@@ -1621,9 +1533,7 @@ mod tests {
                 .iter()
                 .find(|(_, ev)| matches!(ev, FrontendEvent::ConflictResolutionStarted { .. }))
             {
-                Some((_, FrontendEvent::ConflictResolutionStarted { attempt_id, .. })) => {
-                    attempt_id.clone()
-                }
+                Some((_, FrontendEvent::ConflictResolutionStarted { attempt_id, .. })) => attempt_id.clone(),
                 other => panic!("expected ConflictResolutionStarted, got {other:?}"),
             }
         };
@@ -1712,7 +1622,11 @@ mod tests {
 
         assert!(reconciled, "reconciliation must return true (state changed)");
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, TaskStatus::InReview, "parent must be back in_review after reconcile");
+        assert_eq!(
+            status,
+            TaskStatus::InReview,
+            "parent must be back in_review after reconcile"
+        );
         assert!(reason.is_none());
 
         // Event emitted is "conflict_revision_in_flight".
@@ -1722,9 +1636,7 @@ mod tests {
             "conflict_revision_in_flight event must fire during reconcile, got {events:?}",
         );
         // No second revision was spawned (task_fake_revision is still the only one).
-        let all_crz = db
-            .list_conflict_resolutions(None, &[], Some(&chore), None)
-            .unwrap();
+        let all_crz = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
         assert_eq!(all_crz.len(), 1, "reconcile must not insert a new crz");
     }
 
@@ -1740,8 +1652,7 @@ mod tests {
         let pr = "https://github.com/foo/bar/pull/21";
         let (product, chore) = make_in_review(&db, "C-retire-idem", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
-        let closed =
-            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        let closed = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
 
         // Use closed_checker: parent goes blocked (create_revision fails, crz abandoned).
         on_conflict_detected(
@@ -1918,9 +1829,7 @@ mod tests {
         .await;
         assert!(transitioned);
 
-        let attempt = db
-            .active_conflict_resolution_for_work_item(&chore)
-            .unwrap();
+        let attempt = db.active_conflict_resolution_for_work_item(&chore).unwrap();
         assert!(
             attempt.is_some(),
             "on_conflict_detected must insert a conflict_resolution row",
@@ -2105,14 +2014,7 @@ mod tests {
         let before = pub_.events.lock().await.len();
         set_product_auto_pr_maintenance(&db_path, &product, false);
 
-        let r = on_resolved(
-            &db,
-            pub_.as_ref(),
-            None,
-            &candidate(&product, &chore, pr),
-            &[],
-        )
-        .await;
+        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
         assert!(!r, "opted-out product must not retire automatically");
         let (status, reason) = chore_status(&db, &chore);
         assert_eq!(status, TaskStatus::InReview);
@@ -2270,7 +2172,11 @@ mod tests {
 
         // Parent stays in_review — the revision card is the Doing card.
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, TaskStatus::InReview, "parent must stay in Review while revision is in flight");
+        assert_eq!(
+            status,
+            TaskStatus::InReview,
+            "parent must stay in Review while revision is in flight"
+        );
         assert!(reason.is_none());
 
         let attempt = db
@@ -2338,14 +2244,9 @@ mod tests {
         )
         .await;
 
-        let attempts = db
-            .list_conflict_resolutions(None, &[], Some(&chore), None)
-            .unwrap();
+        let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
         assert_eq!(attempts.len(), 1, "same base sha must not stack attempts");
-        let revision_backed = attempts
-            .iter()
-            .filter(|r| r.revision_task_id.is_some())
-            .count();
+        let revision_backed = attempts.iter().filter(|r| r.revision_task_id.is_some()).count();
         assert_eq!(revision_backed, 1, "exactly one revision-backed attempt");
     }
 
@@ -2394,17 +2295,18 @@ mod tests {
             .find(|r| r.base_sha_at_trigger.as_deref() == Some("abc123"))
             .expect("fourth attempt row must exist");
         assert_eq!(fourth.status, "abandoned");
-        assert_eq!(
-            fourth.failure_reason.as_deref(),
-            Some("churn_threshold_exceeded"),
-        );
+        assert_eq!(fourth.failure_reason.as_deref(), Some("churn_threshold_exceeded"),);
         assert!(
             fourth.revision_task_id.is_none(),
             "churn-abandoned attempt must spawn no revision",
         );
         // Churn cap = no fix vehicle → parent must be blocked (human-attention terminal).
         let (status, reason) = chore_status(&db, &chore);
-        assert_eq!(status, TaskStatus::Blocked, "churn cap exhausted: parent must be blocked");
+        assert_eq!(
+            status,
+            TaskStatus::Blocked,
+            "churn cap exhausted: parent must be blocked"
+        );
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
     }
 
@@ -2418,8 +2320,7 @@ mod tests {
         let pr = "https://github.com/foo/bar/pull/33";
         let (product, chore) = make_in_review(&db, "C-rev-fail", pr);
         let pub_ = Arc::new(RecordingPublisher::default());
-        let closed =
-            crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
+        let closed = crate::work::FakePrStateChecker::always(crate::work::PrOpenState::ClosedUnmerged);
 
         on_conflict_detected(
             &db,
@@ -2436,15 +2337,10 @@ mod tests {
         assert_eq!(status, TaskStatus::Blocked);
         assert_eq!(reason.as_deref(), Some("merge_conflict"));
 
-        let attempts = db
-            .list_conflict_resolutions(None, &[], Some(&chore), None)
-            .unwrap();
+        let attempts = db.list_conflict_resolutions(None, &[], Some(&chore), None).unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].status, "abandoned");
-        assert_eq!(
-            attempts[0].failure_reason.as_deref(),
-            Some("revision_create_failed"),
-        );
+        assert_eq!(attempts[0].failure_reason.as_deref(), Some("revision_create_failed"),);
         assert!(attempts[0].revision_task_id.is_none());
     }
 }

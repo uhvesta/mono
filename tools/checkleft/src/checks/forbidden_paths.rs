@@ -14,11 +14,7 @@ use crate::output::{CheckResult, Finding, Location, Severity};
 pub struct ForbiddenPathsCheck;
 
 impl ForbiddenPathsCheck {
-    fn configure_with_dir(
-        &self,
-        config: &toml::Value,
-        config_dir: &Path,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_with_dir(&self, config: &toml::Value, config_dir: &Path) -> Result<Arc<dyn ConfiguredCheck>> {
         Ok(Arc::new(parse_config(config, config_dir)?))
     }
 }
@@ -37,11 +33,7 @@ impl Check for ForbiddenPathsCheck {
         self.configure_with_dir(config, Path::new(""))
     }
 
-    fn configure_scoped(
-        &self,
-        config: &toml::Value,
-        config_dir: Option<&Path>,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_scoped(&self, config: &toml::Value, config_dir: Option<&Path>) -> Result<Arc<dyn ConfiguredCheck>> {
         self.configure_with_dir(config, config_dir.unwrap_or_else(|| Path::new("")))
     }
 }
@@ -138,14 +130,10 @@ fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<CompiledForbi
             bail!("forbidden-paths check config `{field_prefix}.remediation` must not be empty");
         }
         if rule.when.is_empty() {
-            bail!(
-                "forbidden-paths check config `{field_prefix}.when` must contain at least one change kind"
-            );
+            bail!("forbidden-paths check config `{field_prefix}.when` must contain at least one change kind");
         }
         if rule.patterns.is_empty() {
-            bail!(
-                "forbidden-paths check config `{field_prefix}.patterns` must contain at least one pattern"
-            );
+            bail!("forbidden-paths check config `{field_prefix}.patterns` must contain at least one pattern");
         }
 
         rules.push(CompiledForbiddenPathRule {
@@ -173,8 +161,7 @@ fn parse_config(config: &toml::Value, config_dir: &Path) -> Result<CompiledForbi
 fn compile_globset(field_name: &str, patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
+        let glob = Glob::new(pattern).with_context(|| format!("invalid `{field_name}` glob pattern: {pattern}"))?;
         builder.add(glob);
     }
 
@@ -218,9 +205,10 @@ fn candidate_paths(changed_file: &ChangedFile) -> Vec<&Path> {
     let mut paths = vec![changed_file.path.as_path()];
     if matches!(changed_file.kind, ChangeKind::Renamed)
         && let Some(old_path) = changed_file.old_path.as_deref()
-            && old_path != changed_file.path.as_path() {
-                paths.push(old_path);
-            }
+        && old_path != changed_file.path.as_path()
+    {
+        paths.push(old_path);
+    }
     paths
 }
 
@@ -466,7 +454,11 @@ mod tests {
             .expect("run check");
 
         // "other/.build/foo" is outside "mobile", so exclude_files pattern doesn't apply
-        assert_eq!(result.findings.len(), 1, "file outside config_dir should not be excluded");
+        assert_eq!(
+            result.findings.len(),
+            1,
+            "file outside config_dir should not be excluded"
+        );
     }
 
     #[tokio::test]

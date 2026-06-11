@@ -40,18 +40,12 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_server(cli: Cli, cfg: Arc<RuntimeConfig>, isolation: IsolationPaths) -> Result<()> {
-    let socket_path = cli
-        .socket_path
-        .unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
+    let socket_path = cli.socket_path.unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_owned());
 
     // Use the isolation-derived pid path, falling back to env / hard default.
     let pid_file_path = isolation
         .pid_path
-        .or_else(|| {
-            std::env::var("BOSS_ENGINE_PID_PATH")
-                .ok()
-                .map(std::path::PathBuf::from)
-        })
+        .or_else(|| std::env::var("BOSS_ENGINE_PID_PATH").ok().map(std::path::PathBuf::from))
         .unwrap_or_else(|| DEFAULT_PID_PATH.into());
 
     // Use the isolation-derived events socket, falling back to env / home default.
@@ -142,9 +136,7 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
         let mut rx = controller.subscribe();
         loop {
             let state = rx.borrow_and_update().clone();
-            server_state
-                .broadcast_github_auth_state(state.to_dto())
-                .await;
+            server_state.broadcast_github_auth_state(state.to_dto()).await;
 
             if let GitHubAuthState::Authorized {
                 record,
@@ -152,8 +144,7 @@ fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::J
             } = &state
             {
                 let token = record.token.clone();
-                let resolved =
-                    probe_and_record_org_state(work_db.as_ref(), flow.as_ref(), &token).await;
+                let resolved = probe_and_record_org_state(work_db.as_ref(), flow.as_ref(), &token).await;
                 controller.update_org_state(resolved);
             }
 
@@ -203,24 +194,18 @@ pub async fn serve(
                 socket_path: socket_path.display().to_string(),
                 pid: std::process::id(),
             };
-            crate::engine_control::write_token_file(&path, &contents).with_context(|| {
-                format!(
-                    "failed to write engine-control token file {}",
-                    path.display()
-                )
-            })?;
+            crate::engine_control::write_token_file(&path, &contents)
+                .with_context(|| format!("failed to write engine-control token file {}", path.display()))?;
             tracing::info!(
                 token_path = %path.display(),
                 "engine-control token: ready",
             );
-            let guard =
-                crate::engine_control::ControlTokenGuard::new(path.clone(), std::process::id());
+            let guard = crate::engine_control::ControlTokenGuard::new(path.clone(), std::process::id());
             (Some(Arc::new(token)), Some(guard))
         }
         None => (None, None),
     };
-    let server_state =
-        ServerState::new_arc_with_app_pid(cfg.clone(), app_pid, control_token.clone())?;
+    let server_state = ServerState::new_arc_with_app_pid(cfg.clone(), app_pid, control_token.clone())?;
 
     // Always attempt to unlink any existing file at the path before
     // binding. `path.exists()` lies for dangling symlinks and races
@@ -238,33 +223,23 @@ pub async fn serve(
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => {
-            return Err(anyhow::Error::new(err).context(format!(
-                "failed to remove existing socket {}",
-                socket_path.display()
-            )));
+            return Err(
+                anyhow::Error::new(err).context(format!("failed to remove existing socket {}", socket_path.display()))
+            );
         }
     }
 
     let listener = match UnixListener::bind(&socket_path) {
         Ok(listener) => {
-            crate::audit::record_socket_bind(
-                "frontend",
-                &socket_path,
-                crate::audit::SocketBindResult::Succeeded,
-            );
+            crate::audit::record_socket_bind("frontend", &socket_path, crate::audit::SocketBindResult::Succeeded);
             listener
         }
         Err(err) => {
             let msg = err.to_string();
-            crate::audit::record_socket_bind(
-                "frontend",
-                &socket_path,
-                crate::audit::SocketBindResult::Failed(&msg),
+            crate::audit::record_socket_bind("frontend", &socket_path, crate::audit::SocketBindResult::Failed(&msg));
+            return Err(
+                anyhow::Error::new(err).context(format!("failed to bind unix socket {}", socket_path.display()))
             );
-            return Err(anyhow::Error::new(err).context(format!(
-                "failed to bind unix socket {}",
-                socket_path.display()
-            )));
         }
     };
 
@@ -275,10 +250,7 @@ pub async fn serve(
             std::fs::write(&path, format!("{pid}\n"))
                 .with_context(|| format!("failed to write pid file {path_str}"))?;
             tracing::info!(pid, pid_file = %path_str, "engine pid file is ready");
-            Some(PidFileGuard {
-                path: path_str,
-                pid,
-            })
+            Some(PidFileGuard { path: path_str, pid })
         }
         None => None,
     };
@@ -289,22 +261,13 @@ pub async fn serve(
     if let Some(path) = events_socket_path {
         let events_listener = match bind_events_socket(&path) {
             Ok(listener) => {
-                crate::audit::record_socket_bind(
-                    "events",
-                    &path,
-                    crate::audit::SocketBindResult::Succeeded,
-                );
+                crate::audit::record_socket_bind("events", &path, crate::audit::SocketBindResult::Succeeded);
                 listener
             }
             Err(err) => {
                 let msg = err.to_string();
-                crate::audit::record_socket_bind(
-                    "events",
-                    &path,
-                    crate::audit::SocketBindResult::Failed(&msg),
-                );
-                return Err(anyhow::Error::new(err)
-                    .context(format!("failed to bind events socket {}", path.display())));
+                crate::audit::record_socket_bind("events", &path, crate::audit::SocketBindResult::Failed(&msg));
+                return Err(anyhow::Error::new(err).context(format!("failed to bind events socket {}", path.display())));
             }
         };
         tracing::info!(events_socket_path = %path.display(), "events socket is ready");
@@ -378,12 +341,8 @@ pub async fn serve(
         ) {
             Some(current_shim) => {
                 if let Some(home) = std::env::var_os("HOME") {
-                    let stable_bin_dir =
-                        PathBuf::from(home).join("Library/Application Support/Boss/bin");
-                    match crate::runner::install_boss_event_to_stable_bin(
-                        &current_shim,
-                        &stable_bin_dir,
-                    ) {
+                    let stable_bin_dir = PathBuf::from(home).join("Library/Application Support/Boss/bin");
+                    match crate::runner::install_boss_event_to_stable_bin(&current_shim, &stable_bin_dir) {
                         Ok(stable) => {
                             tracing::info!(
                                 stable_path = %stable.display(),
@@ -430,10 +389,7 @@ pub async fn serve(
             new_path = %stable_boss_event_path.display(),
             "healing boss-event path in worker settings files",
         );
-        crate::worker_setup::heal_worker_settings_json(
-            &worker_settings_dir,
-            &stable_boss_event_path,
-        );
+        crate::worker_setup::heal_worker_settings_json(&worker_settings_dir, &stable_boss_event_path);
     }
 
     // Rehydrate dispatch for any work items that were in "Doing"
@@ -472,12 +428,9 @@ pub async fn serve(
         crate::run_reconcile::RunReconcileReport::default()
     } else {
         let now_epoch_s = crate::run_reconcile::current_epoch_s();
-        let report = crate::run_reconcile::probe_in_flight_runs(
-            server_state.cube_client.as_ref(),
-            &in_flight,
-            now_epoch_s,
-        )
-        .await;
+        let report =
+            crate::run_reconcile::probe_in_flight_runs(server_state.cube_client.as_ref(), &in_flight, now_epoch_s)
+                .await;
         tracing::info!(
             in_flight_count = in_flight.len(),
             live = report.live_count,
@@ -493,10 +446,7 @@ pub async fn serve(
         }
         report
     };
-    let skip_dispatch_ids: HashSet<String> = probe_report
-        .skip_dispatch_ids()
-        .map(|s| s.to_owned())
-        .collect();
+    let skip_dispatch_ids: HashSet<String> = probe_report.skip_dispatch_ids().map(|s| s.to_owned()).collect();
 
     // Reap orphans before reconcile dispatch fires. For every Dead
     // verdict the cube probe returned, mark the execution row
@@ -508,7 +458,8 @@ pub async fn serve(
     // in-flight commits the next worker should resume against.
     //
     // See docs/post-crash-recovery.md for the full flow.
-    let orphan_reason = "engine startup: cube probe verdict Dead — worker lease no longer matches recorded state across restart";
+    let orphan_reason =
+        "engine startup: cube probe verdict Dead — worker lease no longer matches recorded state across restart";
     for (execution_id, verdict) in &probe_report.verdicts {
         if !matches!(verdict, crate::run_reconcile::RunReconcileVerdict::Dead) {
             continue;
@@ -700,9 +651,7 @@ pub async fn serve(
     // dispatch / `hosts probe`.
     {
         let coordinator = server_state.execution_coordinator.clone();
-        let engine_socket = crate::runner::engine_events_socket_path()
-            .display()
-            .to_string();
+        let engine_socket = crate::runner::engine_events_socket_path().display().to_string();
         tokio::spawn(async move {
             coordinator.reattach_remote_runs(&engine_socket).await;
         });
@@ -834,10 +783,8 @@ pub async fn serve(
     // §"Persistence: state.db table"). The graceful-shutdown branch
     // below runs one final flush before returning so the last 0–30s
     // window of increments isn't lost on a normal exit.
-    let _metrics_flush_handle = crate::metrics::spawn_flush_task(
-        server_state.metrics.clone(),
-        server_state.work_db.clone(),
-    );
+    let _metrics_flush_handle =
+        crate::metrics::spawn_flush_task(server_state.metrics.clone(), server_state.work_db.clone());
 
     // Periodic stalled-spawn detector: transitions workers from `Spawning`
     // to `WaitingForInput` when they've been stuck without any hook event
@@ -852,18 +799,15 @@ pub async fn serve(
         let live_worker_states = server_state.live_worker_states.clone();
         let server_clone = Arc::clone(&server_state);
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(10));
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let changed = live_worker_states.mark_stalled_spawns(
-                    now,
-                    crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS,
-                );
+                let changed =
+                    live_worker_states.mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
                 if !changed.is_empty() {
                     tracing::info!(
                         slots = ?changed,
@@ -1047,9 +991,7 @@ pub(super) fn register_app_session_trust_ok(
     match (current_app_pid, peer_pid) {
         (None, _) => true, // tests / no-trust-root mode
         (Some(expected), Some(observed)) => {
-            observed == expected
-                || is_descendant_of_any(engine_pid, &[observed])
-                || !pid_is_alive(expected)
+            observed == expected || is_descendant_of_any(engine_pid, &[observed]) || !pid_is_alive(expected)
         }
         (Some(_), None) => false,
     }
@@ -1063,9 +1005,10 @@ pub(super) fn register_app_session_trust_ok(
 pub(super) fn resolve_status_actor(server_state: &ServerState, peer_pid: Option<libc::pid_t>) -> &'static str {
     let boss_pid = server_state.current_boss_pid();
     if let (Some(boss_pid), Some(peer_pid)) = (boss_pid, peer_pid)
-        && is_descendant_of_any(peer_pid, &[boss_pid]) {
-            return boss_protocol::LAST_STATUS_ACTOR_BOSS;
-        }
+        && is_descendant_of_any(peer_pid, &[boss_pid])
+    {
+        return boss_protocol::LAST_STATUS_ACTOR_BOSS;
+    }
     boss_protocol::LAST_STATUS_ACTOR_HUMAN
 }
 

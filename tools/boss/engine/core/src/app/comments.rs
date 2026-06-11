@@ -33,12 +33,7 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
                     "comment_created",
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::CommentResult { comment },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
             Err(err) => send_response(
                 &sink,
@@ -159,12 +154,7 @@ pub(super) async fn handle_comments_dismiss(ctx: Dispatch, req: FrontendRequest)
                     "comment_dismissed",
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::CommentResult { comment },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
             }
             Err(err) => send_response(
                 &sink,
@@ -205,12 +195,7 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
                 "comment_status_changed",
             )
             .await;
-            send_response_with_revision(
-                &sink,
-                &request_id,
-                revision,
-                FrontendEvent::CommentResult { comment },
-            );
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
         }
         Err(err) => send_response(
             &sink,
@@ -240,12 +225,7 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
     else {
         unreachable!()
     };
-    match work_db.update_comment_anchor(
-        &comment_id,
-        &anchor,
-        &new_doc_version,
-        plain_text_projection_version,
-    ) {
+    match work_db.update_comment_anchor(&comment_id, &anchor, &new_doc_version, plain_text_projection_version) {
         Ok(comment) => {
             let revision = publish_comment_invalidation(
                 &server_state,
@@ -256,12 +236,7 @@ pub(super) async fn handle_comments_update_anchor(ctx: Dispatch, req: FrontendRe
                 "comment_anchor_updated",
             )
             .await;
-            send_response_with_revision(
-                &sink,
-                &request_id,
-                revision,
-                FrontendEvent::CommentResult { comment },
-            );
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::CommentResult { comment });
         }
         Err(err) => send_response(
             &sink,
@@ -296,8 +271,7 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
                 &sink,
                 &request_id,
                 FrontendEvent::Error {
-                    message: "comments_dispatch_magic_wand requires app or Boss authority"
-                        .to_owned(),
+                    message: "comments_dispatch_magic_wand requires app or Boss authority".to_owned(),
                 },
             );
             return;
@@ -403,8 +377,7 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
                 let server_state2 = server_state.clone();
                 tokio::spawn(async move {
                     let topic = magic_wand_dispatch_topic(&dispatch_id);
-                    let result =
-                        crate::magic_wand::dispatch(&doc_text, &anchor_exact, &comment_body).await;
+                    let result = crate::magic_wand::dispatch(&doc_text, &anchor_exact, &comment_body).await;
                     let final_dispatch = match result {
                         Ok(mw) => {
                             match work_db2.complete_magic_wand_dispatch(
@@ -591,11 +564,9 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
 
                 // Transition the comment to `dispatched`.
                 let actor = format!("comment_dispatch:{comment_id}");
-                if let Err(err) = work_db.set_comment_status(
-                    &comment_id,
-                    COMMENT_STATUS_DISPATCHED,
-                    Some(actor.as_str()),
-                ) {
+                if let Err(err) =
+                    work_db.set_comment_status(&comment_id, COMMENT_STATUS_DISPATCHED, Some(actor.as_str()))
+                {
                     tracing::error!(
                         comment_id = %comment_id,
                         chore_id = %chore.id,
@@ -625,11 +596,7 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
                     "magic-wand: spawned chore for PR-backed doc comment",
                 );
 
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::MagicWandDispatched { dispatch },
-                );
+                send_response(&sink, &request_id, FrontendEvent::MagicWandDispatched { dispatch });
             }
 
             other => {
@@ -637,9 +604,7 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
                     &sink,
                     &request_id,
                     FrontendEvent::WorkError {
-                        message: format!(
-                            "magic-wand dispatch: unsupported artifact_kind '{other}'"
-                        ),
+                        message: format!("magic-wand dispatch: unsupported artifact_kind '{other}'"),
                     },
                 );
             }

@@ -50,16 +50,14 @@ impl ConfiguredCheck for RepoVisibilityCheck {
             for location in find_public_default_visibility_locations(contents) {
                 findings.push(Finding {
                     severity: Severity::Error,
-                    message: "package default_visibility must not be `//visibility:public`"
-                        .to_owned(),
+                    message: "package default_visibility must not be `//visibility:public`".to_owned(),
                     location: Some(Location {
                         path: changed_file.path.clone(),
                         line: Some(location.line),
                         column: Some(location.column),
                     }),
                     remediations: vec![
-                        "Remove the package default_visibility or narrow visibility on individual targets."
-                            .to_owned(),
+                        "Remove the package default_visibility or narrow visibility on individual targets.".to_owned(),
                     ],
                     suggested_fix: None,
                 });
@@ -88,10 +86,7 @@ struct SourceLocation {
 
 fn find_public_default_visibility_locations(contents: &str) -> Vec<SourceLocation> {
     let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_starlark::LANGUAGE.into())
-        .is_err()
-    {
+    if parser.set_language(&tree_sitter_starlark::LANGUAGE.into()).is_err() {
         return Vec::new();
     }
     let Some(tree) = parser.parse(contents, None) else {
@@ -102,19 +97,11 @@ fn find_public_default_visibility_locations(contents: &str) -> Vec<SourceLocatio
     }
 
     let mut locations = Vec::new();
-    collect_public_default_visibility_locations(
-        tree.root_node(),
-        contents.as_bytes(),
-        &mut locations,
-    );
+    collect_public_default_visibility_locations(tree.root_node(), contents.as_bytes(), &mut locations);
     locations
 }
 
-fn collect_public_default_visibility_locations(
-    node: Node<'_>,
-    source: &[u8],
-    locations: &mut Vec<SourceLocation>,
-) {
+fn collect_public_default_visibility_locations(node: Node<'_>, source: &[u8], locations: &mut Vec<SourceLocation>) {
     if let Some(location) = package_public_visibility_location(node, source) {
         locations.push(location);
     }
@@ -232,13 +219,7 @@ package(
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(
-            result.findings[0]
-                .location
-                .as_ref()
-                .and_then(|loc| loc.line),
-            Some(4)
-        );
+        assert_eq!(result.findings[0].location.as_ref().and_then(|loc| loc.line), Some(4));
     }
 
     #[tokio::test]

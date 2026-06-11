@@ -12,8 +12,7 @@ fn metadata_get_returns_none_for_missing_key() {
 fn metadata_set_then_get_round_trips() {
     let path = temp_db_path("meta-roundtrip");
     let db = WorkDb::open(path).unwrap();
-    db.set_metadata("live_status_disabled_slots", "1,3,7")
-        .unwrap();
+    db.set_metadata("live_status_disabled_slots", "1,3,7").unwrap();
     let value = db.get_metadata("live_status_disabled_slots").unwrap();
     assert_eq!(value.as_deref(), Some("1,3,7"));
 }
@@ -22,10 +21,8 @@ fn metadata_set_then_get_round_trips() {
 fn metadata_set_replaces_prior_value_for_same_key() {
     let path = temp_db_path("meta-replace");
     let db = WorkDb::open(path).unwrap();
-    db.set_metadata("live_status_disabled_slots", "1,3")
-        .unwrap();
-    db.set_metadata("live_status_disabled_slots", "5,7")
-        .unwrap();
+    db.set_metadata("live_status_disabled_slots", "1,3").unwrap();
+    db.set_metadata("live_status_disabled_slots", "5,7").unwrap();
     let value = db.get_metadata("live_status_disabled_slots").unwrap();
     assert_eq!(value.as_deref(), Some("5,7"));
 }
@@ -268,9 +265,7 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
             force_duplicate: false,
         })
         .collect::<Vec<_>>();
-    let created = db
-        .create_many_tasks(CreateManyTasksInput { items: inputs })
-        .unwrap();
+    let created = db.create_many_tasks(CreateManyTasksInput { items: inputs }).unwrap();
 
     assert_eq!(created.len(), 5);
     // ordinals must be contiguous 1..=5 — the in-tx
@@ -283,9 +278,7 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
         assert_eq!(task.autostart, i % 2 == 0);
     }
 
-    let tasks = db
-        .list_tasks(&product.id, Some(&project.id), None, false)
-        .unwrap();
+    let tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
     // Five user-created tasks plus the auto-created design task
     // that every new project carries.
     assert_eq!(tasks.len(), 6);
@@ -354,14 +347,9 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
         .create_many_tasks(CreateManyTasksInput { items: inputs })
         .expect_err("expected rollback");
     let msg = format!("{err:#}");
-    assert!(
-        msg.contains("item 1"),
-        "error must name failing index: {msg}"
-    );
+    assert!(msg.contains("item 1"), "error must name failing index: {msg}");
 
-    let tasks = db
-        .list_tasks(&product.id, Some(&project.id), None, false)
-        .unwrap();
+    let tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
     // The batch's project_task inserts must roll back, but the
     // auto-created design task (inserted in `create_project`'s
     // own committed transaction) is not part of this batch and
@@ -403,9 +391,7 @@ fn create_many_chores_inserts_all_atomically() {
             force_duplicate: false,
         })
         .collect::<Vec<_>>();
-    let created = db
-        .create_many_chores(CreateManyChoresInput { items: inputs })
-        .unwrap();
+    let created = db.create_many_chores(CreateManyChoresInput { items: inputs }).unwrap();
     assert_eq!(created.len(), 3);
     for chore in &created {
         assert_eq!(chore.kind, TaskKind::Chore);
@@ -466,11 +452,7 @@ fn work_tree_includes_runtime_status_per_task() {
     db.reconcile_product_executions(&product.id).unwrap();
 
     // Drive the second chore's execution into a running run.
-    let running_execution = db
-        .list_executions(Some(&chore_running.id))
-        .unwrap()
-        .pop()
-        .unwrap();
+    let running_execution = db.list_executions(Some(&chore_running.id)).unwrap().pop().unwrap();
     db.start_execution_run(
         &running_execution.id,
         "worker-1",
@@ -581,10 +563,7 @@ fn get_task_runtime_tracks_execution_then_run_id() {
         .unwrap();
     let after_run = db.get_task_runtime(&chore.id).unwrap();
     assert_eq!(after_run.execution_status, Some(ExecutionStatus::Running));
-    assert_eq!(
-        after_run.execution_id.as_deref(),
-        Some(execution.id.as_str())
-    );
+    assert_eq!(after_run.execution_id.as_deref(), Some(execution.id.as_str()));
     assert_eq!(after_run.current_run_id.as_deref(), Some(run.id.as_str()));
     assert_eq!(after_run.run_status.as_deref(), Some("active"));
 
@@ -881,18 +860,17 @@ fn creates_and_lists_execution_entities() {
         .unwrap();
 
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(task.id.clone())
-            .kind(ExecutionKind::TaskImplementation)
-            .status(ExecutionStatus::Ready)
-            .cube_repo_id("cube_repo_mono")
-            .workspace_path("/tmp/mono-agent-001")
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(task.id.clone())
+                .kind(ExecutionKind::TaskImplementation)
+                .status(ExecutionStatus::Ready)
+                .cube_repo_id("cube_repo_mono")
+                .workspace_path("/tmp/mono-agent-001")
+                .build(),
+        )
         .unwrap();
-    assert_eq!(
-        execution.repo_remote_url,
-        "git@github.com:spinyfin/mono.git"
-    );
+    assert_eq!(execution.repo_remote_url, "git@github.com:spinyfin/mono.git");
 
     let run = db
         .create_run(CreateRunInput {
@@ -935,10 +913,7 @@ fn creates_and_lists_execution_entities() {
     let items = db.list_attention_items(&execution.id).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].id, attention.id);
-    assert_eq!(
-        db.get_attention_item(&attention.id).unwrap().title,
-        "Need product call"
-    );
+    assert_eq!(db.get_attention_item(&attention.id).unwrap().title, "Need product call");
 
     let _ = std::fs::remove_file(path);
 }
@@ -1016,28 +991,28 @@ fn execution_requires_repo_remote_url_snapshot() {
         .unwrap();
 
     let err = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(product.id.clone())
-            .kind(ExecutionKind::ProjectDesign)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(product.id.clone())
+                .kind(ExecutionKind::ProjectDesign)
+                .build(),
+        )
         .unwrap_err();
     assert!(
-        err.to_string()
-            .contains("does not resolve to a repo_remote_url"),
+        err.to_string().contains("does not resolve to a repo_remote_url"),
         "expected resolver error in `{err}`",
     );
 
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(product.id.clone())
-            .kind(ExecutionKind::ProjectDesign)
-            .repo_remote_url("git@github.com:spinyfin/mono.git")
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(product.id.clone())
+                .kind(ExecutionKind::ProjectDesign)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
         .unwrap();
-    assert_eq!(
-        execution.repo_remote_url,
-        "git@github.com:spinyfin/mono.git"
-    );
+    assert_eq!(execution.repo_remote_url, "git@github.com:spinyfin/mono.git");
 
     let _ = std::fs::remove_file(path);
 }
@@ -1343,11 +1318,7 @@ fn reconcile_dispatches_chore_against_repo_override() {
         .unwrap();
 
     let result = db.reconcile_product_executions(&product.id).unwrap();
-    assert_eq!(
-        result.created.len(),
-        1,
-        "chore should dispatch on first pass"
-    );
+    assert_eq!(result.created.len(), 1, "chore should dispatch on first pass");
     let executions = db.list_executions(Some(&chore.id)).unwrap();
     assert_eq!(executions.len(), 1);
     assert_eq!(
@@ -1357,11 +1328,7 @@ fn reconcile_dispatches_chore_against_repo_override() {
     assert_eq!(executions[0].status, ExecutionStatus::Ready);
 
     // No sticky attention items raised for a resolvable row.
-    assert!(
-        db.list_attention_items_for_work_item(&chore.id)
-            .unwrap()
-            .is_empty(),
-    );
+    assert!(db.list_attention_items_for_work_item(&chore.id).unwrap().is_empty(),);
 
     let _ = std::fs::remove_file(path);
 }
@@ -1403,10 +1370,7 @@ fn reconcile_surfaces_repo_unresolved_attention_when_unresolvable() {
     };
 
     let first_pass = db.reconcile_product_executions(&product.id).unwrap();
-    assert!(
-        first_pass.created.is_empty(),
-        "no execution row when repo unresolved"
-    );
+    assert!(first_pass.created.is_empty(), "no execution row when repo unresolved");
     assert!(
         db.list_executions(None).unwrap().is_empty(),
         "the failure is sticky-via-attention, not via a phantom execution row",
@@ -1420,8 +1384,7 @@ fn reconcile_surfaces_repo_unresolved_attention_when_unresolvable() {
     assert_eq!(item.execution_id, None);
     assert_eq!(item.work_item_id.as_deref(), Some(chore_id.as_str()));
     assert!(
-        item.body_markdown
-            .contains("boss chore update --repo <url>"),
+        item.body_markdown.contains("boss chore update --repo <url>"),
         "body should tell the user how to fix it (got `{}`)",
         item.body_markdown,
     );
@@ -1435,12 +1398,7 @@ fn reconcile_surfaces_repo_unresolved_attention_when_unresolvable() {
     let second_pass = db.reconcile_product_executions(&product.id).unwrap();
     assert!(second_pass.created.is_empty());
     assert!(second_pass.updated.is_empty());
-    assert_eq!(
-        db.list_attention_items_for_work_item(&chore_id)
-            .unwrap()
-            .len(),
-        1,
-    );
+    assert_eq!(db.list_attention_items_for_work_item(&chore_id).unwrap().len(), 1,);
 
     let _ = std::fs::remove_file(path);
 }
@@ -1483,9 +1441,7 @@ fn request_execution_refuses_when_repo_unresolvable() {
 
     let err = db
         .request_execution_with_live_check(
-            RequestExecutionInput::builder()
-                .work_item_id(chore_id.clone())
-                .build(),
+            RequestExecutionInput::builder().work_item_id(chore_id.clone()).build(),
             |_| true,
         )
         .unwrap_err();
@@ -1547,12 +1503,7 @@ fn reconcile_dispatches_after_override_repairs_unresolvable_chore() {
 
     let first_pass = db.reconcile_product_executions(&product.id).unwrap();
     assert!(first_pass.created.is_empty());
-    assert_eq!(
-        db.list_attention_items_for_work_item(&chore_id)
-            .unwrap()
-            .len(),
-        1,
-    );
+    assert_eq!(db.list_attention_items_for_work_item(&chore_id).unwrap().len(), 1,);
 
     db.update_work_item(
         &chore_id,
@@ -1568,10 +1519,7 @@ fn reconcile_dispatches_after_override_repairs_unresolvable_chore() {
     assert_eq!(second_pass.created.len(), 1);
     let executions = db.list_executions(Some(&chore_id)).unwrap();
     assert_eq!(executions.len(), 1);
-    assert_eq!(
-        executions[0].repo_remote_url,
-        "git@github.com:myorg/nimbus.git",
-    );
+    assert_eq!(executions[0].repo_remote_url, "git@github.com:myorg/nimbus.git",);
 
     let _ = std::fs::remove_file(path);
 }
@@ -1606,11 +1554,13 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
 
     let (execution, run) = db
@@ -1626,10 +1576,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     assert_eq!(execution.status, ExecutionStatus::Running);
     assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
-    assert_eq!(
-        execution.workspace_path.as_deref(),
-        Some("/tmp/mono-agent-001")
-    );
+    assert_eq!(execution.workspace_path.as_deref(), Some("/tmp/mono-agent-001"));
     assert!(execution.started_at.is_some());
     assert_eq!(run.execution_id, execution.id);
     assert_eq!(run.agent_id, "worker-1");
@@ -1673,10 +1620,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     // to the latest run for the execution under the hood.
     assert!(reread.transcript_path.is_none());
     let first = db
-        .set_run_transcript_path_if_unset(
-            &execution.id,
-            "/home/u/.claude/projects/foo/sess-1.jsonl",
-        )
+        .set_run_transcript_path_if_unset(&execution.id, "/home/u/.claude/projects/foo/sess-1.jsonl")
         .unwrap();
     assert_eq!(
         first,
@@ -1689,10 +1633,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
     );
     let second = db
-        .set_run_transcript_path_if_unset(
-            &execution.id,
-            "/home/u/.claude/projects/foo/sess-2.jsonl",
-        )
+        .set_run_transcript_path_if_unset(&execution.id, "/home/u/.claude/projects/foo/sess-2.jsonl")
         .unwrap();
     assert_eq!(
         second,
@@ -1715,9 +1656,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     // snapshot's `transcript_path` pinned at NULL even after the
     // write path was fixed in PR #384.
     assert_eq!(
-        db.transcript_path_for_execution(&execution.id)
-            .unwrap()
-            .as_deref(),
+        db.transcript_path_for_execution(&execution.id).unwrap().as_deref(),
         Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
         "read-side lookup must accept an execution id and return the latest run's transcript_path",
     );
@@ -1746,9 +1685,7 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     // different namespace from `execution_id` and must not match.
     // This pins the regression: pre-fix, passing `run.id` was
     // the production code path and would silently return false.
-    let wrong_namespace = db
-        .set_run_transcript_path_if_unset(&run.id, "/y.jsonl")
-        .unwrap();
+    let wrong_namespace = db.set_run_transcript_path_if_unset(&run.id, "/y.jsonl").unwrap();
     assert_eq!(
         wrong_namespace,
         SetRunTranscriptPathOutcome::RowMissing,
@@ -1788,11 +1725,13 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
     // Drive the chore into the Doing column by starting the run —
     // this is the state cancel is supposed to undo.
@@ -1853,11 +1792,13 @@ fn cancel_execution_preserves_in_review_and_done_status() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Running)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
         .unwrap();
     // The worker opened a PR before the human asked to cancel.
     db.update_work_item(
@@ -2057,11 +1998,13 @@ fn start_execution_does_not_downgrade_done_chores() {
     .unwrap();
 
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
 
     db.start_execution_run(
@@ -2180,22 +2123,20 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
     .unwrap();
     // Create an existing execution and force it to a terminal
     // status so the reconcile sees "latest execution is terminal."
-    db.create_execution(CreateExecutionInput::builder()
-        .work_item_id(chore.id.clone())
-        .kind(ExecutionKind::ChoreImplementation)
-        .status(ExecutionStatus::Failed)
-        .build())
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Failed)
+            .build(),
+    )
     .unwrap();
 
     let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
     assert_eq!(redispatched, vec![chore.id.clone()]);
 
     let executions = db.list_executions(Some(&chore.id)).unwrap();
-    assert_eq!(
-        executions.len(),
-        2,
-        "expected the failed exec plus a fresh ready one"
-    );
+    assert_eq!(executions.len(), 2, "expected the failed exec plus a fresh ready one");
     let latest = executions.last().unwrap();
     assert_eq!(latest.status, ExecutionStatus::Ready);
 }
@@ -2241,11 +2182,13 @@ fn reconcile_skips_active_chore_with_live_execution() {
     .unwrap();
     // A waiting_human execution counts as non-terminal — worker
     // is paused but the slot is still owned.
-    db.create_execution(CreateExecutionInput::builder()
-        .work_item_id(chore.id.clone())
-        .kind(ExecutionKind::ChoreImplementation)
-        .status(ExecutionStatus::WaitingHuman)
-        .build())
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::WaitingHuman)
+            .build(),
+    )
     .unwrap();
 
     let redispatched = db.reconcile_active_dispatch(|_| true).unwrap();
@@ -2300,11 +2243,13 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
     )
     .unwrap();
     let stale = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::WaitingHuman)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::WaitingHuman)
+                .build(),
+        )
         .unwrap();
 
     // is_live=false → reconcile should treat the waiting_human
@@ -2352,11 +2297,7 @@ fn start_run_on_host_for_test(db: &WorkDb, host_id: &str) -> String {
         })
         .unwrap();
     let execution = db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     db.start_execution_run_on_host(
         &execution.id,
@@ -2380,10 +2321,7 @@ fn latest_run_host_for_execution_reports_dispatch_host() {
         Some("zakalwe"),
     );
     // An execution with no run yet resolves to None.
-    assert_eq!(
-        db.latest_run_host_for_execution("exec_does_not_exist").unwrap(),
-        None,
-    );
+    assert_eq!(db.latest_run_host_for_execution("exec_does_not_exist").unwrap(), None,);
 }
 
 #[test]
@@ -2395,10 +2333,7 @@ fn set_run_remote_pid_updates_latest_run() {
         "stamping a pid onto an existing run must report it updated a row",
     );
     // No run for this execution → false (benign no-op).
-    assert!(
-        !db.set_run_remote_pid_for_execution("exec_does_not_exist", 7)
-            .unwrap(),
-    );
+    assert!(!db.set_run_remote_pid_for_execution("exec_does_not_exist", 7).unwrap(),);
 }
 
 #[test]
@@ -2417,10 +2352,7 @@ fn list_reattachable_remote_runs_filters_local_and_terminal() {
         !exec_ids.contains(&local_exec.as_str()),
         "a local run must never be reattachable",
     );
-    let remote_handle = runs
-        .iter()
-        .find(|r| r.execution_id == remote_exec)
-        .unwrap();
+    let remote_handle = runs.iter().find(|r| r.execution_id == remote_exec).unwrap();
     assert_eq!(remote_handle.host_id, "zakalwe");
 
     // Settling the execution removes it from the reattachable set.

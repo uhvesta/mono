@@ -115,12 +115,7 @@ fn capture_workspace_diff(workspace_path: &Path) -> Result<String> {
         .args(["diff", "--git"])
         .current_dir(workspace_path)
         .output()
-        .with_context(|| {
-            format!(
-                "failed to spawn `jj diff --git` in {}",
-                workspace_path.display()
-            )
-        })?;
+        .with_context(|| format!("failed to spawn `jj diff --git` in {}", workspace_path.display()))?;
     if !output.status.success() {
         bail!(
             "`jj diff --git` exited with {} in {}: {}",
@@ -138,20 +133,12 @@ fn capture_workspace_diff(workspace_path: &Path) -> Result<String> {
 /// the workspace had no uncommitted work — there is nothing to back up,
 /// so no file is written and `Ok(None)` is returned. Otherwise the patch
 /// is written and its path returned.
-pub fn write_patch_if_nonempty(
-    recovery_dir: &Path,
-    execution_id: &str,
-    diff: &str,
-) -> Result<Option<PathBuf>> {
+pub fn write_patch_if_nonempty(recovery_dir: &Path, execution_id: &str, diff: &str) -> Result<Option<PathBuf>> {
     if diff.trim().is_empty() {
         return Ok(None);
     }
-    std::fs::create_dir_all(recovery_dir).with_context(|| {
-        format!(
-            "failed to create recovery dir {}",
-            recovery_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(recovery_dir)
+        .with_context(|| format!("failed to create recovery dir {}", recovery_dir.display()))?;
     let path = recovery_dir.join(patch_file_name(execution_id));
     std::fs::write(&path, diff.as_bytes())
         .with_context(|| format!("failed to write recovery patch {}", path.display()))?;
@@ -319,8 +306,7 @@ mod tests {
     /// A recorded-but-nonexistent workspace path is skipped cleanly.
     #[test]
     fn backup_dead_execution_skips_when_workspace_missing() {
-        let execution =
-            sample_execution(Some("/nonexistent/boss/workspace/path".to_owned()));
+        let execution = sample_execution(Some("/nonexistent/boss/workspace/path".to_owned()));
         assert!(backup_dead_execution(&execution).is_none());
     }
 
@@ -374,8 +360,7 @@ mod tests {
             return;
         }
         let recovery = TempDir::new().unwrap();
-        let patch =
-            backup_execution_patch(recovery.path(), ws.path(), "exec_clean_1").unwrap();
+        let patch = backup_execution_patch(recovery.path(), ws.path(), "exec_clean_1").unwrap();
         assert!(patch.is_none(), "a clean working copy must not produce a patch");
     }
 

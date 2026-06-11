@@ -19,10 +19,7 @@ pub(super) async fn handle_subscribe(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        let topics = server_state
-            .topic_broker
-            .subscribe(&session_id, &topics)
-            .await;
+        let topics = server_state.topic_broker.subscribe(&session_id, &topics).await;
         send_response(
             &sink,
             &request_id,
@@ -46,10 +43,7 @@ pub(super) async fn handle_unsubscribe(ctx: Dispatch, req: FrontendRequest) {
         unreachable!()
     };
     {
-        let topics = server_state
-            .topic_broker
-            .unsubscribe(&session_id, &topics)
-            .await;
+        let topics = server_state.topic_broker.unsubscribe(&session_id, &topics).await;
         send_response(&sink, &request_id, FrontendEvent::Unsubscribed { topics });
     }
 }

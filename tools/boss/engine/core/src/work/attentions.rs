@@ -98,20 +98,21 @@ fn query_attention(conn: &Connection, id: &str) -> Result<Option<Attention>> {
 /// error when it is ambiguous (the caller should use the `atg_…` id).
 fn resolve_group(conn: &Connection, id: &str) -> Result<Option<AttentionGroup>> {
     if let Some(rest) = id.strip_prefix('A')
-        && let Ok(short_id) = rest.parse::<i64>() {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT {GROUP_COLS} FROM attention_groups WHERE short_id = ?1"
-            ))?;
-            let mut groups = collect_rows(stmt.query_map([short_id], map_attention_group)?)?;
-            return match groups.len() {
-                0 => Ok(None),
-                1 => Ok(Some(groups.remove(0))),
-                _ => bail!(
-                    "attention short id A{short_id} is ambiguous across products; \
+        && let Ok(short_id) = rest.parse::<i64>()
+    {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {GROUP_COLS} FROM attention_groups WHERE short_id = ?1"
+        ))?;
+        let mut groups = collect_rows(stmt.query_map([short_id], map_attention_group)?)?;
+        return match groups.len() {
+            0 => Ok(None),
+            1 => Ok(Some(groups.remove(0))),
+            _ => bail!(
+                "attention short id A{short_id} is ambiguous across products; \
                      use the atg_… id"
-                ),
-            };
-        }
+            ),
+        };
+    }
     query_attention_group(conn, id)
 }
 
@@ -129,14 +130,10 @@ fn derive_grouping_key(input: &CreateAttentionInput) -> Result<String> {
                     "question attention needs association_project_id to derive a grouping key \
                      (or pass group_id / group_key)",
                 )?;
-            let doc_path = input
-                .source_doc_path
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .context(
-                    "question attention needs source_doc_path to derive a grouping key \
+            let doc_path = input.source_doc_path.as_deref().filter(|s| !s.is_empty()).context(
+                "question attention needs source_doc_path to derive a grouping key \
                      (or pass group_id / group_key)",
-                )?;
+            )?;
             Ok(format!("question|{project_id}|doc:{doc_path}"))
         }
         "followup" => {
@@ -173,32 +170,20 @@ fn validate_member_input(input: &CreateAttentionInput) -> Result<()> {
             if input.prompt_text.as_deref().filter(|s| !s.is_empty()).is_none() {
                 bail!("question attention needs a non-empty prompt_text");
             }
-            if question_type == "multiple_choice"
-                && input
-                    .choice_options
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .is_none()
+            if question_type == "multiple_choice" && input.choice_options.as_deref().filter(|s| !s.is_empty()).is_none()
             {
                 bail!("multiple_choice question needs choice_options (a JSON array of strings)");
             }
         }
         "followup" => {
-            if input
-                .proposed_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .is_none()
-            {
+            if input.proposed_name.as_deref().filter(|s| !s.is_empty()).is_none() {
                 bail!("followup attention needs a non-empty proposed_name");
             }
-            if let Some(work_kind) = input
-                .proposed_work_kind
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                && !matches!(work_kind, "task" | "chore" | "project") {
-                    bail!("invalid proposed_work_kind {work_kind:?}; expected task|chore|project");
-                }
+            if let Some(work_kind) = input.proposed_work_kind.as_deref().filter(|s| !s.is_empty())
+                && !matches!(work_kind, "task" | "chore" | "project")
+            {
+                bail!("invalid proposed_work_kind {work_kind:?}; expected task|chore|project");
+            }
         }
         other => bail!("unknown attention kind {other:?}; expected \"question\" or \"followup\""),
     }
@@ -208,10 +193,7 @@ fn validate_member_input(input: &CreateAttentionInput) -> Result<()> {
 /// Resolve the group the new member belongs to: an explicit `group_id`
 /// wins; otherwise reconcile on the grouping key, joining the latest-
 /// generation open group or bumping `generation` past a terminal one.
-fn resolve_or_create_group(
-    conn: &Connection,
-    input: &CreateAttentionInput,
-) -> Result<AttentionGroup> {
+fn resolve_or_create_group(conn: &Connection, input: &CreateAttentionInput) -> Result<AttentionGroup> {
     if let Some(group_id) = input.group_id.as_deref().filter(|s| !s.is_empty()) {
         return resolve_group(conn, group_id).require("attention group", group_id);
     }
@@ -251,14 +233,8 @@ fn create_group(
     grouping_key: &str,
     generation: i64,
 ) -> Result<AttentionGroup> {
-    let assoc_project = input
-        .association_project_id
-        .as_deref()
-        .filter(|s| !s.is_empty());
-    let assoc_task = input
-        .association_task_id
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    let assoc_project = input.association_project_id.as_deref().filter(|s| !s.is_empty());
+    let assoc_task = input.association_task_id.as_deref().filter(|s| !s.is_empty());
 
     // The schema's XOR CHECK requires exactly one association; enforce it
     // here with a clear message rather than surfacing a raw SQLite error.
@@ -269,9 +245,7 @@ fn create_group(
             "attention association is exclusive: set association_project_id OR \
              association_task_id, not both"
         ),
-        (None, None) => bail!(
-            "attention needs an association: set association_project_id or association_task_id"
-        ),
+        (None, None) => bail!("attention needs an association: set association_project_id or association_task_id"),
     };
 
     let id = next_id("atg");
@@ -312,8 +286,7 @@ fn create_group(
         ],
     )?;
 
-    query_attention_group(conn, &id)?
-        .with_context(|| format!("missing attention group after insert: {id}"))
+    query_attention_group(conn, &id)?.with_context(|| format!("missing attention group after insert: {id}"))
 }
 
 /// Next ordinal for a group: one past the current maximum (1-based).
@@ -331,12 +304,7 @@ fn next_member_ordinal(conn: &Connection, group_id: &str) -> Result<i64> {
 /// [`WorkDb::reconcile_attentions`] (idempotent batch upsert). Callers are
 /// responsible for validating the member and for confirming the group is
 /// non-terminal before calling.
-fn insert_member(
-    conn: &Connection,
-    group_id: &str,
-    ordinal: i64,
-    input: &CreateAttentionInput,
-) -> Result<Attention> {
+fn insert_member(conn: &Connection, group_id: &str, ordinal: i64, input: &CreateAttentionInput) -> Result<Attention> {
     let id = next_id("atn");
     let now = now_string();
     let confidence_source = input
@@ -384,11 +352,9 @@ fn insert_member(
 /// (`actioned`/`dismissed`) are left untouched — only an explicit action /
 /// dismissal moves a group into or out of those.
 fn recompute_group_state(conn: &Connection, group_id: &str) -> Result<()> {
-    let state: String = conn.query_row(
-        "SELECT state FROM attention_groups WHERE id = ?1",
-        [group_id],
-        |row| row.get(0),
-    )?;
+    let state: String = conn.query_row("SELECT state FROM attention_groups WHERE id = ?1", [group_id], |row| {
+        row.get(0)
+    })?;
     if group_is_terminal(&state) {
         return Ok(());
     }
@@ -416,10 +382,7 @@ impl WorkDb {
     /// not content-idempotent. The `(grouping_key, generation)` unique index
     /// makes the *group* idempotent; the structured manifest/sentinel
     /// reconcilers (task 3) layer content-dedup on top of this.
-    pub fn create_attention(
-        &self,
-        input: CreateAttentionInput,
-    ) -> Result<(Attention, AttentionGroup)> {
+    pub fn create_attention(&self, input: CreateAttentionInput) -> Result<(Attention, AttentionGroup)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
 
@@ -490,9 +453,7 @@ impl WorkDb {
         // Seed the dedup set + ordinal counter from the group's existing
         // members so re-runs are no-ops and ordinals stay monotonic.
         let existing = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT {ATTN_COLS} FROM attentions WHERE group_id = ?1"
-            ))?;
+            let mut stmt = tx.prepare(&format!("SELECT {ATTN_COLS} FROM attentions WHERE group_id = ?1"))?;
             collect_rows(stmt.query_map([group.id.as_str()], map_attention)?)?
         };
         let mut seen: HashSet<String> = existing
@@ -624,11 +585,7 @@ impl WorkDb {
     /// Dismiss without producing anything. `atg_…` / `A<n>` dismisses the
     /// whole group (terminal); `atn_…` dismisses a single member. `reason`
     /// has no column in the store and is accepted only for wire/CLI parity.
-    pub fn dismiss_attention(
-        &self,
-        id: &str,
-        _reason: Option<String>,
-    ) -> Result<AttentionGroup> {
+    pub fn dismiss_attention(&self, id: &str, _reason: Option<String>) -> Result<AttentionGroup> {
         if id.starts_with("atn_") {
             return self.set_member_answer_state(id, "dismissed", None);
         }
@@ -744,11 +701,7 @@ fn parse_effort(raw: Option<&str>) -> Option<EffortLevel> {
 /// A concise card title for the revision / design task produced from a
 /// question group — derived from the source doc's basename when known.
 fn question_artifact_name(group: &AttentionGroup) -> String {
-    match group
-        .source_doc_path
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    match group.source_doc_path.as_deref().filter(|s| !s.is_empty()) {
         Some(path) => {
             let base = path.rsplit('/').next().unwrap_or(path);
             format!("Apply answered questions to {base}")
@@ -842,10 +795,7 @@ fn action_question_group(
     members: &[Attention],
     pr_checker: &dyn PrStateChecker,
 ) -> Result<(String, String, Vec<String>)> {
-    let answered: Vec<&Attention> = members
-        .iter()
-        .filter(|m| m.answer_state == "answered")
-        .collect();
+    let answered: Vec<&Attention> = members.iter().filter(|m| m.answer_state == "answered").collect();
     if answered.is_empty() {
         bail!(
             "attention group {} has no answered questions to act on; \
@@ -856,11 +806,7 @@ fn action_question_group(
     let brief = build_qa_brief(group, &answered);
     let name = question_artifact_name(group);
 
-    if let Some(parent_task_id) = group
-        .source_task_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(parent_task_id) = group.source_task_id.as_deref().filter(|s| !s.is_empty()) {
         let input = CreateRevisionInput::builder()
             .parent_task_id(parent_task_id)
             .description(brief.clone())
@@ -924,10 +870,7 @@ fn action_followup_group(
     group: &AttentionGroup,
     members: &[Attention],
 ) -> Result<(String, String, Vec<String>)> {
-    let accepted: Vec<&Attention> = members
-        .iter()
-        .filter(|m| m.answer_state == "answered")
-        .collect();
+    let accepted: Vec<&Attention> = members.iter().filter(|m| m.answer_state == "answered").collect();
     if accepted.is_empty() {
         bail!(
             "attention group {} has no accepted followups to create; \
@@ -943,9 +886,8 @@ fn action_followup_group(
         .or(group.source_task_id.as_deref())
         .filter(|s| !s.is_empty())
         .with_context(|| format!("followup group {} has no originating task", group.id))?;
-    let origin = query_task(conn, origin_id)?.with_context(|| {
-        format!("followup group {} references a missing task {origin_id}", group.id)
-    })?;
+    let origin = query_task(conn, origin_id)?
+        .with_context(|| format!("followup group {} references a missing task {origin_id}", group.id))?;
     let product_id = origin.product_id.clone();
     let project_id = origin.project_id.clone();
 
@@ -1077,9 +1019,8 @@ impl WorkDb {
                 "UPDATE attention_groups SET state = 'dismissed', dismissed_at = ?2 WHERE id = ?1",
                 params![group.id, now],
             )?;
-            let group = query_attention_group(&tx, &group.id)?.with_context(|| {
-                format!("missing attention group after auto-dismiss: {}", group.id)
-            })?;
+            let group = query_attention_group(&tx, &group.id)?
+                .with_context(|| format!("missing attention group after auto-dismiss: {}", group.id))?;
             tx.commit()?;
             return Ok(ActionedAttentionGroup {
                 group,

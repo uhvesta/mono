@@ -15,11 +15,7 @@ pub(super) async fn handle_list_projects(ctx: Dispatch, req: FrontendRequest) {
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ListProjects {
-        product_id,
-        dep_filter,
-    } = req
-    else {
+    let FrontendRequest::ListProjects { product_id, dep_filter } = req else {
         unreachable!()
     };
     {
@@ -29,10 +25,7 @@ pub(super) async fn handle_list_projects(ctx: Dispatch, req: FrontendRequest) {
                     &sink,
                     &request_id,
                     server_state.current_work_revision(),
-                    FrontendEvent::ProjectsList {
-                        product_id,
-                        projects,
-                    },
+                    FrontendEvent::ProjectsList { product_id, projects },
                 );
             }
             Err(err) => {
@@ -74,12 +67,7 @@ pub(super) async fn handle_create_project(ctx: Dispatch, req: FrontendRequest) {
                 vec![work_item_id(&item)],
             )
             .await;
-            send_response_with_revision(
-                &sink,
-                &request_id,
-                revision,
-                FrontendEvent::WorkItemCreated { item },
-            );
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
         }
         Err(err) => {
             send_response(
@@ -102,11 +90,7 @@ pub(super) async fn handle_reorder_project_tasks(ctx: Dispatch, req: FrontendReq
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::ReorderProjectTasks {
-        project_id,
-        task_ids,
-    } = req
-    else {
+    let FrontendRequest::ReorderProjectTasks { project_id, task_ids } = req else {
         unreachable!()
     };
     match work_db.get_work_item(&project_id) {
@@ -127,10 +111,7 @@ pub(super) async fn handle_reorder_project_tasks(ctx: Dispatch, req: FrontendReq
                     &sink,
                     &request_id,
                     revision,
-                    FrontendEvent::ProjectTasksReordered {
-                        project_id,
-                        task_ids,
-                    },
+                    FrontendEvent::ProjectTasksReordered { project_id, task_ids },
                 );
             }
             Err(err) => {
@@ -182,12 +163,7 @@ pub(super) async fn handle_set_project_design_doc(ctx: Dispatch, req: FrontendRe
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemUpdated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
             }
             Err(err) => send_response(
                 &sink,
@@ -230,14 +206,8 @@ pub(super) async fn handle_resolve_project_design_doc(ctx: Dispatch, req: Fronte
                 map
             })
             .unwrap_or_default();
-        match work_db
-            .resolve_project_design_doc(&project_id, |repo| leased_repo_paths.get(repo).cloned())
-        {
-            Ok(output) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::ProjectDesignDocResolved { output },
-            ),
+        match work_db.resolve_project_design_doc(&project_id, |repo| leased_repo_paths.get(repo).cloned()) {
+            Ok(output) => send_response(&sink, &request_id, FrontendEvent::ProjectDesignDocResolved { output }),
             Err(err) => send_response(
                 &sink,
                 &request_id,

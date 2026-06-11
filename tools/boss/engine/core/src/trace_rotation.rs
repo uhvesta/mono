@@ -73,9 +73,10 @@ pub fn rotate_on_startup(path: &Path, max_files: usize) {
 /// created if needed.  Called both at startup and after each rotation.
 pub fn open_trace_file(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     OpenOptions::new().create(true).append(true).open(path)
 }
 
@@ -94,10 +95,7 @@ pub fn prune_old_rotated(active_path: &Path, max_files: usize) {
     let to_delete = backups.len() - max_files;
     for path in &backups[..to_delete] {
         if let Err(err) = std::fs::remove_file(path) {
-            eprintln!(
-                "boss-engine: could not prune old trace file {}: {err}",
-                path.display()
-            );
+            eprintln!("boss-engine: could not prune old trace file {}: {err}", path.display());
         }
     }
 }
@@ -158,9 +156,7 @@ impl Write for RotatingJsonlWriter {
                         prune_old_rotated(&self.path, self.max_files);
                     }
                     Err(err) => {
-                        eprintln!(
-                            "boss-engine: could not open new trace file after rotation: {err}"
-                        );
+                        eprintln!("boss-engine: could not open new trace file after rotation: {err}");
                     }
                 }
             }
@@ -317,7 +313,10 @@ mod tests {
 
         writer.write_all(b"small").unwrap();
 
-        assert!(rotated_segments(&path).is_empty(), "no rotation expected below threshold");
+        assert!(
+            rotated_segments(&path).is_empty(),
+            "no rotation expected below threshold"
+        );
     }
 
     #[test]

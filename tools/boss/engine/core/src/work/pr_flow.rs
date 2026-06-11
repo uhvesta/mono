@@ -42,8 +42,8 @@ impl WorkDb {
         let original_workspace_id = execution.cube_workspace_id.clone();
 
         let work_item_id = execution.work_item_id.clone();
-        let task = query_task(&tx, &work_item_id)?
-            .with_context(|| format!("unknown task for execution: {work_item_id}"))?;
+        let task =
+            query_task(&tx, &work_item_id)?.with_context(|| format!("unknown task for execution: {work_item_id}"))?;
         if task.deleted_at.is_some() {
             bail!("cannot complete a deleted task: {work_item_id}");
         }
@@ -54,12 +54,8 @@ impl WorkDb {
         // keep the existing status. `PendingReview` holds the task in
         // its current status so the reviewer pass runs before human Review.
         let new_status = match target {
-            _ if task.status == TaskStatus::Done || task.status == TaskStatus::Archived => {
-                task.status.clone()
-            }
-            WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => {
-                task.status.clone()
-            }
+            _ if task.status == TaskStatus::Done || task.status == TaskStatus::Archived => task.status.clone(),
+            WorkerPrCompletionTarget::InReview if task.status == TaskStatus::InReview => task.status.clone(),
             WorkerPrCompletionTarget::InReview => TaskStatus::InReview,
             WorkerPrCompletionTarget::Done => TaskStatus::Done,
             // P992: hold in current status while the reviewer runs.
@@ -86,12 +82,7 @@ impl WorkDb {
         )?;
 
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(
-                &tx,
-                &task.id,
-                new_status.as_str(),
-                &now,
-            )?;
+            cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
         }
 
         tx.execute(
@@ -248,16 +239,13 @@ impl WorkDb {
              ORDER BY we.finished_at DESC, we.id DESC",
         )?;
         let rows = stmt.query_map([cutoff], |row| {
-            let branch_naming: BranchNaming =
-                deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
+            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
             Ok(LatePrCandidate {
                 execution_id: row.get(0)?,
                 work_item_id: row.get(1)?,
                 repo_remote_url: row.get(2)?,
                 branch_naming,
-                worker_branch_prefix: row
-                    .get::<_, Option<String>>(4)?
-                    .filter(|s| !s.is_empty()),
+                worker_branch_prefix: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
             })
         })?;
         collect_rows(rows)
@@ -274,10 +262,7 @@ impl WorkDb {
     /// unblock the human review lane rather than stranding the card.
     ///
     /// Returns `(task_id, product_id, pr_url)` triples.
-    pub fn list_tasks_with_stalled_reviewer(
-        &self,
-        stale_secs: u64,
-    ) -> Result<Vec<(String, String, String)>> {
+    pub fn list_tasks_with_stalled_reviewer(&self, stale_secs: u64) -> Result<Vec<(String, String, String)>> {
         let conn = self.connect()?;
         let cutoff = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -349,11 +334,7 @@ impl WorkDb {
     ///
     /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
     /// already past `active` (idempotent for concurrent sweeps).
-    pub fn bind_pr_to_active_task_from_terminal_execution(
-        &self,
-        work_item_id: &str,
-        pr_url: &str,
-    ) -> Result<bool> {
+    pub fn bind_pr_to_active_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
         let rows_changed = conn.execute(
@@ -421,8 +402,8 @@ impl WorkDb {
         // can never push to the merged PR.  Block them now so the
         // scheduler stops dispatching them and the kanban shows why.
         block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
-        let updated = query_task(&tx, work_item_id)?
-            .with_context(|| format!("unknown task after update: {work_item_id}"))?;
+        let updated =
+            query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
         tx.commit()?;
         Ok(Some(updated))
     }
@@ -524,10 +505,7 @@ impl WorkDb {
     ///
     /// Used by the cycle-bound check in [`crate::completion::WorkerCompletionHandler`]
     /// before enqueuing a new `pr_review` execution. P992 design §7, task 9.
-    pub fn get_task_review_cycle_state(
-        &self,
-        task_id: &str,
-    ) -> Result<(i64, Option<String>)> {
+    pub fn get_task_review_cycle_state(&self, task_id: &str) -> Result<(i64, Option<String>)> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT review_cycle, last_reviewed_sha FROM tasks WHERE id = ?1",
@@ -544,11 +522,7 @@ impl WorkDb {
     /// revision was warranted. A missing or empty `last_reviewed_sha` records
     /// `NULL` (the reviewer could not determine the HEAD SHA).
     /// P992 design §7, task 9.
-    pub fn increment_task_review_cycle(
-        &self,
-        task_id: &str,
-        last_reviewed_sha: Option<&str>,
-    ) -> Result<()> {
+    pub fn increment_task_review_cycle(&self, task_id: &str, last_reviewed_sha: Option<&str>) -> Result<()> {
         let conn = self.connect()?;
         let rows = conn.execute(
             "UPDATE tasks
@@ -557,11 +531,7 @@ impl WorkDb {
                  updated_at        = ?3
              WHERE id = ?1
                AND deleted_at IS NULL",
-            params![
-                task_id,
-                last_reviewed_sha.filter(|s| !s.is_empty()),
-                now_string(),
-            ],
+            params![task_id, last_reviewed_sha.filter(|s| !s.is_empty()), now_string(),],
         )?;
         if rows == 0 {
             bail!("unknown or deleted task: {task_id}");

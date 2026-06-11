@@ -7,13 +7,11 @@ use regex::Regex;
 
 use crate::path::validate_relative_path;
 
-static IFCHANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^LINT\.IfChange(?:\(([A-Za-z0-9_-]+)\))?$").expect("valid ifchange regex")
-});
+static IFCHANGE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^LINT\.IfChange(?:\(([A-Za-z0-9_-]+)\))?$").expect("valid ifchange regex"));
 static THENCHANGE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^LINT\.ThenChange\(([^)]+)\)$").expect("valid thenchange regex"));
-static LABEL_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]+$").expect("valid label regex"));
+static LABEL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_-]+$").expect("valid label regex"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedIfChangeFile {
@@ -24,9 +22,7 @@ pub struct ParsedIfChangeFile {
 
 impl ParsedIfChangeFile {
     pub fn block_by_label(&self, label: &str) -> Option<&ParsedIfChangeBlock> {
-        self.labels
-            .get(label)
-            .and_then(|index| self.blocks.get(*index))
+        self.labels.get(label).and_then(|index| self.blocks.get(*index))
     }
 }
 
@@ -83,13 +79,14 @@ pub fn parse_ifchange_file(path: &Path, contents: &str) -> Result<ParsedIfChange
                     );
                 }
                 if let Some(label) = label.as_ref()
-                    && labels.contains_key(label) {
-                        bail!(
-                            "{}:{}: duplicate `LINT.IfChange({label})` label",
-                            path.display(),
-                            line_number
-                        );
-                    }
+                    && labels.contains_key(label)
+                {
+                    bail!(
+                        "{}:{}: duplicate `LINT.IfChange({label})` label",
+                        path.display(),
+                        line_number
+                    );
+                }
                 current = Some(OpenIfChangeBlock {
                     source_label: label,
                     ifchange_line: line_number,
@@ -231,10 +228,7 @@ const VERSION: &str = "v1";
 
         assert_eq!(parsed.blocks.len(), 1);
         assert_eq!(parsed.blocks[0].source_label, None);
-        assert_eq!(
-            parsed.blocks[0].body_range,
-            Some(LineRange { start: 3, end: 3 })
-        );
+        assert_eq!(parsed.blocks[0].body_range, Some(LineRange { start: 3, end: 3 }));
         assert_eq!(
             parsed.blocks[0].target,
             ThenChangeTarget::File {
@@ -291,11 +285,7 @@ message User {}
         )
         .expect_err("must fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate `LINT.IfChange(shared)` label")
-        );
+        assert!(error.to_string().contains("duplicate `LINT.IfChange(shared)` label"));
     }
 
     #[test]
@@ -324,20 +314,13 @@ still open
         )
         .expect_err("must fail");
 
-        assert!(
-            error
-                .to_string()
-                .contains("missing a closing `LINT.ThenChange(...)`")
-        );
+        assert!(error.to_string().contains("missing a closing `LINT.ThenChange(...)`"));
     }
 
     #[test]
     fn rejects_thenchange_without_ifchange() {
-        let error = parse_ifchange_file(
-            Path::new("docs/guide.md"),
-            "// LINT.ThenChange(other/file.md)\n",
-        )
-        .expect_err("must fail");
+        let error = parse_ifchange_file(Path::new("docs/guide.md"), "// LINT.ThenChange(other/file.md)\n")
+            .expect_err("must fail");
 
         assert!(
             error

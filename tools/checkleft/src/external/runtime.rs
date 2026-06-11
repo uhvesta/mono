@@ -12,13 +12,12 @@ use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, W
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
 
-use super::component_bindings::checkleft::check::types as wit_types;
 use super::component_bindings::Check as WitCheck;
+use super::component_bindings::checkleft::check::types as wit_types;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
-    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits,
-    ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    run_declarative_check,
+    EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
+    ExternalCheckPackage, ExternalCheckPackageImplementation, run_declarative_check,
 };
 
 mod cwasm_cache;
@@ -125,7 +124,9 @@ impl HostState {
         Ok(Self {
             ctx: builder.build(),
             table: ResourceTable::new(),
-            limiter: MemoryLimiter { max_bytes: max_memory_bytes },
+            limiter: MemoryLimiter {
+                max_bytes: max_memory_bytes,
+            },
         })
     }
 }
@@ -237,12 +238,9 @@ pub struct DefaultExternalCheckExecutor {
 impl DefaultExternalCheckExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        let root = root.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize check runtime root {}",
-                root.display()
-            )
-        })?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize check runtime root {}", root.display()))?;
         if !root.is_dir() {
             bail!("check runtime root is not a directory: {}", root.display());
         }
@@ -251,15 +249,13 @@ impl DefaultExternalCheckExecutor {
         let ticker = EpochTicker::start(Arc::clone(&engine));
 
         let cache_dir = root.join(".checkleft-cwasm");
-        let component_cache = ComponentAotCache::open(&cache_dir)
-            .map(Some)
-            .unwrap_or_else(|_| {
-                tracing::warn!(
-                    "failed to open .cwasm cache at {}; component-v1 will use JIT compilation",
-                    cache_dir.display()
-                );
-                None
-            });
+        let component_cache = ComponentAotCache::open(&cache_dir).map(Some).unwrap_or_else(|_| {
+            tracing::warn!(
+                "failed to open .cwasm cache at {}; component-v1 will use JIT compilation",
+                cache_dir.display()
+            );
+            None
+        });
 
         Ok(Self {
             root,
@@ -275,12 +271,9 @@ impl DefaultExternalCheckExecutor {
     /// cache location.
     pub fn new_with_cache(root: impl Into<PathBuf>, cache_dir: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        let root = root.canonicalize().with_context(|| {
-            format!(
-                "failed to canonicalize check runtime root {}",
-                root.display()
-            )
-        })?;
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize check runtime root {}", root.display()))?;
         if !root.is_dir() {
             bail!("check runtime root is not a directory: {}", root.display());
         }
@@ -314,9 +307,8 @@ impl DefaultExternalCheckExecutor {
             bytes.to_vec()
         } else {
             let artifact_path = self.resolve_artifact_path(&component.artifact_path)?;
-            fs::read(&artifact_path).with_context(|| {
-                format!("failed to read wasm artifact {}", artifact_path.display())
-            })?
+            fs::read(&artifact_path)
+                .with_context(|| format!("failed to read wasm artifact {}", artifact_path.display()))?
         };
 
         let actual_sha256 = sha256_hex(&component_bytes);
@@ -331,11 +323,8 @@ impl DefaultExternalCheckExecutor {
             );
         }
 
-        let wasm_component = self.load_or_compile_component(
-            &package.id,
-            &component_bytes,
-            &component.artifact_sha256,
-        )?;
+        let wasm_component =
+            self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)?;
         run_component_check(
             &self.engine,
             &self.root,
@@ -417,15 +406,12 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
 /// × n_files`, also clamped to the ceiling.
 ///
 /// Returns `(timeout_ms, max_memory_bytes)`.
-fn resolve_component_limits(
-    limits: Option<&ExternalCheckComponentLimits>,
-    n_files: usize,
-) -> (u64, usize) {
+fn resolve_component_limits(limits: Option<&ExternalCheckComponentLimits>, n_files: usize) -> (u64, usize) {
     let timeout_ms = if let Some(explicit) = limits.and_then(|l| l.timeout_ms) {
         explicit.min(HOST_CEILING_TIMEOUT_MS)
     } else {
-        let proportional = BASE_COMPONENT_TIMEOUT_MS
-            .saturating_add(PER_FILE_COMPONENT_TIMEOUT_MS.saturating_mul(n_files as u64));
+        let proportional =
+            BASE_COMPONENT_TIMEOUT_MS.saturating_add(PER_FILE_COMPONENT_TIMEOUT_MS.saturating_mul(n_files as u64));
         proportional.min(HOST_CEILING_TIMEOUT_MS)
     };
 
@@ -454,10 +440,7 @@ fn format_file_list(changeset: &ChangeSet) -> String {
         return "<no files>".to_owned();
     }
     let cap = files.len().min(5);
-    let head: Vec<String> = files[..cap]
-        .iter()
-        .map(|f| f.path.display().to_string())
-        .collect();
+    let head: Vec<String> = files[..cap].iter().map(|f| f.path.display().to_string()).collect();
     if files.len() > 5 {
         format!("{} … ({} files total)", head.join(", "), files.len())
     } else {
@@ -493,11 +476,7 @@ fn lift_access_scope(scope: Option<&wit_types::AccessScope>) -> AccessScope {
     }
 }
 
-fn compile_component(
-    engine: &Engine,
-    package_id: &str,
-    component_bytes: &[u8],
-) -> Result<Component> {
+fn compile_component(engine: &Engine, package_id: &str, component_bytes: &[u8]) -> Result<Component> {
     wasmtime(Component::new(engine, component_bytes))
         .with_context(|| format!("failed to compile component for `{package_id}`"))
 }
@@ -524,8 +503,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         source_tree,
         config,
     } = run;
-    let (timeout_ticks, max_memory_bytes) =
-        resolve_component_limits(limits, changeset.changed_files.len());
+    let (timeout_ticks, max_memory_bytes) = resolve_component_limits(limits, changeset.changed_files.len());
     let linker = build_component_v1_linker(engine)?;
 
     // Phase 1: instantiate with an empty WASI context (no preopens) to call
@@ -544,18 +522,15 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
             .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?
     };
 
-    let descriptor = descriptors
-        .iter()
-        .find(|d| d.name == check_name)
-        .ok_or_else(|| {
-            let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
-            anyhow::anyhow!(
-                "component `{}` does not export a check named `{}`; available: [{}]",
-                package.id,
-                check_name,
-                exported.join(", ")
-            )
-        })?;
+    let descriptor = descriptors.iter().find(|d| d.name == check_name).ok_or_else(|| {
+        let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        anyhow::anyhow!(
+            "component `{}` does not export a check named `{}`; available: [{}]",
+            package.id,
+            check_name,
+            exported.join(", ")
+        )
+    })?;
 
     let access_scope = lift_access_scope(descriptor.access_scope.as_ref());
 
@@ -568,10 +543,8 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     // Phase 2: re-instantiate with a WASI context that preopens the sandbox
     // root at "/". The guest reads via std::fs with no checkleft-specific
     // call; enforcement is structural (only sandboxed files exist).
-    let host_state =
-        HostState::with_sandbox_root(sandbox.root.path(), max_memory_bytes).with_context(|| {
-            format!("failed to configure WASI context for check `{}`", package.id)
-        })?;
+    let host_state = HostState::with_sandbox_root(sandbox.root.path(), max_memory_bytes)
+        .with_context(|| format!("failed to configure WASI context for check `{}`", package.id))?;
     let mut store = Store::new(engine, host_state);
     store.limiter(|state| &mut state.limiter);
     store.set_epoch_deadline(timeout_ticks);
@@ -582,22 +555,24 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
 
     let input = lower_check_input(changeset, config)?;
     let file_list = format_file_list(changeset);
-    let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input))
-        .map_err(|err| {
-            if is_interrupt_error(&err) {
-                anyhow::anyhow!(
-                    "check `{}` in component `{}` exceeded its {} ms wall-clock limit \
+    let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input)).map_err(|err| {
+        if is_interrupt_error(&err) {
+            anyhow::anyhow!(
+                "check `{}` in component `{}` exceeded its {} ms wall-clock limit \
                      while processing: {}",
-                    check_name, package.id, timeout_ticks, file_list,
-                )
-            } else {
-                err.context(format!(
-                    "`run-check` call failed for check `{}` in component `{}` \
+                check_name,
+                package.id,
+                timeout_ticks,
+                file_list,
+            )
+        } else {
+            err.context(format!(
+                "`run-check` call failed for check `{}` in component `{}` \
                      while processing: {}",
-                    check_name, package.id, file_list,
-                ))
-            }
-        })?;
+                check_name, package.id, file_list,
+            ))
+        }
+    })?;
 
     let findings = run_result.map_err(|e| match e {
         wit_types::CheckError::UnknownCheck(name) => anyhow::anyhow!(
@@ -605,12 +580,9 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
             package.id,
             name
         ),
-        wit_types::CheckError::Failed(msg) => anyhow::anyhow!(
-            "check `{}` in component `{}` failed: {}",
-            check_name,
-            package.id,
-            msg
-        ),
+        wit_types::CheckError::Failed(msg) => {
+            anyhow::anyhow!("check `{}` in component `{}` failed: {}", check_name, package.id, msg)
+        }
     })?;
 
     // `sandbox` is kept alive until here so the preopened directory persists
@@ -676,8 +648,8 @@ fn lower_changeset(changeset: &ChangeSet) -> wit_types::ChangeSet {
 }
 
 fn lower_check_input(changeset: &ChangeSet, config: &toml::Value) -> Result<wit_types::CheckInput> {
-    let config_json = serde_json::to_string(config)
-        .context("failed to serialize config to JSON for component input")?;
+    let config_json =
+        serde_json::to_string(config).context("failed to serialize config to JSON for component input")?;
     Ok(wit_types::CheckInput {
         changeset: lower_changeset(changeset),
         config_json,

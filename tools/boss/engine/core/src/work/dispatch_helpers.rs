@@ -56,10 +56,7 @@ pub(crate) fn allocate_automation_short_id(conn: &Connection, product_id: &str) 
 /// per-product counter (rather than sharing the tasks/projects sequence)
 /// so the first group in a busy product is `A1`, not `A<large>`.
 /// See `tools/boss/docs/designs/attentions.md` §"Schema and wire summary".
-pub(crate) fn allocate_attention_group_short_id(
-    conn: &Connection,
-    product_id: &str,
-) -> Result<i64> {
+pub(crate) fn allocate_attention_group_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
     let current: i64 = conn
         .query_row(
             "SELECT next_value FROM attention_group_short_id_sequences WHERE product_id = ?1",
@@ -108,11 +105,7 @@ pub(crate) fn attention_target_from_input(
 /// reconcile passes against the same work item don't pile up rows.
 /// Caller supplies the kind label (`task`, `chore`, `project`) so
 /// the message names the right CLI verb.
-pub(crate) fn record_repo_unresolved_attention(
-    conn: &Connection,
-    work_item_id: &str,
-    kind_label: &str,
-) -> Result<()> {
+pub(crate) fn record_repo_unresolved_attention(conn: &Connection, work_item_id: &str, kind_label: &str) -> Result<()> {
     let already_open: i64 = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM work_attention_items
@@ -147,10 +140,7 @@ pub(crate) fn record_repo_unresolved_attention(
 /// else) and bails with the same human-facing message
 /// `repo_unresolved_attention_body` produces. Callers MUST resolve
 /// friendly ids (`T42`) before passing `work_item_id` here.
-pub(crate) fn ensure_dispatch_repo_resolvable(
-    conn: &mut Connection,
-    work_item_id: &str,
-) -> Result<()> {
+pub(crate) fn ensure_dispatch_repo_resolvable(conn: &mut Connection, work_item_id: &str) -> Result<()> {
     if resolve_repo_for_work_item(conn, work_item_id)?.is_some() {
         return Ok(());
     }
@@ -174,10 +164,7 @@ pub(crate) fn repo_unresolved_attention_body(work_item_id: &str, kind_label: &st
 /// `repo_unresolved` message. Tasks under a project use `task`;
 /// project-less rows are `chore`. Projects don't dispatch directly,
 /// so the message there falls back to the safe generic.
-pub(crate) fn repo_unresolved_kind_label(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<&'static str> {
+pub(crate) fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) -> Result<&'static str> {
     Ok(match classify_id(work_item_id)? {
         ItemKind::Task => {
             let task = query_task(conn, work_item_id)?
@@ -213,10 +200,7 @@ pub(crate) fn ensure_execution_exists(conn: &Connection, execution_id: &str) -> 
 /// `projects` so cross-product or stale-by-deletion edges never leak
 /// into a kanban payload. Sorted to match `prerequisites_of` /
 /// `dependents_of` so consumers see a stable order.
-pub(crate) fn collect_product_dependencies(
-    conn: &Connection,
-    product_id: &str,
-) -> Result<Vec<WorkItemDependency>> {
+pub(crate) fn collect_product_dependencies(conn: &Connection, product_id: &str) -> Result<Vec<WorkItemDependency>> {
     let mut stmt = conn.prepare(
         "SELECT d.dependent_id, d.prerequisite_id, d.relation, d.created_at
          FROM work_item_dependencies d
@@ -244,11 +228,7 @@ pub(crate) fn collect_product_dependencies(
     collect_rows(rows)
 }
 
-pub(crate) fn collect_task_runtimes(
-    conn: &Connection,
-    tasks: &[Task],
-    chores: &[Task],
-) -> Result<Vec<TaskRuntime>> {
+pub(crate) fn collect_task_runtimes(conn: &Connection, tasks: &[Task], chores: &[Task]) -> Result<Vec<TaskRuntime>> {
     let mut runtimes = Vec::with_capacity(tasks.len() + chores.len());
     for task in tasks.iter().chain(chores.iter()) {
         runtimes.push(query_task_runtime(conn, &task.id)?);
@@ -268,10 +248,7 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Resul
     // latest row is not itself live, prefer a live (running /
     // waiting_human) execution. Steady state — the latest row IS the
     // live run — skips the extra lookup.
-    let latest_is_live = latest
-        .as_ref()
-        .map(|e| e.status.is_live())
-        .unwrap_or(false);
+    let latest_is_live = latest.as_ref().map(|e| e.status.is_live()).unwrap_or(false);
     let execution = if latest_is_live {
         latest
     } else if let Some(live) = query_live_execution_for_work_item(conn, work_item_id)? {
@@ -279,22 +256,16 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Resul
     } else {
         latest
     };
-    let (execution_status, run_status, execution_id, current_run_id) =
-        if let Some(execution) = execution {
-            let latest_run = query_latest_run(conn, &execution.id)?;
-            let (run_status, run_id) = match latest_run {
-                Some((id, status)) => (Some(status), Some(id)),
-                None => (None, None),
-            };
-            (
-                Some(execution.status),
-                run_status,
-                Some(execution.id),
-                run_id,
-            )
-        } else {
-            (None, None, None, None)
+    let (execution_status, run_status, execution_id, current_run_id) = if let Some(execution) = execution {
+        let latest_run = query_latest_run(conn, &execution.id)?;
+        let (run_status, run_id) = match latest_run {
+            Some((id, status)) => (Some(status), Some(id)),
+            None => (None, None),
         };
+        (Some(execution.status), run_status, Some(execution.id), run_id)
+    } else {
+        (None, None, None, None)
+    };
     Ok(TaskRuntime {
         work_item_id: work_item_id.to_owned(),
         execution_status,
@@ -304,10 +275,7 @@ pub(crate) fn query_task_runtime(conn: &Connection, work_item_id: &str) -> Resul
     })
 }
 
-pub(crate) fn query_latest_run(
-    conn: &Connection,
-    execution_id: &str,
-) -> Result<Option<(String, String)>> {
+pub(crate) fn query_latest_run(conn: &Connection, execution_id: &str) -> Result<Option<(String, String)>> {
     conn.query_row(
         "SELECT id, status
          FROM work_runs
@@ -392,10 +360,7 @@ pub(crate) fn reconcile_work_item_execution(
     };
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
-            if execution.kind == kind
-                && execution.status.can_reconcile()
-                && execution.status != effective_status
-            {
+            if execution.kind == kind && execution.status.can_reconcile() && execution.status != effective_status {
                 let updated = update_execution_status(conn, &execution.id, effective_status)?;
                 result.updated.push(updated);
             }
@@ -444,10 +409,7 @@ pub(crate) fn get_chain_root_task(conn: &Connection, revision_id: &str) -> Resul
 /// Return the `cube_workspace_id` from the most recent non-failed
 /// execution of `chain_root_id`. Used as the soft preferred workspace
 /// for revision dispatch — warmth only, never a hard requirement.
-pub(crate) fn preferred_workspace_for_chain_root(
-    conn: &Connection,
-    chain_root_id: &str,
-) -> Result<Option<String>> {
+pub(crate) fn preferred_workspace_for_chain_root(conn: &Connection, chain_root_id: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT cube_workspace_id
          FROM work_executions
@@ -477,19 +439,15 @@ pub(crate) fn preferred_workspace_for_chain_root(
 /// re-dispatched. The table name is selected from a fixed prefix→table
 /// map (never from caller data), so the formatted query is not an
 /// injection surface.
-pub(crate) fn retired_spawning_attempt_status(
-    conn: &Connection,
-    task: &Task,
-) -> Result<Option<String>> {
+pub(crate) fn retired_spawning_attempt_status(conn: &Connection, task: &Task) -> Result<Option<String>> {
     let created_via = task.created_via.as_str();
-    let (table, attempt_id) =
-        if let Some(id) = created_via.strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
-            ("conflict_resolutions", id)
-        } else if let Some(id) = created_via.strip_prefix(CREATED_VIA_CI_FIX_PREFIX) {
-            ("ci_remediations", id)
-        } else {
-            return Ok(None);
-        };
+    let (table, attempt_id) = if let Some(id) = created_via.strip_prefix(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
+        ("conflict_resolutions", id)
+    } else if let Some(id) = created_via.strip_prefix(CREATED_VIA_CI_FIX_PREFIX) {
+        ("ci_remediations", id)
+    } else {
+        return Ok(None);
+    };
     if attempt_id.is_empty() {
         return Ok(None);
     }
@@ -658,10 +616,7 @@ pub(crate) fn reconcile_revision_execution(
             let updated = update_execution_status(conn, &existing.id, effective_status)?;
             result.updated.push(updated);
         }
-        Some(existing)
-            if existing.kind == ExecutionKind::RevisionImplementation
-                && existing.status.can_reconcile() =>
-        {
+        Some(existing) if existing.kind == ExecutionKind::RevisionImplementation && existing.status.can_reconcile() => {
             // Already in the right status — nothing to do.
         }
         _ => {
@@ -671,8 +626,7 @@ pub(crate) fn reconcile_revision_execution(
                 record_repo_unresolved_attention(conn, &task.id, label)?;
                 return Ok(());
             };
-            let preferred_workspace_id =
-                preferred_workspace_for_chain_root(conn, &chain_root_task.id)?;
+            let preferred_workspace_id = preferred_workspace_for_chain_root(conn, &chain_root_task.id)?;
             let created = insert_execution(
                 conn,
                 CreateExecutionInput::builder()
@@ -831,9 +785,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                     existing.status.clone()
                 };
                 let next_priority = priority.unwrap_or(existing.priority);
-                let next_preferred = preferred_workspace_id
-                    .clone()
-                    .or(existing.preferred_workspace_id);
+                let next_preferred = preferred_workspace_id.clone().or(existing.preferred_workspace_id);
                 conn.execute(
                     "UPDATE work_executions
                      SET status = ?2,
@@ -1027,12 +979,7 @@ mod tests {
     /// Raw-insert a task row with full control over `kind` and
     /// `deleted_at`, bypassing the create-time repo invariant. Mirrors
     /// the legacy-row inserts in `work/tests/t01.rs`. Returns the id.
-    fn insert_raw_task(
-        conn: &Connection,
-        product_id: &str,
-        kind: &str,
-        deleted_at: Option<&str>,
-    ) -> String {
+    fn insert_raw_task(conn: &Connection, product_id: &str, kind: &str, deleted_at: Option<&str>) -> String {
         let id = next_id("task");
         let now = now_string();
         conn.execute(
@@ -1051,12 +998,7 @@ mod tests {
         let db = open_db();
         let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
         let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product)
-                    .name("Chore")
-                    .build(),
-            )
+            .create_chore(CreateChoreInput::builder().product_id(product).name("Chore").build())
             .unwrap();
         let exec = db
             .request_execution(RequestExecutionInput::builder().work_item_id(chore.id).build())
@@ -1211,14 +1153,8 @@ mod tests {
         let db = open_db();
         let conn = db.connect().unwrap();
         // Project / product ids classify by prefix and never hit the DB.
-        assert_eq!(
-            repo_unresolved_kind_label(&conn, "proj_abc").unwrap(),
-            "project"
-        );
-        assert_eq!(
-            repo_unresolved_kind_label(&conn, "prod_abc").unwrap(),
-            "product"
-        );
+        assert_eq!(repo_unresolved_kind_label(&conn, "proj_abc").unwrap(), "project");
+        assert_eq!(repo_unresolved_kind_label(&conn, "prod_abc").unwrap(), "product");
     }
 
     #[test]
@@ -1275,10 +1211,7 @@ mod tests {
         assert_eq!(item.status, "open");
         assert_eq!(item.execution_id, None);
         assert_eq!(item.work_item_id.as_deref(), Some(work_id.as_str()));
-        assert_eq!(
-            item.body_markdown,
-            repo_unresolved_attention_body(&work_id, "chore"),
-        );
+        assert_eq!(item.body_markdown, repo_unresolved_attention_body(&work_id, "chore"),);
 
         // Second call while one is already open does NOT duplicate.
         record_repo_unresolved_attention(&conn, &work_id, "chore").unwrap();
@@ -1296,20 +1229,13 @@ mod tests {
         let db = open_db();
         let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
         let chore = db
-            .create_chore(
-                CreateChoreInput::builder()
-                    .product_id(product)
-                    .name("Chore")
-                    .build(),
-            )
+            .create_chore(CreateChoreInput::builder().product_id(product).name("Chore").build())
             .unwrap();
 
         let mut conn = db.connect().unwrap();
         ensure_dispatch_repo_resolvable(&mut conn, &chore.id).unwrap();
         assert!(
-            db.list_attention_items_for_work_item(&chore.id)
-                .unwrap()
-                .is_empty(),
+            db.list_attention_items_for_work_item(&chore.id).unwrap().is_empty(),
             "a resolvable work item must not raise an attention item",
         );
     }
@@ -1325,10 +1251,7 @@ mod tests {
         let mut conn = db.connect().unwrap();
         let err = ensure_dispatch_repo_resolvable(&mut conn, &chore_id).unwrap_err();
         // Bails with the exact single-source message.
-        assert_eq!(
-            err.to_string(),
-            repo_unresolved_attention_body(&chore_id, "chore"),
-        );
+        assert_eq!(err.to_string(), repo_unresolved_attention_body(&chore_id, "chore"),);
         drop(conn);
 
         // The sticky row was committed despite the bail, and exactly one

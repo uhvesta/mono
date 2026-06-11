@@ -242,9 +242,9 @@ pub(super) fn validate_declarative_implementation(
 
 fn validate_requirement(name: &str, raw: RawBinaryRequirement) -> Result<BinaryRequirement> {
     let binding = match (raw.default.bazel, raw.default.path) {
-        (Some(_), Some(_)) => bail!(
-            "binary `{name}` default binding must set exactly one of `bazel` or `path`, not both"
-        ),
+        (Some(_), Some(_)) => {
+            bail!("binary `{name}` default binding must set exactly one of `bazel` or `path`, not both")
+        }
         (Some(bazel), None) => BinaryBinding::Bazel(non_empty(&format!("needs.{name}.default.bazel"), bazel)?),
         (None, Some(path)) => BinaryBinding::Path(non_empty(&format!("needs.{name}.default.path"), path)?),
         (None, None) => bail!("binary `{name}` default binding must set one of `bazel` or `path`"),
@@ -252,10 +252,7 @@ fn validate_requirement(name: &str, raw: RawBinaryRequirement) -> Result<BinaryR
     Ok(BinaryRequirement { default: binding })
 }
 
-fn validate_invocation(
-    needs: &BTreeMap<String, BinaryRequirement>,
-    raw: RawInvocation,
-) -> Result<Invocation> {
+fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvocation) -> Result<Invocation> {
     let id = non_empty("invocations[].id", raw.id)?;
     let run = non_empty("invocations[].run", raw.run)?;
     if !needs.contains_key(&run) {
@@ -340,7 +337,10 @@ fn validate_transform(id: &str, raw: RawTransform) -> Result<transform::Transfor
             let selector = Selector::parse(&select)
                 .map_err(|err| anyhow::anyhow!("invocation `{id}` has invalid `select`: {err}"))?;
             let finding = validate_finding(id, finding)?;
-            Ok(transform::Transform::Json(transform::JsonTransform { selector, finding }))
+            Ok(transform::Transform::Json(transform::JsonTransform {
+                selector,
+                finding,
+            }))
         }
         // The identity transform: the binary already emits checkleft findings JSON
         // directly. This is how an old `exec-v1` check expresses itself in the
@@ -369,8 +369,7 @@ fn validate_transform(id: &str, raw: RawTransform) -> Result<transform::Transfor
 
 fn validate_finding(id: &str, raw: RawFinding) -> Result<transform::FindingTemplate> {
     let parse = |field: &str, value: String| -> Result<Template> {
-        Template::parse(&value)
-            .map_err(|err| anyhow::anyhow!("invocation `{id}` finding.{field} is invalid: {err}"))
+        Template::parse(&value).map_err(|err| anyhow::anyhow!("invocation `{id}` finding.{field} is invalid: {err}"))
     };
     Ok(transform::FindingTemplate {
         path: parse("path", raw.path)?,

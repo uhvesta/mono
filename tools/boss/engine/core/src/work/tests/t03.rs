@@ -173,20 +173,17 @@ fn records_failed_execution_start_attempt() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
 
     let (execution, run) = db
-        .fail_execution_start(
-            &execution.id,
-            "worker-1",
-            Some("mono"),
-            "cube workspace lease failed",
-        )
+        .fail_execution_start(&execution.id, "worker-1", Some("mono"), "cube workspace lease failed")
         .unwrap();
     assert_eq!(execution.status, ExecutionStatus::Failed);
     assert_eq!(execution.cube_repo_id.as_deref(), Some("mono"));
@@ -194,10 +191,7 @@ fn records_failed_execution_start_attempt() {
     assert!(execution.workspace_path.is_none());
     assert!(execution.finished_at.is_some());
     assert_eq!(run.status, "failed");
-    assert_eq!(
-        run.error_text.as_deref(),
-        Some("cube workspace lease failed")
-    );
+    assert_eq!(run.error_text.as_deref(), Some("cube workspace lease failed"));
     assert!(run.finished_at.is_some());
 
     let _ = std::fs::remove_file(path);
@@ -233,11 +227,13 @@ fn finishes_active_run_into_waiting_human_with_attention() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
 
     let (execution, run) = db
@@ -274,16 +270,10 @@ fn finishes_active_run_into_waiting_human_with_attention() {
 
     assert_eq!(execution.status, ExecutionStatus::WaitingHuman);
     assert_eq!(execution.cube_lease_id.as_deref(), Some("lease-1"));
-    assert_eq!(
-        execution.workspace_path.as_deref(),
-        Some("/tmp/mono-agent-001")
-    );
+    assert_eq!(execution.workspace_path.as_deref(), Some("/tmp/mono-agent-001"));
     assert!(execution.finished_at.is_none());
     assert_eq!(run.status, "completed");
-    assert_eq!(
-        run.result_summary.as_deref(),
-        Some("Implemented the first pass.")
-    );
+    assert_eq!(run.result_summary.as_deref(), Some("Implemented the first pass."));
     assert!(run.error_text.is_none());
     assert!(run.finished_at.is_some());
     let attention = attention.expect("attention item should be created");
@@ -323,11 +313,13 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
         })
         .unwrap();
     let execution = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore.id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
         .unwrap();
 
     let (execution, run) = db
@@ -370,19 +362,10 @@ fn finishes_active_run_as_failed_and_clears_workspace_when_requested() {
 fn parse_iso8601_to_epoch_handles_canonical_shapes() {
     // Reference epochs cross-checked with `date -u -d '...' +%s`.
     assert_eq!(parse_iso8601_to_epoch("1970-01-01T00:00:00Z"), Some(0));
-    assert_eq!(
-        parse_iso8601_to_epoch("2026-05-07T18:55:45Z"),
-        Some(1_778_180_145)
-    );
+    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45Z"), Some(1_778_180_145));
     // Fractional seconds are truncated, not rounded.
-    assert_eq!(
-        parse_iso8601_to_epoch("2026-05-07T18:55:45.000Z"),
-        Some(1_778_180_145)
-    );
-    assert_eq!(
-        parse_iso8601_to_epoch("2026-05-07T18:55:45.999Z"),
-        Some(1_778_180_145)
-    );
+    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45.000Z"), Some(1_778_180_145));
+    assert_eq!(parse_iso8601_to_epoch("2026-05-07T18:55:45.999Z"), Some(1_778_180_145));
     // Already-canonical numeric strings are left untouched.
     assert_eq!(parse_iso8601_to_epoch("1778180145"), None);
     assert_eq!(parse_iso8601_to_epoch(""), None);
@@ -439,11 +422,9 @@ fn migrate_timestamps_rewrites_iso_rows_to_epoch() {
     let db = WorkDb::open(path.clone()).unwrap();
     let conn = db.connect().unwrap();
     let updated_at: String = conn
-        .query_row(
-            "SELECT updated_at FROM tasks WHERE id = ?1",
-            params![chore.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT updated_at FROM tasks WHERE id = ?1", params![chore.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(updated_at, "1778180145");
 
@@ -850,9 +831,7 @@ fn dependent_auto_unblocks_when_prereq_marked_done() {
     .unwrap();
 
     let a_after = db.get_work_item(&a.id).unwrap();
-    let WorkItem::Chore(t) = a_after else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = a_after else { panic!() };
     assert_eq!(t.status, TaskStatus::Todo);
     assert_eq!(t.last_status_actor, "engine");
     let _ = std::fs::remove_file(path);
@@ -922,9 +901,7 @@ fn auto_unblock_creates_ready_execution() {
     .unwrap();
 
     let dep_after = db.get_work_item(&dep.id).unwrap();
-    let WorkItem::Chore(t) = dep_after else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = dep_after else { panic!() };
     assert_eq!(t.status, TaskStatus::Todo, "dependent must be unblocked to todo");
 
     // Key assertion: the execution must be `ready` so the coordinator
@@ -932,7 +909,8 @@ fn auto_unblock_creates_ready_execution() {
     let executions = db.list_executions(Some(&dep.id)).unwrap();
     assert_eq!(executions.len(), 1, "must have exactly one execution");
     assert_eq!(
-        executions[0].status, ExecutionStatus::Ready,
+        executions[0].status,
+        ExecutionStatus::Ready,
         "auto-unblock must promote execution to ready so coordinator can dispatch"
     );
     let _ = std::fs::remove_file(path);
@@ -1017,9 +995,7 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
     // Sanity: dependent is auto-blocked by the engine because at
     // least one prereq is still gating.
     let blocked = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(t) = blocked else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = blocked else { panic!() };
     assert_eq!(t.status, TaskStatus::Blocked);
     assert_eq!(t.last_status_actor, "engine");
 
@@ -1034,11 +1010,10 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
     )
     .unwrap();
     let still_blocked = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(t) = still_blocked else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = still_blocked else { panic!() };
     assert_eq!(
-        t.status, TaskStatus::Blocked,
+        t.status,
+        TaskStatus::Blocked,
         "dependent must stay blocked while at least one prereq is still gating",
     );
     assert_eq!(t.last_status_actor, "engine");
@@ -1053,11 +1028,10 @@ fn dependent_stays_blocked_until_all_multi_prereqs_done() {
     )
     .unwrap();
     let unblocked = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(t) = unblocked else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = unblocked else { panic!() };
     assert_eq!(
-        t.status, TaskStatus::Todo,
+        t.status,
+        TaskStatus::Todo,
         "all prereqs done — dependent must auto-unblock"
     );
     assert_eq!(t.last_status_actor, "engine");
@@ -1133,9 +1107,7 @@ fn prereq_regression_does_not_re_block_dependents() {
     )
     .unwrap();
     let unblocked = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(t) = unblocked else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = unblocked else { panic!() };
     assert_eq!(t.status, TaskStatus::Todo);
     assert_eq!(t.last_status_actor, "engine");
 
@@ -1152,11 +1124,10 @@ fn prereq_regression_does_not_re_block_dependents() {
     )
     .unwrap();
     let after_regression = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(t) = after_regression else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = after_regression else { panic!() };
     assert_eq!(
-        t.status, TaskStatus::Todo,
+        t.status,
+        TaskStatus::Todo,
         "prereq regressing out of `done` must NOT yank the dependent back to `blocked`",
     );
     // The dispatcher gate must still see the regressed prereq as
@@ -1241,17 +1212,13 @@ fn cyclic_edges_do_not_loop_the_cascade() {
     // Drive B to `done` via the merge poller's path — the same
     // entry point the production bug reported. Must return
     // promptly; if the cascade looped, this would hang.
-    let updated = db
-        .mark_chore_pr_merged(&b.id, "https://example.test/pr/1")
-        .unwrap();
+    let updated = db.mark_chore_pr_merged(&b.id, "https://example.test/pr/1").unwrap();
     assert!(
         updated.is_some(),
         "mark_chore_pr_merged should report a transition for the cycle prereq",
     );
     let b_after = db.get_work_item(&b.id).unwrap();
-    let WorkItem::Chore(t) = b_after else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = b_after else { panic!() };
     assert_eq!(t.status, TaskStatus::Done);
     let _ = std::fs::remove_file(path);
 }
@@ -1351,7 +1318,8 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!("expected WorkItem::Task for revision")
     };
     assert_eq!(
-        rev_t.status, TaskStatus::Blocked,
+        rev_t.status,
+        TaskStatus::Blocked,
         "revision must be auto-blocked after add_dependency"
     );
 
@@ -1360,7 +1328,8 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!()
     };
     assert_eq!(
-        chore_t.status, TaskStatus::Blocked,
+        chore_t.status,
+        TaskStatus::Blocked,
         "chore dependent must be auto-blocked after add_dependency"
     );
 
@@ -1376,11 +1345,10 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
 
     // Revision must now be unblocked (gate satisfied by in_review).
     let rev_after = db.get_work_item(&revision_id).unwrap();
-    let WorkItem::Task(rev_a) = rev_after else {
-        panic!()
-    };
+    let WorkItem::Task(rev_a) = rev_after else { panic!() };
     assert_eq!(
-        rev_a.status, TaskStatus::Todo,
+        rev_a.status,
+        TaskStatus::Todo,
         "revision must unblock when prereq reaches in_review",
     );
     assert!(
@@ -1394,7 +1362,8 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
         panic!()
     };
     assert_eq!(
-        chore_a.status, TaskStatus::Blocked,
+        chore_a.status,
+        TaskStatus::Blocked,
         "non-revision chore must remain blocked when prereq is only in_review",
     );
 
@@ -1408,11 +1377,10 @@ fn revision_unblocks_when_prereq_reaches_in_review() {
     )
     .unwrap();
     let chore_done = db.get_work_item(&chore_dep.id).unwrap();
-    let WorkItem::Chore(chore_d) = chore_done else {
-        panic!()
-    };
+    let WorkItem::Chore(chore_d) = chore_done else { panic!() };
     assert_eq!(
-        chore_d.status, TaskStatus::Todo,
+        chore_d.status,
+        TaskStatus::Todo,
         "chore must unblock when prereq reaches done",
     );
 }
@@ -1500,9 +1468,7 @@ fn manual_block_is_not_auto_unblocked() {
     .unwrap();
 
     let a_after = db.get_work_item(&a.id).unwrap();
-    let WorkItem::Chore(t) = a_after else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = a_after else { panic!() };
     assert_eq!(t.status, TaskStatus::Blocked);
     assert_eq!(t.last_status_actor, "human");
     let _ = std::fs::remove_file(path);
@@ -1697,9 +1663,7 @@ fn request_execution_refuses_gated_work_item() {
     })
     .unwrap();
     let err = db
-        .request_execution(RequestExecutionInput::builder()
-            .work_item_id(a.id.clone())
-            .build())
+        .request_execution(RequestExecutionInput::builder().work_item_id(a.id.clone()).build())
         .unwrap_err()
         .to_string();
     assert!(err.contains("gated by"), "unexpected error: {err}");
@@ -1766,11 +1730,10 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     .unwrap();
     // dependent is now auto-blocked by the engine.
     let dep_after_add = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(t) = dep_after_add else {
-        panic!()
-    };
+    let WorkItem::Chore(t) = dep_after_add else { panic!() };
     assert_eq!(
-        t.status, TaskStatus::Blocked,
+        t.status,
+        TaskStatus::Blocked,
         "engine should have auto-blocked dependent"
     );
     assert_eq!(t.blocked_reason.as_deref(), Some("dependency"));
@@ -1807,18 +1770,18 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
     // blocked_reason is NULL because we cleared it above to simulate
     // the stale-block scenario.
     let still_stuck = db.get_work_item(&dependent.id).unwrap();
-    let WorkItem::Chore(stuck) = still_stuck else {
-        panic!()
-    };
+    let WorkItem::Chore(stuck) = still_stuck else { panic!() };
     assert_eq!(stuck.status, TaskStatus::Blocked, "cascade skipped — still stuck");
     assert_eq!(stuck.blocked_reason, None);
 
     // RequestExecution (the user-override path) must succeed and
     // clear the stale block.
     let execution = db
-        .request_execution(RequestExecutionInput::builder()
-            .work_item_id(dependent.id.clone())
-            .build())
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(dependent.id.clone())
+                .build(),
+        )
         .expect("RequestExecution should succeed when all prereqs are done");
 
     assert_eq!(execution.status, ExecutionStatus::Ready, "execution must be ready");
@@ -1830,7 +1793,8 @@ fn request_execution_clears_stale_dependency_block_when_prereqs_done() {
         panic!()
     };
     assert_eq!(
-        final_task.status, TaskStatus::Todo,
+        final_task.status,
+        TaskStatus::Todo,
         "blocked_reason=dependency must be cleared to todo on RequestExecution"
     );
     assert!(
@@ -1887,11 +1851,9 @@ fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
     assert!(table_has_column(&conn, "tasks", "last_status_actor").unwrap());
     assert!(table_has_column(&conn, "projects", "last_status_actor").unwrap());
     let version: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
     let _ = std::fs::remove_file(path);
@@ -1907,7 +1869,7 @@ fn migration_adds_project_design_doc_columns() {
     let path = disk_db_path("design-doc-migrate");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
-            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE products (
                  id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
                  description TEXT NOT NULL DEFAULT '', repo_remote_url TEXT,
@@ -1933,8 +1895,8 @@ fn migration_adds_project_design_doc_columns() {
              INSERT INTO projects(id, product_id, name, slug, status, priority, created_at, updated_at)
              VALUES ('proj_legacy', 'prod_legacy', 'Legacy', 'legacy', 'planned', 'medium', '1700000000', '1700000000');
              INSERT INTO metadata(key, value) VALUES ('schema_version','4');",
-        )
-        .unwrap();
+    )
+    .unwrap();
     drop(conn);
 
     let db = WorkDb::open(path.clone()).unwrap();
@@ -2015,9 +1977,7 @@ fn create_via_round_trip_per_source() {
             no_design_task: false,
         })
         .unwrap();
-    let project_tasks = db
-        .list_tasks(&product.id, Some(&project.id), None, false)
-        .unwrap();
+    let project_tasks = db.list_tasks(&product.id, Some(&project.id), None, false).unwrap();
     let design_task = project_tasks
         .iter()
         .find(|t| t.kind == TaskKind::Design)
@@ -2075,11 +2035,9 @@ fn migration_adds_created_via_with_unknown_default() {
     let legacy = query_task(&conn, "task_legacy").unwrap().unwrap();
     assert_eq!(legacy.created_via, CREATED_VIA_UNKNOWN);
     let version: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
     let _ = std::fs::remove_file(path);
@@ -2121,11 +2079,9 @@ fn fresh_init_includes_tasks_repo_remote_url() {
     assert_eq!(index_exists, 1);
 
     let version: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
 
@@ -2209,11 +2165,9 @@ fn migration_from_v4_adds_tasks_repo_remote_url() {
 
     // schema_version moves from 4 → current.
     let version: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(version, "20");
 
@@ -2272,7 +2226,8 @@ fn redispatch_preserves_investigation_execution_kind() {
         )
         .unwrap();
     assert_eq!(
-        first.kind, ExecutionKind::InvestigationImplementation,
+        first.kind,
+        ExecutionKind::InvestigationImplementation,
         "first dispatch should carry the investigation kind"
     );
 
@@ -2293,7 +2248,8 @@ fn redispatch_preserves_investigation_execution_kind() {
         "redispatch should create a fresh execution, not reuse the stale one"
     );
     assert_eq!(
-        redispatched.kind, ExecutionKind::InvestigationImplementation,
+        redispatched.kind,
+        ExecutionKind::InvestigationImplementation,
         "redispatched investigation must NOT downgrade to task_implementation"
     );
 
@@ -2379,7 +2335,11 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
         .find(|t| t.id == investigation.id)
         .expect("investigation must be delivered in the work tree's tasks array");
     assert_eq!(found.kind, TaskKind::Investigation);
-    assert_eq!(found.status, TaskStatus::InReview, "an open doc PR moves the card to Review");
+    assert_eq!(
+        found.status,
+        TaskStatus::InReview,
+        "an open doc PR moves the card to Review"
+    );
     assert_eq!(
         found.pr_url.as_deref(),
         Some(pr),
@@ -2394,8 +2354,7 @@ fn investigation_open_pr_exposes_derived_doc_link_in_work_tree() {
     // (e.g. a mistaken skip_serializing_if) would also fail here. This is the
     // T1310 gap-hunt addition: if this passes but the live card shows no link,
     // the gap is in the app's IPC reception (parseTask) or render path.
-    let tasks_json = serde_json::to_value(&tree.tasks)
-        .expect("work tree tasks must be JSON-serializable");
+    let tasks_json = serde_json::to_value(&tree.tasks).expect("work tree tasks must be JSON-serializable");
     let inv_json = tasks_json
         .as_array()
         .expect("tasks is an array")
@@ -2569,9 +2528,7 @@ fn cold_path_pr_detection_covers_investigations() {
 
     // Late-PR fallback set (recently-terminal) must also include it.
     db.mark_execution_redundant(&exec.id).unwrap();
-    let late = db
-        .list_recently_terminal_executions_pending_pr_detection(3600)
-        .unwrap();
+    let late = db.list_recently_terminal_executions_pending_pr_detection(3600).unwrap();
     assert!(
         late.iter().any(|c| c.execution_id == exec.id),
         "cold-path late-PR detection must cover investigations (recently-terminal sweep)"

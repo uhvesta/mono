@@ -83,9 +83,6 @@ mod tests {
             Severity::parse_with_default(Some("unknown"), Severity::Warning),
             Severity::Warning
         );
-        assert_eq!(
-            Severity::parse_with_default(None, Severity::Error),
-            Severity::Error
-        );
+        assert_eq!(Severity::parse_with_default(None, Severity::Error), Severity::Error);
     }
 }

@@ -7,9 +7,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::auth::{
-    AUTH_ENDPOINT, AuthChallenge, FinalTokenResponse, IDENTITY_WORKFLOW_ENDPOINT_PREFIX,
-    TokenRequest, TokenResponse, WorkflowEntryPointRequest, WorkflowProceedRequest, WorkflowRoute,
-    WorkflowRouteResponse,
+    AUTH_ENDPOINT, AuthChallenge, FinalTokenResponse, IDENTITY_WORKFLOW_ENDPOINT_PREFIX, TokenRequest, TokenResponse,
+    WorkflowEntryPointRequest, WorkflowProceedRequest, WorkflowRoute, WorkflowRouteResponse,
 };
 use crate::error::RobinhoodClientError;
 
@@ -23,7 +22,8 @@ pub struct RobinhoodClient {
 const DEFAULT_IDENTITY_BASE_URL: &str = "https://identi.robinhood.com/";
 const DEFAULT_API_BASE_URL: &str = "https://api.robinhood.com/";
 const INSTRUMENT_LOOKUP_CHUNK: usize = 50;
-const OPTION_ORDER_STATES: &str = "canceled,cancelled,filled,failed,partially_filled_rest_cancelled,voided,rejected,locate_failed";
+const OPTION_ORDER_STATES: &str =
+    "canceled,cancelled,filled,failed,partially_filled_rest_cancelled,voided,rejected,locate_failed";
 
 fn ensure_rustls_provider() {
     static INIT: OnceLock<()> = OnceLock::new();
@@ -47,10 +47,7 @@ impl RobinhoodClient {
         Self::with_http_client_and_identity_base(http, base_url, DEFAULT_IDENTITY_BASE_URL)
     }
 
-    pub fn with_base_urls(
-        base_url: &str,
-        identity_base_url: &str,
-    ) -> Result<Self, RobinhoodClientError> {
+    pub fn with_base_urls(base_url: &str, identity_base_url: &str) -> Result<Self, RobinhoodClientError> {
         ensure_rustls_provider();
         let http = Client::builder().build()?;
         Self::with_http_client_and_identity_base(http, base_url, identity_base_url)
@@ -78,11 +75,7 @@ impl RobinhoodClient {
         &self.http
     }
 
-    pub async fn initiate_login(
-        &self,
-        username: &str,
-        password: &str,
-    ) -> Result<AuthChallenge, RobinhoodClientError> {
+    pub async fn initiate_login(&self, username: &str, password: &str) -> Result<AuthChallenge, RobinhoodClientError> {
         let device_token = Uuid::new_v4();
         let request_id = Uuid::new_v4();
 
@@ -100,10 +93,7 @@ impl RobinhoodClient {
         ))
     }
 
-    pub async fn fetch_verification_result(
-        &self,
-        workflow_id: &str,
-    ) -> Result<bool, RobinhoodClientError> {
+    pub async fn fetch_verification_result(&self, workflow_id: &str) -> Result<bool, RobinhoodClientError> {
         let path = format!("verification_workflows/polaris_migrated/{workflow_id}/");
         let url = self
             .identity_base_url
@@ -121,10 +111,7 @@ impl RobinhoodClient {
         Ok(verification.result)
     }
 
-    pub async fn advance_workflow_entry_point(
-        &self,
-        workflow_id: &str,
-    ) -> Result<WorkflowRoute, RobinhoodClientError> {
+    pub async fn advance_workflow_entry_point(&self, workflow_id: &str) -> Result<WorkflowRoute, RobinhoodClientError> {
         let path = format!("{IDENTITY_WORKFLOW_ENDPOINT_PREFIX}{workflow_id}/");
         let url = self
             .identity_base_url
@@ -144,10 +131,7 @@ impl RobinhoodClient {
         Ok(route.route)
     }
 
-    pub async fn fetch_accounts(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<RobinhoodAccount>, RobinhoodClientError> {
+    pub async fn fetch_accounts(&self, access_token: &str) -> Result<Vec<RobinhoodAccount>, RobinhoodClientError> {
         let mut url = self
             .base_url
             .join("accounts/")
@@ -165,11 +149,7 @@ impl RobinhoodClient {
         let body = response.bytes().await?;
         let payload: RobinhoodAccountsResponse = serde_json::from_slice(&body)?;
 
-        Ok(payload
-            .results
-            .into_iter()
-            .map(RobinhoodAccount::from)
-            .collect())
+        Ok(payload.results.into_iter().map(RobinhoodAccount::from).collect())
     }
 
     pub async fn fetch_positions(
@@ -181,9 +161,7 @@ impl RobinhoodClient {
             .base_url
             .join("positions/")
             .map_err(RobinhoodClientError::InvalidEndpointUrl)?;
-        url.set_query(Some(&format!(
-            "account_number={account_number}&nonzero=true"
-        )));
+        url.set_query(Some(&format!("account_number={account_number}&nonzero=true")));
 
         let mut positions = Vec::new();
         let mut next_url: Option<Url> = Some(url);
@@ -214,12 +192,13 @@ impl RobinhoodClient {
                     continue;
                 }
 
-                let quantity = quantity_text.parse::<f64>().map_err(|error| {
-                    RobinhoodClientError::InvalidPositionQuantity {
-                        symbol: symbol.clone(),
-                        source: error,
-                    }
-                })?;
+                let quantity =
+                    quantity_text
+                        .parse::<f64>()
+                        .map_err(|error| RobinhoodClientError::InvalidPositionQuantity {
+                            symbol: symbol.clone(),
+                            source: error,
+                        })?;
 
                 positions.push(RobinhoodPosition { symbol, quantity });
             }
@@ -398,10 +377,7 @@ impl RobinhoodClient {
         Ok(payload.results)
     }
 
-    pub async fn fetch_push_prompt_status(
-        &self,
-        challenge_id: &str,
-    ) -> Result<String, RobinhoodClientError> {
+    pub async fn fetch_push_prompt_status(&self, challenge_id: &str) -> Result<String, RobinhoodClientError> {
         let path = format!("push/{challenge_id}/get_prompts_status/");
         let url = self
             .base_url
@@ -434,10 +410,7 @@ impl RobinhoodClient {
         self.request_token(&payload, false).await
     }
 
-    pub async fn complete_device_approval(
-        &self,
-        workflow_id: &str,
-    ) -> Result<WorkflowRoute, RobinhoodClientError> {
+    pub async fn complete_device_approval(&self, workflow_id: &str) -> Result<WorkflowRoute, RobinhoodClientError> {
         let path = format!("{IDENTITY_WORKFLOW_ENDPOINT_PREFIX}{workflow_id}/");
         let url = self
             .identity_base_url
@@ -667,10 +640,7 @@ pub struct RobinhoodOptionOrderExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{
-        CLIENT_ID, GRANT_TYPE, IDENTITY_CLIENT_VERSION, READ_ONLY_SECONDARY_TOKEN,
-        TOKEN_REQUEST_PATH,
-    };
+    use crate::auth::{CLIENT_ID, GRANT_TYPE, IDENTITY_CLIENT_VERSION, READ_ONLY_SECONDARY_TOKEN, TOKEN_REQUEST_PATH};
     use serde_json::json;
     use uuid::Uuid;
     use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
@@ -692,8 +662,7 @@ mod tests {
     fn new_with_http_client_rejects_invalid_url() {
         let http = test_http_client();
 
-        let err =
-            RobinhoodClient::with_http_client(http, "not a url").expect_err("expected invalid url");
+        let err = RobinhoodClient::with_http_client(http, "not a url").expect_err("expected invalid url");
 
         match err {
             RobinhoodClientError::InvalidBaseUrl(_) => {}
@@ -752,17 +721,10 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid base url");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid base url");
 
-        let challenge = client
-            .initiate_login("user", "pass")
-            .await
-            .expect("challenge expected");
+        let challenge = client.initiate_login("user", "pass").await.expect("challenge expected");
 
         assert_eq!(challenge.verification_workflow().id, "workflow-id");
         assert_eq!(
@@ -784,12 +746,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid base url");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid base url");
 
         let err = client
             .initiate_login("user", "pass")
@@ -824,12 +782,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid base url");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid base url");
 
         let positions = client
             .fetch_positions("access-token", "5QT29231")
@@ -876,12 +830,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid base url");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid base url");
 
         let positions = client
             .fetch_positions("token", "12345678")
@@ -900,9 +850,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path(
-                "/verification_workflows/polaris_migrated/workflow-id/",
-            ))
+            .and(path("/verification_workflows/polaris_migrated/workflow-id/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": true
             })))
@@ -912,12 +860,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let result = client
             .fetch_verification_result("workflow-id")
@@ -932,9 +876,7 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path(
-                "/verification_workflows/polaris_migrated/workflow-id/",
-            ))
+            .and(path("/verification_workflows/polaris_migrated/workflow-id/"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
@@ -942,12 +884,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let err = client
             .fetch_verification_result("workflow-id")
@@ -999,12 +937,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let route = client
             .advance_workflow_entry_point("workflow-id")
@@ -1018,14 +952,8 @@ mod tests {
             .as_ref()
             .expect("challenge params");
         assert_eq!(params.sheriff_flow_id.as_deref(), Some("login_suv"));
-        let challenge = params
-            .sheriff_challenge
-            .as_ref()
-            .expect("sheriff challenge");
-        assert_eq!(
-            challenge.id.as_deref(),
-            Some("32c929b0-8186-4025-9d70-e3043c6f1429")
-        );
+        let challenge = params.sheriff_challenge.as_ref().expect("sheriff challenge");
+        assert_eq!(challenge.id.as_deref(), Some("32c929b0-8186-4025-9d70-e3043c6f1429"));
         assert_eq!(challenge.challenge_type.as_deref(), Some("PROMPT"));
     }
 
@@ -1042,12 +970,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let err = client
             .advance_workflow_entry_point("workflow-id")
@@ -1075,12 +999,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let status = client
             .fetch_push_prompt_status("challenge-id")
@@ -1103,12 +1023,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let err = client
             .fetch_push_prompt_status("challenge-id")
@@ -1148,12 +1064,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let token = client
             .finalize_login("user", "pass", &device_token, &request_id)
@@ -1179,12 +1091,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let err = client
             .finalize_login("user", "pass", &device_token, &request_id)
@@ -1224,12 +1132,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let route = client
             .complete_device_approval("workflow-id")
@@ -1253,12 +1157,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("valid urls");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("valid urls");
 
         let err = client
             .complete_device_approval("workflow-id")
@@ -1277,19 +1177,10 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/accounts/"))
-            .and(wiremock::matchers::header(
-                "authorization",
-                "Bearer test-token",
-            ))
-            .and(wiremock::matchers::query_param(
-                "default_to_all_accounts",
-                "true",
-            ))
+            .and(wiremock::matchers::header("authorization", "Bearer test-token"))
+            .and(wiremock::matchers::query_param("default_to_all_accounts", "true"))
             .and(wiremock::matchers::query_param("include_managed", "true"))
-            .and(wiremock::matchers::query_param(
-                "include_multiple_individual",
-                "true",
-            ))
+            .and(wiremock::matchers::query_param("include_multiple_individual", "true"))
             .and(wiremock::matchers::query_param("is_default", "false"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "results": [
@@ -1311,27 +1202,17 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            test_http_client(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("construct client");
+        let client = RobinhoodClient::with_http_client_and_identity_base(test_http_client(), &base_url, &identity_url)
+            .expect("construct client");
 
-        let accounts = client
-            .fetch_accounts("test-token")
-            .await
-            .expect("fetch accounts");
+        let accounts = client.fetch_accounts("test-token").await.expect("fetch accounts");
 
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[0].account_number, "1234");
         assert_eq!(accounts[0].brokerage_account_type.as_deref(), Some("Cash"));
         assert!(accounts[0].is_default);
         assert_eq!(accounts[1].account_number, "5678");
-        assert_eq!(
-            accounts[1].brokerage_account_type.as_deref(),
-            Some("Margin")
-        );
+        assert_eq!(accounts[1].brokerage_account_type.as_deref(), Some("Margin"));
         assert!(!accounts[1].is_default);
     }
 
@@ -1340,8 +1221,7 @@ mod tests {
         let server = MockServer::start().await;
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         Mock::given(method("GET"))
             .and(path("/instruments/"))
@@ -1359,10 +1239,7 @@ mod tests {
             .await;
 
         let ids = vec!["instrument-1".to_string()];
-        let symbols = client
-            .get_symbols("test-token", &ids)
-            .await
-            .expect("fetch symbols");
+        let symbols = client.get_symbols("test-token", &ids).await.expect("fetch symbols");
 
         assert_eq!(symbols.get("instrument-1"), Some(&"TSLA".to_string()));
     }
@@ -1373,8 +1250,7 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         Mock::given(method("GET"))
             .and(path("/instruments/"))
@@ -1399,10 +1275,7 @@ mod tests {
             " ".to_string(),
             "instrument-1".to_string(),
         ];
-        let symbols = client
-            .get_symbols("test-token", &ids)
-            .await
-            .expect("fetch symbols");
+        let symbols = client.get_symbols("test-token", &ids).await.expect("fetch symbols");
 
         assert_eq!(symbols.get("instrument-1"), Some(&"TSLA".to_string()));
         assert_eq!(symbols.get("instrument-2"), Some(&"AAPL".to_string()));
@@ -1414,13 +1287,10 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         let total = INSTRUMENT_LOOKUP_CHUNK + 5;
-        let ids: Vec<String> = (0..total)
-            .map(|index| format!("instrument-{index}"))
-            .collect();
+        let ids: Vec<String> = (0..total).map(|index| format!("instrument-{index}")).collect();
 
         let first_ids = (0..INSTRUMENT_LOOKUP_CHUNK)
             .map(|index| format!("instrument-{index}"))
@@ -1474,10 +1344,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let symbols = client
-            .get_symbols("test-token", &ids)
-            .await
-            .expect("fetch symbols");
+        let symbols = client.get_symbols("test-token", &ids).await.expect("fetch symbols");
 
         assert_eq!(symbols.len(), total);
         assert_eq!(symbols.get("instrument-0"), Some(&"SYM0".to_string()));
@@ -1526,8 +1393,7 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         let page = client
             .fetch_orders_page("token", "5QT29231", 200, None)
@@ -1558,8 +1424,7 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         let page = client
             .fetch_orders_page("token", "5QT29231", 50, Some("abc123"))
@@ -1607,8 +1472,7 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         let page = client
             .fetch_option_orders_page("token", &["5QT29231", "926053604"], 25, None)
@@ -1641,8 +1505,7 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client =
-            RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
+        let client = RobinhoodClient::with_base_urls(&base_url, &identity_url).expect("create client");
 
         let page = client
             .fetch_option_orders_page("token", &["5QT29231"], 10, Some("abc123"))
@@ -1665,12 +1528,8 @@ mod tests {
 
         let base_url = format!("{}/", server.uri());
         let identity_url = format!("{}/", server.uri());
-        let client = RobinhoodClient::with_http_client_and_identity_base(
-            Client::new(),
-            &base_url,
-            &identity_url,
-        )
-        .expect("construct client");
+        let client = RobinhoodClient::with_http_client_and_identity_base(Client::new(), &base_url, &identity_url)
+            .expect("construct client");
 
         let error = client
             .fetch_accounts("test-token")

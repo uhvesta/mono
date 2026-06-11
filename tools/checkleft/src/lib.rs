@@ -114,8 +114,7 @@ mod tests {
         };
 
         let encoded = serde_json::to_string(&result).expect("serialize check result");
-        let decoded: CheckResult =
-            serde_json::from_str(&encoded).expect("deserialize check result");
+        let decoded: CheckResult = serde_json::from_str(&encoded).expect("deserialize check result");
         assert_eq!(result, decoded);
     }
 

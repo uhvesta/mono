@@ -95,18 +95,13 @@ pub fn create_sandbox(
     })
 }
 
-fn resolve_allowlist(
-    changeset: &ChangeSet,
-    scope: &AccessScope,
-    source_tree: &dyn SourceTree,
-) -> Result<Vec<PathBuf>> {
+fn resolve_allowlist(changeset: &ChangeSet, scope: &AccessScope, source_tree: &dyn SourceTree) -> Result<Vec<PathBuf>> {
     let mut paths = match scope {
         AccessScope::ModifiedOnly => {
             let mut paths = Vec::new();
             for file in &changeset.changed_files {
-                validate_relative_path(&file.path).with_context(|| {
-                    format!("invalid path in changeset: {}", file.path.display())
-                })?;
+                validate_relative_path(&file.path)
+                    .with_context(|| format!("invalid path in changeset: {}", file.path.display()))?;
                 if source_tree.exists(&file.path) {
                     paths.push(file.path.clone());
                 }
@@ -115,13 +110,10 @@ fn resolve_allowlist(
         }
 
         AccessScope::WholeRepo => {
-            let glob_paths = source_tree
-                .glob("**")
-                .context("failed to enumerate whole-repo files")?;
+            let glob_paths = source_tree.glob("**").context("failed to enumerate whole-repo files")?;
             for p in &glob_paths {
-                validate_relative_path(p).with_context(|| {
-                    format!("source tree returned invalid path: {}", p.display())
-                })?;
+                validate_relative_path(p)
+                    .with_context(|| format!("source tree returned invalid path: {}", p.display()))?;
             }
             glob_paths
         }
@@ -132,9 +124,8 @@ fn resolve_allowlist(
 
             // Changeset paths are always included regardless of glob patterns.
             for file in &changeset.changed_files {
-                validate_relative_path(&file.path).with_context(|| {
-                    format!("invalid path in changeset: {}", file.path.display())
-                })?;
+                validate_relative_path(&file.path)
+                    .with_context(|| format!("invalid path in changeset: {}", file.path.display()))?;
                 if source_tree.exists(&file.path) && seen.insert(file.path.clone()) {
                     paths.push(file.path.clone());
                 }
@@ -145,9 +136,8 @@ fn resolve_allowlist(
                     .glob(pattern)
                     .with_context(|| format!("failed to expand glob pattern `{pattern}`"))?;
                 for p in matches {
-                    validate_relative_path(&p).with_context(|| {
-                        format!("source tree returned invalid path: {}", p.display())
-                    })?;
+                    validate_relative_path(&p)
+                        .with_context(|| format!("source tree returned invalid path: {}", p.display()))?;
                     if seen.insert(p.clone()) {
                         paths.push(p);
                     }
@@ -201,8 +191,7 @@ fn populate_sandbox_file(
     let content = source_tree
         .read_file(relative_path)
         .with_context(|| format!("failed to read source file {}", relative_path.display()))?;
-    fs::write(&dest, &content)
-        .with_context(|| format!("failed to write sandbox file {}", dest.display()))?;
+    fs::write(&dest, &content).with_context(|| format!("failed to write sandbox file {}", dest.display()))?;
 
     Ok(())
 }
@@ -227,10 +216,7 @@ mod tests {
     impl MapSourceTree {
         fn new(entries: &[(&str, &[u8])]) -> Self {
             Self {
-                files: entries
-                    .iter()
-                    .map(|(p, c)| (PathBuf::from(p), c.to_vec()))
-                    .collect(),
+                files: entries.iter().map(|(p, c)| (PathBuf::from(p), c.to_vec())).collect(),
             }
         }
     }
@@ -315,18 +301,20 @@ mod tests {
 
     #[test]
     fn modified_only_includes_changed_files() {
-        let tree = MapSourceTree::new(&[
-            ("src/lib.rs", b"pub fn lib() {}"),
-            ("src/main.rs", b"fn main() {}"),
-        ]);
+        let tree = MapSourceTree::new(&[("src/lib.rs", b"pub fn lib() {}"), ("src/main.rs", b"fn main() {}")]);
         let cs = changeset(&["src/lib.rs"]);
         let ceiling = tempdir().unwrap();
-        let result =
-            create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
-        assert!(result.root.path().join("src/lib.rs").exists(), "lib.rs should be in sandbox");
-        assert!(!result.root.path().join("src/main.rs").exists(), "main.rs should not be in sandbox");
+        assert!(
+            result.root.path().join("src/lib.rs").exists(),
+            "lib.rs should be in sandbox"
+        );
+        assert!(
+            !result.root.path().join("src/main.rs").exists(),
+            "main.rs should not be in sandbox"
+        );
         assert_eq!(result.allowed_paths, vec![PathBuf::from("src/lib.rs")]);
     }
 
@@ -335,11 +323,13 @@ mod tests {
         let tree = MapSourceTree::new(&[("src/kept.rs", b"fn kept() {}")]);
         let cs = deleted_changeset(&["src/deleted.rs"]);
         let ceiling = tempdir().unwrap();
-        let result =
-            create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
-        assert!(result.allowed_paths.is_empty(), "deleted file should not appear in sandbox");
+        assert!(
+            result.allowed_paths.is_empty(),
+            "deleted file should not appear in sandbox"
+        );
     }
 
     #[test]
@@ -347,9 +337,8 @@ mod tests {
         let tree = MapSourceTree::new(&[("src/lib.rs", b"pub fn lib() {}")]);
         let cs = ChangeSet::new(vec![]);
         let ceiling = tempdir().unwrap();
-        let result =
-            create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
         assert!(result.allowed_paths.is_empty());
     }
@@ -365,9 +354,8 @@ mod tests {
         ]);
         let cs = changeset(&["src/lib.rs"]);
         let ceiling = tempdir().unwrap();
-        let result =
-            create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
         assert!(result.root.path().join("src/lib.rs").exists());
         assert!(result.root.path().join("src/main.rs").exists());
@@ -377,15 +365,11 @@ mod tests {
 
     #[test]
     fn whole_repo_with_empty_changeset_still_enumerates_tree() {
-        let tree = MapSourceTree::new(&[
-            ("a.txt", b"alpha"),
-            ("b.txt", b"beta"),
-        ]);
+        let tree = MapSourceTree::new(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
         let cs = ChangeSet::new(vec![]);
         let ceiling = tempdir().unwrap();
-        let result =
-            create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
         assert_eq!(result.allowed_paths.len(), 2);
     }
@@ -412,10 +396,22 @@ mod tests {
 
         // changeset file + both Cargo.toml matches
         let paths = &result.allowed_paths;
-        assert!(paths.contains(&PathBuf::from("src/lib.rs")), "changeset file must be included");
-        assert!(paths.contains(&PathBuf::from("Cargo.toml")), "root Cargo.toml must be included");
-        assert!(paths.contains(&PathBuf::from("other/Cargo.toml")), "nested Cargo.toml must be included");
-        assert!(!paths.contains(&PathBuf::from("src/main.rs")), "non-glob non-changeset file must be excluded");
+        assert!(
+            paths.contains(&PathBuf::from("src/lib.rs")),
+            "changeset file must be included"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("Cargo.toml")),
+            "root Cargo.toml must be included"
+        );
+        assert!(
+            paths.contains(&PathBuf::from("other/Cargo.toml")),
+            "nested Cargo.toml must be included"
+        );
+        assert!(
+            !paths.contains(&PathBuf::from("src/main.rs")),
+            "non-glob non-changeset file must be excluded"
+        );
     }
 
     #[test]
@@ -436,10 +432,7 @@ mod tests {
 
     #[test]
     fn globs_no_duplicate_paths() {
-        let tree = MapSourceTree::new(&[
-            ("Cargo.toml", b"[package]"),
-            ("src/lib.rs", b"fn f() {}"),
-        ]);
+        let tree = MapSourceTree::new(&[("Cargo.toml", b"[package]"), ("src/lib.rs", b"fn f() {}")]);
         // changeset has Cargo.toml, and glob also matches it — must appear once
         let cs = changeset(&["Cargo.toml"]);
         let ceiling = tempdir().unwrap();
@@ -465,13 +458,7 @@ mod tests {
             old_path: None,
         }]);
         let ceiling = tempdir().unwrap();
-        let err = create_sandbox(
-            &cs,
-            AccessScope::ModifiedOnly,
-            &tree,
-            &HostCeiling::new(ceiling.path()),
-        )
-        .unwrap_err();
+        let err = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path())).unwrap_err();
         assert!(
             err.to_string().contains("traversal") || err.to_string().contains("invalid path"),
             "expected traversal error, got: {err}"
@@ -487,13 +474,7 @@ mod tests {
             old_path: None,
         }]);
         let ceiling = tempdir().unwrap();
-        let err = create_sandbox(
-            &cs,
-            AccessScope::ModifiedOnly,
-            &tree,
-            &HostCeiling::new(ceiling.path()),
-        )
-        .unwrap_err();
+        let err = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path())).unwrap_err();
         assert!(
             err.to_string().contains("absolute") || err.to_string().contains("invalid path"),
             "expected absolute path error, got: {err}"
@@ -532,32 +513,22 @@ mod tests {
         let cs = changeset(&["src/virtual.rs"]);
         let ceiling = tempdir().unwrap(); // no files on disk here
 
-        let result = create_sandbox(
-            &cs,
-            AccessScope::ModifiedOnly,
-            &tree,
-            &HostCeiling::new(ceiling.path()),
-        )
-        .expect("create sandbox with virtual tree");
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox with virtual tree");
 
-        let content = fs::read(result.root.path().join("src/virtual.rs"))
-            .expect("read materialized file");
+        let content = fs::read(result.root.path().join("src/virtual.rs")).expect("read materialized file");
         assert_eq!(content, b"fn virtual_fn() {}");
         assert_eq!(result.allowed_paths, vec![PathBuf::from("src/virtual.rs")]);
     }
 
     #[test]
     fn virtual_tree_whole_repo_materializes_all_files() {
-        let tree = MapSourceTree::new(&[
-            ("a/x.rs", b"fn x() {}"),
-            ("b/y.rs", b"fn y() {}"),
-        ]);
+        let tree = MapSourceTree::new(&[("a/x.rs", b"fn x() {}"), ("b/y.rs", b"fn y() {}")]);
         let cs = ChangeSet::new(vec![]);
         let ceiling = tempdir().unwrap();
 
-        let result =
-            create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
         assert_eq!(
             fs::read(result.root.path().join("a/x.rs")).expect("read a/x.rs"),
@@ -576,13 +547,8 @@ mod tests {
         let (dir, tree) = disk_source_tree(&[("src/real.rs", b"fn real() {}")]);
         let cs = changeset(&["src/real.rs"]);
 
-        let result = create_sandbox(
-            &cs,
-            AccessScope::ModifiedOnly,
-            &tree,
-            &HostCeiling::new(dir.path()),
-        )
-        .expect("create sandbox with local tree");
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(dir.path()))
+            .expect("create sandbox with local tree");
 
         let content = fs::read(result.root.path().join("src/real.rs")).expect("read hardlinked file");
         assert_eq!(content, b"fn real() {}");
@@ -592,26 +558,17 @@ mod tests {
 
     #[test]
     fn modified_only_allowed_paths_are_sorted() {
-        let tree = MapSourceTree::new(&[
-            ("z.rs", b"fn z() {}"),
-            ("a.rs", b"fn a() {}"),
-            ("m.rs", b"fn m() {}"),
-        ]);
+        let tree = MapSourceTree::new(&[("z.rs", b"fn z() {}"), ("a.rs", b"fn a() {}"), ("m.rs", b"fn m() {}")]);
         // Provide changeset in reverse-alphabetical order.
         let cs = changeset(&["z.rs", "m.rs", "a.rs"]);
         let ceiling = tempdir().unwrap();
 
-        let result =
-            create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
-                .expect("create sandbox");
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(ceiling.path()))
+            .expect("create sandbox");
 
         assert_eq!(
             result.allowed_paths,
-            vec![
-                PathBuf::from("a.rs"),
-                PathBuf::from("m.rs"),
-                PathBuf::from("z.rs"),
-            ],
+            vec![PathBuf::from("a.rs"), PathBuf::from("m.rs"), PathBuf::from("z.rs"),],
             "allowed_paths must be sorted regardless of changeset order"
         );
     }
@@ -637,19 +594,12 @@ mod tests {
         // Also write a regular file so the SourceTree is non-empty.
         fs::write(inside.path().join("normal.rs"), b"fn ok() {}").expect("write normal file");
 
-        let tree = crate::source_tree::LocalSourceTree::new(inside.path())
-            .expect("create tree");
+        let tree = crate::source_tree::LocalSourceTree::new(inside.path()).expect("create tree");
 
         // WholeRepo would include link.txt via glob; the sandbox must reject it
         // because LocalSourceTree.read_file rejects escaping symlinks.
         let cs = ChangeSet::new(vec![]);
-        let err = create_sandbox(
-            &cs,
-            AccessScope::WholeRepo,
-            &tree,
-            &HostCeiling::new(inside.path()),
-        )
-        .unwrap_err();
+        let err = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(inside.path())).unwrap_err();
 
         let full_err = format!("{:#}", err);
         assert!(
@@ -666,19 +616,13 @@ mod tests {
         // Symlink pointing to another file within the tree root — must succeed.
         let dir = tempdir().expect("create dir");
         fs::write(dir.path().join("target.rs"), b"fn target() {}").expect("write target");
-        unix_fs::symlink(dir.path().join("target.rs"), dir.path().join("link.rs"))
-            .expect("create symlink");
+        unix_fs::symlink(dir.path().join("target.rs"), dir.path().join("link.rs")).expect("create symlink");
 
         let tree = crate::source_tree::LocalSourceTree::new(dir.path()).expect("create tree");
         let cs = ChangeSet::new(vec![]);
 
-        let result = create_sandbox(
-            &cs,
-            AccessScope::WholeRepo,
-            &tree,
-            &HostCeiling::new(dir.path()),
-        )
-        .expect("sandbox creation with safe symlink must succeed");
+        let result = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(dir.path()))
+            .expect("sandbox creation with safe symlink must succeed");
 
         // Both entries are materialized; symlink is resolved to content.
         assert!(
@@ -689,8 +633,7 @@ mod tests {
             result.root.path().join("link.rs").exists(),
             "link.rs (resolved via SourceTree) must be in sandbox"
         );
-        let link_content =
-            fs::read(result.root.path().join("link.rs")).expect("read link.rs content");
+        let link_content = fs::read(result.root.path().join("link.rs")).expect("read link.rs content");
         assert_eq!(link_content, b"fn target() {}");
     }
 }

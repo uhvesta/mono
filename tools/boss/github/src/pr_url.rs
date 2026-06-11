@@ -92,10 +92,7 @@ mod tests {
             pr_number_from_url("https://github.com/spinyfin/mono/pull/568"),
             Some(568),
         );
-        assert_eq!(
-            pr_number_from_url("https://github.com/owner/my-repo/pull/1"),
-            Some(1),
-        );
+        assert_eq!(pr_number_from_url("https://github.com/owner/my-repo/pull/1"), Some(1),);
         assert_eq!(pr_number_from_url("https://example.com/owner/repo/pull/1"), None);
         assert_eq!(pr_number_from_url("not-a-url"), None);
     }

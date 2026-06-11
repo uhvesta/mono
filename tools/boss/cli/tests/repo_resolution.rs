@@ -23,10 +23,7 @@ use anyhow::{Result, anyhow};
 use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
-use boss_protocol::{
-    CreateChoreInput, CreateProductInput, FrontendEvent, FrontendRequest, Product, Task,
-    WorkItem,
-};
+use boss_protocol::{CreateChoreInput, CreateProductInput, FrontendEvent, FrontendRequest, Product, Task, WorkItem};
 use serde_json::Value;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,17 +38,17 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
         Ok(Self {
             socket_path,
@@ -72,24 +69,16 @@ impl Drop for TestEngine {
 }
 
 async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client
-        .send_request(&FrontendRequest::CreateProduct { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
         FrontendEvent::WorkItemCreated {
             item: WorkItem::Product(p),
         } => Ok(p),
-        other => Err(anyhow!(
-            "unexpected engine event for product create: {other:?}"
-        )),
+        other => Err(anyhow!("unexpected engine event for product create: {other:?}")),
     }
 }
 
 async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Result<Task> {
-    match client
-        .send_request(&FrontendRequest::CreateChore { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateChore { input }).await? {
         FrontendEvent::WorkItemCreated {
             item: WorkItem::Chore(task) | WorkItem::Task(task),
         } => Ok(task),

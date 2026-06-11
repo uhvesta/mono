@@ -6,9 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::check::{Check, ConfiguredCheck};
-use crate::ifchange::{
-    LineRange, ParsedIfChangeBlock, ParsedIfChangeFile, ThenChangeTarget, parse_ifchange_file,
-};
+use crate::ifchange::{LineRange, ParsedIfChangeBlock, ParsedIfChangeFile, ThenChangeTarget, parse_ifchange_file};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, FileDiff, SourceTree, TreeVersion};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
@@ -101,9 +99,7 @@ struct ChangedFileAnalysis {
 
 impl ChangedFileAnalysis {
     fn contracts_to_check(&self) -> impl Iterator<Item = &ParsedIfChangeBlock> {
-        self.current_touched
-            .iter()
-            .chain(self.fallback_base_touched.iter())
+        self.current_touched.iter().chain(self.fallback_base_touched.iter())
     }
 }
 
@@ -202,10 +198,7 @@ fn parse_versioned_file(
     let contents = tree.read_file_versioned(path, version).map_err(|error| {
         Box::new(Finding {
             severity,
-            message: format!(
-                "failed to read `{}` for ifchange analysis: {error}",
-                path.display()
-            ),
+            message: format!("failed to read `{}` for ifchange analysis: {error}", path.display()),
             location: Some(Location {
                 path: finding_path.to_path_buf(),
                 line: None,
@@ -316,14 +309,12 @@ fn target_status(
                 return Ok(TargetStatus::MissingFile);
             }
 
-            let parsed_current =
-                parse_ifchange_file(path, &String::from_utf8(tree.read_file(path)?)?)?;
+            let parsed_current = parse_ifchange_file(path, &String::from_utf8(tree.read_file(path)?)?)?;
             if parsed_current.block_by_label(label).is_none() {
                 return Ok(TargetStatus::MissingLabel);
             }
 
-            let Some(target_analysis) = analyses.iter().find(|analysis| analysis.path == *path)
-            else {
+            let Some(target_analysis) = analyses.iter().find(|analysis| analysis.path == *path) else {
                 return Ok(TargetStatus::NotChanged);
             };
             Ok(
@@ -355,11 +346,7 @@ fn file_changed(changeset: &ChangeSet, target_path: &Path) -> bool {
     })
 }
 
-fn broken_target_finding(
-    source_path: PathBuf,
-    block: &ParsedIfChangeBlock,
-    detail: String,
-) -> Finding {
+fn broken_target_finding(source_path: PathBuf, block: &ParsedIfChangeBlock, detail: String) -> Finding {
     Finding {
         severity: Severity::Error,
         message: format!("{}: {detail}", render_target(&block.target)),
@@ -411,8 +398,7 @@ mod tests {
             "// LINT.IfChange\nschema v2\n// LINT.ThenChange(frontend/schema.txt)\n",
         )
         .expect("write source");
-        fs::write(temp.path().join("frontend/schema.txt"), "schema view v2\n")
-            .expect("write target");
+        fs::write(temp.path().join("frontend/schema.txt"), "schema view v2\n").expect("write target");
 
         let result = run_check(temp.path()).await;
         assert!(result.findings.is_empty());
@@ -492,11 +478,7 @@ mod tests {
 
         let result = run_check(temp.path()).await;
         assert_eq!(result.findings.len(), 1);
-        assert!(
-            result.findings[0]
-                .message
-                .contains("frontend/schema.txt:view")
-        );
+        assert!(result.findings[0].message.contains("frontend/schema.txt:view"));
     }
 
     fn write_linked_pair(root: &Path) {
@@ -513,16 +495,10 @@ mod tests {
     async fn run_check(root: &Path) -> CheckResult {
         let vcs = Vcs::detect(root).expect("detect vcs");
         let changeset = vcs.current_changeset().expect("current changeset");
-        let tree =
-            LocalSourceTree::with_base_revision(root, Some(BaseRevision::Git("HEAD".to_owned())))
-                .expect("tree");
+        let tree = LocalSourceTree::with_base_revision(root, Some(BaseRevision::Git("HEAD".to_owned()))).expect("tree");
 
         IfChangeThenChangeCheck
-            .run(
-                &changeset,
-                &tree,
-                &toml::Value::Table(toml::map::Map::new()),
-            )
+            .run(&changeset, &tree, &toml::Value::Table(toml::map::Map::new()))
             .await
             .expect("run check")
     }

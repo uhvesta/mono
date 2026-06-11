@@ -96,10 +96,18 @@ impl Parse for CheckArgs {
         }
 
         let name = name.ok_or_else(|| {
-            syn::Error::new(proc_macro2::Span::call_site(), "#[check] requires `name = \"...\"` argument")
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "#[check] requires `name = \"...\"` argument",
+            )
         })?;
 
-        Ok(CheckArgs { name, description, severity, access_scope })
+        Ok(CheckArgs {
+            name,
+            description,
+            severity,
+            access_scope,
+        })
     }
 }
 
@@ -231,7 +239,9 @@ struct ExportChecksInput {
 
 impl Parse for ExportChecksInput {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
-        Ok(ExportChecksInput { fns: Punctuated::parse_terminated(input)? })
+        Ok(ExportChecksInput {
+            fns: Punctuated::parse_terminated(input)?,
+        })
     }
 }
 
@@ -263,10 +273,8 @@ pub fn export_checks(input: TokenStream) -> TokenStream {
 
 fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
     let fns: Vec<&Ident> = input.fns.iter().collect();
-    let entry_statics: Vec<proc_macro2::Ident> = fns
-        .iter()
-        .map(|id| format_ident!("__CHECKLEFT_ENTRY_{}", id))
-        .collect();
+    let entry_statics: Vec<proc_macro2::Ident> =
+        fns.iter().map(|id| format_ident!("__CHECKLEFT_ENTRY_{}", id)).collect();
 
     let wit = WIT_CONTENT;
 

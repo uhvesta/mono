@@ -86,9 +86,7 @@ use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transient_error::{
     EscalateReason, RecoveryDecision, RecoveryPolicy, classify_claude_error, extract_worker_error,
 };
-use crate::work::{
-    ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb,
-};
+use crate::work::{ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb};
 
 /// How often the sweep runs.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
@@ -236,10 +234,7 @@ pub async fn run_one_pass(
         }
 
         // Grace guard: don't act on a worker that only just started.
-        let started_epoch = execution
-            .started_at
-            .as_deref()
-            .and_then(|s| s.parse::<i64>().ok());
+        let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
         match started_epoch {
             Some(t) if t < grace_cutoff => {}
             _ => {
@@ -250,11 +245,7 @@ pub async fn run_one_pass(
 
         // Ground truth: the transcript. No path → no signal → leave it
         // for the other reconcilers.
-        let Some(transcript_path) = work_db
-            .latest_transcript_path(&execution_id)
-            .ok()
-            .flatten()
-        else {
+        let Some(transcript_path) = work_db.latest_transcript_path(&execution_id).ok().flatten() else {
             outcome.no_error_skipped += 1;
             continue;
         };
@@ -282,8 +273,7 @@ pub async fn run_one_pass(
                 // session: if it didn't clear the error by the next
                 // sweep, fall through to orphan+respawn.
                 let already_nudged = nudged_executions.remove(&execution_id);
-                let try_nudge =
-                    !already_nudged && state.activity == WorkerActivity::Idle;
+                let try_nudge = !already_nudged && state.activity == WorkerActivity::Idle;
 
                 if try_nudge {
                     let msg = format!(
@@ -301,16 +291,12 @@ pub async fn run_one_pass(
                             );
                             dispatch_events
                                 .emit(
-                                    DispatchEvent::new(
-                                        Stage::TransientRecoveryNudge,
-                                        Outcome::Ok,
-                                        &execution_id,
-                                    )
-                                    .with_work_item(&work_item_id)
-                                    .with_details(serde_json::json!({
-                                        "error": clipped,
-                                        "class": "transient",
-                                    })),
+                                    DispatchEvent::new(Stage::TransientRecoveryNudge, Outcome::Ok, &execution_id)
+                                        .with_work_item(&work_item_id)
+                                        .with_details(serde_json::json!({
+                                            "error": clipped,
+                                            "class": "transient",
+                                        })),
                                 )
                                 .await;
                             outcome.nudged += 1;
@@ -334,12 +320,9 @@ pub async fn run_one_pass(
                     "transient Claude API error (auto-resume attempt {attempt}/{max}): {clipped}",
                     max = policy.max_attempts(),
                 );
-                if let Err(err) = work_db.request_resume_execution(
-                    &execution_id,
-                    attempt as i64,
-                    dispatch_not_before,
-                    &reason,
-                ) {
+                if let Err(err) =
+                    work_db.request_resume_execution(&execution_id, attempt as i64, dispatch_not_before, &reason)
+                {
                     tracing::warn!(
                         execution_id,
                         ?err,
@@ -395,12 +378,8 @@ pub async fn run_one_pass(
             RecoveryDecision::Escalate { reason } => {
                 let (kind, class_label) = match reason {
                     EscalateReason::Permanent => (ATTENTION_KIND_RECOVERY_PERMANENT, "permanent"),
-                    EscalateReason::Indeterminate => {
-                        (ATTENTION_KIND_RECOVERY_PERMANENT, "indeterminate")
-                    }
-                    EscalateReason::RetriesExhausted => {
-                        (ATTENTION_KIND_RECOVERY_EXHAUSTED, "transient")
-                    }
+                    EscalateReason::Indeterminate => (ATTENTION_KIND_RECOVERY_PERMANENT, "indeterminate"),
+                    EscalateReason::RetriesExhausted => (ATTENTION_KIND_RECOVERY_EXHAUSTED, "transient"),
                 };
                 // Settle the execution so it isn't re-inspected; ignore a
                 // race where another reconciler already marked it terminal.
@@ -415,9 +394,7 @@ pub async fn run_one_pass(
                     );
                 }
                 let title = match reason {
-                    EscalateReason::RetriesExhausted => {
-                        "Worker auto-recovery exhausted retries".to_owned()
-                    }
+                    EscalateReason::RetriesExhausted => "Worker auto-recovery exhausted retries".to_owned(),
                     _ => "Worker hit a non-retryable Claude API error".to_owned(),
                 };
                 let body = format!(
@@ -431,9 +408,7 @@ pub async fn run_one_pass(
                     reason = reason.as_str(),
                     max = policy.max_attempts(),
                 );
-                if let Err(err) =
-                    work_db.upsert_work_item_attention(&work_item_id, kind, &title, &body)
-                {
+                if let Err(err) = work_db.upsert_work_item_attention(&work_item_id, kind, &title, &body) {
                     tracing::warn!(
                         execution_id,
                         work_item_id = %work_item_id,
@@ -452,19 +427,15 @@ pub async fn run_one_pass(
                 release_slot(&coordinator, state.slot_id).await;
                 dispatch_events
                     .emit(
-                        DispatchEvent::new(
-                            Stage::TransientRecoveryExhausted,
-                            Outcome::Error,
-                            &execution_id,
-                        )
-                        .with_work_item(&work_item_id)
-                        .with_details(serde_json::json!({
-                            "reason": reason.as_str(),
-                            "class": class_label,
-                            "prior_attempts": prior_attempts,
-                            "max_attempts": policy.max_attempts(),
-                            "error": clipped,
-                        })),
+                        DispatchEvent::new(Stage::TransientRecoveryExhausted, Outcome::Error, &execution_id)
+                            .with_work_item(&work_item_id)
+                            .with_details(serde_json::json!({
+                                "reason": reason.as_str(),
+                                "class": class_label,
+                                "prior_attempts": prior_attempts,
+                                "max_attempts": policy.max_attempts(),
+                                "error": clipped,
+                            })),
                     )
                     .await;
                 coordinator.kick();
@@ -481,10 +452,7 @@ pub async fn run_one_pass(
 fn should_inspect(activity: WorkerActivity) -> bool {
     matches!(
         activity,
-        WorkerActivity::Idle
-            | WorkerActivity::WaitingForInput
-            | WorkerActivity::Errored
-            | WorkerActivity::Terminated
+        WorkerActivity::Idle | WorkerActivity::WaitingForInput | WorkerActivity::Errored | WorkerActivity::Terminated
     )
 }
 
@@ -494,9 +462,7 @@ async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, slot_id: u8) {
     // "auto-worker-N" prefix and release_worker_and_kick routes to
     // the correct pool via pool_for_worker_id.
     let worker_id = worker_id_for_slot(slot_id);
-    coordinator
-        .release_worker_and_kick(&worker_id, None)
-        .await;
+    coordinator.release_worker_and_kick(&worker_id, None).await;
 }
 
 /// Append an `[engine-reconcile]` audit line to the work item's
@@ -513,12 +479,9 @@ fn append_recovery_audit(work_db: &WorkDb, work_item_id: &str, note: &str, now_e
     let current_desc = match &item {
         boss_protocol::WorkItem::Product(p) => p.description.as_str(),
         boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => {
-            t.description.as_str()
-        }
+        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
     };
-    let new_desc =
-        format!("{current_desc}\n[engine-reconcile] epoch {now_epoch_secs}: {note}.");
+    let new_desc = format!("{current_desc}\n[engine-reconcile] epoch {now_epoch_secs}: {note}.");
     if let Err(err) = work_db.update_work_item(
         work_item_id,
         WorkItemPatch {
@@ -526,7 +489,11 @@ fn append_recovery_audit(work_db: &WorkDb, work_item_id: &str, note: &str, now_e
             ..WorkItemPatch::default()
         },
     ) {
-        tracing::warn!(work_item_id, ?err, "transient-recovery: audit append failed (non-fatal)");
+        tracing::warn!(
+            work_item_id,
+            ?err,
+            "transient-recovery: audit append failed (non-fatal)"
+        );
     }
 }
 
@@ -608,8 +575,8 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionCoordinator, WorkerPool,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionCoordinator, WorkerPool,
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::runner::{ExecutionRunner, RunOutcome};
@@ -758,10 +725,12 @@ mod tests {
     ) -> String {
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id)
-                .preferred_workspace_id("mono-agent-007")
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id)
+                    .preferred_workspace_id("mono-agent-007")
+                    .build(),
+            )
             .unwrap();
         db.start_execution_run(
             &execution.id,
@@ -783,8 +752,7 @@ mod tests {
             .unwrap()
             .as_secs()
             .saturating_sub(600) as i64;
-        db.force_started_at_for_test(&execution.id, old_started)
-            .unwrap();
+        db.force_started_at_for_test(&execution.id, old_started).unwrap();
         execution.id
     }
 
@@ -806,12 +774,7 @@ mod tests {
         ))
     }
 
-    fn register_idle_slot(
-        live_states: &LiveWorkerStateRegistry,
-        slot_id: u8,
-        execution_id: &str,
-        work_item_id: &str,
-    ) {
+    fn register_idle_slot(live_states: &LiveWorkerStateRegistry, slot_id: u8, execution_id: &str, work_item_id: &str) {
         live_states.register_spawn(
             slot_id,
             execution_id,
@@ -855,11 +818,7 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        let worker_id = coordinator
-            .worker_pool()
-            .claim_worker(&exec_id, None)
-            .await
-            .unwrap();
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
@@ -906,11 +865,7 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        let worker_id = coordinator
-            .worker_pool()
-            .claim_worker(&exec_id, None)
-            .await
-            .unwrap();
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
 
@@ -934,7 +889,10 @@ mod tests {
         // Second pass: nudge already tried, error still present → orphan+respawn.
         assert_eq!(outcome.resumed, 1, "second pass should orphan+respawn");
         assert_eq!(outcome.nudged, 0);
-        assert!(!nudged.contains(&exec_id), "id removed from nudged set on orphan+respawn");
+        assert!(
+            !nudged.contains(&exec_id),
+            "id removed from nudged set on orphan+respawn"
+        );
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         let dead = execs.iter().find(|e| e.id == exec_id).unwrap();
@@ -964,11 +922,7 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        let worker_id = coordinator
-            .worker_pool()
-            .claim_worker(&dead_id, None)
-            .await
-            .unwrap();
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
@@ -1022,11 +976,7 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        let worker_id = coordinator
-            .worker_pool()
-            .claim_worker(&dead_id, None)
-            .await
-            .unwrap();
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
@@ -1048,7 +998,9 @@ mod tests {
 
         let execs = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(
-            !execs.iter().any(|e| e.id != dead_id && e.status == ExecutionStatus::Ready),
+            !execs
+                .iter()
+                .any(|e| e.id != dead_id && e.status == ExecutionStatus::Ready),
             "permanent error must not create a resume execution",
         );
         let attn = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -1079,11 +1031,7 @@ mod tests {
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        let worker_id = coordinator
-            .worker_pool()
-            .claim_worker(&dead_id, None)
-            .await
-            .unwrap();
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
@@ -1112,18 +1060,13 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_active_chore(&db, &product_id);
         // Error, then more work → recovered. extract_worker_error → None.
-        let transcript =
-            write_transcript(&dir, "t.jsonl", &[SOCKET_ERROR_LINE, NORMAL_LINE]);
+        let transcript = write_transcript(&dir, "t.jsonl", &[SOCKET_ERROR_LINE, NORMAL_LINE]);
         let db = Arc::new(db);
         let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
 
         let live = Arc::new(LiveWorkerStateRegistry::new());
         let coordinator = make_coordinator(db.clone(), 2);
-        let worker_id = coordinator
-            .worker_pool()
-            .claim_worker(&dead_id, None)
-            .await
-            .unwrap();
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
         let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
         register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
 
@@ -1157,10 +1100,12 @@ mod tests {
 
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .preferred_workspace_id("mono-agent-007")
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .preferred_workspace_id("mono-agent-007")
+                    .build(),
+            )
             .unwrap();
         db.start_execution_run(
             &execution.id,
@@ -1171,8 +1116,7 @@ mod tests {
             "/tmp/mono-agent-007",
         )
         .unwrap();
-        db.set_run_transcript_path_if_unset(&execution.id, &transcript)
-            .unwrap();
+        db.set_run_transcript_path_if_unset(&execution.id, &transcript).unwrap();
         // started_at = NOW (within grace).
         db.force_started_at_for_test(&execution.id, now()).unwrap();
 
@@ -1340,11 +1284,7 @@ mod tests {
         // The retained prefix (everything before the ellipsis) stays within
         // the byte budget.
         let prefix = out.strip_suffix('…').unwrap();
-        assert!(
-            prefix.len() <= 10,
-            "prefix {} bytes must be <= max_bytes",
-            prefix.len()
-        );
+        assert!(prefix.len() <= 10, "prefix {} bytes must be <= max_bytes", prefix.len());
         assert_eq!(prefix, "x".repeat(10));
     }
 
@@ -1396,5 +1336,4 @@ mod tests {
             );
         }
     }
-
 }

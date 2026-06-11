@@ -84,8 +84,7 @@ pub fn take_backup(work_db: &WorkDb, dest: &Path) -> Result<()> {
         anyhow::bail!("cannot VACUUM INTO an in-memory database");
     }
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create backup dir {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create backup dir {}", parent.display()))?;
     }
     let dest_str = dest
         .to_str()
@@ -101,8 +100,8 @@ pub fn take_backup(work_db: &WorkDb, dest: &Path) -> Result<()> {
 /// Delete the oldest `state.db.bak-*` files in `backup_dir`, keeping at
 /// most `keep`. Files that do not match the backup prefix are untouched.
 pub fn apply_retention(backup_dir: &Path, keep: usize) -> Result<()> {
-    let read_dir = std::fs::read_dir(backup_dir)
-        .with_context(|| format!("read backup dir {}", backup_dir.display()))?;
+    let read_dir =
+        std::fs::read_dir(backup_dir).with_context(|| format!("read backup dir {}", backup_dir.display()))?;
 
     let mut backups: Vec<PathBuf> = read_dir
         .filter_map(|e| e.ok())
@@ -229,21 +228,14 @@ mod tests {
         let dest = tmp.path().join("backups").join("state.db.bak-test");
         take_backup(&db, &dest).expect("backup should succeed");
         assert!(dest.exists(), "backup file must be created");
-        assert!(
-            dest.metadata().unwrap().len() > 0,
-            "backup file must be non-empty"
-        );
+        assert!(dest.metadata().unwrap().len() > 0, "backup file must be non-empty");
     }
 
     #[test]
     fn backup_creates_missing_parent_dirs() {
         let tmp = TempDir::new().unwrap();
         let db = open_file_db(tmp.path());
-        let dest = tmp
-            .path()
-            .join("nested")
-            .join("deep")
-            .join("state.db.bak-test");
+        let dest = tmp.path().join("nested").join("deep").join("state.db.bak-test");
         take_backup(&db, &dest).expect("backup should create missing dirs");
         assert!(dest.exists());
     }
@@ -264,17 +256,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         for i in 1..=5u8 {
-            std::fs::write(
-                dir.join(format!("state.db.bak-2026010{i}-120000")),
-                b"x",
-            )
-            .unwrap();
+            std::fs::write(dir.join(format!("state.db.bak-2026010{i}-120000")), b"x").unwrap();
         }
         apply_retention(dir, 3).expect("retention should succeed");
-        let remaining: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        let remaining: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(remaining.len(), 3, "should keep only the 3 newest");
         assert!(!dir.join("state.db.bak-20260101-120000").exists());
         assert!(!dir.join("state.db.bak-20260102-120000").exists());
@@ -319,19 +304,12 @@ mod tests {
         // Pre-populate with more files than the keep limit.
         std::fs::create_dir_all(&backup_dir).unwrap();
         for i in 1..=3u8 {
-            std::fs::write(
-                backup_dir.join(format!("state.db.bak-2020010{i}-000000")),
-                b"old",
-            )
-            .unwrap();
+            std::fs::write(backup_dir.join(format!("state.db.bak-2020010{i}-000000")), b"old").unwrap();
         }
         // run_backup with retention=2 should add one new file and delete the
         // oldest two so only 2 remain (the new one + one pre-existing).
         run_backup(&db, &backup_dir, 2);
-        let remaining: Vec<_> = std::fs::read_dir(&backup_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        let remaining: Vec<_> = std::fs::read_dir(&backup_dir).unwrap().filter_map(|e| e.ok()).collect();
         assert_eq!(
             remaining.len(),
             2,
@@ -345,10 +323,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         run_backup(&db, tmp.path(), 24);
         // No backup file should have been created.
-        let entries: Vec<_> = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        let entries: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().filter_map(|e| e.ok()).collect();
         assert!(
             entries.is_empty(),
             "run_backup must not create files for in-memory databases"

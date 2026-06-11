@@ -33,12 +33,7 @@ pub(crate) struct TokenRequest<'a> {
 }
 
 impl<'a> TokenRequest<'a> {
-    pub(crate) fn new(
-        username: &'a str,
-        password: &'a str,
-        device_token: &'a str,
-        request_id: &'a str,
-    ) -> Self {
+    pub(crate) fn new(username: &'a str, password: &'a str, device_token: &'a str, request_id: &'a str) -> Self {
         Self {
             device_token,
             client_id: CLIENT_ID,
@@ -71,11 +66,7 @@ pub struct AuthChallenge {
 }
 
 impl AuthChallenge {
-    pub fn new(
-        device_token: Uuid,
-        request_id: Uuid,
-        verification_workflow: VerificationWorkflow,
-    ) -> Self {
+    pub fn new(device_token: Uuid, request_id: Uuid, verification_workflow: VerificationWorkflow) -> Self {
         Self {
             device_token,
             request_id,
@@ -142,9 +133,7 @@ impl<'a> WorkflowProceedRequest<'a> {
             client_version: IDENTITY_CLIENT_VERSION,
             screen_name: "DEVICE_APPROVAL_CHALLENGE",
             id: workflow_id,
-            device_approval_challenge_action: DeviceApprovalChallengeAction {
-                proceed: Proceed {},
-            },
+            device_approval_challenge_action: DeviceApprovalChallengeAction { proceed: Proceed {} },
         }
     }
 }

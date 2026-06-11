@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use boss_protocol::WorkItemPatch;
 use crate::metrics::Registry;
+use boss_protocol::WorkItemPatch;
 
 use super::super::{register_metrics, run_one_pass};
 
@@ -23,9 +23,7 @@ async fn b8_auto_syncs_when_only_upstream_changed() {
     let registry = super::spy_registry(Arc::clone(&tracker));
     let metrics = Registry::new();
     register_metrics(&metrics);
-    let outcome1 =
-        run_one_pass(&db, &registry, &metrics, &super::noop_pub(), &super::ambient_resolver())
-            .await;
+    let outcome1 = run_one_pass(&db, &registry, &metrics, &super::noop_pub(), &super::ambient_resolver()).await;
     assert_eq!(outcome1.items_imported, 1, "tick 1 should import the item");
 
     let task = db.find_by_external_ref("spy", "spy#100").unwrap().unwrap();
@@ -40,9 +38,14 @@ async fn b8_auto_syncs_when_only_upstream_changed() {
     let metrics2 = Registry::new();
     register_metrics(&metrics2);
     let publisher = Arc::new(super::RecordingPublisher::default());
-    let outcome2 =
-        run_one_pass(&db, &registry2, &metrics2, publisher.as_ref(), &super::ambient_resolver())
-            .await;
+    let outcome2 = run_one_pass(
+        &db,
+        &registry2,
+        &metrics2,
+        publisher.as_ref(),
+        &super::ambient_resolver(),
+    )
+    .await;
 
     assert_eq!(outcome2.title_body_synced, 1, "should auto-sync");
     assert_eq!(outcome2.title_body_conflict, 0);
@@ -87,7 +90,10 @@ async fn b8_skips_sync_when_both_sides_changed() {
     // Simulate an operator edit of the task name on the boss side.
     db.update_task(
         &task.id,
-        WorkItemPatch { name: Some("Operator Title".to_owned()), ..Default::default() },
+        WorkItemPatch {
+            name: Some("Operator Title".to_owned()),
+            ..Default::default()
+        },
         "human",
     )
     .expect("update_task");
@@ -97,9 +103,14 @@ async fn b8_skips_sync_when_both_sides_changed() {
     let registry2 = super::spy_registry(tracker2);
     let metrics2 = Registry::new();
     register_metrics(&metrics2);
-    let outcome2 =
-        run_one_pass(&db, &registry2, &metrics2, &super::noop_pub(), &super::ambient_resolver())
-            .await;
+    let outcome2 = run_one_pass(
+        &db,
+        &registry2,
+        &metrics2,
+        &super::noop_pub(),
+        &super::ambient_resolver(),
+    )
+    .await;
 
     assert_eq!(outcome2.title_body_conflict, 1, "should detect conflict");
     assert_eq!(outcome2.title_body_synced, 0, "should NOT auto-sync");
@@ -128,9 +139,14 @@ async fn b8_no_op_when_nothing_changed() {
     let registry2 = super::spy_registry(tracker2);
     let metrics2 = Registry::new();
     register_metrics(&metrics2);
-    let outcome2 =
-        run_one_pass(&db, &registry2, &metrics2, &super::noop_pub(), &super::ambient_resolver())
-            .await;
+    let outcome2 = run_one_pass(
+        &db,
+        &registry2,
+        &metrics2,
+        &super::noop_pub(),
+        &super::ambient_resolver(),
+    )
+    .await;
 
     assert_eq!(outcome2.title_body_synced, 0, "nothing to sync");
     assert_eq!(outcome2.title_body_conflict, 0, "no conflict");

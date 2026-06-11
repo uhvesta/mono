@@ -1,9 +1,7 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use broker_robinhood::{
-    AuthChallenge, RobinhoodClient, RobinhoodClientError, WorkflowRoute, WorkflowScreen,
-};
+use broker_robinhood::{AuthChallenge, RobinhoodClient, RobinhoodClientError, WorkflowRoute, WorkflowScreen};
 use indicatif::{ProgressBar, ProgressStyle};
 use rpassword::prompt_password;
 use serde_json::Value;
@@ -94,18 +92,14 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
 
     progress.set_message("Checking verification workflow");
     let verification_result = client.fetch_verification_result(&workflow_id).await?;
-    vprintln(
-        verbose,
-        format_args!("Verification result: {verification_result}"),
-    );
+    vprintln(verbose, format_args!("Verification result: {verification_result}"));
 
     progress.set_message("Requesting device approval challenge");
     let route = client.advance_workflow_entry_point(&workflow_id).await?;
     log_route(verbose, &route);
 
     let challenge_id = extract_challenge_id(&route);
-    let status =
-        wait_for_push_validation(&client, challenge_id.as_deref(), &progress, verbose).await?;
+    let status = wait_for_push_validation(&client, challenge_id.as_deref(), &progress, verbose).await?;
 
     match status.as_deref() {
         Some("validated") => {}
@@ -120,9 +114,7 @@ async fn authenticate(username: &str, password: &str, verbose: bool) -> Result<(
             return Ok(());
         }
         None => {
-            progress.abandon_with_message(
-                "No push challenge was available; rerun `hood auth` to retry.",
-            );
+            progress.abandon_with_message("No push challenge was available; rerun `hood auth` to retry.");
             return Ok(());
         }
     }
@@ -161,12 +153,7 @@ fn extract_challenge_id(route: &WorkflowRoute) -> Option<String> {
     route
         .replace
         .as_ref()
-        .and_then(|replace| {
-            replace
-                .screen
-                .device_approval_challenge_screen_params
-                .as_ref()
-        })
+        .and_then(|replace| replace.screen.device_approval_challenge_screen_params.as_ref())
         .and_then(|params| params.sheriff_challenge.as_ref())
         .and_then(|challenge| challenge.id.clone())
 }
@@ -176,22 +163,10 @@ fn log_challenge(verbose: bool, challenge: &AuthChallenge) {
         return;
     }
 
-    eprintln!(
-        "Verification workflow ID: {}",
-        challenge.verification_workflow().id
-    );
-    eprintln!(
-        "Workflow status: {}",
-        challenge.verification_workflow().workflow_status
-    );
-    eprintln!(
-        "Device token: {}",
-        redact_string(&challenge.device_token().to_string())
-    );
-    eprintln!(
-        "Request ID: {}",
-        redact_string(&challenge.request_id().to_string())
-    );
+    eprintln!("Verification workflow ID: {}", challenge.verification_workflow().id);
+    eprintln!("Workflow status: {}", challenge.verification_workflow().workflow_status);
+    eprintln!("Device token: {}", redact_string(&challenge.device_token().to_string()));
+    eprintln!("Request ID: {}", redact_string(&challenge.request_id().to_string()));
 }
 
 fn log_route(verbose: bool, route: &WorkflowRoute) {
@@ -260,9 +235,7 @@ async fn wait_for_push_validation(
     let mut last_status: Option<String> = None;
 
     for attempt in 1..=MAX_PUSH_ATTEMPTS {
-        progress.set_message(format!(
-            "Waiting for push approval ({attempt}/{MAX_PUSH_ATTEMPTS})"
-        ));
+        progress.set_message(format!("Waiting for push approval ({attempt}/{MAX_PUSH_ATTEMPTS})"));
         let status = client.fetch_push_prompt_status(challenge_id).await?;
 
         vprintln(
@@ -289,11 +262,7 @@ async fn wait_for_push_validation(
     Ok(last_status)
 }
 
-async fn complete_device_approval(
-    client: &RobinhoodClient,
-    workflow_id: &str,
-    verbose: bool,
-) -> Result<()> {
+async fn complete_device_approval(client: &RobinhoodClient, workflow_id: &str, verbose: bool) -> Result<()> {
     let route = client.complete_device_approval(workflow_id).await?;
 
     if verbose {
@@ -320,25 +289,16 @@ fn redact_sensitive_value(value: Value) -> Value {
                 })
                 .collect(),
         ),
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(redact_sensitive_value).collect())
-        }
+        Value::Array(values) => Value::Array(values.into_iter().map(redact_sensitive_value).collect()),
         other => other,
     }
 }
 
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    [
-        "token",
-        "password",
-        "secret",
-        "credential",
-        "authorization",
-        "auth",
-    ]
-    .iter()
-    .any(|needle| key.contains(needle))
+    ["token", "password", "secret", "credential", "authorization", "auth"]
+        .iter()
+        .any(|needle| key.contains(needle))
 }
 
 fn redact_string(value: &str) -> String {

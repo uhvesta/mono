@@ -46,12 +46,8 @@ pub enum RunPolicy {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum FingerprintInput {
-    File {
-        file: String,
-    },
-    Value {
-        value: String,
-    },
+    File { file: String },
+    Value { value: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,12 +123,8 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(CubeError::Io(source)),
     };
-    let config: SetupConfig = serde_yaml::from_str(&raw).map_err(|source| {
-        CubeError::InvalidArgument(format!(
-            "failed to parse `{}`: {source}",
-            path.display()
-        ))
-    })?;
+    let config: SetupConfig = serde_yaml::from_str(&raw)
+        .map_err(|source| CubeError::InvalidArgument(format!("failed to parse `{}`: {source}", path.display())))?;
     if config.version != SUPPORTED_VERSION {
         return Err(CubeError::InvalidArgument(format!(
             "unsupported setup config version `{}` in `{}`",
@@ -166,10 +158,7 @@ pub fn read_setup_config(workspace_path: &Path) -> Result<Option<SetupConfig>, C
     Ok(Some(config))
 }
 
-pub fn compute_fingerprint(
-    workspace_path: &Path,
-    step: &SetupStep,
-) -> Result<String, CubeError> {
+pub fn compute_fingerprint(workspace_path: &Path, step: &SetupStep) -> Result<String, CubeError> {
     let mut hasher = Sha256::new();
     hasher.update(step.command.as_bytes());
     hasher.update([0u8]);
@@ -219,8 +208,7 @@ pub fn run_setup_engine(
     for step in &config.steps {
         let started = Instant::now();
         let fingerprint = compute_fingerprint(&workspace.workspace_path, step)?;
-        let stored =
-            store.get_workspace_setup_state(&workspace.repo, &workspace.workspace_id, &step.id)?;
+        let stored = store.get_workspace_setup_state(&workspace.repo, &workspace.workspace_id, &step.id)?;
         let action = decide_action(step.run_when, stored.as_ref(), &fingerprint);
         match action {
             StepAction::Skip(reason) => {
@@ -273,11 +261,7 @@ enum StepAction {
     Skip(SkipReason),
 }
 
-fn decide_action(
-    policy: RunPolicy,
-    stored: Option<&WorkspaceSetupState>,
-    fingerprint: &str,
-) -> StepAction {
+fn decide_action(policy: RunPolicy, stored: Option<&WorkspaceSetupState>, fingerprint: &str) -> StepAction {
     match policy {
         RunPolicy::Always => StepAction::Run,
         RunPolicy::OnCreate => match stored {
@@ -285,19 +269,13 @@ fn decide_action(
             None => StepAction::Run,
         },
         RunPolicy::OnFingerprintChange => match stored {
-            Some(state) if state.fingerprint == fingerprint => {
-                StepAction::Skip(SkipReason::FingerprintUnchanged)
-            }
+            Some(state) if state.fingerprint == fingerprint => StepAction::Skip(SkipReason::FingerprintUnchanged),
             _ => StepAction::Run,
         },
     }
 }
 
-fn invoke_step(
-    runner: &dyn CommandRunner,
-    workspace_path: &Path,
-    step: &SetupStep,
-) -> Result<(), CubeError> {
+fn invoke_step(runner: &dyn CommandRunner, workspace_path: &Path, step: &SetupStep) -> Result<(), CubeError> {
     let parts = shlex::split(&step.command).ok_or_else(|| {
         CubeError::InvalidArgument(format!(
             "setup step `{}` has an unparseable command: {}",
@@ -305,12 +283,9 @@ fn invoke_step(
         ))
     })?;
     let mut iter = parts.into_iter();
-    let program = iter.next().ok_or_else(|| {
-        CubeError::InvalidArgument(format!(
-            "setup step `{}` resolved to an empty command",
-            step.id
-        ))
-    })?;
+    let program = iter
+        .next()
+        .ok_or_else(|| CubeError::InvalidArgument(format!("setup step `{}` resolved to an empty command", step.id)))?;
     let args: Vec<String> = iter.collect();
     runner.run(&CommandInvocation {
         cwd: workspace_path.to_path_buf(),
@@ -327,8 +302,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FingerprintInput, RunPolicy, SetupConfig, SetupStep, compute_fingerprint, decide_action,
-        read_setup_config, setup_config_path,
+        FingerprintInput, RunPolicy, SetupConfig, SetupStep, compute_fingerprint, decide_action, read_setup_config,
+        setup_config_path,
     };
     use crate::store::WorkspaceSetupState;
 
@@ -499,10 +474,7 @@ steps:
     #[test]
     fn decide_action_always_runs() {
         let ran = stored("abc");
-        assert!(matches!(
-            decide_action(RunPolicy::Always, None, "abc"),
-            StepAction::Run
-        ));
+        assert!(matches!(decide_action(RunPolicy::Always, None, "abc"), StepAction::Run));
         assert!(matches!(
             decide_action(RunPolicy::Always, Some(&ran), "abc"),
             StepAction::Run

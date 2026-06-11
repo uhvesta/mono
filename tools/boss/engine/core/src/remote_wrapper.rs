@@ -108,7 +108,10 @@ mod tests {
     #[test]
     fn expected_version_has_eng_prefix() {
         let v = expected_version();
-        assert!(v.starts_with("eng-"), "expected_version should start with `eng-`, got {v}");
+        assert!(
+            v.starts_with("eng-"),
+            "expected_version should start with `eng-`, got {v}"
+        );
     }
 
     #[test]

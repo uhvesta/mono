@@ -46,8 +46,7 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
     db.increment_ci_attempts_used(&chore.id).unwrap();
     db.increment_ci_attempts_used(&chore.id).unwrap();
     db.increment_ci_attempts_used(&chore.id).unwrap();
-    db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url)
-        .unwrap();
+    db.mark_chore_blocked_ci_failure_exhausted(&chore.id, &pr_url).unwrap();
 
     let (snapshot, was_exhausted) = db
         .retry_ci_remediation_for_work_item(&chore.id)
@@ -180,17 +179,12 @@ fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
     assert!(kinds.contains(&"ci"));
     assert!(kinds.contains(&"conflict"));
     // Filter to only `ci`.
-    let only_ci = db
-        .list_engine_attempts(&["ci".into()], None, &[], None, None)
-        .unwrap();
+    let only_ci = db.list_engine_attempts(&["ci".into()], None, &[], None, None).unwrap();
     assert_eq!(only_ci.len(), 1);
     assert_eq!(only_ci[0].kind, "ci");
     assert_eq!(only_ci[0].id, ci.id);
     // ci rows expose `attempt_kind` under `extra`.
-    assert_eq!(
-        only_ci[0].extra.get("attempt_kind").map(String::as_str),
-        Some("fix")
-    );
+    assert_eq!(only_ci[0].extra.get("attempt_kind").map(String::as_str), Some("fix"));
     // Filter to only `conflict`.
     let only_conflict = db
         .list_engine_attempts(&["conflict".into()], None, &[], None, None)
@@ -205,9 +199,7 @@ fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
         .unwrap();
     assert!(only_rebase.is_empty());
     // Limit honoured.
-    let capped = db
-        .list_engine_attempts(&[], None, &[], None, Some(1))
-        .unwrap();
+    let capped = db.list_engine_attempts(&[], None, &[], None, Some(1)).unwrap();
     assert_eq!(capped.len(), 1);
 
     let _ = std::fs::remove_file(path);
@@ -295,18 +287,18 @@ fn get_live_execution_returns_waiting_human_execution_for_work_item() {
     // A second ready execution for the same chore (as would be created by
     // the orphan sweep).
     let exec_b = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore_id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .repo_remote_url("git@github.com:foo/bar.git")
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build(),
+        )
         .unwrap();
 
     // exec_b should see exec_a as live.
-    let live = db
-        .get_live_execution_for_work_item(&chore_id, &exec_b.id)
-        .unwrap();
+    let live = db.get_live_execution_for_work_item(&chore_id, &exec_b.id).unwrap();
     assert!(live.is_some(), "exec_a should appear as live");
     assert_eq!(live.unwrap().id, exec_a_id);
 }
@@ -317,13 +309,8 @@ fn get_live_execution_excludes_specified_id() {
     let (_, chore_id, exec_a_id) = make_waiting_human_chore(&db, "live-exec-exclude");
 
     // Querying with exec_a as the exclude_id should return None.
-    let live = db
-        .get_live_execution_for_work_item(&chore_id, &exec_a_id)
-        .unwrap();
-    assert!(
-        live.is_none(),
-        "should not return the excluded execution itself"
-    );
+    let live = db.get_live_execution_for_work_item(&chore_id, &exec_a_id).unwrap();
+    assert!(live.is_none(), "should not return the excluded execution itself");
 }
 
 #[test]
@@ -335,17 +322,17 @@ fn get_live_execution_returns_none_when_all_executions_are_terminal() {
     db.mark_execution_redundant(&exec_a_id).unwrap();
 
     let exec_b = db
-        .create_execution(CreateExecutionInput::builder()
-            .work_item_id(chore_id.clone())
-            .kind(ExecutionKind::ChoreImplementation)
-            .status(ExecutionStatus::Ready)
-            .repo_remote_url("git@github.com:foo/bar.git")
-            .build())
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:foo/bar.git")
+                .build(),
+        )
         .unwrap();
 
-    let live = db
-        .get_live_execution_for_work_item(&chore_id, &exec_b.id)
-        .unwrap();
+    let live = db.get_live_execution_for_work_item(&chore_id, &exec_b.id).unwrap();
     assert!(
         live.is_none(),
         "no live execution should remain after exec_a is abandoned"
@@ -369,9 +356,7 @@ fn list_recently_terminal_finds_abandoned_exec_for_active_chore() {
     let db = WorkDb::open(temp_db_path("late-pr-list")).unwrap();
     let (_, chore_id, exec_id) = make_abandoned_chore_with_workspace(&db, "late-pr-list");
 
-    let candidates = db
-        .list_recently_terminal_executions_pending_pr_detection(3600)
-        .unwrap();
+    let candidates = db.list_recently_terminal_executions_pending_pr_detection(3600).unwrap();
     assert_eq!(candidates.len(), 1, "should find one late PR candidate");
     assert_eq!(candidates[0].execution_id, exec_id);
     assert_eq!(candidates[0].work_item_id, chore_id);
@@ -393,9 +378,7 @@ fn list_recently_terminal_excludes_chore_with_pr_url_already_set() {
     )
     .unwrap();
 
-    let candidates = db
-        .list_recently_terminal_executions_pending_pr_detection(3600)
-        .unwrap();
+    let candidates = db.list_recently_terminal_executions_pending_pr_detection(3600).unwrap();
     assert!(
         candidates.is_empty(),
         "chore already has pr_url — should not appear as candidate"
@@ -408,10 +391,7 @@ fn bind_pr_to_active_task_transitions_to_in_review() {
     let (_, chore_id, exec_id) = make_abandoned_chore_with_workspace(&db, "bind-pr-active");
 
     let updated = db
-        .bind_pr_to_active_task_from_terminal_execution(
-            &chore_id,
-            "https://github.com/foo/bar/pull/99",
-        )
+        .bind_pr_to_active_task_from_terminal_execution(&chore_id, "https://github.com/foo/bar/pull/99")
         .unwrap();
     assert!(updated, "should return true on first bind");
 
@@ -420,10 +400,7 @@ fn bind_pr_to_active_task_transitions_to_in_review() {
         other => panic!("expected chore or task, got {other:?}"),
     };
     assert_eq!(task.status, TaskStatus::InReview);
-    assert_eq!(
-        task.pr_url.as_deref(),
-        Some("https://github.com/foo/bar/pull/99")
-    );
+    assert_eq!(task.pr_url.as_deref(), Some("https://github.com/foo/bar/pull/99"));
 
     // Execution itself should still be abandoned (not touched by bind).
     let exec = db.get_execution(&exec_id).unwrap();
@@ -436,23 +413,14 @@ fn bind_pr_to_active_task_is_idempotent_when_already_in_review() {
     let (_, chore_id, _) = make_abandoned_chore_with_workspace(&db, "bind-pr-idempotent");
 
     let first = db
-        .bind_pr_to_active_task_from_terminal_execution(
-            &chore_id,
-            "https://github.com/foo/bar/pull/99",
-        )
+        .bind_pr_to_active_task_from_terminal_execution(&chore_id, "https://github.com/foo/bar/pull/99")
         .unwrap();
     assert!(first);
 
     let second = db
-        .bind_pr_to_active_task_from_terminal_execution(
-            &chore_id,
-            "https://github.com/foo/bar/pull/99",
-        )
+        .bind_pr_to_active_task_from_terminal_execution(&chore_id, "https://github.com/foo/bar/pull/99")
         .unwrap();
-    assert!(
-        !second,
-        "should return false when task is already past active"
-    );
+    assert!(!second, "should return false when task is already past active");
 }
 
 #[test]
@@ -480,10 +448,7 @@ fn fresh_db_has_parent_task_id_column_and_index() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(
-        index_exists, 1,
-        "idx_tasks_parent_task_id must exist after fresh init"
-    );
+    assert_eq!(index_exists, 1, "idx_tasks_parent_task_id must exist after fresh init");
 }
 
 #[test]
@@ -615,10 +580,7 @@ fn upgrade_from_schema_without_revision_columns_yields_same_shape() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(
-        index_exists, 1,
-        "idx_tasks_parent_task_id must exist after upgrade"
-    );
+    assert_eq!(index_exists, 1, "idx_tasks_parent_task_id must exist after upgrade");
 
     let exec_cols: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(work_executions)").unwrap();
@@ -643,10 +605,7 @@ fn chain_root_returns_self_for_non_revision_task() {
     let chore_id = make_chore_root(&db, &product_id, "self");
     let conn = db.connect().unwrap();
     let root = chain_root(&conn, &chore_id).unwrap();
-    assert_eq!(
-        root, chore_id,
-        "chain_root of a non-revision task must return itself"
-    );
+    assert_eq!(root, chore_id, "chain_root of a non-revision task must return itself");
 }
 
 #[test]
@@ -746,18 +705,13 @@ fn create_revision_succeeds_for_open_pr() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     assert_eq!(revision.kind, TaskKind::Revision);
     assert_eq!(revision.parent_task_id.as_deref(), Some(parent_id.as_str()));
     assert_eq!(revision.product_id, product_id);
     assert_eq!(revision.status, TaskStatus::Todo);
-    assert!(
-        revision.pr_url.is_none(),
-        "revision must not inherit parent pr_url"
-    );
+    assert!(revision.pr_url.is_none(), "revision must not inherit parent pr_url");
 }
 
 #[test]
@@ -767,15 +721,10 @@ fn create_revision_errors_when_parent_has_no_pr() {
     let parent_id = make_chore_root(&db, &product_id, "no-pr");
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let err = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap_err();
+    let err = db.create_revision(revision_input(&parent_id), &checker).unwrap_err();
 
     let msg = err.to_string();
-    assert!(
-        msg.contains("has no PR yet"),
-        "expected 'has no PR yet' in: {msg}"
-    );
+    assert!(msg.contains("has no PR yet"), "expected 'has no PR yet' in: {msg}");
 }
 
 #[test]
@@ -787,19 +736,11 @@ fn create_revision_errors_when_parent_pr_merged_via_cached_status() {
 
     // Probe would return Open, but the cached status='done' gate fires first.
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let err = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap_err();
+    let err = db.create_revision(revision_input(&parent_id), &checker).unwrap_err();
 
     let msg = err.to_string();
-    assert!(
-        msg.contains("already merged"),
-        "expected 'already merged' in: {msg}"
-    );
-    assert!(
-        msg.contains("#99"),
-        "expected PR number in error message: {msg}"
-    );
+    assert!(msg.contains("already merged"), "expected 'already merged' in: {msg}");
+    assert!(msg.contains("#99"), "expected PR number in error message: {msg}");
 }
 
 #[test]
@@ -811,15 +752,10 @@ fn create_revision_errors_when_pr_merged_via_live_probe() {
 
     // Live probe says merged (race: PR merged after cache was last updated).
     let checker = FakePrStateChecker::always(PrOpenState::Merged);
-    let err = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap_err();
+    let err = db.create_revision(revision_input(&parent_id), &checker).unwrap_err();
 
     let msg = err.to_string();
-    assert!(
-        msg.contains("already merged"),
-        "expected 'already merged' in: {msg}"
-    );
+    assert!(msg.contains("already merged"), "expected 'already merged' in: {msg}");
 }
 
 #[test]
@@ -831,19 +767,14 @@ fn create_revision_errors_when_pr_closed_unmerged() {
 
     // Live probe says closed without merging.
     let checker = FakePrStateChecker::always(PrOpenState::ClosedUnmerged);
-    let err = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap_err();
+    let err = db.create_revision(revision_input(&parent_id), &checker).unwrap_err();
 
     let msg = err.to_string();
     assert!(
         msg.contains("closed without merging"),
         "expected 'closed without merging' in: {msg}"
     );
-    assert!(
-        msg.contains("#77"),
-        "expected PR number in error message: {msg}"
-    );
+    assert!(msg.contains("#77"), "expected PR number in error message: {msg}");
 }
 
 #[test]
@@ -855,23 +786,17 @@ fn create_revision_of_revision_gates_against_chain_root() {
 
     // R1: revision of the root chore.
     let checker_open = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&root_id), &checker_open)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&root_id), &checker_open).unwrap();
     assert_eq!(r1.kind, TaskKind::Revision);
 
     // R2: revision of R1 — gate should resolve to root's PR.
-    let r2 = db
-        .create_revision(revision_input(&r1.id), &checker_open)
-        .unwrap();
+    let r2 = db.create_revision(revision_input(&r1.id), &checker_open).unwrap();
     assert_eq!(r2.kind, TaskKind::Revision);
     assert_eq!(r2.parent_task_id.as_deref(), Some(r1.id.as_str()));
 
     // Now simulate the root's PR being closed; revising R1 should fail.
     let checker_closed = FakePrStateChecker::always(PrOpenState::ClosedUnmerged);
-    let err = db
-        .create_revision(revision_input(&r1.id), &checker_closed)
-        .unwrap_err();
+    let err = db.create_revision(revision_input(&r1.id), &checker_closed).unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("closed without merging"),
@@ -887,9 +812,7 @@ fn create_revision_inherits_product_and_project_from_root() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     assert_eq!(
         revision.product_id, product_id,
@@ -963,9 +886,7 @@ fn create_revision_inherits_repo_remote_url_from_root() {
     }
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&root_chore.id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&root_chore.id), &checker).unwrap();
 
     assert_eq!(
         revision.repo_remote_url.as_deref(),
@@ -977,9 +898,7 @@ fn create_revision_inherits_repo_remote_url_from_root() {
     // row — this is what was returning None (→ pre-start failure) before.
     let conn = db.connect().unwrap();
     assert_eq!(
-        resolve_repo_for_work_item(&conn, &revision.id)
-            .unwrap()
-            .as_deref(),
+        resolve_repo_for_work_item(&conn, &revision.id).unwrap().as_deref(),
         Some(root_repo),
         "dispatch must resolve the inherited repo so the execution can lease a workspace"
     );
@@ -1028,12 +947,8 @@ fn create_revision_of_revision_inherits_repo_from_chain_root() {
     }
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&root_chore.id), &checker)
-        .unwrap();
-    let r2 = db
-        .create_revision(revision_input(&r1.id), &checker)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&root_chore.id), &checker).unwrap();
+    let r2 = db.create_revision(revision_input(&r1.id), &checker).unwrap();
 
     assert_eq!(r1.repo_remote_url.as_deref(), Some(root_repo));
     assert_eq!(
@@ -1057,9 +972,7 @@ fn task_show_projection_includes_parent_task_id_for_revision() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
     let short_id = revision.short_id.expect("revision must have a short_id");
 
     // `boss task show <full-id>` path.
@@ -1093,10 +1006,7 @@ fn task_show_projection_includes_parent_task_id_for_revision() {
 
 #[test]
 fn revision_name_single_line_unchanged() {
-    assert_eq!(
-        revision_name_from_description("Fix the thing"),
-        "Fix the thing"
-    );
+    assert_eq!(revision_name_from_description("Fix the thing"), "Fix the thing");
 }
 
 #[test]
@@ -1119,11 +1029,7 @@ fn revision_name_truncates_long_first_line_at_word_boundary() {
     // Build a line longer than 120 chars with a space before the limit.
     let long = "word ".repeat(30); // 150 chars: "word " × 30
     let name = revision_name_from_description(&long);
-    assert!(
-        name.len() <= 125,
-        "name must be ≤120 + '…': got {}",
-        name.len()
-    );
+    assert!(name.len() <= 125, "name must be ≤120 + '…': got {}", name.len());
     assert!(name.ends_with('…'), "long names must end with ellipsis");
 }
 
@@ -1187,13 +1093,7 @@ fn create_revision_with_autostart_false_stores_zero() {
 
 #[test]
 fn attach_revision_projections_assigns_seq_and_pr_url() {
-    let root = make_bare_task(
-        "root",
-        "chore",
-        None,
-        Some("https://gh/pull/1"),
-        "2026-01-01",
-    );
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/1"), "2026-01-01");
     let r1 = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
     let r2 = make_bare_task("r2", "revision", Some("root"), None, "2026-01-03");
 
@@ -1202,30 +1102,18 @@ fn attach_revision_projections_assigns_seq_and_pr_url() {
 
     let rev1 = result.iter().find(|t| t.id == "r1").unwrap();
     assert_eq!(rev1.revision_seq, Some(1), "r1 must be R1");
-    assert_eq!(
-        rev1.revision_parent_pr_url.as_deref(),
-        Some("https://gh/pull/1")
-    );
+    assert_eq!(rev1.revision_parent_pr_url.as_deref(), Some("https://gh/pull/1"));
 
     let rev2 = result.iter().find(|t| t.id == "r2").unwrap();
     assert_eq!(rev2.revision_seq, Some(2), "r2 must be R2");
-    assert_eq!(
-        rev2.revision_parent_pr_url.as_deref(),
-        Some("https://gh/pull/1")
-    );
+    assert_eq!(rev2.revision_parent_pr_url.as_deref(), Some("https://gh/pull/1"));
 }
 
 #[test]
 fn attach_revision_projections_chained_revisions_flat_seq() {
     // R2 is a revision-of-R1 (chained); both should still get a flat
     // sequence number relative to the chain root.
-    let root = make_bare_task(
-        "root",
-        "chore",
-        None,
-        Some("https://gh/pull/2"),
-        "2026-01-01",
-    );
+    let root = make_bare_task("root", "chore", None, Some("https://gh/pull/2"), "2026-01-01");
     let r1 = make_bare_task("r1", "revision", Some("root"), None, "2026-01-02");
     let r2 = make_bare_task("r2", "revision", Some("r1"), None, "2026-01-03");
 
@@ -1244,19 +1132,10 @@ fn attach_revision_projections_chained_revisions_flat_seq() {
 
 #[test]
 fn attach_revision_projections_non_revision_tasks_unaffected() {
-    let task = make_bare_task(
-        "t1",
-        "project_task",
-        None,
-        Some("https://gh/pull/3"),
-        "2026-01-01",
-    );
+    let task = make_bare_task("t1", "project_task", None, Some("https://gh/pull/3"), "2026-01-01");
     let result = attach_revision_projections(vec![task], &[]);
     let t = &result[0];
-    assert_eq!(
-        t.revision_seq, None,
-        "non-revision tasks must not get a seq"
-    );
+    assert_eq!(t.revision_seq, None, "non-revision tasks must not get a seq");
     assert_eq!(t.revision_parent_pr_url, None);
 }
 
@@ -1269,9 +1148,7 @@ fn get_work_tree_includes_revision_seq_and_pr_url() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     let tree = db.get_work_tree(&product_id).unwrap();
     // Revision arrives in the tasks array (not chores).
@@ -1297,20 +1174,11 @@ fn get_work_tree_two_revisions_get_distinct_seqs() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
-    let r2 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let r2 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     let tree = db.get_work_tree(&product_id).unwrap();
-    let seq = |id: &str| {
-        tree.tasks
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.revision_seq)
-    };
+    let seq = |id: &str| tree.tasks.iter().find(|t| t.id == id).and_then(|t| t.revision_seq);
     assert_eq!(seq(&r1.id), Some(1), "r1 must be R1");
     assert_eq!(seq(&r2.id), Some(2), "r2 must be R2");
 }
@@ -1436,7 +1304,10 @@ fn get_work_tree_has_in_progress_revision() {
     db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     let tree = db.get_work_tree(&product_id).unwrap();
-    let root_chore = tree.chores.iter().find(|c| c.id == parent_id)
+    let root_chore = tree
+        .chores
+        .iter()
+        .find(|c| c.id == parent_id)
         .expect("chain root chore must be in work_tree.chores");
 
     assert!(
@@ -1460,7 +1331,10 @@ fn get_work_tree_flag_cleared_when_revision_in_review() {
     db.force_task_status_for_test(&revision.id, "in_review").unwrap();
 
     let tree = db.get_work_tree(&product_id).unwrap();
-    let root_chore = tree.chores.iter().find(|c| c.id == parent_id)
+    let root_chore = tree
+        .chores
+        .iter()
+        .find(|c| c.id == parent_id)
         .expect("chain root chore must be in work_tree.chores");
 
     assert!(
@@ -1480,24 +1354,19 @@ fn create_revision_first_has_no_auto_dep() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     // R1 has no prior revision — status must still be `todo`.
     assert_eq!(
-        r1.status, TaskStatus::Todo,
+        r1.status,
+        TaskStatus::Todo,
         "first revision must stay todo (no auto-block)"
     );
 
     // No dependency edges at all.
     let conn = db.connect().unwrap();
-    let prereqs =
-        crate::work_dependencies::prerequisites_of(&conn, &r1.id, Some("blocks")).unwrap();
-    assert!(
-        prereqs.is_empty(),
-        "first revision must have no prerequisite edges"
-    );
+    let prereqs = crate::work_dependencies::prerequisites_of(&conn, &r1.id, Some("blocks")).unwrap();
+    assert!(prereqs.is_empty(), "first revision must have no prerequisite edges");
 }
 
 /// Second revision on the same PR must be auto-gated on the first.
@@ -1509,28 +1378,21 @@ fn create_revision_second_auto_blocks_on_first() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
-    let r2 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let r2 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     // R2 must be blocked because R1 is still active.
     assert_eq!(
-        r2.status, TaskStatus::Blocked,
+        r2.status,
+        TaskStatus::Blocked,
         "second revision must be auto-blocked by first"
     );
 
     // R2 must have a blocks prerequisite on R1.
     let conn = db.connect().unwrap();
-    let prereqs =
-        crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
+    let prereqs = crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
     assert_eq!(prereqs.len(), 1, "r2 must have exactly one prerequisite");
-    assert_eq!(
-        prereqs[0].prerequisite_id, r1.id,
-        "r2's prerequisite must be r1"
-    );
+    assert_eq!(prereqs[0].prerequisite_id, r1.id, "r2's prerequisite must be r1");
 }
 
 /// Third revision auto-gates on the second (the most-recent active
@@ -1543,19 +1405,12 @@ fn create_revision_third_auto_blocks_on_second() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
-    let r2 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
-    let r3 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let r2 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+    let r3 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     let conn = db.connect().unwrap();
-    let prereqs =
-        crate::work_dependencies::prerequisites_of(&conn, &r3.id, Some("blocks")).unwrap();
+    let prereqs = crate::work_dependencies::prerequisites_of(&conn, &r3.id, Some("blocks")).unwrap();
     assert_eq!(prereqs.len(), 1, "r3 must have exactly one prerequisite");
     assert_eq!(
         prereqs[0].prerequisite_id, r2.id,
@@ -1578,9 +1433,7 @@ fn create_revision_skips_done_revision_as_tail() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let r1 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let r1 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     // Mark R1 done.
     let conn = db.connect().unwrap();
@@ -1592,20 +1445,15 @@ fn create_revision_skips_done_revision_as_tail() {
     drop(conn);
 
     // R2 filed after R1 is done — no active tail → R2 stays todo.
-    let r2 = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let r2 = db.create_revision(revision_input(&parent_id), &checker).unwrap();
     assert_eq!(
-        r2.status, TaskStatus::Todo,
+        r2.status,
+        TaskStatus::Todo,
         "second revision must stay todo when the only prior revision is done"
     );
     let conn = db.connect().unwrap();
-    let prereqs =
-        crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
-    assert!(
-        prereqs.is_empty(),
-        "no prerequisite edge when prior revision is done"
-    );
+    let prereqs = crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
+    assert!(prereqs.is_empty(), "no prerequisite edge when prior revision is done");
 }
 
 // ── block_pending_revisions_on_parent_close / parent-PR-merged invalidation ─
@@ -1620,9 +1468,7 @@ fn mark_chore_pr_merged_blocks_todo_revision() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
     assert_eq!(revision.status, TaskStatus::Todo);
 
     // Simulate the parent PR merging.
@@ -1634,7 +1480,8 @@ fn mark_chore_pr_merged_blocks_todo_revision() {
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
-        rev_after.status, TaskStatus::Blocked,
+        rev_after.status,
+        TaskStatus::Blocked,
         "todo revision must be blocked after parent PR merges"
     );
     assert_eq!(
@@ -1661,9 +1508,7 @@ fn mark_chore_pr_merged_keeps_in_review_revision_done_not_blocked() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     // Simulate the revision having pushed its commit and moved to in_review.
     let conn = db.connect().unwrap();
@@ -1681,7 +1526,8 @@ fn mark_chore_pr_merged_keeps_in_review_revision_done_not_blocked() {
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
-        rev_after.status, TaskStatus::Done,
+        rev_after.status,
+        TaskStatus::Done,
         "in_review revision must become done (not blocked) when parent PR merges"
     );
 }
@@ -1695,9 +1541,7 @@ fn mark_chore_pr_merged_does_not_re_block_done_revision() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     let conn = db.connect().unwrap();
     conn.execute(
@@ -1714,7 +1558,8 @@ fn mark_chore_pr_merged_does_not_re_block_done_revision() {
         other => panic!("unexpected variant: {other:?}"),
     };
     assert_eq!(
-        rev_after.status, TaskStatus::Done,
+        rev_after.status,
+        TaskStatus::Done,
         "already-done revision must not be touched"
     );
     assert_eq!(
@@ -1733,9 +1578,7 @@ fn list_active_revision_executions_for_chain_returns_leased_only() {
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
     let checker = FakePrStateChecker::always(PrOpenState::Open);
-    let revision = db
-        .create_revision(revision_input(&parent_id), &checker)
-        .unwrap();
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
 
     // Insert a running execution WITH a cube lease.
     // Note: work_executions.priority is an i64 (0 = default); tasks.priority is TEXT.
@@ -1770,14 +1613,8 @@ fn list_active_revision_executions_for_chain_returns_leased_only() {
     .unwrap();
     drop(conn);
 
-    let active = db
-        .list_active_revision_executions_for_chain(&parent_id)
-        .unwrap();
-    assert_eq!(
-        active.len(),
-        1,
-        "only the running leased execution must be returned"
-    );
+    let active = db.list_active_revision_executions_for_chain(&parent_id).unwrap();
+    assert_eq!(active.len(), 1, "only the running leased execution must be returned");
     assert_eq!(active[0].id, exec_id);
 }
 
@@ -1790,13 +1627,8 @@ fn list_active_revision_executions_for_chain_empty_for_no_revisions() {
     let pr_url = "https://github.com/spinyfin/mono/pull/809";
     let parent_id = make_in_review_chore(&db, &product_id, pr_url);
 
-    let active = db
-        .list_active_revision_executions_for_chain(&parent_id)
-        .unwrap();
-    assert!(
-        active.is_empty(),
-        "chain with no revisions must yield empty vec"
-    );
+    let active = db.list_active_revision_executions_for_chain(&parent_id).unwrap();
+    assert!(active.is_empty(), "chain with no revisions must yield empty vec");
 }
 
 // ── Revision dispatch via request_execution ───────────────────────────
@@ -1832,7 +1664,8 @@ fn request_execution_for_revision_task_produces_revision_implementation_kind() {
         .unwrap();
 
     assert_eq!(
-        exec.kind, ExecutionKind::RevisionImplementation,
+        exec.kind,
+        ExecutionKind::RevisionImplementation,
         "request_execution must produce revision_implementation for kind=revision tasks, got {:?}",
         exec.kind,
     );
@@ -1895,7 +1728,8 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
         "re-dispatch must create a fresh execution row",
     );
     assert_eq!(
-        second_exec.kind, ExecutionKind::RevisionImplementation,
+        second_exec.kind,
+        ExecutionKind::RevisionImplementation,
         "re-dispatched revision must still be revision_implementation, got {:?}",
         second_exec.kind,
     );
@@ -1913,12 +1747,7 @@ fn request_execution_redispatch_of_revision_preserves_revision_kind_and_pr_url()
 /// Mirrors what `conflict_watch::maybe_spawn_conflict_revision` produces:
 /// `created_via = "merge-conflict:<crz_id>"`, parent = the chore, and (as
 /// in the steady-state loop) the row already flipped to `active`.
-fn insert_conflict_revision_row(
-    db: &WorkDb,
-    product_id: &str,
-    parent_task_id: &str,
-    crz_id: &str,
-) -> String {
+fn insert_conflict_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str, crz_id: &str) -> String {
     let conn = db.connect().unwrap();
     let id = next_id("task");
     let now = now_string();
@@ -2117,12 +1946,7 @@ fn merge_conflict_revision_still_redispatches_while_attempt_active() {
 /// Mirrors what `ci_watch` produces for a CI remediation: `created_via =
 /// "ci-fix:<ci_remediations.id>"`, parent = the chore, and (as in the
 /// steady-state loop) the row already flipped to `active`.
-fn insert_ci_fix_revision_row(
-    db: &WorkDb,
-    product_id: &str,
-    parent_task_id: &str,
-    rem_id: &str,
-) -> String {
+fn insert_ci_fix_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str, rem_id: &str) -> String {
     let conn = db.connect().unwrap();
     let id = next_id("task");
     let now = now_string();
@@ -2162,8 +1986,7 @@ fn setup_ci_fix_revision(
         .unwrap()
         .unwrap();
     let revision_id = insert_ci_fix_revision_row(db, product_id, chore_id, &rem.id);
-    db.set_ci_remediation_revision_task_id(&rem.id, &revision_id)
-        .unwrap();
+    db.set_ci_remediation_revision_task_id(&rem.id, &revision_id).unwrap();
     (rem.id, revision_id)
 }
 
@@ -2250,8 +2073,7 @@ fn ci_fix_revision_stops_dispatch_after_attempt_fails() {
     assert_eq!(after_first[0].1, "ready");
 
     // The CI fix attempt fails (retires terminally).
-    db.mark_ci_remediation_failed(&rem_id, "ran out of attempts")
-        .unwrap();
+    db.mark_ci_remediation_failed(&rem_id, "ran out of attempts").unwrap();
 
     // Second reconcile: no new execution; queued row abandoned; revision settled.
     db.reconcile_product_executions(&product_id).unwrap();
@@ -2518,18 +2340,14 @@ fn conflict_resolution_revision_execution_records_transcript_path() {
 
     // Simulate the worker's first hook event reporting its transcript path.
     let transcript_path = "/tmp/mono-agent-064/.boss/session.jsonl";
-    let outcome = db
-        .set_run_transcript_path_if_unset(exec_id, transcript_path)
-        .unwrap();
+    let outcome = db.set_run_transcript_path_if_unset(exec_id, transcript_path).unwrap();
     assert!(
         matches!(outcome, SetRunTranscriptPathOutcome::Updated),
         "set_run_transcript_path_if_unset must return Updated for a new run; got {outcome:?}",
     );
 
     // Confirm the path is readable via the execution-id namespace.
-    let recorded = db
-        .transcript_path_for_execution(exec_id)
-        .unwrap();
+    let recorded = db.transcript_path_for_execution(exec_id).unwrap();
     assert_eq!(
         recorded.as_deref(),
         Some(transcript_path),

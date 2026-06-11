@@ -11,10 +11,9 @@ use crate::check::{Check, CheckRegistry, ConfiguredCheck};
 use crate::checks::register_builtin_checks;
 use crate::config::ConfigResolver;
 use crate::external::{
-    BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor, ExternalCheckExecutor,
-    ExternalCheckComponentPackage, ExternalCheckImplementationRef, ExternalCheckPackage,
-    ExternalCheckPackageImplementation, ExternalCheckPackageProvider,
-    parse_external_check_package_manifest,
+    BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor, ExternalCheckComponentPackage,
+    ExternalCheckExecutor, ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
+    ExternalCheckPackageProvider, parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -27,10 +26,7 @@ struct StaticExternalProvider {
 }
 
 impl ExternalCheckPackageProvider for StaticExternalProvider {
-    fn resolve(
-        &self,
-        _implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>> {
+    fn resolve(&self, _implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>> {
         Ok(self.package.clone())
     }
 }
@@ -130,8 +126,7 @@ impl Check for MetadataCapturingCheck {
 #[async_trait]
 impl ConfiguredCheck for MetadataCapturingCheck {
     async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
-        *self.seen_bypass_reason.lock().expect("lock bypass reason") =
-            changeset.bypass_reason(&self.directive_name);
+        *self.seen_bypass_reason.lock().expect("lock bypass reason") = changeset.bypass_reason(&self.directive_name);
         *self.seen_change_id.lock().expect("lock change id") = changeset.change_id.clone();
         *self.seen_repository.lock().expect("lock repository") = changeset.repository.clone();
 
@@ -249,10 +244,7 @@ id = "capture-descriptions"
         *seen_bypass_reason.lock().expect("lock bypass reason"),
         Some("Legitimate exception for validation.".to_owned())
     );
-    assert_eq!(
-        *seen_change_id.lock().expect("lock change id"),
-        Some("235".to_owned())
-    );
+    assert_eq!(*seen_change_id.lock().expect("lock change id"), Some("235".to_owned()));
     assert_eq!(
         *seen_repository.lock().expect("lock repository"),
         Some("example/flunge".to_owned())
@@ -568,17 +560,10 @@ checks:
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].check_id, "checks-config");
     assert_eq!(
-        results[0].findings[0]
-            .location
-            .as_ref()
-            .map(|location| &location.path),
+        results[0].findings[0].location.as_ref().map(|location| &location.path),
         Some(&Path::new("CHECKS.yaml").to_path_buf())
     );
-    assert!(
-        results[0].findings[0]
-            .message
-            .contains("failed to parse checks config")
-    );
+    assert!(results[0].findings[0].message.contains("failed to parse checks config"));
 }
 
 #[tokio::test]
@@ -618,10 +603,7 @@ max_lines = "many"
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].check_id, "file-size");
     assert_eq!(
-        results[0].findings[0]
-            .location
-            .as_ref()
-            .map(|location| &location.path),
+        results[0].findings[0].location.as_ref().map(|location| &location.path),
         Some(&Path::new("CHECKS.toml").to_path_buf())
     );
     assert!(
@@ -629,11 +611,7 @@ max_lines = "many"
             .message
             .contains("invalid file-size check config")
     );
-    assert!(
-        !results[0].findings[0]
-            .message
-            .contains("check execution failed")
-    );
+    assert!(!results[0].findings[0].message.contains("check execution failed"));
 }
 
 #[tokio::test]
@@ -668,11 +646,7 @@ check = "not-registered"
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].check_id, "spelling-typos");
     assert_eq!(results[0].findings[0].severity, Severity::Error);
-    assert!(
-        results[0].findings[0]
-            .message
-            .contains("unknown implementation")
-    );
+    assert!(results[0].findings[0].message.contains("unknown implementation"));
 }
 
 #[tokio::test]

@@ -75,11 +75,7 @@ impl WorkDb {
     ///
     /// Errors when the execution is unknown or already terminal —
     /// callers shouldn't try to reap a row that's already done.
-    pub fn mark_execution_orphaned(
-        &self,
-        execution_id: &str,
-        reason: &str,
-    ) -> Result<WorkExecution> {
+    pub fn mark_execution_orphaned(&self, execution_id: &str, reason: &str) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -179,8 +175,7 @@ impl WorkDb {
 
         let new_id = next_id("exec");
         let dispatch_not_before = dispatch_not_before_epoch.to_string();
-        let branch_naming_json =
-            serde_json::to_string(&dead.branch_naming).unwrap_or_default();
+        let branch_naming_json = serde_json::to_string(&dead.branch_naming).unwrap_or_default();
         tx.execute(
             "INSERT INTO work_executions (
                 id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
@@ -305,9 +300,7 @@ impl WorkDb {
              FROM work_executions
              WHERE cube_lease_id IS NOT NULL",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         let mut map = HashMap::new();
         for row in rows {
             let (lease_id, execution_id) = row?;
@@ -363,10 +356,7 @@ impl WorkDb {
     /// the merge poller to find in-flight revision workers to stop after
     /// the parent PR merges.  Only executions that hold a cube workspace
     /// lease are returned (same predicate as `list_in_flight_executions`).
-    pub fn list_active_revision_executions_for_chain(
-        &self,
-        chain_root_id: &str,
-    ) -> Result<Vec<WorkExecution>> {
+    pub fn list_active_revision_executions_for_chain(&self, chain_root_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let revision_ids = collect_chain_revision_ids(&conn, chain_root_id)?;
         if revision_ids.is_empty() {
@@ -392,10 +382,7 @@ impl WorkDb {
         Ok(executions)
     }
 
-    pub fn reconcile_product_executions(
-        &self,
-        product_id: &str,
-    ) -> Result<ExecutionReconcileResult> {
+    pub fn reconcile_product_executions(&self, product_id: &str) -> Result<ExecutionReconcileResult> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let _product = query_product(&tx, product_id).require("product", product_id)?;
@@ -459,10 +446,7 @@ impl WorkDb {
                 }
                 TaskKind::ProjectTask | TaskKind::Design => {
                     if let Some(project_id) = &task.project_id {
-                        project_tasks
-                            .entry(project_id.clone())
-                            .or_default()
-                            .push(task);
+                        project_tasks.entry(project_id.clone()).or_default().push(task);
                     }
                 }
                 TaskKind::Task => {
@@ -501,13 +485,7 @@ impl WorkDb {
                     | TaskKind::Revision
                     | TaskKind::Task => ExecutionKind::TaskImplementation,
                 };
-                reconcile_work_item_execution(
-                    &tx,
-                    &mut result,
-                    &task.id,
-                    execution_kind,
-                    desired_status,
-                )?;
+                reconcile_work_item_execution(&tx, &mut result, &task.id, execution_kind, desired_status)?;
             }
         }
 
@@ -638,8 +616,7 @@ impl WorkDb {
         )?;
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let run = query_run(&tx, &run_id)?
-            .with_context(|| format!("missing run after insert: {run_id}"))?;
+        let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
         Ok((execution, run))
     }
@@ -781,8 +758,7 @@ impl WorkDb {
         )?;
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let run = query_run(&tx, &run_id)?
-            .with_context(|| format!("missing run after insert: {run_id}"))?;
+        let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
         Ok((execution, run))
     }
@@ -872,8 +848,7 @@ impl WorkDb {
         };
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let run = query_run(&tx, &run_id)?
-            .with_context(|| format!("missing run after insert: {run_id}"))?;
+        let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
         tx.commit()?;
         Ok((execution, run, outcome))
     }
@@ -964,9 +939,7 @@ impl WorkDb {
             }
             let provided = input.execution_id.as_deref().unwrap_or(execution_id);
             if provided != execution_id {
-                bail!(
-                    "attention item execution `{provided}` does not match finished execution `{execution_id}`",
-                );
+                bail!("attention item execution `{provided}` does not match finished execution `{execution_id}`",);
             }
 
             let attention_id = next_id("attn");
@@ -989,9 +962,8 @@ impl WorkDb {
             )?;
 
             Some(
-                query_attention_item(&tx, &attention_id)?.with_context(|| {
-                    format!("missing attention item after insert: {attention_id}")
-                })?,
+                query_attention_item(&tx, &attention_id)?
+                    .with_context(|| format!("missing attention item after insert: {attention_id}"))?,
             )
         } else {
             None
@@ -1038,8 +1010,7 @@ impl WorkDb {
             ],
         )?;
 
-        let run =
-            query_run(&tx, &id)?.with_context(|| format!("missing run after insert: {id}"))?;
+        let run = query_run(&tx, &id)?.with_context(|| format!("missing run after insert: {id}"))?;
         tx.commit()?;
         Ok(run)
     }
@@ -1230,11 +1201,7 @@ impl WorkDb {
     /// resolved to the live `work_runs.id`. Returns `true` when a row was
     /// updated, `false` when no run exists yet (benign — the caller logs
     /// and moves on; the pid is informational, not a spawn precondition).
-    pub fn set_run_remote_pid_for_execution(
-        &self,
-        execution_id: &str,
-        remote_pid: i64,
-    ) -> Result<bool> {
+    pub fn set_run_remote_pid_for_execution(&self, execution_id: &str, remote_pid: i64) -> Result<bool> {
         let conn = self.connect()?;
         let updated = conn.execute(
             "UPDATE work_runs
@@ -1359,11 +1326,7 @@ impl WorkDb {
     }
 
     #[cfg(test)]
-    pub fn force_execution_status_for_test(
-        &self,
-        work_item_id: &str,
-        status: ExecutionStatus,
-    ) -> Result<()> {
+    pub fn force_execution_status_for_test(&self, work_item_id: &str, status: ExecutionStatus) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE work_executions SET status = ?2 WHERE work_item_id = ?1",
@@ -1392,11 +1355,7 @@ impl WorkDb {
         Ok(())
     }
 
-    pub fn force_transient_failure_count_for_test(
-        &self,
-        execution_id: &str,
-        count: i64,
-    ) -> Result<()> {
+    pub fn force_transient_failure_count_for_test(&self, execution_id: &str, count: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE work_executions SET transient_failure_count = ?2 WHERE id = ?1",
@@ -1410,11 +1369,7 @@ impl WorkDb {
     /// the snapshotted strategy without needing to re-create the full
     /// product/editorial-rules fixture.
     #[cfg(test)]
-    pub fn force_branch_naming_for_test(
-        &self,
-        execution_id: &str,
-        naming: &BranchNaming,
-    ) -> Result<()> {
+    pub fn force_branch_naming_for_test(&self, execution_id: &str, naming: &BranchNaming) -> Result<()> {
         let json = serde_json::to_string(naming)
             .with_context(|| format!("failed to serialise BranchNaming for {execution_id}"))?;
         let conn = self.connect()?;

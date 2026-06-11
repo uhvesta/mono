@@ -44,9 +44,7 @@ use boss_protocol::{ExecutionStatus, RequestExecutionInput};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
-use crate::work::{
-    WorkDb, ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS,
-};
+use crate::work::{ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb};
 
 /// Minimum age of `tasks.updated_at` before an active work item with
 /// no live execution is treated as an orphan. Guards against racing a
@@ -83,12 +81,7 @@ pub fn spawn_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let outcome = run_one_pass(
-                work_db.as_ref(),
-                coordinator.clone(),
-                dispatch_events.as_ref(),
-            )
-            .await;
+            let outcome = run_one_pass(work_db.as_ref(), coordinator.clone(), dispatch_events.as_ref()).await;
             if outcome.has_activity() {
                 tracing::info!(
                     redispatched = outcome.redispatched,
@@ -144,9 +137,7 @@ pub async fn run_one_pass(
 
     for work_item_id in candidates {
         // Churn guard: count terminal executions in the trailing window.
-        let recent_terminal = match work_db
-            .count_recent_terminal_executions(&work_item_id, churn_cutoff)
-        {
+        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff) {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(
@@ -219,16 +210,17 @@ pub async fn run_one_pass(
         // clobber a live in-flight workspace and create a duplicate worker on the
         // same row.
         if let Some(live) = &live_execution
-            && live.status == ExecutionStatus::WaitingHuman {
-                tracing::warn!(
-                    work_item_id = %work_item_id,
-                    execution_id = %live.id,
-                    "orphan sweep: candidate has a waiting_human execution; skipping \
-                     (should have been excluded by DB query — investigate)",
-                );
-                outcome.waiting_human_skipped += 1;
-                continue;
-            }
+            && live.status == ExecutionStatus::WaitingHuman
+        {
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                execution_id = %live.id,
+                "orphan sweep: candidate has a waiting_human execution; skipping \
+                 (should have been excluded by DB query — investigate)",
+            );
+            outcome.waiting_human_skipped += 1;
+            continue;
+        }
 
         // Request a fresh execution. The `is_live` closure treats an
         // execution as live only if a worker slot currently claims it.
@@ -268,15 +260,11 @@ pub async fn run_one_pass(
 
         dispatch_events
             .emit(
-                DispatchEvent::new(
-                    Stage::OrphanActiveRedispatch,
-                    Outcome::Ok,
-                    &new_execution.id,
-                )
-                .with_work_item(&work_item_id)
-                .with_details(serde_json::json!({
-                    "recent_terminal_executions": recent_terminal,
-                })),
+                DispatchEvent::new(Stage::OrphanActiveRedispatch, Outcome::Ok, &new_execution.id)
+                    .with_work_item(&work_item_id)
+                    .with_details(serde_json::json!({
+                        "recent_terminal_executions": recent_terminal,
+                    })),
             )
             .await;
 
@@ -298,8 +286,8 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionCoordinator, WorkerPool,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionCoordinator, WorkerPool,
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::runner::{ExecutionRunner, RunOutcome};
@@ -325,11 +313,7 @@ mod tests {
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!("orphan sweep tests don't invoke cube")
         }
-        async fn create_change(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
             unimplemented!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {
@@ -424,8 +408,7 @@ mod tests {
             .unwrap()
             .as_secs()
             .saturating_sub(600) as i64;
-        db.force_updated_at_for_test(work_item_id, old_epoch)
-            .unwrap();
+        db.force_updated_at_for_test(work_item_id, old_epoch).unwrap();
     }
 
     fn make_coordinator(db: Arc<WorkDb>, pool_size: usize) -> Arc<ExecutionCoordinator> {
@@ -459,10 +442,7 @@ mod tests {
         assert_eq!(events.len(), 1, "expected exactly one dispatch event");
         assert_eq!(events[0].stage, "orphan_active_redispatch");
         assert_eq!(events[0].outcome, "ok");
-        assert_eq!(
-            events[0].work_item_id.as_deref(),
-            Some(work_item_id.as_str())
-        );
+        assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()));
 
         let executions = db.list_executions(Some(&work_item_id)).unwrap();
         assert!(
@@ -483,15 +463,14 @@ mod tests {
         // Insert a ready execution and claim it in the pool — this makes
         // the item appear "already queued" (no-candidate via DB query).
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
             .unwrap();
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution.id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         // With a `ready` execution the DB query filters the item out.
@@ -511,10 +490,7 @@ mod tests {
 
         let db = Arc::new(db);
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker("dummy-exec-id", None)
-            .await;
+        coordinator.worker_pool().claim_worker("dummy-exec-id", None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
@@ -532,17 +508,10 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id);
         make_old(&db, &work_item_id);
 
-        let now_epoch = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_execution_for_test(
-                &work_item_id,
-                "orphaned",
-                now_epoch - i,
-            )
-            .unwrap();
+            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+                .unwrap();
         }
 
         let db = Arc::new(db);

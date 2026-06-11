@@ -419,11 +419,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
     );
 
     for f in &findings {
-        let loc = f
-            .location
-            .as_deref()
-            .map(|l| format!(" ({l})"))
-            .unwrap_or_default();
+        let loc = f.location.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
         let category = match f.category {
             ReviewFindingCategory::Correctness => "correctness",
             ReviewFindingCategory::Regression => "regression",
@@ -766,8 +762,7 @@ pub fn render_reviewer_initial_prompt(
 
 fn render_rubric_section(scope: &ReviewScope) -> String {
     match scope {
-        ReviewScope::Code => {
-            "## Review rubric — code PR\n\
+        ReviewScope::Code => "## Review rubric — code PR\n\
              \n\
              Apply a **high bar**: push back only on real problems, not \
              stylistic preferences. Every finding must name a file (and \
@@ -804,10 +799,8 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
              - Required-sections check for design docs (problem/goals/approach \
                headings present).\n\
              \n"
-                .to_owned()
-        }
-        ReviewScope::DocsOnly => {
-            "## Review rubric — docs-only PR\n\
+        .to_owned(),
+        ReviewScope::DocsOnly => "## Review rubric — docs-only PR\n\
              \n\
              This PR contains only documentation files. Apply the **light \
              rubric** — skip code-review concerns (correctness, regressions, \
@@ -827,8 +820,7 @@ fn render_rubric_section(scope: &ReviewScope) -> String {
              Do NOT apply the code rubric (correctness, regressions, \
              architecture, tests, edge cases) to this docs-only PR.\n\
              \n"
-                .to_owned()
-        }
+        .to_owned(),
     }
 }
 
@@ -866,10 +858,7 @@ mod tests {
         assert!(parsed.revision_warranted);
         assert_eq!(parsed.findings.len(), 1);
         assert_eq!(parsed.findings[0].severity, ReviewFindingSeverity::High);
-        assert_eq!(
-            parsed.findings[0].category,
-            ReviewFindingCategory::Regression
-        );
+        assert_eq!(parsed.findings[0].category, ReviewFindingCategory::Regression);
         assert!(parsed.regression_check.performed);
     }
 
@@ -958,7 +947,10 @@ mod tests {
         assert!(prompt.contains("head999"), "prompt must include head SHA");
         assert!(prompt.contains("src/main.rs"), "prompt must list changed files");
         assert!(prompt.contains("tests/test.rs"), "prompt must list changed files");
-        assert!(prompt.contains("gh pr diff 99"), "prompt must use PR number in diff command");
+        assert!(
+            prompt.contains("gh pr diff 99"),
+            "prompt must use PR number in diff command"
+        );
         assert!(
             prompt.contains("already checked out to the PR head"),
             "prompt must state workspace is at PR head"
@@ -980,9 +972,7 @@ mod tests {
             base_sha: "base111".to_owned(),
             head_sha: "head222".to_owned(),
             changed_files: vec!["src/lib.rs".to_owned()],
-            diff_content: Some(
-                "diff --git a/src/lib.rs b/src/lib.rs\n+fn new() {}".to_owned(),
-            ),
+            diff_content: Some("diff --git a/src/lib.rs b/src/lib.rs\n+fn new() {}".to_owned()),
         };
         let prompt = render_reviewer_initial_prompt(
             "Add a feature",
@@ -1137,10 +1127,7 @@ mod tests {
 
     #[test]
     fn classify_mixed_returns_code() {
-        assert_eq!(
-            classify_changed_files(&["README.md", "src/lib.rs"]),
-            ReviewScope::Code,
-        );
+        assert_eq!(classify_changed_files(&["README.md", "src/lib.rs"]), ReviewScope::Code,);
     }
 
     #[test]
@@ -1243,7 +1230,10 @@ mod tests {
             .expect("ReviewResult must parse even without regression_check (T1359 robustness)");
         assert!(result.revision_warranted, "revision_warranted must be preserved");
         assert_eq!(result.findings.len(), 1, "findings must be preserved");
-        assert!(!result.regression_check.performed, "missing regression_check defaults to performed=false");
+        assert!(
+            !result.regression_check.performed,
+            "missing regression_check defaults to performed=false"
+        );
     }
 
     #[test]
@@ -1301,9 +1291,7 @@ mod tests {
     #[test]
     fn extract_review_result_finds_block_after_prose() {
         let json = make_review_result_json(true, serde_json::json!([]));
-        let text = format!(
-            "I reviewed the PR.\n\nSome analysis here.\n\n```json\n{json}\n```"
-        );
+        let text = format!("I reviewed the PR.\n\nSome analysis here.\n\n```json\n{json}\n```");
         let result = extract_review_result(&text).expect("should parse");
         assert!(result.revision_warranted);
     }
@@ -1320,16 +1308,19 @@ mod tests {
     fn extract_review_result_parses_bare_json_after_prose() {
         // Regression fixture for T1304 / PR #1320 shape:
         // "## Review summary … Key findings below.\n\n{ … }"
-        let json = make_review_result_json(true, serde_json::json!([
-            {
-                "severity": "high",
-                "category": "correctness",
-                "file": "src/lib.rs",
-                "title": "missing null check",
-                "detail": "foo can be null here",
-                "confidence": "high"
-            }
-        ]));
+        let json = make_review_result_json(
+            true,
+            serde_json::json!([
+                {
+                    "severity": "high",
+                    "category": "correctness",
+                    "file": "src/lib.rs",
+                    "title": "missing null check",
+                    "detail": "foo can be null here",
+                    "confidence": "high"
+                }
+            ]),
+        );
         let text = format!(
             "## Review summary\n\nI reviewed the PR carefully.\n\
              \nKey findings below.\n\n{json}"
@@ -1418,15 +1409,21 @@ mod tests {
 }
 }"#;
 
-        let result = extract_review_result(bare_json)
-            .expect("T1359 exact quark JSON (bare, unfenced) must parse successfully");
+        let result =
+            extract_review_result(bare_json).expect("T1359 exact quark JSON (bare, unfenced) must parse successfully");
         assert!(result.revision_warranted, "revision_warranted must be true");
         assert!(
-            result.findings.iter().any(|f| matches!(f.severity, ReviewFindingSeverity::High)),
+            result
+                .findings
+                .iter()
+                .any(|f| matches!(f.severity, ReviewFindingSeverity::High)),
             "high-severity finding must be present",
         );
         assert!(
-            result.findings.iter().any(|f| matches!(f.category, ReviewFindingCategory::Correctness)),
+            result
+                .findings
+                .iter()
+                .any(|f| matches!(f.category, ReviewFindingCategory::Correctness)),
             "correctness finding must be present",
         );
     }
@@ -1480,8 +1477,8 @@ mod tests {
              The main issue is an orphan-tag leak in the release script. \
              Full structured result:\n\n{json}"
         );
-        let result = extract_review_result(&text)
-            .expect("rich bare-JSON ReviewResult must be extracted (T1359 regression)");
+        let result =
+            extract_review_result(&text).expect("rich bare-JSON ReviewResult must be extracted (T1359 regression)");
         assert!(result.revision_warranted, "revision_warranted must be true");
         assert_eq!(result.findings.len(), 2, "must recover both findings");
         assert_eq!(
@@ -1489,10 +1486,7 @@ mod tests {
             ReviewFindingSeverity::High,
             "first finding must be high severity",
         );
-        assert_eq!(
-            result.findings[0].category,
-            ReviewFindingCategory::Correctness,
-        );
+        assert_eq!(result.findings[0].category, ReviewFindingCategory::Correctness,);
     }
 
     /// Regression fixture for T1359: when the bare JSON is preceded by prose
@@ -1529,18 +1523,15 @@ mod tests {
             "The release script sets TAG=${{TAG}} and runs `git push ${{RELEASE}}`.\n\n\
              If the push fails, the local tag at ${{TAG}} persists.\n\n{json}"
         );
-        let result = extract_review_result(&text)
-            .expect("ReviewResult must be found even when preceding prose has bare braces");
+        let result =
+            extract_review_result(&text).expect("ReviewResult must be found even when preceding prose has bare braces");
         assert!(result.revision_warranted);
         assert_eq!(result.findings.len(), 1);
     }
 
     // --- passes_severity_gate ---
 
-    fn make_finding(
-        severity: ReviewFindingSeverity,
-        category: ReviewFindingCategory,
-    ) -> ReviewFinding {
+    fn make_finding(severity: ReviewFindingSeverity, category: ReviewFindingCategory) -> ReviewFinding {
         ReviewFinding::builder()
             .severity(severity)
             .category(category)
@@ -1652,15 +1643,17 @@ mod tests {
             head_sha: String::new(),
             summary: "One bug found.".to_owned(),
             revision_warranted: true,
-            findings: vec![ReviewFinding::builder()
-                .severity(ReviewFindingSeverity::High)
-                .category(ReviewFindingCategory::Correctness)
-                .file("src/main.rs")
-                .location("fn handle, ~L42")
-                .title("Null pointer dereference")
-                .detail("The handle function dereferences without a null check; add a guard.")
-                .confidence(ReviewFindingConfidence::High)
-                .build()],
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::High)
+                    .category(ReviewFindingCategory::Correctness)
+                    .file("src/main.rs")
+                    .location("fn handle, ~L42")
+                    .title("Null pointer dereference")
+                    .detail("The handle function dereferences without a null check; add a guard.")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
             regression_check: RegressionCheck {
                 performed: true,
                 suspected_deletions: vec![],

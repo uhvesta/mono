@@ -37,11 +37,7 @@ pub enum Scenario {
 /// 7. No CI signal → `Local`
 pub fn classify(env: &CiEnvironment, default_branch: &str) -> Scenario {
     // Rule 1 — GitHub merge_group event (highest priority for merge-queue).
-    if env
-        .github_event_name
-        .as_deref()
-        .is_some_and(|e| e == "merge_group")
-    {
+    if env.github_event_name.as_deref().is_some_and(|e| e == "merge_group") {
         return Scenario::MergeQueue;
     }
 
@@ -55,11 +51,7 @@ pub fn classify(env: &CiEnvironment, default_branch: &str) -> Scenario {
     }
 
     // Rule 3 — GitHub pull_request event.
-    if env
-        .github_event_name
-        .as_deref()
-        .is_some_and(|e| e == "pull_request")
-    {
+    if env.github_event_name.as_deref().is_some_and(|e| e == "pull_request") {
         let base_branch = env
             .github_base_ref
             .clone()
@@ -69,12 +61,7 @@ pub fn classify(env: &CiEnvironment, default_branch: &str) -> Scenario {
     }
 
     // Rule 4 — Buildkite PR (BUILDKITE_PULL_REQUEST is set and not "false").
-    if env.buildkite
-        && env
-            .buildkite_pull_request
-            .as_deref()
-            .is_some_and(|v| v != "false")
-    {
+    if env.buildkite && env.buildkite_pull_request.as_deref().is_some_and(|v| v != "false") {
         let base_branch = env
             .buildkite_pull_request_base_branch
             .clone()
@@ -84,13 +71,8 @@ pub fn classify(env: &CiEnvironment, default_branch: &str) -> Scenario {
     }
 
     // Rules 5 & 6 — GHA push event.
-    if env
-        .github_event_name
-        .as_deref()
-        .is_some_and(|e| e == "push")
-    {
-        let branch = branch_from_github_ref(env.github_ref.as_deref())
-            .unwrap_or_else(|| default_branch.to_owned());
+    if env.github_event_name.as_deref().is_some_and(|e| e == "push") {
+        let branch = branch_from_github_ref(env.github_ref.as_deref()).unwrap_or_else(|| default_branch.to_owned());
         if branch == default_branch {
             return Scenario::PushToDefault;
         }
@@ -98,12 +80,7 @@ pub fn classify(env: &CiEnvironment, default_branch: &str) -> Scenario {
     }
 
     // Rules 5 & 6 — Buildkite push (not PR, not merge queue).
-    if env.buildkite
-        && env
-            .buildkite_pull_request
-            .as_deref()
-            .is_some_and(|v| v == "false")
-    {
+    if env.buildkite && env.buildkite_pull_request.as_deref().is_some_and(|v| v == "false") {
         let branch = env
             .buildkite_branch
             .clone()

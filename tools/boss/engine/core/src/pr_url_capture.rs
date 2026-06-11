@@ -48,25 +48,18 @@ use regex::Regex;
 /// `https://github.com/owner/repo/pull/123/files` returns
 /// `https://github.com/owner/repo/pull/123`.
 static PR_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+")
-        .expect("PR URL regex compiles")
+    Regex::new(r"https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/\d+").expect("PR URL regex compiles")
 });
 
 /// Captures the `owner/repo` slug from a PR URL.
 static PR_URL_SLUG_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/\d+")
-        .expect("PR URL slug regex compiles")
+    Regex::new(r"https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/\d+").expect("PR URL slug regex compiles")
 });
 
 /// Well-known placeholder owner/repo slugs used in tests and documentation
 /// (compared case-insensitively). These are rejected as a belt-and-suspenders
 /// check even before the product-repo gate runs.
-static PLACEHOLDER_SLUGS: &[&str] = &[
-    "foo/bar",
-    "octocat/hello-world",
-    "someuser/somerepo",
-    "example/example",
-];
+static PLACEHOLDER_SLUGS: &[&str] = &["foo/bar", "octocat/hello-world", "someuser/somerepo", "example/example"];
 
 /// Parse `product_repo_remote_url` (SSH `git@github.com:owner/repo.git` or
 /// HTTPS `https://github.com/owner/repo`) into a lowercase `owner/repo` slug.
@@ -97,14 +90,11 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
         .ok_or_else(|| format!("URL does not contain a recognisable owner/repo slug: {pr_url}"))?;
 
     if PLACEHOLDER_SLUGS.iter().any(|p| pr_slug == *p) {
-        return Err(format!(
-            "owner/repo `{pr_slug}` is a well-known test placeholder"
-        ));
+        return Err(format!("owner/repo `{pr_slug}` is a well-known test placeholder"));
     }
 
-    let product_slug = parse_product_slug(product_repo_remote_url).ok_or_else(|| {
-        format!("could not parse product repo slug from `{product_repo_remote_url}`")
-    })?;
+    let product_slug = parse_product_slug(product_repo_remote_url)
+        .ok_or_else(|| format!("could not parse product repo slug from `{product_repo_remote_url}`"))?;
 
     if pr_slug != product_slug {
         return Err(format!(
@@ -132,9 +122,7 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
 pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> Option<String> {
     let scan = |field: &str| -> Option<String> {
         let text = tool_response.get(field)?.as_str()?;
-        PR_URL_RE
-            .find(text)
-            .map(|m| m.as_str().to_owned())
+        PR_URL_RE.find(text).map(|m| m.as_str().to_owned())
     };
     scan("stdout").or_else(|| scan("stderr"))
 }
@@ -203,10 +191,7 @@ impl StagedPrUrlCache {
     /// Stage `pr_url` against `execution_id` if no URL is currently
     /// staged. Returns whether the staging happened or was skipped.
     pub fn record_if_unset(&self, execution_id: &str, pr_url: &str) -> StagePrUrlOutcome {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("StagedPrUrlCache mutex poisoned");
+        let mut guard = self.inner.lock().expect("StagedPrUrlCache mutex poisoned");
         if guard.contains_key(execution_id) {
             StagePrUrlOutcome::AlreadyStaged
         } else {
@@ -382,10 +367,7 @@ mod tests {
     #[test]
     fn cache_records_first_url_for_an_execution() {
         let cache = StagedPrUrlCache::new();
-        let outcome = cache.record_if_unset(
-            "exec_abc",
-            "https://github.com/spinyfin/mono/pull/458",
-        );
+        let outcome = cache.record_if_unset("exec_abc", "https://github.com/spinyfin/mono/pull/458");
         assert_eq!(outcome, StagePrUrlOutcome::Staged);
         assert_eq!(
             cache.get("exec_abc").as_deref(),
@@ -400,14 +382,8 @@ mod tests {
         // Bash call (e.g. inspecting a referenced PR) must not have
         // the staged URL clobbered. First-writer-wins.
         let cache = StagedPrUrlCache::new();
-        cache.record_if_unset(
-            "exec_abc",
-            "https://github.com/spinyfin/mono/pull/458",
-        );
-        let outcome = cache.record_if_unset(
-            "exec_abc",
-            "https://github.com/spinyfin/mono/pull/999",
-        );
+        cache.record_if_unset("exec_abc", "https://github.com/spinyfin/mono/pull/458");
+        let outcome = cache.record_if_unset("exec_abc", "https://github.com/spinyfin/mono/pull/999");
         assert_eq!(outcome, StagePrUrlOutcome::AlreadyStaged);
         assert_eq!(
             cache.get("exec_abc").as_deref(),
@@ -418,14 +394,8 @@ mod tests {
     #[test]
     fn cache_isolates_executions() {
         let cache = StagedPrUrlCache::new();
-        cache.record_if_unset(
-            "exec_a",
-            "https://github.com/spinyfin/mono/pull/1",
-        );
-        cache.record_if_unset(
-            "exec_b",
-            "https://github.com/spinyfin/mono/pull/2",
-        );
+        cache.record_if_unset("exec_a", "https://github.com/spinyfin/mono/pull/1");
+        cache.record_if_unset("exec_b", "https://github.com/spinyfin/mono/pull/2");
         assert_eq!(
             cache.get("exec_a").as_deref(),
             Some("https://github.com/spinyfin/mono/pull/1"),
@@ -439,19 +409,13 @@ mod tests {
     #[test]
     fn cache_forget_drops_entry_and_allows_re_record() {
         let cache = StagedPrUrlCache::new();
-        cache.record_if_unset(
-            "exec_abc",
-            "https://github.com/spinyfin/mono/pull/458",
-        );
+        cache.record_if_unset("exec_abc", "https://github.com/spinyfin/mono/pull/458");
         cache.forget("exec_abc");
         assert_eq!(cache.get("exec_abc"), None);
         // A fresh record after forget should succeed — useful if
         // the same execution_id gets reused (it shouldn't in prod,
         // but the semantics are: forget clears state).
-        let outcome = cache.record_if_unset(
-            "exec_abc",
-            "https://github.com/spinyfin/mono/pull/999",
-        );
+        let outcome = cache.record_if_unset("exec_abc", "https://github.com/spinyfin/mono/pull/999");
         assert_eq!(outcome, StagePrUrlOutcome::Staged);
         assert_eq!(
             cache.get("exec_abc").as_deref(),
@@ -559,10 +523,7 @@ mod tests {
             "stderr": "",
         });
         let extracted = extract_pr_url_from_bash_response(&response).unwrap();
-        let result = validate_pr_url(
-            &extracted,
-            "git@github.com:spinyfin/mono.git",
-        );
+        let result = validate_pr_url(&extracted, "git@github.com:spinyfin/mono.git");
         assert!(result.is_err(), "foo/bar should be rejected");
         let reason = result.unwrap_err();
         assert!(
@@ -578,10 +539,7 @@ mod tests {
             "stderr": "",
         });
         let extracted = extract_pr_url_from_bash_response(&response).unwrap();
-        assert_eq!(
-            validate_pr_url(&extracted, "git@github.com:spinyfin/mono.git"),
-            Ok(()),
-        );
+        assert_eq!(validate_pr_url(&extracted, "git@github.com:spinyfin/mono.git"), Ok(()),);
     }
 
     #[test]
@@ -591,10 +549,7 @@ mod tests {
             "stderr": "",
         });
         let extracted = extract_pr_url_from_bash_response(&response).unwrap();
-        let result = validate_pr_url(
-            &extracted,
-            "git@github.com:spinyfin/mono.git",
-        );
+        let result = validate_pr_url(&extracted, "git@github.com:spinyfin/mono.git");
         assert!(result.is_err(), "octocat/Hello-World should be rejected");
     }
 

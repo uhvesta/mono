@@ -28,11 +28,7 @@ impl WorkDb {
     /// validate the slug — `claude` is the source of truth on what
     /// `--model` accepts, and a new model must be adoptable without
     /// an engine release blocking it (design §Q3).
-    pub fn set_product_default_model(
-        &self,
-        product_id: &str,
-        model: Option<&str>,
-    ) -> Result<Product> {
+    pub fn set_product_default_model(&self, product_id: &str, model: Option<&str>) -> Result<Product> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let _ = query_product(&tx, product_id).require("product", product_id)?;
@@ -177,14 +173,7 @@ impl WorkDb {
         }
 
         let updated = query_project(&tx, &input.project_id).require("project", &input.project_id)?;
-        record_design_doc_audit(
-            &tx,
-            &input.project_id,
-            &before,
-            &updated,
-            AUDIT_ACTOR_HUMAN,
-            &now,
-        )?;
+        record_design_doc_audit(&tx, &input.project_id, &before, &updated, AUDIT_ACTOR_HUMAN, &now)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -246,10 +235,7 @@ impl WorkDb {
             });
         };
 
-        let branch = project
-            .design_doc_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_owned());
+        let branch = project.design_doc_branch.clone().unwrap_or_else(|| "main".to_owned());
 
         let kind = if let Some(product_repo) = product.repo_remote_url.as_deref()
             && product_repo == repo.as_str()
@@ -332,14 +318,7 @@ impl WorkDb {
             params![project_id, repo, branch, validated_path, now],
         )?;
         let after = query_project(&tx, project_id).require("project", project_id)?;
-        record_design_doc_audit(
-            &tx,
-            project_id,
-            &before,
-            &after,
-            AUDIT_ACTOR_DESIGN_DETECTOR,
-            &now,
-        )?;
+        record_design_doc_audit(&tx, project_id, &before, &after, AUDIT_ACTOR_DESIGN_DETECTOR, &now)?;
         tx.commit()?;
         Ok(true)
     }
@@ -353,10 +332,7 @@ impl WorkDb {
     /// (`design_doc_repo_remote_url`, `design_doc_branch`,
     /// `design_doc_path`); the schema is general so future edits to
     /// other project properties can ride along without a re-migration.
-    pub fn list_project_property_audit(
-        &self,
-        project_id: &str,
-    ) -> Result<Vec<ProjectPropertyAuditEntry>> {
+    pub fn list_project_property_audit(&self, project_id: &str) -> Result<Vec<ProjectPropertyAuditEntry>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id, project_id, property, old_value, new_value, actor, changed_at
@@ -411,8 +387,7 @@ impl WorkDb {
         approved_path: &str,
     ) -> Result<Option<WorkAttentionItem>> {
         let approved_path = validate_design_doc_path(approved_path)?;
-        let approved_repo =
-            canonicalize_design_doc_repo_remote_url(approved_repo_remote_url.map(str::to_owned));
+        let approved_repo = canonicalize_design_doc_repo_remote_url(approved_repo_remote_url.map(str::to_owned));
         let approved_branch = normalize_optional_text(approved_branch.map(str::to_owned));
 
         let conn = self.connect()?;
@@ -427,16 +402,10 @@ impl WorkDb {
             .design_doc_repo_remote_url
             .clone()
             .or_else(|| product.repo_remote_url.clone());
-        let approved_repo_effective = approved_repo
-            .clone()
-            .or_else(|| product.repo_remote_url.clone());
+        let approved_repo_effective = approved_repo.clone().or_else(|| product.repo_remote_url.clone());
 
-        let project_branch_effective = project
-            .design_doc_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_owned());
-        let approved_branch_effective =
-            approved_branch.clone().unwrap_or_else(|| "main".to_owned());
+        let project_branch_effective = project.design_doc_branch.clone().unwrap_or_else(|| "main".to_owned());
+        let approved_branch_effective = approved_branch.clone().unwrap_or_else(|| "main".to_owned());
 
         if project_repo_effective == approved_repo_effective
             && project_branch_effective == approved_branch_effective
@@ -448,14 +417,10 @@ impl WorkDb {
         let title = "Design doc pointer disagrees with approved design".to_owned();
         let body_markdown = format!(
             "The project's design-doc pointer (`{project_repo}` `{project_branch}` `{project_path}`) differs from the location of the approved design doc (`{approved_repo}` `{approved_branch}` `{approved_path}`). Update the project pointer with `boss project set-design-doc` or revoke the approval.",
-            project_repo = project_repo_effective
-                .as_deref()
-                .unwrap_or("<no repo resolved>"),
+            project_repo = project_repo_effective.as_deref().unwrap_or("<no repo resolved>"),
             project_branch = project_branch_effective,
             project_path = project_path,
-            approved_repo = approved_repo_effective
-                .as_deref()
-                .unwrap_or("<no repo resolved>"),
+            approved_repo = approved_repo_effective.as_deref().unwrap_or("<no repo resolved>"),
             approved_branch = approved_branch_effective,
             approved_path = approved_path,
         );

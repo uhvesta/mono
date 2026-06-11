@@ -1,7 +1,5 @@
 use super::*;
-use boss_protocol::{
-    PLANNER_OUTCOME_APPLIED, PLANNER_OUTCOME_RUNNING, PLANNER_OUTCOME_STAGED, PlannerRun,
-};
+use boss_protocol::{PLANNER_OUTCOME_APPLIED, PLANNER_OUTCOME_RUNNING, PLANNER_OUTCOME_STAGED, PlannerRun};
 
 // ---- input types ----
 
@@ -55,8 +53,7 @@ fn map_planner_run(row: &Row<'_>) -> rusqlite::Result<PlannerRun> {
     })
 }
 
-const SELECT_PLANNER_RUN: &str =
-    "SELECT id, project_id, product_id, design_task_id, caller,
+const SELECT_PLANNER_RUN: &str = "SELECT id, project_id, product_id, design_task_id, caller,
             doc_ref, model, input_summary, raw_output, effort_audit,
             notes, outcome, result_summary, created_at, updated_at
      FROM planner_runs";
@@ -155,13 +152,8 @@ impl WorkDb {
         let id_idx = extra_params.len() + 1;
         extra_params.push(Box::new(id.to_owned()));
 
-        let sql = format!(
-            "UPDATE planner_runs SET {} WHERE id = ?{}",
-            sets.join(", "),
-            id_idx,
-        );
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            extra_params.iter().map(|p| p.as_ref()).collect();
+        let sql = format!("UPDATE planner_runs SET {} WHERE id = ?{}", sets.join(", "), id_idx,);
+        let params_refs: Vec<&dyn rusqlite::ToSql> = extra_params.iter().map(|p| p.as_ref()).collect();
         let changed = conn.execute(&sql, params_refs.as_slice())?;
         if changed == 0 {
             return Ok(None);
@@ -233,10 +225,7 @@ impl WorkDb {
     /// the id was unknown.
     pub fn delete_planner_run(&self, id: &str) -> Result<bool> {
         let conn = self.connect()?;
-        let changed = conn.execute(
-            "DELETE FROM planner_runs WHERE id = ?1",
-            params![id],
-        )?;
+        let changed = conn.execute("DELETE FROM planner_runs WHERE id = ?1", params![id])?;
         Ok(changed > 0)
     }
 }
@@ -463,9 +452,7 @@ mod tests {
         let db = open();
         let (product_id, project_id) = product_and_project(&db);
         assert!(
-            db.live_planner_run_for_project(&project_id)
-                .unwrap()
-                .is_none(),
+            db.live_planner_run_for_project(&project_id).unwrap().is_none(),
             "no live run before claim"
         );
         let run = db

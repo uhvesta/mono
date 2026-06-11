@@ -11,12 +11,11 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter,
-    FrontendEvent, FrontendRequest, LinkExternalRefInput, ListDependenciesInput,
-    Product, Project, ProjectDesignDocState, ProjectStatus, RemoveDependencyInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProjectDesignDocInput, Task, TaskKind,
-    TaskStatus, TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    AddDependencyInput, CreateChoreInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateTaskInput, DependencyDirection, DependencyFilter, FrontendEvent, FrontendRequest,
+    LinkExternalRefInput, ListDependenciesInput, Product, Project, ProjectDesignDocState, ProjectStatus,
+    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProjectDesignDocInput, Task,
+    TaskKind, TaskStatus, TopicEventPayload, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
     WorkItemDependencyView, WorkItemPatch, work_product_topic,
 };
 
@@ -35,17 +34,17 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(std::path::PathBuf::from(":memory:")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(std::path::PathBuf::from(":memory:"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
 
         Ok(Self {
@@ -427,10 +426,7 @@ async fn chore_repo_remote_url_override_round_trip() -> Result<()> {
         .iter()
         .find(|c| c.id == chore.id)
         .expect("chore missing from list");
-    assert_eq!(
-        row.repo_remote_url.as_deref(),
-        Some("git@github.com:myorg/nimbus.git"),
-    );
+    assert_eq!(row.repo_remote_url.as_deref(), Some("git@github.com:myorg/nimbus.git"),);
 
     // Update-to-clear: the engine canonicalises empty-string to
     // `None` (matching the existing `--pr-url ""` convention).
@@ -520,9 +516,7 @@ async fn second_client_receives_invalidation_from_first() -> Result<()> {
     let invalidation = watcher.next_invalidation(Duration::from_secs(2)).await?;
     assert_eq!(invalidation.topic, topic);
     match invalidation.event {
-        TopicEventPayload::WorkInvalidated {
-            reason, product_id, ..
-        } => {
+        TopicEventPayload::WorkInvalidated { reason, product_id, .. } => {
             assert_eq!(reason, "project_created");
             assert_eq!(product_id.as_deref(), Some(product.id.as_str()));
         }
@@ -789,50 +783,34 @@ async fn bind_pr_sequence_is_idempotent_on_engine() -> Result<()> {
 }
 
 async fn create_product(client: &mut BossClient, input: CreateProductInput) -> Result<Product> {
-    match client
-        .send_request(&FrontendRequest::CreateProduct { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateProduct { input }).await? {
         FrontendEvent::WorkItemCreated { item } => expect_product(item),
         other => Err(unexpected_event("product create", other)),
     }
 }
 
 async fn create_project(client: &mut BossClient, input: CreateProjectInput) -> Result<Project> {
-    match client
-        .send_request(&FrontendRequest::CreateProject { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateProject { input }).await? {
         FrontendEvent::WorkItemCreated { item } => expect_project(item),
         other => Err(unexpected_event("project create", other)),
     }
 }
 
 async fn create_task(client: &mut BossClient, input: CreateTaskInput) -> Result<Task> {
-    match client
-        .send_request(&FrontendRequest::CreateTask { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateTask { input }).await? {
         FrontendEvent::WorkItemCreated { item } => expect_task(item),
         other => Err(unexpected_event("task create", other)),
     }
 }
 
 async fn create_chore(client: &mut BossClient, input: CreateChoreInput) -> Result<Task> {
-    match client
-        .send_request(&FrontendRequest::CreateChore { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateChore { input }).await? {
         FrontendEvent::WorkItemCreated { item } => expect_chore(item),
         other => Err(unexpected_event("chore create", other)),
     }
 }
 
-async fn update_work_item(
-    client: &mut BossClient,
-    id: &str,
-    patch: WorkItemPatch,
-) -> Result<WorkItem> {
+async fn update_work_item(client: &mut BossClient, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
     match client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: id.to_owned(),
@@ -865,10 +843,7 @@ async fn restore_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem
     }
 }
 
-async fn list_chores_including_deleted(
-    client: &mut BossClient,
-    product_id: &str,
-) -> Result<Vec<Task>> {
+async fn list_chores_including_deleted(client: &mut BossClient, product_id: &str) -> Result<Vec<Task>> {
     match client
         .send_request(&FrontendRequest::ListChores {
             product_id: product_id.to_owned(),
@@ -910,11 +885,7 @@ async fn list_projects_filtered(
     }
 }
 
-async fn list_tasks(
-    client: &mut BossClient,
-    product_id: &str,
-    project_id: Option<&str>,
-) -> Result<Vec<Task>> {
+async fn list_tasks(client: &mut BossClient, product_id: &str, project_id: Option<&str>) -> Result<Vec<Task>> {
     list_tasks_filtered(client, product_id, project_id, None).await
 }
 
@@ -997,14 +968,8 @@ fn unexpected_event(context: &str, event: FrontendEvent) -> anyhow::Error {
     )
 }
 
-async fn add_dependency(
-    client: &mut BossClient,
-    input: AddDependencyInput,
-) -> Result<WorkItemDependency> {
-    match client
-        .send_request(&FrontendRequest::AddDependency { input })
-        .await?
-    {
+async fn add_dependency(client: &mut BossClient, input: AddDependencyInput) -> Result<WorkItemDependency> {
+    match client.send_request(&FrontendRequest::AddDependency { input }).await? {
         FrontendEvent::DependencyAdded { edge } => Ok(edge),
         other => Err(unexpected_event("add dependency", other)),
     }
@@ -1020,10 +985,7 @@ async fn remove_dependency(client: &mut BossClient, input: RemoveDependencyInput
     }
 }
 
-async fn list_dependencies(
-    client: &mut BossClient,
-    input: ListDependenciesInput,
-) -> Result<WorkItemDependencyView> {
+async fn list_dependencies(client: &mut BossClient, input: ListDependenciesInput) -> Result<WorkItemDependencyView> {
     match client
         .send_request(&FrontendRequest::ListDependencies { input })
         .await?
@@ -1320,11 +1282,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
     .await?;
     assert_eq!(detail.work_item_id, target.id);
     assert_eq!(detail.prerequisites.len(), 2, "fixture has 2 prereqs");
-    let prereq_ids: Vec<&str> = detail
-        .prerequisites
-        .iter()
-        .map(|edge| edge.id.as_str())
-        .collect();
+    let prereq_ids: Vec<&str> = detail.prerequisites.iter().map(|edge| edge.id.as_str()).collect();
     assert!(
         prereq_ids.contains(&prereq1.id.as_str()) && prereq_ids.contains(&prereq2.id.as_str()),
         "prereqs must surface both ids, got {prereq_ids:?}"
@@ -1350,9 +1308,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
         &mut client,
         &product.id,
         None,
-        Some(DependencyFilter::PrerequisitesOf {
-            id: target.id.clone(),
-        }),
+        Some(DependencyFilter::PrerequisitesOf { id: target.id.clone() }),
     )
     .await?;
     let listed_ids: Vec<String> = prereqs_listed.iter().map(|t| t.id.clone()).collect();
@@ -1365,9 +1321,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
         &mut client,
         &product.id,
         None,
-        Some(DependencyFilter::DependentsOf {
-            id: target.id.clone(),
-        }),
+        Some(DependencyFilter::DependentsOf { id: target.id.clone() }),
     )
     .await?;
     assert!(
@@ -1380,9 +1334,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
     let dep_chores = list_chores_filtered(
         &mut client,
         &product.id,
-        Some(DependencyFilter::DependentsOf {
-            id: target.id.clone(),
-        }),
+        Some(DependencyFilter::DependentsOf { id: target.id.clone() }),
     )
     .await?;
     assert_eq!(dep_chores.len(), 1);
@@ -1390,13 +1342,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
 
     // `boss task list --blocked-by-deps` → the target (its prereqs are
     // both incomplete). Prereqs themselves and the chore are excluded.
-    let blocked = list_tasks_filtered(
-        &mut client,
-        &product.id,
-        None,
-        Some(DependencyFilter::BlockedByDeps),
-    )
-    .await?;
+    let blocked = list_tasks_filtered(&mut client, &product.id, None, Some(DependencyFilter::BlockedByDeps)).await?;
     let blocked_ids: Vec<String> = blocked.iter().map(|t| t.id.clone()).collect();
     assert!(
         blocked_ids.contains(&target.id),
@@ -1410,13 +1356,7 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
     // `boss task list --unblocked` → tasks in `todo` with no incomplete
     // prereq. Both prereqs qualify; target is in `blocked` (auto-flip
     // from phase 2) so does not.
-    let unblocked = list_tasks_filtered(
-        &mut client,
-        &product.id,
-        None,
-        Some(DependencyFilter::Unblocked),
-    )
-    .await?;
+    let unblocked = list_tasks_filtered(&mut client, &product.id, None, Some(DependencyFilter::Unblocked)).await?;
     let unblocked_ids: Vec<String> = unblocked.iter().map(|t| t.id.clone()).collect();
     assert!(
         unblocked_ids.contains(&prereq1.id) && unblocked_ids.contains(&prereq2.id),
@@ -1485,23 +1425,14 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
         })
         .await?
     {
-        FrontendEvent::WorkItemsCreated { items } => items
-            .into_iter()
-            .map(expect_task)
-            .collect::<Result<Vec<_>>>()?,
+        FrontendEvent::WorkItemsCreated { items } => items.into_iter().map(expect_task).collect::<Result<Vec<_>>>()?,
         other => return Err(unexpected_event("create-many tasks", other)),
     };
     assert_eq!(created_tasks.len(), 4);
     let listed_tasks = list_tasks(&mut client, &product.id, Some(&project.id)).await?;
     // 4 user-created project_tasks plus the auto-created design task.
     assert_eq!(listed_tasks.len(), 5);
-    assert_eq!(
-        listed_tasks
-            .iter()
-            .filter(|t| t.kind == TaskKind::Design)
-            .count(),
-        1,
-    );
+    assert_eq!(listed_tasks.iter().filter(|t| t.kind == TaskKind::Design).count(), 1,);
 
     let chore_inputs: Vec<CreateChoreInput> = (0..3)
         .map(|i| CreateChoreInput {
@@ -1519,16 +1450,11 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
         .collect();
     let created_chores = match client
         .send_request(&FrontendRequest::CreateManyChores {
-            input: CreateManyChoresInput {
-                items: chore_inputs,
-            },
+            input: CreateManyChoresInput { items: chore_inputs },
         })
         .await?
     {
-        FrontendEvent::WorkItemsCreated { items } => items
-            .into_iter()
-            .map(expect_chore)
-            .collect::<Result<Vec<_>>>()?,
+        FrontendEvent::WorkItemsCreated { items } => items.into_iter().map(expect_chore).collect::<Result<Vec<_>>>()?,
         other => return Err(unexpected_event("create-many chores", other)),
     };
     assert_eq!(created_chores.len(), 3);
@@ -1585,10 +1511,7 @@ async fn create_many_tasks_and_chores_round_trip() -> Result<()> {
     Ok(())
 }
 
-async fn set_project_design_doc(
-    client: &mut BossClient,
-    input: SetProjectDesignDocInput,
-) -> Result<Project> {
+async fn set_project_design_doc(client: &mut BossClient, input: SetProjectDesignDocInput) -> Result<Project> {
     match client
         .send_request(&FrontendRequest::SetProjectDesignDoc { input })
         .await?
@@ -1768,10 +1691,7 @@ async fn project_design_doc_rpcs_round_trip_through_engine() -> Result<()> {
     assert!(cleared.design_doc_repo_remote_url.is_none());
     assert!(cleared.design_doc_branch.is_none());
     let resolved_cleared = resolve_project_design_doc(&mut client, &project.id).await?;
-    assert!(matches!(
-        resolved_cleared.state,
-        ProjectDesignDocState::NotSet,
-    ));
+    assert!(matches!(resolved_cleared.state, ProjectDesignDocState::NotSet,));
 
     // ----- broken pointer (path set, no repo available) --------------------
     // A product without a `repo_remote_url` and a project whose pointer
@@ -1996,7 +1916,12 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
                 "error should name the product slug: {message}"
             );
         }
-        other => return Err(unexpected_event("expected WorkError for task override rejection", other)),
+        other => {
+            return Err(unexpected_event(
+                "expected WorkError for task override rejection",
+                other,
+            ));
+        }
     }
 
     // Same enforcement for chores.
@@ -2023,7 +1948,12 @@ async fn create_task_with_explicit_repo_on_single_repo_product_is_rejected() -> 
                 "chore: error should describe the invariant violation: {message}"
             );
         }
-        other => return Err(unexpected_event("expected WorkError for chore override rejection", other)),
+        other => {
+            return Err(unexpected_event(
+                "expected WorkError for chore override rejection",
+                other,
+            ));
+        }
     }
 
     Ok(())
@@ -2270,10 +2200,7 @@ async fn product_dispatch_preamble_round_trip() -> Result<()> {
         )
         .await?,
     )?;
-    assert!(
-        cleared.dispatch_preamble.is_none(),
-        "empty string clears the preamble",
-    );
+    assert!(cleared.dispatch_preamble.is_none(), "empty string clears the preamble",);
 
     Ok(())
 }
@@ -2283,10 +2210,7 @@ async fn create_chore_expect_duplicate(
     client: &mut BossClient,
     input: CreateChoreInput,
 ) -> Result<(String, i64, String, i64)> {
-    match client
-        .send_request(&FrontendRequest::CreateChore { input })
-        .await?
-    {
+    match client.send_request(&FrontendRequest::CreateChore { input }).await? {
         FrontendEvent::WorkItemDuplicateBlocked {
             existing_id,
             existing_short_id,
@@ -2337,23 +2261,22 @@ async fn chore_duplicate_guard_blocks_within_window() -> Result<()> {
     .await?;
 
     // Immediate retry (within 60 s) is rejected with structured info.
-    let (existing_id, existing_short_id, blocked_name, age_secs) =
-        create_chore_expect_duplicate(
-            &mut client,
-            CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Dedup Me".to_owned(), // trimmed match
-                description: Some("different description".to_owned()),
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            },
-        )
-        .await?;
+    let (existing_id, existing_short_id, blocked_name, age_secs) = create_chore_expect_duplicate(
+        &mut client,
+        CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Dedup Me".to_owned(), // trimmed match
+            description: Some("different description".to_owned()),
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        },
+    )
+    .await?;
 
     assert_eq!(existing_id, first.id, "existing_id must reference the first row");
     assert_eq!(
@@ -2526,10 +2449,7 @@ async fn task_duplicate_guard_blocks_within_window() -> Result<()> {
         },
     )
     .await?;
-    assert_ne!(
-        cross.id, first.id,
-        "same name in different product must be allowed",
-    );
+    assert_ne!(cross.id, first.id, "same name in different product must be allowed",);
 
     Ok(())
 }
@@ -2585,7 +2505,10 @@ async fn link_external_ref_stores_binding_and_is_findable() -> Result<()> {
     };
 
     // The returned item must have external_ref populated.
-    let ext = updated.external_ref.as_ref().expect("external_ref should be set after link");
+    let ext = updated
+        .external_ref
+        .as_ref()
+        .expect("external_ref should be set after link");
     assert_eq!(ext.kind, "github");
     assert_eq!(ext.canonical_id, "spinyfin/mono#560");
     assert!(ext.unbound_at.is_none(), "newly linked row must not be unbound");

@@ -359,8 +359,7 @@ impl WorkDb {
             )
             .with_context(|| format!("failed to connect to in-memory db {}", mem.uri))?
         } else {
-            Connection::open(&self.path)
-                .with_context(|| format!("failed to open work db {}", self.path.display()))?
+            Connection::open(&self.path).with_context(|| format!("failed to open work db {}", self.path.display()))?
         };
         // WAL lets readers and writers coexist (read-side concurrency
         // is unaffected by an in-flight write) and `busy_timeout`

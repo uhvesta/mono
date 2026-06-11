@@ -163,10 +163,7 @@ pub async fn run_one_pass(
         // Grace-period guard: skip executions whose `started_at` is
         // within DEAD_PID_GRACE_SECS or not yet recorded. A missing
         // `started_at` means the pane hasn't fully exec'd yet.
-        let started_epoch = execution
-            .started_at
-            .as_deref()
-            .and_then(|s| s.parse::<i64>().ok());
+        let started_epoch = execution.started_at.as_deref().and_then(|s| s.parse::<i64>().ok());
         match started_epoch {
             None => {
                 outcome.grace_skipped += 1;
@@ -239,13 +236,14 @@ pub async fn run_one_pass(
                 execution_id,
                 now_epoch_secs,
                 recovery_patch.as_deref(),
-            ) {
-                tracing::warn!(
-                    work_item_id,
-                    ?err,
-                    "dead-pid sweep: failed to append audit line to description (non-fatal)",
-                );
-            }
+            )
+        {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "dead-pid sweep: failed to append audit line to description (non-fatal)",
+            );
+        }
 
         // Release the worker pool slot so the orphan sweep detects
         // the chore and creates a fresh ready execution for redispatch.
@@ -254,9 +252,7 @@ pub async fn run_one_pass(
         // "auto-worker-N" prefix and release_worker_and_kick routes to the
         // correct pool via pool_for_worker_id.
         let worker_id = worker_id_for_slot(state.slot_id);
-        coordinator
-            .release_worker_and_kick(&worker_id, None)
-            .await;
+        coordinator.release_worker_and_kick(&worker_id, None).await;
 
         // Structured event for bossctl dispatch tail.
         dispatch_events
@@ -292,9 +288,7 @@ fn append_reconcile_audit(
     let current_desc = match &item {
         boss_protocol::WorkItem::Product(p) => p.description.as_str(),
         boss_protocol::WorkItem::Project(p) => p.description.as_str(),
-        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => {
-            t.description.as_str()
-        }
+        boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description.as_str(),
     };
     let recovery_note = match recovery_patch {
         Some(path) => format!(" Uncommitted work backed up to {}.", path.display()),
@@ -343,10 +337,7 @@ pub(crate) fn probe_pid(pid: i32) -> PidStatus {
 }
 
 fn is_terminal_activity(activity: WorkerActivity) -> bool {
-    matches!(
-        activity,
-        WorkerActivity::Terminated | WorkerActivity::Errored
-    )
+    matches!(activity, WorkerActivity::Terminated | WorkerActivity::Errored)
 }
 
 #[cfg(test)]
@@ -361,8 +352,8 @@ mod tests {
 
     use super::*;
     use crate::coordinator::{
-        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease,
-        CubeWorkspaceStatus, ExecutionCoordinator, WorkerPool,
+        CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
+        ExecutionCoordinator, WorkerPool,
     };
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
@@ -389,11 +380,7 @@ mod tests {
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }
-        async fn create_change(
-            &self,
-            _: &std::path::Path,
-            _: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _: &std::path::Path, _: &str) -> Result<CubeChangeHandle> {
             unimplemented!()
         }
         async fn release_workspace(&self, _: &str) -> Result<()> {
@@ -484,17 +471,14 @@ mod tests {
     fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id)
-                .build())
+            .request_execution(RequestExecutionInput::builder().work_item_id(work_item_id).build())
             .unwrap();
         let old_started_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs()
             .saturating_sub(300) as i64; // 5 minutes ago
-        db.force_started_at_for_test(&execution.id, old_started_at)
-            .unwrap();
+        db.force_started_at_for_test(&execution.id, old_started_at).unwrap();
         execution.id
     }
 
@@ -564,21 +548,21 @@ mod tests {
         );
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.reaped, 0, "live PID must not be reaped");
         assert_eq!(outcome.alive_skipped, 1);
         assert!(sink.events().await.is_empty());
 
         let exec = db.get_execution(&execution_id).unwrap();
-        assert_eq!(exec.status, ExecutionStatus::Ready, "execution must be untouched when PID alive");
+        assert_eq!(
+            exec.status,
+            ExecutionStatus::Ready,
+            "execution must be untouched when PID alive"
+        );
     }
 
     /// A slot with shell_pid == 0 (PID not yet reported by the app) is
@@ -601,14 +585,10 @@ mod tests {
         );
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.reaped, 0, "zero PID must be skipped");
         assert_eq!(outcome.unknown_pid_skipped, 1);
@@ -626,39 +606,27 @@ mod tests {
 
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
             .unwrap();
         // Stamp started_at = NOW so the grace guard fires.
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        db.force_started_at_for_test(&execution.id, now_secs)
-            .unwrap();
+        let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        db.force_started_at_for_test(&execution.id, now_secs).unwrap();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
         // Use a definitely-dead PID; the grace guard should fire before
         // we even get to the kill(0) probe.
         let the_dead_pid = dead_pid();
-        register_slot_with_binding(
-            &live_states,
-            1,
-            &execution.id,
-            the_dead_pid,
-            &work_item_id,
-        );
+        register_slot_with_binding(&live_states, 1, &execution.id, the_dead_pid, &work_item_id);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution.id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.reaped, 0, "grace period must prevent reaping fresh executions");
         assert_eq!(outcome.grace_skipped, 1);
@@ -674,30 +642,22 @@ mod tests {
 
         use boss_protocol::RequestExecutionInput;
         let execution = db
-            .request_execution(RequestExecutionInput::builder()
-                .work_item_id(work_item_id.clone())
-                .build())
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
             .unwrap();
         // Do NOT force started_at — leave it NULL.
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_binding(
-            &live_states,
-            1,
-            &execution.id,
-            dead_pid(),
-            &work_item_id,
-        );
+        register_slot_with_binding(&live_states, 1, &execution.id, dead_pid(), &work_item_id);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution.id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution.id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.reaped, 0, "missing started_at must be treated as too fresh");
         assert_eq!(outcome.grace_skipped, 1);
@@ -714,13 +674,7 @@ mod tests {
 
         let execution_id = create_old_execution(&db, &work_item_id);
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        live_states.register_spawn(
-            1,
-            &execution_id,
-            "claude-opus-4-7",
-            std::process::id() as i32,
-            None,
-        );
+        live_states.register_spawn(1, &execution_id, "claude-opus-4-7", std::process::id() as i32, None);
         // Advance to Terminated via a SessionEnd event.
         live_states.apply_event(
             1,
@@ -731,16 +685,15 @@ mod tests {
         );
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
-        assert_eq!(outcome.reaped, 0, "Terminated activity must not be reaped by this sweep");
+        assert_eq!(
+            outcome.reaped, 0,
+            "Terminated activity must not be reaped by this sweep"
+        );
     }
 
     /// The core invariant: a slot with a dead PID and an old enough
@@ -758,19 +711,10 @@ mod tests {
         let the_dead_pid = dead_pid();
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_binding(
-            &live_states,
-            1,
-            &execution_id,
-            the_dead_pid,
-            &work_item_id,
-        );
+        register_slot_with_binding(&live_states, 1, &execution_id, the_dead_pid, &work_item_id);
 
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator
-            .worker_pool()
-            .claim_worker(&execution_id, None)
-            .await;
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
 
         // Verify the slot starts claimed.
         let claimed_before = coordinator.worker_pool().claimed_execution_ids().await;
@@ -780,8 +724,7 @@ mod tests {
         );
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome =
-            run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sink.as_ref()).await;
 
         assert_eq!(outcome.reaped, 1, "dead-PID execution must be reaped");
         assert_eq!(outcome.alive_skipped, 0);
@@ -789,7 +732,8 @@ mod tests {
         // Execution must be terminal (`orphaned`) in the DB.
         let exec = db.get_execution(&execution_id).unwrap();
         assert_eq!(
-            exec.status, ExecutionStatus::Orphaned,
+            exec.status,
+            ExecutionStatus::Orphaned,
             "execution must be marked orphaned after dead-PID reap",
         );
 
@@ -805,17 +749,12 @@ mod tests {
         assert_eq!(events.len(), 1, "expected exactly one dispatch event");
         assert_eq!(events[0].stage, "dead_pid_reconcile");
         assert_eq!(events[0].outcome, "ok");
-        assert_eq!(
-            events[0].work_item_id.as_deref(),
-            Some(work_item_id.as_str()),
-        );
+        assert_eq!(events[0].work_item_id.as_deref(), Some(work_item_id.as_str()),);
 
         // The task description must contain the [engine-reconcile] audit line.
         let item = db.get_work_item(&work_item_id).unwrap();
         let desc = match &item {
-            boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => {
-                t.description.clone()
-            }
+            boss_protocol::WorkItem::Chore(t) | boss_protocol::WorkItem::Task(t) => t.description.clone(),
             _ => panic!("expected chore"),
         };
         assert!(

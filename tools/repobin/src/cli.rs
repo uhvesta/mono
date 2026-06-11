@@ -4,10 +4,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "repobin",
-    about = "Install and dispatch repo-local Bazel tools"
-)]
+#[command(name = "repobin", about = "Install and dispatch repo-local Bazel tools")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -89,11 +86,7 @@ mod tests {
                 assert_eq!(args.tool, "boss");
                 assert_eq!(
                     args.args,
-                    vec![
-                        OsString::from("task"),
-                        OsString::from("list"),
-                        OsString::from("--json"),
-                    ]
+                    vec![OsString::from("task"), OsString::from("list"), OsString::from("--json"),]
                 );
             }
             _ => panic!("expected exec command"),

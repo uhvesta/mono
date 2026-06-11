@@ -17,27 +17,14 @@ struct RecordingPublisher {
 #[async_trait]
 impl ExecutionPublisher for RecordingPublisher {
     async fn publish(&self, _: &str, _: &str, _: &str, _: &str) {}
-    async fn publish_work_item_changed(
-        &self,
-        product_id: &str,
-        work_item_id: &str,
-        reason: &str,
-    ) {
-        self.events.lock().await.push((
-            product_id.to_owned(),
-            work_item_id.to_owned(),
-            reason.to_owned(),
-        ));
-    }
-    async fn publish_frontend_event_on_product(
-        &self,
-        product_id: &str,
-        event: FrontendEvent,
-    ) {
-        self.typed_events
+    async fn publish_work_item_changed(&self, product_id: &str, work_item_id: &str, reason: &str) {
+        self.events
             .lock()
             .await
-            .push((product_id.to_owned(), event));
+            .push((product_id.to_owned(), work_item_id.to_owned(), reason.to_owned()));
+    }
+    async fn publish_frontend_event_on_product(&self, product_id: &str, event: FrontendEvent) {
+        self.typed_events.lock().await.push((product_id.to_owned(), event));
     }
 }
 
@@ -169,10 +156,11 @@ async fn detection_flips_in_review_to_blocked_ci_failure() {
     assert!(events.iter().any(|(_, _, r)| r == "ci_revision_in_flight"));
 
     let typed = pub_.typed_events.lock().await.clone();
-    assert!(typed.iter().any(|(_, ev)| matches!(
-        ev,
-        FrontendEvent::CiRemediationStarted { .. }
-    )));
+    assert!(
+        typed
+            .iter()
+            .any(|(_, ev)| matches!(ev, FrontendEvent::CiRemediationStarted { .. }))
+    );
 
     // Counter incremented by one because we created a fix-kind attempt.
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 1);
@@ -304,11 +292,8 @@ async fn detection_lands_exhausted_when_budget_is_zero() {
     let (product, chore) = make_in_review(&db, "C-exh", pr);
     // Set the per-product budget to 0 ("notify only").
     let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute(
-        "UPDATE products SET ci_attempt_budget = 0 WHERE id = ?1",
-        [&product],
-    )
-    .unwrap();
+    conn.execute("UPDATE products SET ci_attempt_budget = 0 WHERE id = ?1", [&product])
+        .unwrap();
     drop(conn);
 
     let pub_ = Arc::new(RecordingPublisher::default());
@@ -327,15 +312,13 @@ async fn detection_lands_exhausted_when_budget_is_zero() {
     assert_eq!(reason.as_deref(), Some("ci_failure_exhausted"));
 
     let typed = pub_.typed_events.lock().await.clone();
-    assert!(typed.iter().any(|(_, ev)| matches!(
-        ev,
-        FrontendEvent::CiRemediationExhausted { .. }
-    )));
+    assert!(
+        typed
+            .iter()
+            .any(|(_, ev)| matches!(ev, FrontendEvent::CiRemediationExhausted { .. }))
+    );
     // No attempt row should have been inserted.
-    assert!(db
-        .active_ci_remediation_for_work_item(&chore)
-        .unwrap()
-        .is_none());
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
 }
 
 #[tokio::test]
@@ -410,13 +393,7 @@ async fn full_cycle_detect_then_retire() {
     assert_eq!(status, TaskStatus::InReview);
 
     // 2. Retire — CI is back to clean.
-    let resolved = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let resolved = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(resolved);
     let (status, reason) = chore_state(&db, &chore);
     assert_eq!(status, TaskStatus::InReview);
@@ -441,13 +418,7 @@ async fn full_cycle_detect_then_retire() {
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
 
     // 4. Repeat retire — no-op.
-    let again = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let again = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(!again);
 }
 
@@ -478,13 +449,7 @@ async fn retire_skipped_when_product_opt_out_flag_disabled() {
     .unwrap();
     drop(conn);
 
-    let retired = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let retired = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(!retired, "opted-out product must not retire automatically");
     // In the in_review model the parent was never blocked; the retire
     // no-op leaves it in_review.
@@ -527,18 +492,10 @@ async fn retire_without_active_attempt_emits_ci_failure_cleared() {
 
     // 2. CI goes green on its own — no active attempt left.
     assert!(
-        db.active_ci_remediation_for_work_item(&chore)
-            .unwrap()
-            .is_none(),
+        db.active_ci_remediation_for_work_item(&chore).unwrap().is_none(),
         "attempt must be terminal before retire"
     );
-    let resolved = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let resolved = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(resolved, "retire must succeed even without active attempt");
 
     let (status, reason) = chore_state(&db, &chore);
@@ -556,10 +513,9 @@ async fn retire_without_active_attempt_emits_ci_failure_cleared() {
         "CiFailureCleared must be emitted when task clears without active attempt"
     );
     assert!(
-        !typed.iter().any(|(_, ev)| matches!(
-            ev,
-            FrontendEvent::CiRemediationSucceeded { .. }
-        )),
+        !typed
+            .iter()
+            .any(|(_, ev)| matches!(ev, FrontendEvent::CiRemediationSucceeded { .. })),
         "CiRemediationSucceeded must NOT be emitted when there is no active attempt"
     );
 }
@@ -623,11 +579,7 @@ async fn in_flight_supersedes_stale_ci_failure() {
         "CiFailureCleared must drop the stale badge",
     );
     let events = pub_.events.lock().await.clone();
-    assert!(
-        events
-            .iter()
-            .any(|(_, _, r)| r == "ci_failure_superseded_in_progress"),
-    );
+    assert!(events.iter().any(|(_, _, r)| r == "ci_failure_superseded_in_progress"),);
 
     // Budget is NOT reset — the re-run hasn't passed yet, so a fresh
     // failure must keep consuming the remaining allotment.
@@ -656,9 +608,7 @@ async fn in_flight_supersede_skips_when_active_remediation() {
     )
     .await;
     assert!(
-        db.active_ci_remediation_for_work_item(&chore)
-            .unwrap()
-            .is_some(),
+        db.active_ci_remediation_for_work_item(&chore).unwrap().is_some(),
         "attempt must be active before the supersede check",
     );
 
@@ -689,14 +639,8 @@ async fn in_flight_supersede_noop_when_in_review() {
     let (product, chore) = make_in_review(&db, "C-noop", pr);
     let pub_ = Arc::new(RecordingPublisher::default());
 
-    let cleared = on_ci_in_flight_supersedes_failure(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-        None,
-    )
-    .await;
+    let cleared =
+        on_ci_in_flight_supersedes_failure(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[], None).await;
     assert!(!cleared, "an in_review chore has no stale failure to clear");
 
     let (status, _) = chore_state(&db, &chore);
@@ -834,12 +778,7 @@ async fn never_starts_alert_resets_on_new_head_sha() {
         &probe(pr, "head-A"),
     )
     .await;
-    rewind_inflight_observation(
-        &db_path,
-        &chore,
-        "head-A",
-        current_unix_secs() - (3 * 60 * 60),
-    );
+    rewind_inflight_observation(&db_path, &chore, "head-A", current_unix_secs() - (3 * 60 * 60));
     let level = on_ci_in_flight(
         &db,
         pub_.as_ref(),
@@ -919,12 +858,7 @@ fn current_unix_secs() -> i64 {
 /// Rewrite the `first_observed_at` timestamp on a
 /// `ci_inflight_observations` row to simulate the passage of time
 /// without sleeping. Used by the never-starts-alert tests.
-fn rewind_inflight_observation(
-    db_path: &std::path::Path,
-    work_item_id: &str,
-    head_sha: &str,
-    when_unix_secs: i64,
-) {
+fn rewind_inflight_observation(db_path: &std::path::Path, work_item_id: &str, head_sha: &str, when_unix_secs: i64) {
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute(
         "UPDATE ci_inflight_observations
@@ -999,9 +933,7 @@ async fn new_commit_all_inflight_abandons_stale_remediation_and_clears_badge() {
     );
 
     // The stale row must be abandoned — not terminal-failed, not pending.
-    let still_active = db
-        .active_ci_remediation_for_work_item(&chore)
-        .unwrap();
+    let still_active = db.active_ci_remediation_for_work_item(&chore).unwrap();
     assert!(
         still_active.is_none(),
         "the stale remediation row must be abandoned, not left pending",
@@ -1057,7 +989,9 @@ async fn new_commit_all_inflight_abandons_stale_remediation_and_clears_badge() {
 
     let typed_after = pub_.typed_events.lock().await.clone();
     assert!(
-        !typed_after.iter().any(|(_, ev)| matches!(ev, FrontendEvent::CiFailureCleared { .. })),
+        !typed_after
+            .iter()
+            .any(|(_, ev)| matches!(ev, FrontendEvent::CiFailureCleared { .. })),
         "CiFailureCleared must NOT be emitted when the active remediation is for the same head",
     );
 }
@@ -1067,8 +1001,7 @@ fn encode_failed_checks_round_trip() {
     let json = super::encode_failed_checks(&[RequiredCheckFailure {
         name: "ci/test".into(),
         conclusion: "FAILURE".into(),
-        target_url:
-            "https://github.com/foo/bar/actions/runs/1/job/2".into(),
+        target_url: "https://github.com/foo/bar/actions/runs/1/job/2".into(),
         provider: CiProvider::GithubActions,
         provider_job_id: Some("2".into()),
     }]);
@@ -1236,9 +1169,7 @@ async fn detection_idempotent_does_not_double_spawn_revision() {
     )
     .await;
 
-    let attempts = db
-        .list_ci_remediations(None, &[], Some(&chore), None)
-        .unwrap();
+    let attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
     assert_eq!(attempts.len(), 1, "same head sha must not stack attempts");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let revisions: i64 = conn
@@ -1297,11 +1228,7 @@ async fn retrigger_creates_bespoke_execution_and_no_revision() {
         .unwrap();
     assert_eq!(exec_count, 1, "retrigger must park a ci_remediation execution");
     let revisions: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE kind = 'revision'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM tasks WHERE kind = 'revision'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(revisions, 0, "retrigger must not create a revision");
 
@@ -1351,9 +1278,7 @@ async fn rebase_only_success_refunds_budget_slot() {
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
 
     // 4. Idempotent — repeat is a no-op.
-    let again = db
-        .mark_ci_remediation_succeeded_via_rebase(&attempt.id)
-        .unwrap();
+    let again = db.mark_ci_remediation_succeeded_via_rebase(&attempt.id).unwrap();
     assert!(again.is_none(), "second call must be a no-op");
     assert_eq!(db.get_ci_attempts_used(&chore).unwrap(), 0);
 }
@@ -1420,14 +1345,8 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         .active_ci_remediation_for_work_item(&chore)
         .unwrap()
         .expect("active attempt row");
-    assert_eq!(
-        attempt.failure_kind.as_deref(),
-        Some("merge_queue_rebounce")
-    );
-    assert_eq!(
-        attempt.before_commit_sha.as_deref(),
-        Some("synthetic-merge-sha-abc")
-    );
+    assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
+    assert_eq!(attempt.before_commit_sha.as_deref(), Some("synthetic-merge-sha-abc"));
     assert!(
         attempt.revision_task_id.is_some(),
         "attempt must have revision_task_id stamped"
@@ -1466,13 +1385,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
     // Step 2: simulate the merge_poller's next sweep — the head-branch CI
     // probe returns Clean (statusCheckRollup is all SUCCESS), so sweep_one
     // calls on_ci_resolved.  This must NOT clear the rebounce block.
-    let cleared = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let cleared = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(
         !cleared,
         "on_ci_resolved must not clear a merge_queue_rebounce block based on \
@@ -1544,7 +1457,10 @@ async fn rebounce_detection_idempotent_on_same_sha() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(rev_count, 1, "exactly one revision; duplicate probe must not spawn a second");
+    assert_eq!(
+        rev_count, 1,
+        "exactly one revision; duplicate probe must not spawn a second"
+    );
 }
 
 /// After the worker marks the attempt succeeded, the next `on_ci_resolved`
@@ -1583,13 +1499,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
     // 3. Now on_ci_resolved fires (head-branch CI still clean) — no active
     //    attempt exists, so the rebounce guard does not fire and the block
     //    is cleared correctly.
-    let cleared = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let cleared = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(cleared, "after worker succeeds, on_ci_resolved must clear the block");
 
     let (status, _) = chore_state(&db, &chore);
@@ -1676,13 +1586,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         .expect("succeeded_via_rebase update");
 
     // Step 3: on_ci_resolved clears the block → chore in_review again.
-    let cleared = on_ci_resolved(
-        &db,
-        pub_.as_ref(),
-        &candidate(&product, &chore, pr),
-        &[],
-    )
-    .await;
+    let cleared = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
     assert!(cleared, "on_ci_resolved must clear the block after SHA_1 is terminal");
     let (status, _) = chore_state(&db, &chore);
     assert_eq!(status, TaskStatus::InReview);
@@ -1700,7 +1604,10 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         &[],
     )
     .await;
-    assert!(sha1_replay, "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)");
+    assert!(
+        sha1_replay,
+        "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)"
+    );
     let (status, reason) = chore_state(&db, &chore);
     assert_eq!(status, TaskStatus::Blocked);
     assert_eq!(reason.as_deref(), Some("ci_failure"));
@@ -1819,8 +1726,7 @@ async fn detection_defers_when_prior_ci_fix_revision_still_in_flight() {
     // Step 2: simulate premature retirement of attempt A — the originally-
     // failing checks are no longer in the failure set (e.g. a re-triggered
     // flaky check now passes while R1's worker is still running with no push).
-    db.mark_ci_remediation_succeeded(&attempt_a.id, None)
-        .unwrap();
+    db.mark_ci_remediation_succeeded(&attempt_a.id, None).unwrap();
 
     // Verify R1 is still `todo` (worker has not started yet / no push).
     let rev_task = match db.get_work_item(&rev_id).unwrap() {
@@ -1835,9 +1741,7 @@ async fn detection_defers_when_prior_ci_fix_revision_still_in_flight() {
 
     // Verify primary gate is now bypassed (no active ci_remediations row).
     assert!(
-        db.active_ci_remediation_for_work_item(&chore)
-            .unwrap()
-            .is_none(),
+        db.active_ci_remediation_for_work_item(&chore).unwrap().is_none(),
         "primary gate bypassed: no active ci_remediations row",
     );
 
@@ -1860,7 +1764,7 @@ async fn detection_defers_when_prior_ci_fix_revision_still_in_flight() {
         pub_.as_ref(),
         &fix_checker(),
         &candidate(&product, &chore, pr),
-        &probe(pr, "head-1"),  // same head — same failing SHA
+        &probe(pr, "head-1"), // same head — same failing SHA
         &one_failure(),
     )
     .await;
@@ -1870,9 +1774,7 @@ async fn detection_defers_when_prior_ci_fix_revision_still_in_flight() {
     );
 
     // Only one ci_remediations row and one revision must exist.
-    let all_attempts = db
-        .list_ci_remediations(None, &[], Some(&chore), None)
-        .unwrap();
+    let all_attempts = db.list_ci_remediations(None, &[], Some(&chore), None).unwrap();
     assert_eq!(all_attempts.len(), 1, "must not create a second attempt row");
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1925,8 +1827,7 @@ async fn detection_allowed_after_prior_revision_pushes() {
         },
     )
     .unwrap();
-    db.mark_ci_remediation_succeeded(&attempt_a.id, Some("head-2"))
-        .unwrap();
+    db.mark_ci_remediation_succeeded(&attempt_a.id, Some("head-2")).unwrap();
 
     // Chore returns to in_review.
     db.update_work_item(

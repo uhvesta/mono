@@ -63,20 +63,14 @@ impl BazelAdapter for RealBazel {
             source,
         })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| RepobinError::SpawnBazel {
-                action: "build".to_string(),
-                source: io::Error::other("missing stdout pipe"),
-            })?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| RepobinError::SpawnBazel {
-                action: "build".to_string(),
-                source: io::Error::other("missing stderr pipe"),
-            })?;
+        let stdout = child.stdout.take().ok_or_else(|| RepobinError::SpawnBazel {
+            action: "build".to_string(),
+            source: io::Error::other("missing stdout pipe"),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| RepobinError::SpawnBazel {
+            action: "build".to_string(),
+            source: io::Error::other("missing stderr pipe"),
+        })?;
 
         let (tx, rx) = mpsc::channel();
         let stdout_handle = spawn_reader(stdout, tx.clone());
@@ -102,12 +96,10 @@ impl BazelAdapter for RealBazel {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if let Some(status) =
-                        child.try_wait().map_err(|source| RepobinError::WaitBazel {
-                            action: "build".to_string(),
-                            source,
-                        })?
-                    {
+                    if let Some(status) = child.try_wait().map_err(|source| RepobinError::WaitBazel {
+                        action: "build".to_string(),
+                        source,
+                    })? {
                         break status;
                     }
                 }
@@ -120,11 +112,7 @@ impl BazelAdapter for RealBazel {
             }
 
             if !streaming && started_at.elapsed() >= STREAM_BUILD_OUTPUT {
-                writeln!(
-                    stderr_writer,
-                    "repobin: build still running; streaming Bazel output..."
-                )
-                .ok();
+                writeln!(stderr_writer, "repobin: build still running; streaming Bazel output...").ok();
                 if !combined_output.is_empty() {
                     stderr_writer.write_all(&combined_output).ok();
                 }
@@ -306,10 +294,7 @@ mod tests {
             source_label_to_path("//tools/boss/engine:src/engine.rs"),
             Some(PathBuf::from("tools/boss/engine/src/engine.rs"))
         );
-        assert_eq!(
-            source_label_to_path("//:README.md"),
-            Some(PathBuf::from("README.md"))
-        );
+        assert_eq!(source_label_to_path("//:README.md"), Some(PathBuf::from("README.md")));
         assert_eq!(source_label_to_path("@external//pkg:file.rs"), None);
         assert_eq!(source_label_to_path("not-a-label"), None);
     }

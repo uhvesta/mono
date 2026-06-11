@@ -202,32 +202,21 @@ impl ConfigResolver {
         })
     }
 
-    pub async fn new_with_options(
-        root: impl Into<PathBuf>,
-        options: ConfigResolverOptions,
-    ) -> Result<Self> {
+    pub async fn new_with_options(root: impl Into<PathBuf>, options: ConfigResolverOptions) -> Result<Self> {
         let root = canonicalize_root(root.into())?;
-        let external_root_configs = if let Some(external_checks_file) =
-            normalize_optional_cli_value(options.external_checks_file)
-        {
-            if normalize_optional_cli_value(options.external_checks_url).is_some() {
-                bail!("only one of external checks file or external checks URL may be configured");
-            }
-            vec![load_external_checks_file_path(
-                &root,
-                &external_checks_file,
-            )?]
-        } else if let Some(external_checks_url) =
-            normalize_optional_cli_value(options.external_checks_url)
-        {
-            load_external_checks_chain(&external_checks_url).await?
-        } else if let Some(external_checks_url) =
-            discover_root_external_checks_url_for_prefetch(&root)?
-        {
-            load_external_checks_chain(&external_checks_url).await?
-        } else {
-            Vec::new()
-        };
+        let external_root_configs =
+            if let Some(external_checks_file) = normalize_optional_cli_value(options.external_checks_file) {
+                if normalize_optional_cli_value(options.external_checks_url).is_some() {
+                    bail!("only one of external checks file or external checks URL may be configured");
+                }
+                vec![load_external_checks_file_path(&root, &external_checks_file)?]
+            } else if let Some(external_checks_url) = normalize_optional_cli_value(options.external_checks_url) {
+                load_external_checks_chain(&external_checks_url).await?
+            } else if let Some(external_checks_url) = discover_root_external_checks_url_for_prefetch(&root)? {
+                load_external_checks_chain(&external_checks_url).await?
+            } else {
+                Vec::new()
+            };
 
         Ok(Self {
             root,
@@ -321,10 +310,7 @@ impl ConfigResolver {
             .strip_prefix(&self.root)
             .unwrap_or(config_path.as_path())
             .to_path_buf();
-        let check_config_dir = config_relative_path
-            .parent()
-            .unwrap_or(Path::new(""))
-            .to_path_buf();
+        let check_config_dir = config_relative_path.parent().unwrap_or(Path::new("")).to_path_buf();
 
         let checks_file = match parse_checks_file(&config_path, &config_relative_path) {
             Ok(checks_file) => checks_file,
@@ -373,18 +359,17 @@ impl ConfigResolver {
             } else {
                 None
             };
-            let policy =
-                match parse_policy_config(&configured_id, &check.policy, check.enabled, None) {
-                    Ok(policy) => policy,
-                    Err(err) => {
-                        resolved.push_diagnostic(config_check_diagnostic(
-                            configured_id.clone(),
-                            config_relative_path.clone(),
-                            err.to_string(),
-                        ));
-                        continue;
-                    }
-                };
+            let policy = match parse_policy_config(&configured_id, &check.policy, check.enabled, None) {
+                Ok(policy) => policy,
+                Err(err) => {
+                    resolved.push_diagnostic(config_check_diagnostic(
+                        configured_id.clone(),
+                        config_relative_path.clone(),
+                        err.to_string(),
+                    ));
+                    continue;
+                }
+            };
             resolved.upsert(CheckConfig {
                 check: check_name,
                 id: configured_id,
@@ -471,10 +456,7 @@ struct LoadedChecksFile {
     parsed: ParsedChecksFile,
 }
 
-fn parse_checks_file(
-    path: &Path,
-    relative_path: &Path,
-) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
+fn parse_checks_file(path: &Path, relative_path: &Path) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
     let contents = fs::read_to_string(path).map_err(|err| {
         config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
@@ -488,11 +470,8 @@ fn parse_checks_file(
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
 
     match extension {
-        "yaml" | "yml" => {
-            serde_yaml::from_str(&contents).map_err(|err| yaml_parse_diagnostic(relative_path, err))
-        }
-        "toml" => toml::from_str(&contents)
-            .map_err(|err| toml_parse_diagnostic(relative_path, &contents, err)),
+        "yaml" | "yml" => serde_yaml::from_str(&contents).map_err(|err| yaml_parse_diagnostic(relative_path, err)),
+        "toml" => toml::from_str(&contents).map_err(|err| toml_parse_diagnostic(relative_path, &contents, err)),
         _ => Err(config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
             relative_path.to_path_buf(),
@@ -504,17 +483,10 @@ fn parse_checks_file(
     }
 }
 
-fn parse_checks_contents(
-    contents: &str,
-    extension: &str,
-    source_label: &str,
-) -> Result<ParsedChecksFile> {
+fn parse_checks_contents(contents: &str, extension: &str, source_label: &str) -> Result<ParsedChecksFile> {
     match extension {
-        "yaml" | "yml" => serde_yaml::from_str(contents)
-            .with_context(|| format!("failed to parse {source_label}")),
-        "toml" => {
-            toml::from_str(contents).with_context(|| format!("failed to parse {source_label}"))
-        }
+        "yaml" | "yml" => serde_yaml::from_str(contents).with_context(|| format!("failed to parse {source_label}")),
+        "toml" => toml::from_str(contents).with_context(|| format!("failed to parse {source_label}")),
         _ => bail!(
             "unsupported checks config extension for {} (expected .yaml or .toml)",
             source_label
@@ -577,9 +549,7 @@ fn parse_check_definitions(
                 format!("invalid `check_definitions.exec_paths` entry `{trimmed}`: {err}"),
                 None,
                 None,
-                Some(
-                    "Each exec_paths entry must be a safe relative directory path.".to_owned(),
-                ),
+                Some("Each exec_paths entry must be a safe relative directory path.".to_owned()),
             ));
         }
         exec_paths.push(path);
@@ -632,9 +602,7 @@ fn resolve_check_implementation(
 
     // Bundled defs (embedded in binary, zero install).
     if in_bundled {
-        return Ok(Some(ExternalCheckImplementationRef::Bundled(
-            check_name.to_owned(),
-        )));
+        return Ok(Some(ExternalCheckImplementationRef::Bundled(check_name.to_owned())));
     }
 
     // exec_paths at lower priority (when bundled does not win).
@@ -654,11 +622,7 @@ fn resolve_check_implementation(
 /// repo-root-relative path if found. YAML is checked before TOML within each
 /// directory, preserving existing behaviour for declarative definitions.
 /// Returns `None` if no match exists in any exec_path.
-fn find_in_exec_paths(
-    exec_paths: &[PathBuf],
-    check_name: &str,
-    repo_root: &Path,
-) -> Result<Option<PathBuf>> {
+fn find_in_exec_paths(exec_paths: &[PathBuf], check_name: &str, repo_root: &Path) -> Result<Option<PathBuf>> {
     for exec_path in exec_paths {
         for filename in [CHECK_DEF_FILE_NAME_YAML, CHECK_DEF_FILE_NAME_TOML] {
             let manifest_rel = exec_path.join(check_name).join(filename);
@@ -693,14 +657,12 @@ fn parse_policy_config(
     }
 
     let severity = match policy.severity.as_deref() {
-        Some(raw) => Some(
-            parse_policy_severity(raw).with_context(|| match config_source {
-                Some(config_source) => {
-                    format!("invalid `policy.severity` for check `{check_id}` in {config_source}")
-                }
-                None => format!("invalid `policy.severity` for check `{check_id}`"),
-            })?,
-        ),
+        Some(raw) => Some(parse_policy_severity(raw).with_context(|| match config_source {
+            Some(config_source) => {
+                format!("invalid `policy.severity` for check `{check_id}` in {config_source}")
+            }
+            None => format!("invalid `policy.severity` for check `{check_id}`"),
+        })?),
         None => None,
     };
 
@@ -711,9 +673,9 @@ fn parse_policy_config(
 
     let stale_exclusion_mode = match policy.stale_exclusion_severity.as_deref() {
         Some(raw) => Some(parse_stale_exclusion_mode(raw).with_context(|| match config_source {
-            Some(config_source) => format!(
-                "invalid `policy.stale_exclusion_severity` for check `{check_id}` in {config_source}"
-            ),
+            Some(config_source) => {
+                format!("invalid `policy.stale_exclusion_severity` for check `{check_id}` in {config_source}")
+            }
             None => format!("invalid `policy.stale_exclusion_severity` for check `{check_id}`"),
         })?),
         None => None,
@@ -760,11 +722,7 @@ fn yaml_parse_diagnostic(relative_path: &Path, err: serde_yaml::Error) -> Config
     )
 }
 
-fn toml_parse_diagnostic(
-    relative_path: &Path,
-    contents: &str,
-    err: toml::de::Error,
-) -> ConfigDiagnostic {
+fn toml_parse_diagnostic(relative_path: &Path, contents: &str, err: toml::de::Error) -> ConfigDiagnostic {
     let (line, column) = err
         .span()
         .map(|span| offset_to_line_column(contents, span.start))
@@ -781,11 +739,7 @@ fn toml_parse_diagnostic(
     )
 }
 
-fn config_check_diagnostic(
-    check_id: String,
-    source_path: PathBuf,
-    message: String,
-) -> ConfigDiagnostic {
+fn config_check_diagnostic(check_id: String, source_path: PathBuf, message: String) -> ConfigDiagnostic {
     config_file_diagnostic(
         check_id,
         source_path,
@@ -835,10 +789,7 @@ fn canonicalize_root(root: PathBuf) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("failed to canonicalize root {}", root.display()))?;
     if !root.is_dir() {
-        bail!(
-            "config resolver root is not a directory: {}",
-            root.display()
-        );
+        bail!("config resolver root is not a directory: {}", root.display());
     }
 
     Ok(root)
@@ -863,10 +814,7 @@ fn apply_local_settings(
                 format!("invalid `settings.stale_exclusion_severity`: {error}"),
                 None,
                 None,
-                Some(
-                    "Set `settings.stale_exclusion_severity` to `off`, `warning`, or `error`."
-                        .to_owned(),
-                ),
+                Some("Set `settings.stale_exclusion_severity` to `off`, `warning`, or `error`.".to_owned()),
             )),
         }
     }
@@ -878,8 +826,7 @@ fn apply_local_settings(
         resolved.push_diagnostic(config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
             source_path.to_path_buf(),
-            "`settings.external_checks_url` is only supported in the repository root config"
-                .to_owned(),
+            "`settings.external_checks_url` is only supported in the repository root config".to_owned(),
             None,
             None,
             Some("Remove `settings.external_checks_url` from child CHECKS files.".to_owned()),
@@ -899,20 +846,12 @@ fn apply_local_settings(
     }
 }
 
-fn apply_external_checks_file(
-    resolved: &mut ResolvedChecks,
-    external_checks_file: &LoadedChecksFile,
-) -> Result<()> {
+fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_file: &LoadedChecksFile) -> Result<()> {
     if let Some(include_config_files) = external_checks_file.parsed.settings.include_config_files {
         resolved.include_config_files = include_config_files;
     }
 
-    if let Some(raw) = external_checks_file
-        .parsed
-        .settings
-        .stale_exclusion_severity
-        .as_deref()
-    {
+    if let Some(raw) = external_checks_file.parsed.settings.stale_exclusion_severity.as_deref() {
         resolved.stale_exclusion_mode = parse_stale_exclusion_mode(raw).with_context(|| {
             format!(
                 "invalid `settings.stale_exclusion_severity` in {}",
@@ -1003,10 +942,7 @@ fn discover_root_external_checks_url_for_prefetch(root: &Path) -> Result<Option<
     Ok(Some(external_checks_url))
 }
 
-fn load_external_checks_file_path(
-    root: &Path,
-    external_checks_file: &str,
-) -> Result<LoadedChecksFile> {
+fn load_external_checks_file_path(root: &Path, external_checks_file: &str) -> Result<LoadedChecksFile> {
     let resolved_path = resolve_external_checks_file_path(root, external_checks_file)?;
     let source_label = resolved_path.display().to_string();
     let parsed = parse_checks_contents_from_path(&resolved_path, &source_label)?;
@@ -1045,23 +981,19 @@ fn resolve_external_checks_file_path(root: &Path, raw_path: &str) -> Result<Path
         return Ok(path);
     }
 
-    validate_relative_path(&path)
-        .context("external checks file path must be a safe relative path")?;
+    validate_relative_path(&path).context("external checks file path must be a safe relative path")?;
     Ok(root.join(path))
 }
 
 fn parse_checks_contents_from_path(path: &Path, source_label: &str) -> Result<ParsedChecksFile> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read external checks config {source_label}"))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read external checks config {source_label}"))?;
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     parse_checks_contents(&contents, extension, source_label)
         .with_context(|| format!("failed to parse external checks config {source_label}"))
 }
 
-fn normalize_configured_external_checks_url(
-    raw: Option<String>,
-    source_label: &str,
-) -> Result<Option<String>> {
+fn normalize_configured_external_checks_url(raw: Option<String>, source_label: &str) -> Result<Option<String>> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -1109,19 +1041,14 @@ async fn load_external_checks_chain(external_checks_url: &str) -> Result<Vec<Loa
     Ok(loaded)
 }
 
-fn resolve_external_checks_url(
-    raw_url: &str,
-    base_url: Option<&reqwest::Url>,
-) -> Result<reqwest::Url> {
+fn resolve_external_checks_url(raw_url: &str, base_url: Option<&reqwest::Url>) -> Result<reqwest::Url> {
     let trimmed = raw_url.trim();
     if trimmed.is_empty() {
         bail!("external checks URL must not be empty");
     }
 
     let parsed = match base_url {
-        Some(base_url) => base_url
-            .join(trimmed)
-            .or_else(|_| reqwest::Url::parse(trimmed)),
+        Some(base_url) => base_url.join(trimmed).or_else(|_| reqwest::Url::parse(trimmed)),
         None => reqwest::Url::parse(trimmed),
     };
 
@@ -1138,9 +1065,7 @@ fn validate_external_root_check_implementation(
         return Ok(());
     };
 
-    if origin == CheckConfigOrigin::ExternalFile
-        && matches!(implementation, ExternalCheckImplementationRef::File(_))
-    {
+    if origin == CheckConfigOrigin::ExternalFile && matches!(implementation, ExternalCheckImplementationRef::File(_)) {
         bail!(
             "invalid `implementation` for check `{check_id}` in {source_label}: external checks files may only use `generated:` or `bundled:` implementations"
         );
@@ -1149,10 +1074,7 @@ fn validate_external_root_check_implementation(
     Ok(())
 }
 
-async fn fetch_external_checks_file(
-    client: &reqwest::Client,
-    url: reqwest::Url,
-) -> Result<LoadedChecksFile> {
+async fn fetch_external_checks_file(client: &reqwest::Client, url: reqwest::Url) -> Result<LoadedChecksFile> {
     let mut last_retryable_error = None;
 
     for attempt in 1..=EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
@@ -1178,8 +1100,7 @@ async fn fetch_external_checks_file(
                 }
 
                 if !status.is_success() {
-                    let response_error =
-                        format!("external checks config {} returned {}", url, status);
+                    let response_error = format!("external checks config {} returned {}", url, status);
                     if is_retryable_http_status(status) {
                         last_retryable_error = Some(response_error);
                         if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
@@ -1219,28 +1140,17 @@ async fn fetch_external_checks_file(
                 });
             }
             Err(error) => {
-                last_retryable_error = Some(format!(
-                    "failed to retrieve external checks config {}: {error}",
-                    url
-                ));
+                last_retryable_error = Some(format!("failed to retrieve external checks config {}: {error}", url));
                 if attempt == EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS {
                     break;
                 }
-                tokio::time::sleep(external_checks_retry_delay(
-                    attempt,
-                    StatusCode::REQUEST_TIMEOUT,
-                ))
-                .await;
+                tokio::time::sleep(external_checks_retry_delay(attempt, StatusCode::REQUEST_TIMEOUT)).await;
             }
         }
     }
 
-    let message = last_retryable_error
-        .unwrap_or_else(|| format!("failed to retrieve external checks config {}", url));
-    bail!(
-        "{message} after {} attempts",
-        EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS
-    )
+    let message = last_retryable_error.unwrap_or_else(|| format!("failed to retrieve external checks config {}", url));
+    bail!("{message} after {} attempts", EXTERNAL_CHECKS_FETCH_MAX_ATTEMPTS)
 }
 
 fn is_retryable_http_status(status: StatusCode) -> bool {
@@ -1275,10 +1185,7 @@ fn resolve_checks_file_path(dir: &Path) -> Result<Option<PathBuf>, ConfigDiagnos
                 line: None,
                 column: None,
             },
-            remediation: Some(
-                "Remove one of the two config files so checkleft knows which one to load."
-                    .to_owned(),
-            ),
+            remediation: Some("Remove one of the two config files so checkleft knows which one to load.".to_owned()),
         });
     }
 

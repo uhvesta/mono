@@ -55,10 +55,7 @@ pub(crate) fn migrate_work_executions_pr_url(conn: &Connection) -> Result<()> {
 /// Idempotent.
 pub(crate) fn migrate_work_executions_pr_head_before(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "pr_head_before")? {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN pr_head_before TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_executions ADD COLUMN pr_head_before TEXT", [])?;
     }
     Ok(())
 }
@@ -79,10 +76,7 @@ pub(crate) fn migrate_work_executions_pr_head_before(conn: &Connection) -> Resul
 /// new-PR flow (no bound PR to snapshot). Idempotent.
 pub(crate) fn migrate_work_executions_metadata_fix_columns(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "pr_body_before")? {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN pr_body_before TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_executions ADD COLUMN pr_body_before TEXT", [])?;
     }
     if !work_executions_has_column(conn, "metadata_fix_confirmed_at")? {
         conn.execute(
@@ -242,9 +236,7 @@ pub(crate) fn migrate_timestamps_to_epoch(conn: &Connection) -> Result<()> {
         );
         let mut stmt = conn.prepare(&select_sql)?;
         let rows: Vec<(i64, String)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (rowid, value) in rows {

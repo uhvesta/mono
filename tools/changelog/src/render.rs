@@ -23,10 +23,7 @@ impl ChangelogRenderer for GithubMarkdownRenderer {
         }
         // Two blank lines before the Full Changelog line.
         out.push_str("\n\n");
-        out.push_str(&format!(
-            "**Full Changelog**: {}",
-            range.compare_url,
-        ));
+        out.push_str(&format!("**Full Changelog**: {}", range.compare_url,));
         out
     }
 }
@@ -41,8 +38,7 @@ mod tests {
         let range = ChangelogRange {
             from_tag: "v1.0.0".to_string(),
             to_tag: "v1.1.0".to_string(),
-            compare_url:
-                "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
+            compare_url: "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
             entries: vec![
                 ChangelogEntry {
                     pr_number: 42,
@@ -78,8 +74,7 @@ mod tests {
         let range = ChangelogRange {
             from_tag: "v1.0.0".to_string(),
             to_tag: "v1.1.0".to_string(),
-            compare_url:
-                "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
+            compare_url: "https://github.com/example/repo/compare/v1.0.0...v1.1.0".to_string(),
             entries: vec![],
         };
 

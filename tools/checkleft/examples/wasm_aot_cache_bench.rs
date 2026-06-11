@@ -46,16 +46,14 @@ fn main() -> Result<()> {
     cache.load_or_compile(&engine, "bench-component", &component_bytes, &artifact_sha256)?;
 
     let warm = measure("warm  (AOT cache hit)", SAMPLES, || {
-        let _ = black_box(cache.load_or_compile(
-            &engine,
-            "bench-component",
-            &component_bytes,
-            &artifact_sha256,
-        )?);
+        let _ = black_box(cache.load_or_compile(&engine, "bench-component", &component_bytes, &artifact_sha256)?);
         Ok(())
     })?;
 
-    println!("\nSpeedup (cold / warm): {:.1}×", cold.as_secs_f64() / warm.as_secs_f64());
+    println!(
+        "\nSpeedup (cold / warm): {:.1}×",
+        cold.as_secs_f64() / warm.as_secs_f64()
+    );
 
     Ok(())
 }

@@ -121,9 +121,7 @@ fn run_typo_check(
                     }),
                     remediations: vec![format!(
                         "Replace `{}` with `{}`. {}",
-                        compiled_rule.rule.typo,
-                        compiled_rule.rule.canonical,
-                        compiled_rule.rule.guidance
+                        compiled_rule.rule.typo, compiled_rule.rule.canonical, compiled_rule.rule.guidance
                     )],
                     suggested_fix: None,
                 });
@@ -141,21 +139,14 @@ fn run_typo_check(
 }
 
 fn parse_typo_config(config: &toml::Value) -> Result<ParsedTypoConfig> {
-    let parsed: TypoConfig = config
-        .clone()
-        .try_into()
-        .context("invalid typo check config")?;
+    let parsed: TypoConfig = config.clone().try_into().context("invalid typo check config")?;
 
     if parsed.rules.is_empty() {
         bail!("typo check config must contain at least one rule");
     }
 
     Ok(ParsedTypoConfig {
-        rules: parsed
-            .rules
-            .into_iter()
-            .map(typo_rule_from_config)
-            .collect(),
+        rules: parsed.rules.into_iter().map(typo_rule_from_config).collect(),
     })
 }
 
@@ -180,8 +171,7 @@ fn compile_rules(rules: &[TypoRule]) -> Result<Vec<CompiledTypoRule>> {
             MatchKind::Substring => Matcher::Substring(rule.typo.to_ascii_lowercase()),
             MatchKind::Word => {
                 let pattern = format!(r"(?i)\b{}\b", regex::escape(&rule.typo));
-                let regex = Regex::new(&pattern)
-                    .with_context(|| format!("invalid typo rule regex: {pattern}"))?;
+                let regex = Regex::new(&pattern).with_context(|| format!("invalid typo rule regex: {pattern}"))?;
                 Matcher::Word(regex)
             }
         };
@@ -265,11 +255,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_hyphenated_word_matches() {
         let temp = tempdir().expect("create temp dir");
-        fs::write(
-            temp.path().join("config.txt"),
-            "id = \"custom-typo-check\"\n",
-        )
-        .expect("write file");
+        fs::write(temp.path().join("config.txt"), "id = \"custom-typo-check\"\n").expect("write file");
 
         let check = TypoCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");

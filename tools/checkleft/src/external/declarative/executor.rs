@@ -19,9 +19,7 @@ use globset::{Glob, GlobSetBuilder};
 use crate::input::{ChangeKind, ChangeSet};
 use crate::output::{CheckResult, Finding};
 
-use super::{
-    ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode, resolve,
-};
+use super::{ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode, resolve};
 
 /// Run a declarative check end-to-end. `repo_root` is the working directory
 /// invocations run from (and the Bazel workspace, when the `bazel` resolver is used).
@@ -80,9 +78,13 @@ fn run_invocation(
     invocation: &Invocation,
     files: &[String],
 ) -> Result<Vec<Finding>> {
-    let binary = binaries
-        .get(&invocation.run)
-        .ok_or_else(|| anyhow::anyhow!("invocation `{}` binary `{}` was not resolved", invocation.id, invocation.run))?;
+    let binary = binaries.get(&invocation.run).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invocation `{}` binary `{}` was not resolved",
+            invocation.id,
+            invocation.run
+        )
+    })?;
 
     match invocation.mode {
         InvocationMode::Batch => {

@@ -22,8 +22,8 @@ use boss_client::{BossClient, wait_for_socket};
 use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent,
-    FrontendRequest, Product, Project, Task, WorkItem,
+    CreateChoreInput, CreateProductInput, CreateProjectInput, CreateTaskInput, FrontendEvent, FrontendRequest, Product,
+    Project, Task, WorkItem,
 };
 use serde_json::Value;
 
@@ -39,17 +39,21 @@ impl TestEngine {
     async fn spawn() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
         let socket_for_serve = socket_path.clone();
         let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
-        Ok(Self { socket_path, _temp: temp, join })
+        Ok(Self {
+            socket_path,
+            _temp: temp,
+            join,
+        })
     }
 
     fn socket_str(&self) -> &str {
@@ -77,7 +81,9 @@ async fn create_product(client: &mut BossClient, name: &str) -> Result<Product> 
         })
         .await?
     {
-        FrontendEvent::WorkItemCreated { item: WorkItem::Product(p) } => Ok(p),
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => Ok(p),
         other => Err(anyhow!("unexpected response for product create: {other:?}")),
     }
 }
@@ -96,17 +102,14 @@ async fn create_project(client: &mut BossClient, product_id: &str, name: &str) -
         })
         .await?
     {
-        FrontendEvent::WorkItemCreated { item: WorkItem::Project(p) } => Ok(p),
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Project(p),
+        } => Ok(p),
         other => Err(anyhow!("unexpected response for project create: {other:?}")),
     }
 }
 
-async fn create_task(
-    client: &mut BossClient,
-    product_id: &str,
-    project_id: &str,
-    name: &str,
-) -> Result<Task> {
+async fn create_task(client: &mut BossClient, product_id: &str, project_id: &str, name: &str) -> Result<Task> {
     match client
         .send_request(&FrontendRequest::CreateTask {
             input: CreateTaskInput {
@@ -125,7 +128,9 @@ async fn create_task(
         })
         .await?
     {
-        FrontendEvent::WorkItemCreated { item: WorkItem::Task(t) } => Ok(t),
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => Ok(t),
         other => Err(anyhow!("unexpected response for task create: {other:?}")),
     }
 }
@@ -148,7 +153,9 @@ async fn create_chore(client: &mut BossClient, product_id: &str, name: &str) -> 
         })
         .await?
     {
-        FrontendEvent::WorkItemCreated { item: WorkItem::Chore(t) } => Ok(t),
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        } => Ok(t),
         other => Err(anyhow!("unexpected response for chore create: {other:?}")),
     }
 }
@@ -378,10 +385,7 @@ async fn chore_show_wrong_kind_project_names_correct_verb() -> Result<()> {
     let short_id = project.short_id.ok_or_else(|| anyhow!("project has no short_id"))?;
 
     let selector = format!("{}/{short_id}", product.slug);
-    let stderr = run_boss_expect_failure(
-        engine.socket_str(),
-        &["chore", "show", &selector],
-    )?;
+    let stderr = run_boss_expect_failure(engine.socket_str(), &["chore", "show", &selector])?;
     assert!(
         stderr.contains("boss project show"),
         "expected error to suggest `boss project show`, got: {stderr}"

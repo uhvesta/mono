@@ -83,10 +83,7 @@ pub struct Eligibility {
 /// `decision_required` attention item with the eligibility list as
 /// the body. The caller is responsible for filtering on
 /// `pinned_host_id` semantics: when set, only that host can win.
-pub fn select_host(
-    requirements: &ChoreRequirements,
-    slots: &[HostSlot],
-) -> (Option<String>, Vec<Eligibility>) {
+pub fn select_host(requirements: &ChoreRequirements, slots: &[HostSlot]) -> (Option<String>, Vec<Eligibility>) {
     let mut report = Vec::with_capacity(slots.len());
     let mut candidates: Vec<&HostSlot> = Vec::new();
 
@@ -135,9 +132,7 @@ pub fn select_host(
         .min_by(|a, b| {
             // Branch affinity: a host with a prior run sorts *before*
             // one without (so we want false > true under min).
-            let aff = b
-                .had_prior_run_on_branch
-                .cmp(&a.had_prior_run_on_branch);
+            let aff = b.had_prior_run_on_branch.cmp(&a.had_prior_run_on_branch);
             if aff != std::cmp::Ordering::Equal {
                 return aff;
             }
@@ -209,7 +204,7 @@ mod tests {
     fn no_free_slots_excludes_host() {
         let reqs = ChoreRequirements::default();
         let slots = vec![
-            slot("local", 1, 1, &[]),     // full
+            slot("local", 1, 1, &[]), // full
             slot("zakalwe", 1, 0, &[]),
         ];
         let (picked, _report) = select_host(&reqs, &slots);
@@ -274,18 +269,17 @@ mod tests {
         let slots = vec![slot("local", 4, 0, &[])];
         let (picked, report) = select_host(&reqs, &slots);
         assert!(picked.is_none());
-        assert!(report.iter().any(|r| r
-            .reasons
-            .iter()
-            .any(|x| matches!(x, IneligibilityReason::NotPinned))));
+        assert!(
+            report
+                .iter()
+                .any(|r| r.reasons.iter().any(|x| matches!(x, IneligibilityReason::NotPinned)))
+        );
     }
 
     #[test]
     fn missing_capabilities_reported_per_host() {
         let reqs = ChoreRequirements {
-            required_capabilities: ["os=macos".into(), "xcode=15".into()]
-                .into_iter()
-                .collect(),
+            required_capabilities: ["os=macos".into(), "xcode=15".into()].into_iter().collect(),
             pinned_host_id: None,
         };
         let slots = vec![slot("linux-host", 4, 0, &["os=linux"])];
@@ -309,10 +303,7 @@ mod tests {
     fn lexicographic_tiebreak_is_deterministic() {
         // No affinity, equal slots — should pick `aardvark` over `zebra`.
         let reqs = ChoreRequirements::default();
-        let slots = vec![
-            slot("zebra", 4, 0, &[]),
-            slot("aardvark", 4, 0, &[]),
-        ];
+        let slots = vec![slot("zebra", 4, 0, &[]), slot("aardvark", 4, 0, &[])];
         let (picked, _) = select_host(&reqs, &slots);
         assert_eq!(picked.as_deref(), Some("aardvark"));
     }

@@ -27,10 +27,7 @@ pub fn now_unix_secs() -> u64 {
 /// the `<filename>.<all-digits>` predicate that [`rotated_segments`] uses to
 /// find these files again.
 pub fn rotated_segment_path(base: &Path, secs: u64) -> PathBuf {
-    let mut name = base
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
+    let mut name = base.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(format!(".{secs}"));
     match base.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),

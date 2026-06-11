@@ -97,10 +97,7 @@ impl ConflictDiagnosis {
 /// Accepts the canonical `git version X.Y.Z` prefix; extra vendor suffixes
 /// (e.g. `(Apple Git-145)`) are ignored.
 pub fn parse_git_version(version_output: &str) -> Option<(u32, u32, u32)> {
-    let ver = version_output
-        .strip_prefix("git version ")?
-        .split_whitespace()
-        .next()?;
+    let ver = version_output.strip_prefix("git version ")?.split_whitespace().next()?;
     let mut parts = ver.split('.').filter_map(|p| p.parse::<u32>().ok());
     Some((parts.next()?, parts.next()?, parts.next().unwrap_or(0)))
 }
@@ -129,11 +126,7 @@ async fn git_version() -> Option<(u32, u32, u32)> {
 /// Falls back to `<workspace_path>/.git` when `git_target` is absent,
 /// which covers colocated jj+git workspaces (test fixtures, dev-mode).
 fn resolve_git_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
-    let git_target_file = workspace_path
-        .join(".jj")
-        .join("repo")
-        .join("store")
-        .join("git_target");
+    let git_target_file = workspace_path.join(".jj").join("repo").join("store").join("git_target");
 
     if git_target_file.exists() {
         let raw = std::fs::read_to_string(&git_target_file)?;
@@ -162,11 +155,7 @@ fn resolve_git_dir(workspace_path: &Path) -> std::io::Result<PathBuf> {
 /// block the spawn — the worker can still take over from a fresh
 /// `jj rebase -d main`. The `Err` path is reserved for genuine
 /// caller misuse (workspace path doesn't exist, etc.).
-pub async fn collect(
-    workspace_path: &Path,
-    base_sha: &str,
-    head_sha: &str,
-) -> std::io::Result<ConflictDiagnosis> {
+pub async fn collect(workspace_path: &Path, base_sha: &str, head_sha: &str) -> std::io::Result<ConflictDiagnosis> {
     // Cube workspaces are jj-only (no top-level `.git`); git must be
     // told where the store is via GIT_DIR, otherwise it fails with
     // "not a git repository" during directory discovery.
@@ -272,9 +261,7 @@ async fn collect_legacy(
         ));
     }
 
-    let merge_base = String::from_utf8_lossy(&mb_output.stdout)
-        .trim()
-        .to_owned();
+    let merge_base = String::from_utf8_lossy(&mb_output.stdout).trim().to_owned();
 
     let output = Command::new("git")
         .args(["merge-tree", &merge_base, base_sha, head_sha])
@@ -413,10 +400,7 @@ mod tests {
 
     #[test]
     fn parses_standard_version_string() {
-        assert_eq!(
-            parse_git_version("git version 2.39.3"),
-            Some((2, 39, 3))
-        );
+        assert_eq!(parse_git_version("git version 2.39.3"), Some((2, 39, 3)));
     }
 
     #[test]
@@ -484,7 +468,8 @@ mod tests {
 
     #[test]
     fn legacy_no_conflict_markers_returns_empty() {
-        let stdout = "changed in both\n  base   100644 abc a.txt\n  our    100644 def a.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let stdout =
+            "changed in both\n  base   100644 abc a.txt\n  our    100644 def a.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n";
         let parsed = parse_legacy_output("base", "head", stdout);
         assert!(parsed.files.is_empty());
         assert!(parsed.error.is_none());
@@ -656,11 +641,7 @@ changed in both\n\
         let ws = jj_ws.path();
         let store_path = ws.join(".jj").join("repo").join("store");
         std::fs::create_dir_all(&store_path).unwrap();
-        std::fs::write(
-            store_path.join("git_target"),
-            git_repo.join(".git").to_str().unwrap(),
-        )
-        .unwrap();
+        std::fs::write(store_path.join("git_target"), git_repo.join(".git").to_str().unwrap()).unwrap();
         // Intentionally no .git at ws root — this is the jj-only shape.
 
         let diag = collect(ws, "main", "feature").await.unwrap();
@@ -708,14 +689,8 @@ changed in both\n\
         run_git(repo, &["commit", "-q", "-am", "main"]).await;
 
         let git_dir = repo.join(".git");
-        let diag = collect_legacy(repo, &git_dir, "main", "feature")
-            .await
-            .unwrap();
-        assert!(
-            diag.error.is_none(),
-            "collect_legacy errored: {:?}",
-            diag.error
-        );
+        let diag = collect_legacy(repo, &git_dir, "main", "feature").await.unwrap();
+        assert!(diag.error.is_none(), "collect_legacy errored: {:?}", diag.error);
         assert_eq!(
             diag.files.len(),
             1,

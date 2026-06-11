@@ -11,13 +11,11 @@
 //! is a pure function of (escalation events, chore corpus,
 //! thresholds); it does not retune anything itself.
 
-use boss_protocol::{
-    EffortAuditMarkerRow, EffortAuditReport, EffortEscalation, EffortLevel,
-};
+use boss_protocol::{EffortAuditMarkerRow, EffortAuditReport, EffortEscalation, EffortLevel};
 
 use crate::effort::{
-    UNDER_CLASS_PROMOTE_THRESHOLD, WELL_CLASSIFIED_RATE_CEILING, WELL_CLASSIFIED_VOLUME_FLOOR,
-    all_markers, marker_matches_text, original_level_for_marker,
+    UNDER_CLASS_PROMOTE_THRESHOLD, WELL_CLASSIFIED_RATE_CEILING, WELL_CLASSIFIED_VOLUME_FLOOR, all_markers,
+    marker_matches_text, original_level_for_marker,
 };
 
 /// One chore as the audit sees it: just enough to run the marker
@@ -87,15 +85,12 @@ pub fn build_report(
     // the matcher's O(text * marker) cost contained to a single
     // pass; the marker corpus is ~34 entries today and the chore
     // count is in the hundreds per product, so this is cheap.
-    let mut matches_per_marker: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
+    let mut matches_per_marker: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for chore in chores {
         let haystack = chore.haystack();
         for marker in all_markers() {
             if marker_matches_text(marker, &haystack) {
-                *matches_per_marker
-                    .entry(marker.to_ascii_lowercase())
-                    .or_insert(0) += 1;
+                *matches_per_marker.entry(marker.to_ascii_lowercase()).or_insert(0) += 1;
             }
         }
     }
@@ -106,8 +101,7 @@ pub fn build_report(
     // just won't have a `matches` denominator from the current
     // chore corpus, which the rate calc handles by emitting
     // `under_class_rate: None`.
-    let mut escalations_per_marker: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
+    let mut escalations_per_marker: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut total_escalations = 0u32;
     for event in events {
         if !is_promotion(event.original_level, event.new_level) {
@@ -116,9 +110,7 @@ pub fn build_report(
         }
         total_escalations += 1;
         for marker in &event.markers {
-            *escalations_per_marker
-                .entry(marker.to_ascii_lowercase())
-                .or_insert(0) += 1;
+            *escalations_per_marker.entry(marker.to_ascii_lowercase()).or_insert(0) += 1;
         }
     }
 
@@ -140,8 +132,7 @@ pub fn build_report(
         .map(|marker| {
             let matches = matches_per_marker.get(&marker).copied().unwrap_or(0);
             let escalations = escalations_per_marker.get(&marker).copied().unwrap_or(0);
-            let original_level =
-                original_level_for_marker(&marker).unwrap_or(EffortLevel::Max);
+            let original_level = original_level_for_marker(&marker).unwrap_or(EffortLevel::Max);
             let under_class_rate = if matches == 0 {
                 None
             } else {
@@ -189,13 +180,8 @@ pub fn build_report(
 fn annotate(matches: u32, rate: Option<f64>) -> Option<String> {
     match rate {
         None => None,
-        Some(r) if r > UNDER_CLASS_PROMOTE_THRESHOLD => {
-            Some("consider promoting".to_owned())
-        }
-        Some(r)
-            if r < WELL_CLASSIFIED_RATE_CEILING
-                && matches >= WELL_CLASSIFIED_VOLUME_FLOOR =>
-        {
+        Some(r) if r > UNDER_CLASS_PROMOTE_THRESHOLD => Some("consider promoting".to_owned()),
+        Some(r) if r < WELL_CLASSIFIED_RATE_CEILING && matches >= WELL_CLASSIFIED_VOLUME_FLOOR => {
             Some("marker holds; level correct".to_owned())
         }
         _ => None,
@@ -213,12 +199,7 @@ mod tests {
         }
     }
 
-    fn event(
-        id: &str,
-        original: EffortLevel,
-        new: EffortLevel,
-        markers: &[&str],
-    ) -> EffortEscalation {
+    fn event(id: &str, original: EffortLevel, new: EffortLevel, markers: &[&str]) -> EffortEscalation {
         EffortEscalation {
             id: id.to_owned(),
             product_id: "prod_test".to_owned(),
@@ -306,11 +287,7 @@ mod tests {
     #[test]
     fn promote_annotation_fires_above_threshold() {
         // 2/3 = 66.7% > 30% threshold → "consider promoting."
-        let chores = vec![
-            chore("rename a", ""),
-            chore("rename b", ""),
-            chore("rename c", ""),
-        ];
+        let chores = vec![chore("rename a", ""), chore("rename b", ""), chore("rename c", "")];
         let events = vec![
             event("e1", EffortLevel::Trivial, EffortLevel::Medium, &["rename"]),
             event("e2", EffortLevel::Trivial, EffortLevel::Small, &["rename"]),
@@ -324,19 +301,10 @@ mod tests {
     fn holds_annotation_fires_when_low_rate_and_high_volume() {
         // 0 escalations against 6 matches; 0% < 5% ceiling and
         // volume (6) >= floor (5) → "marker holds".
-        let chores: Vec<_> = (0..6)
-            .map(|i| chore(&format!("Investigate path {i}"), ""))
-            .collect();
+        let chores: Vec<_> = (0..6).map(|i| chore(&format!("Investigate path {i}"), "")).collect();
         let report = build_report("p", "boss", None, &chores, &[], "0".to_owned());
-        let row = report
-            .rows
-            .iter()
-            .find(|r| r.marker == "investigate")
-            .unwrap();
-        assert_eq!(
-            row.annotation.as_deref(),
-            Some("marker holds; level correct"),
-        );
+        let row = report.rows.iter().find(|r| r.marker == "investigate").unwrap();
+        assert_eq!(row.annotation.as_deref(), Some("marker holds; level correct"),);
     }
 
     #[test]
@@ -344,15 +312,9 @@ mod tests {
         // 0% rate, but only 3 matches < volume floor (5) → no
         // annotation. Avoids endorsing a marker that simply hasn't
         // appeared often enough to call.
-        let chores: Vec<_> = (0..3)
-            .map(|i| chore(&format!("Investigate path {i}"), ""))
-            .collect();
+        let chores: Vec<_> = (0..3).map(|i| chore(&format!("Investigate path {i}"), "")).collect();
         let report = build_report("p", "boss", None, &chores, &[], "0".to_owned());
-        let row = report
-            .rows
-            .iter()
-            .find(|r| r.marker == "investigate")
-            .unwrap();
+        let row = report.rows.iter().find(|r| r.marker == "investigate").unwrap();
         assert!(row.annotation.is_none(), "annotation={:?}", row.annotation);
     }
 
@@ -363,13 +325,14 @@ mod tests {
         // the human can see it had escalations, but original_level
         // is `Max` (the sentinel "not in current corpus") and
         // matches is 0.
-        let events = vec![event("e1", EffortLevel::Trivial, EffortLevel::Medium, &["legacy-marker"])];
+        let events = vec![event(
+            "e1",
+            EffortLevel::Trivial,
+            EffortLevel::Medium,
+            &["legacy-marker"],
+        )];
         let report = build_report("p", "boss", None, &[], &events, "0".to_owned());
-        let row = report
-            .rows
-            .iter()
-            .find(|r| r.marker == "legacy-marker")
-            .unwrap();
+        let row = report.rows.iter().find(|r| r.marker == "legacy-marker").unwrap();
         assert_eq!(row.matches, 0);
         assert_eq!(row.escalations, 1);
         assert!(row.under_class_rate.is_none());

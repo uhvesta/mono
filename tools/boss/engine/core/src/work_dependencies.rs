@@ -70,12 +70,7 @@ pub fn insert_edge(
 /// Remove the named edge, if present. Returns `true` when a row was
 /// actually deleted, `false` for a no-op delete (Q6: `rm` on a
 /// missing edge is a success).
-pub fn delete_edge(
-    conn: &Connection,
-    dependent_id: &str,
-    prerequisite_id: &str,
-    relation: &str,
-) -> Result<bool> {
+pub fn delete_edge(conn: &Connection, dependent_id: &str, prerequisite_id: &str, relation: &str) -> Result<bool> {
     let rows = conn.execute(
         "DELETE FROM work_item_dependencies
          WHERE dependent_id = ?1 AND prerequisite_id = ?2 AND relation = ?3",
@@ -123,11 +118,7 @@ pub fn prerequisites_of(
 
 /// Edges whose `prerequisite_id` is `work_item_id` — i.e. the rows
 /// that depend on `work_item_id`.
-pub fn dependents_of(
-    conn: &Connection,
-    work_item_id: &str,
-    relation: Option<&str>,
-) -> Result<Vec<WorkItemDependency>> {
+pub fn dependents_of(conn: &Connection, work_item_id: &str, relation: Option<&str>) -> Result<Vec<WorkItemDependency>> {
     edges_for(
         conn,
         "SELECT dependent_id, prerequisite_id, relation, created_at
@@ -148,9 +139,7 @@ fn edges_for(
 ) -> Result<Vec<WorkItemDependency>> {
     let mut out = Vec::new();
     if let Some(rel) = relation {
-        let sql = format!(
-            "{base_sql} AND relation = ?2 ORDER BY created_at ASC, {order_by_id_column} ASC"
-        );
+        let sql = format!("{base_sql} AND relation = ?2 ORDER BY created_at ASC, {order_by_id_column} ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![work_item_id, rel], map_edge)?;
         for row in rows {
@@ -191,11 +180,7 @@ pub fn query_edge(
 /// would form a cycle. Designed to run inside the same transaction
 /// as the upcoming insert so a concurrent writer sees the proposed
 /// row before adding its own.
-pub fn would_create_cycle(
-    conn: &Connection,
-    dependent_id: &str,
-    prerequisite_id: &str,
-) -> Result<bool> {
+pub fn would_create_cycle(conn: &Connection, dependent_id: &str, prerequisite_id: &str) -> Result<bool> {
     if dependent_id == prerequisite_id {
         return Ok(true);
     }
@@ -263,11 +248,7 @@ pub fn status_satisfies(work_item_id: &str, status: &str) -> bool {
 /// For all non-revision dependents the standard rules apply: task
 /// prereqs satisfy on `done`; project prereqs satisfy on
 /// `done`/`archived`.
-pub fn status_satisfies_for_dependent(
-    prereq_id: &str,
-    prereq_status: &str,
-    dependent_kind: Option<&str>,
-) -> bool {
+pub fn status_satisfies_for_dependent(prereq_id: &str, prereq_status: &str, dependent_kind: Option<&str>) -> bool {
     if dependent_kind == Some("revision") && prereq_status == "in_review" {
         return true;
     }
@@ -276,10 +257,7 @@ pub fn status_satisfies_for_dependent(
 
 /// Look up the `kind` column for a task row. Returns `None` for
 /// project ids, unknown ids, and soft-deleted rows.
-pub fn lookup_work_item_kind(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<Option<String>> {
+pub fn lookup_work_item_kind(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if !work_item_id.starts_with("task_") {
         return Ok(None);
     }
@@ -297,10 +275,7 @@ pub fn lookup_work_item_kind(
 /// caller decides whether that's an error or a "treat as satisfied"
 /// signal (a soft-deleted prereq has its edge dropped immediately,
 /// so this code path should rarely see one).
-pub fn lookup_work_item_status(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<Option<String>> {
+pub fn lookup_work_item_status(conn: &Connection, work_item_id: &str) -> Result<Option<String>> {
     if work_item_id.starts_with("proj_") {
         return conn
             .query_row(
@@ -334,10 +309,7 @@ pub fn lookup_work_item_status(
 /// `in_review` (the PR is open and the revision can push to it).
 /// For all other dependents the standard `done`/`archived` rules
 /// apply.
-pub fn gating_prereqs_for(
-    conn: &Connection,
-    work_item_id: &str,
-) -> Result<Vec<String>> {
+pub fn gating_prereqs_for(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
     let dependent_kind = lookup_work_item_kind(conn, work_item_id)?;
     let edges = prerequisites_of(conn, work_item_id, Some(RELATION_BLOCKS))?;
     let mut gating = Vec::new();
@@ -375,15 +347,13 @@ mod tests {
     #[test]
     fn insert_then_idempotent_reinsert() {
         let conn = fresh_db();
-        let (edge, outcome) =
-            insert_edge(&conn, "task_a", "task_b", RELATION_BLOCKS, "1000").unwrap();
+        let (edge, outcome) = insert_edge(&conn, "task_a", "task_b", RELATION_BLOCKS, "1000").unwrap();
         assert_eq!(outcome, EdgeInsertOutcome::Inserted);
         assert_eq!(edge.dependent_id, "task_a");
         assert_eq!(edge.prerequisite_id, "task_b");
         assert_eq!(edge.relation, RELATION_BLOCKS);
 
-        let (_, outcome2) =
-            insert_edge(&conn, "task_a", "task_b", RELATION_BLOCKS, "9999").unwrap();
+        let (_, outcome2) = insert_edge(&conn, "task_a", "task_b", RELATION_BLOCKS, "9999").unwrap();
         assert_eq!(outcome2, EdgeInsertOutcome::AlreadyExists);
     }
 

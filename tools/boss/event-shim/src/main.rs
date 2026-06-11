@@ -85,8 +85,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let socket_path = env::var(SOCKET_ENV)
-        .map_err(|_| anyhow!("{SOCKET_ENV} not set; refusing to deliver hook event"))?;
+    let socket_path =
+        env::var(SOCKET_ENV).map_err(|_| anyhow!("{SOCKET_ENV} not set; refusing to deliver hook event"))?;
 
     let mut payload = Vec::new();
     io::stdin()
@@ -118,9 +118,10 @@ fn run() -> Result<()> {
     // the current event's connect would otherwise sit in the backlog
     // ahead of the drained connections.
     if let Some(buf) = buffer_path.as_deref()
-        && let Err(err) = drain_buffer(&socket_path, buf) {
-            eprintln!("boss-event: drain of {} skipped: {err:#}", buf.display());
-        }
+        && let Err(err) = drain_buffer(&socket_path, buf)
+    {
+        eprintln!("boss-event: drain of {} skipped: {err:#}", buf.display());
+    }
 
     // Then send the current event, with bounded connect-retry and a
     // single mid-send reconnect on broken pipe.
@@ -130,9 +131,7 @@ fn run() -> Result<()> {
             Err(_first_err) => {
                 // Mid-send failure: the engine may have bounced
                 // between connect and write. Reopen once and resend.
-                match connect_once(&socket_path)
-                    .and_then(|s| send_to_stream(s, &payload_line))
-                {
+                match connect_once(&socket_path).and_then(|s| send_to_stream(s, &payload_line)) {
                     Ok(()) => Ok(()),
                     Err(err) => {
                         eprintln!(
@@ -163,8 +162,7 @@ fn buffer_or_lose(buffer_path: Option<&Path>, payload: &[u8]) -> Result<()> {
             "no workspace buffer path available (set {WORKSPACE_ENV} or run from a writable cwd); event dropped"
         ));
     };
-    append_to_buffer(buffer_path, payload)
-        .with_context(|| format!("buffering event to {}", buffer_path.display()))
+    append_to_buffer(buffer_path, payload).with_context(|| format!("buffering event to {}", buffer_path.display()))
 }
 
 /// Inject `_boss_run_id` into a hook JSON object payload when the env
@@ -176,15 +174,11 @@ fn maybe_splice_run_id(payload: &[u8]) -> Result<Vec<u8>> {
     if run_id.is_empty() {
         return Err(anyhow!("BOSS_RUN_ID is empty"));
     }
-    let mut value: serde_json::Value =
-        serde_json::from_slice(payload).context("hook payload was not JSON")?;
+    let mut value: serde_json::Value = serde_json::from_slice(payload).context("hook payload was not JSON")?;
     let object = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("hook payload was not a JSON object"))?;
-    object.insert(
-        "_boss_run_id".to_owned(),
-        serde_json::Value::String(run_id),
-    );
+    object.insert("_boss_run_id".to_owned(), serde_json::Value::String(run_id));
     Ok(serde_json::to_vec(&value)?)
 }
 
@@ -221,8 +215,7 @@ fn retry_delays() -> Vec<Duration> {
 
 /// One connect attempt, no retry.
 fn connect_once(path: &str) -> Result<UnixStream> {
-    UnixStream::connect(path)
-        .with_context(|| format!("connecting to events socket at {path}"))
+    UnixStream::connect(path).with_context(|| format!("connecting to events socket at {path}"))
 }
 
 /// Bounded retry loop around `connect_once`. Sleeps between attempts
@@ -270,8 +263,7 @@ fn send_one(socket_path: &str, payload: &[u8]) -> Result<()> {
 /// past [`MAX_BUFFERED_EVENTS`] lines.
 fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
     if let Some(parent) = buffer_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {} ", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {} ", parent.display()))?;
     }
     let file = OpenOptions::new()
         .create(true)
@@ -283,12 +275,8 @@ fn append_to_buffer(buffer_path: &Path, payload: &[u8]) -> Result<()> {
     let _guard = LockGuard(&file);
 
     let mut writer = &file;
-    writer
-        .write_all(payload)
-        .context("writing payload to event buffer")?;
-    writer
-        .write_all(b"\n")
-        .context("writing terminator to event buffer")?;
+    writer.write_all(payload).context("writing payload to event buffer")?;
+    writer.write_all(b"\n").context("writing terminator to event buffer")?;
     writer.flush().context("flushing event buffer")?;
 
     // Cheap line-count check. Hook payloads are small (< a few KB), and
@@ -363,8 +351,7 @@ fn count_lines(file: &File) -> Result<usize> {
 /// Read every non-empty newline-terminated record from the buffer.
 fn read_lines(file: &File) -> Result<Vec<Vec<u8>>> {
     let mut f = file;
-    f.seek(SeekFrom::Start(0))
-        .context("seeking buffer file to read")?;
+    f.seek(SeekFrom::Start(0)).context("seeking buffer file to read")?;
     let reader = BufReader::new(f);
     let mut out = Vec::new();
     for line in reader.split(b'\n') {
@@ -391,8 +378,7 @@ fn trim_to_last(file: &File, keep: usize) -> Result<()> {
 fn rewrite_lines(file: &File, lines: &[Vec<u8>]) -> Result<()> {
     let mut f = file;
     f.set_len(0).context("truncating event buffer")?;
-    f.seek(SeekFrom::Start(0))
-        .context("seeking event buffer to start")?;
+    f.seek(SeekFrom::Start(0)).context("seeking event buffer to start")?;
     for line in lines {
         f.write_all(line).context("rewriting buffer line")?;
         f.write_all(b"\n").context("rewriting buffer terminator")?;
@@ -527,16 +513,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let buf = dir.path().join(".boss/events-pending.jsonl");
         std::fs::create_dir_all(buf.parent().unwrap()).unwrap();
-        std::fs::write(
-            &buf,
-            b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n{\"d\":4}\n",
-        )
-        .unwrap();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&buf)
-            .unwrap();
+        std::fs::write(&buf, b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n{\"d\":4}\n").unwrap();
+        let file = OpenOptions::new().read(true).write(true).open(&buf).unwrap();
         // Simulate a successful drain of the first two events: rewrite
         // with just the tail.
         let lines: Vec<Vec<u8>> = vec![b"{\"c\":3}".to_vec(), b"{\"d\":4}".to_vec()];

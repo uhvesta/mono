@@ -48,16 +48,8 @@ pub(crate) fn record_design_doc_audit(
             &before.design_doc_repo_remote_url,
             &after.design_doc_repo_remote_url,
         ),
-        (
-            "design_doc_branch",
-            &before.design_doc_branch,
-            &after.design_doc_branch,
-        ),
-        (
-            "design_doc_path",
-            &before.design_doc_path,
-            &after.design_doc_path,
-        ),
+        ("design_doc_branch", &before.design_doc_branch, &after.design_doc_branch),
+        ("design_doc_path", &before.design_doc_path, &after.design_doc_path),
     ];
     for (property, old, new) in columns {
         if old == new {
@@ -178,10 +170,7 @@ pub fn canonicalize_repo_remote_url(value: Option<String>) -> Option<String> {
 /// owns the repo. Errors when the caller violates the invariant:
 ///   - product has a repo AND caller supplied a non-empty override
 ///   - product has no repo AND caller supplied no repo
-pub(crate) fn enforce_task_repo_invariant(
-    product: &Product,
-    input_repo: Option<String>,
-) -> Result<Option<String>> {
+pub(crate) fn enforce_task_repo_invariant(product: &Product, input_repo: Option<String>) -> Result<Option<String>> {
     let canonicalized = canonicalize_repo_remote_url(input_repo);
     if let Some(product_repo) = product.repo_remote_url.as_deref() {
         if canonicalized.is_some() {
@@ -242,11 +231,7 @@ pub(crate) fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, pat
 /// (e.g. an enterprise mirror or non-GitHub host) so callers know the
 /// raw-content fast path is unavailable and should fall back to the
 /// web URL.
-pub(crate) fn render_design_doc_raw_content_url(
-    repo_remote_url: &str,
-    branch: &str,
-    path: &str,
-) -> Option<String> {
+pub(crate) fn render_design_doc_raw_content_url(repo_remote_url: &str, branch: &str, path: &str) -> Option<String> {
     // Percent-encode only `/` in branch names. Other characters legal in
     // Git branch names (alphanumeric, `-`, `_`, `.`) are safe in a query
     // string without encoding.
@@ -262,10 +247,7 @@ pub(crate) fn render_design_doc_raw_content_url(
 /// `None` when no product matches. `NULL` `repo_remote_url` rows are
 /// excluded so a freshly-created product without a URL doesn't
 /// silently match the project's pointer.
-pub(crate) fn find_product_by_repo_remote_url(
-    conn: &Connection,
-    repo_remote_url: &str,
-) -> Result<Option<String>> {
+pub(crate) fn find_product_by_repo_remote_url(conn: &Connection, repo_remote_url: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT id FROM products
          WHERE repo_remote_url IS NOT NULL AND repo_remote_url = ?1

@@ -58,7 +58,9 @@ pub struct GhAuthStatusResolver {
 
 impl Default for GhAuthStatusResolver {
     fn default() -> Self {
-        Self { gh_binary: PathBuf::from("gh") }
+        Self {
+            gh_binary: PathBuf::from("gh"),
+        }
     }
 }
 
@@ -108,7 +110,10 @@ impl TrackerCredentialResolver for GhAuthStatusResolver {
                     %detail,
                     "gh auth status failed; GitHub-bound products will be skipped until auth is restored"
                 );
-                Err(TrackerCredentialError::AuthFailed { host: host.to_owned(), detail })
+                Err(TrackerCredentialError::AuthFailed {
+                    host: host.to_owned(),
+                    detail,
+                })
             }
             other => Err(TrackerCredentialError::UnsupportedKind(other.to_owned())),
         }
@@ -135,7 +140,10 @@ pub struct KeychainOAuthResolver {
 
 impl KeychainOAuthResolver {
     pub fn new(store: KeychainTokenStore) -> Self {
-        Self { store, fallback: GhAuthStatusResolver::default() }
+        Self {
+            store,
+            fallback: GhAuthStatusResolver::default(),
+        }
     }
 
     /// Test constructor: supply a custom fallback resolver (e.g. one pointing

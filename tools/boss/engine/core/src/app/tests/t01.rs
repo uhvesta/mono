@@ -1,6 +1,6 @@
-use super::*;
 use super::super::server::process_group_signal_target;
 use super::super::worker_events::extract_last_assistant_text;
+use super::*;
 
 #[test]
 fn process_group_signal_target_negates_pgid_for_live_pid() {
@@ -77,22 +77,12 @@ async fn reap_worker_process_tree_kills_orphan_child() {
     );
 }
 
-
 #[test]
 fn coalesces_same_topic_into_a_single_pending_envelope() {
     let mut q = SessionQueue::new();
-    assert_eq!(
-        q.enqueue(topic_envelope("work.products", 1)),
-        EnqueueOutcome::Enqueued
-    );
-    assert_eq!(
-        q.enqueue(topic_envelope("work.products", 2)),
-        EnqueueOutcome::Coalesced
-    );
-    assert_eq!(
-        q.enqueue(topic_envelope("work.products", 3)),
-        EnqueueOutcome::Coalesced
-    );
+    assert_eq!(q.enqueue(topic_envelope("work.products", 1)), EnqueueOutcome::Enqueued);
+    assert_eq!(q.enqueue(topic_envelope("work.products", 2)), EnqueueOutcome::Coalesced);
+    assert_eq!(q.enqueue(topic_envelope("work.products", 3)), EnqueueOutcome::Coalesced);
     assert_eq!(q.items.len(), 1);
     let env = q.pop_front().unwrap();
     assert_eq!(env.revision, Some(3));
@@ -139,16 +129,10 @@ fn enqueue_marks_slow_when_queue_is_full() {
             EnqueueOutcome::Enqueued
         );
     }
-    assert_eq!(
-        q.enqueue(response_envelope("overflow")),
-        EnqueueOutcome::Slow
-    );
+    assert_eq!(q.enqueue(response_envelope("overflow")), EnqueueOutcome::Slow);
     assert!(q.slow);
     // Subsequent enqueues continue to report Slow.
-    assert_eq!(
-        q.enqueue(response_envelope("after-overflow")),
-        EnqueueOutcome::Slow
-    );
+    assert_eq!(q.enqueue(response_envelope("after-overflow")), EnqueueOutcome::Slow);
 }
 
 #[test]
@@ -205,9 +189,7 @@ async fn broker_publish_disconnects_slow_subscriber() {
 
     let broker = TopicBroker::default();
     broker.register_session("session-1", sink.clone()).await;
-    broker
-        .subscribe("session-1", &["work.products".to_owned()])
-        .await;
+    broker.subscribe("session-1", &["work.products".to_owned()]).await;
 
     // Publishing one more event should overflow and trigger shutdown.
     broker
@@ -224,7 +206,6 @@ async fn broker_publish_disconnects_slow_subscriber() {
     assert!(!inner.sinks.contains_key("session-1"));
     assert!(!inner.sessions_by_topic.contains_key("work.products"));
 }
-
 
 /// The engine-health helper must surface a
 /// `missing_anthropic_api_key` issue when the agent config
@@ -260,7 +241,10 @@ async fn engine_health_report_flags_missing_anthropic_api_key() {
 #[tokio::test]
 async fn engine_health_report_is_empty_when_api_key_present() {
     let temp = tempfile::tempdir().unwrap();
-    let work = crate::config::WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build();
+    let work = crate::config::WorkConfig::builder()
+        .cwd(temp.path().to_path_buf())
+        .db_path(temp.path().join("state.db"))
+        .build();
     let agent = crate::config::AgentConfig {
         anthropic_api_key: Some("sk-test".to_owned()),
         cube: crate::config::CubeConfig {
@@ -334,8 +318,7 @@ async fn get_engine_version_response_matches_swift_app_parser() {
     // emits. Using a literal here (not a Rust struct) so a serde
     // refactor that broke wire compatibility couldn't sneak past
     // a round-trip test.
-    let request =
-        b"{\"request_id\":\"version-check\",\"payload\":{\"type\":\"get_engine_version\"}}\n";
+    let request = b"{\"request_id\":\"version-check\",\"payload\":{\"type\":\"get_engine_version\"}}\n";
     write_half.write_all(request).await.unwrap();
     write_half.flush().await.unwrap();
 
@@ -405,10 +388,7 @@ async fn send_to_app_round_trips_via_deliver_response() {
 
     // Pull the EngineRequest event off the sink; that gives us
     // the request_id the engine assigned.
-    let envelope = sink
-        .next()
-        .await
-        .expect("an EngineRequest event should be enqueued");
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let request_id = match &envelope.payload {
         FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
         other => panic!("expected EngineRequest, got {other:?}"),
@@ -451,12 +431,10 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
     let send = tokio::spawn(async move {
         server_clone
             .send_to_app(
-                EngineToAppRequest::ReleaseWorkerPane(
-                    crate::protocol::ReleaseWorkerPaneInput {
-                        slot_id: 1,
-                        kill_grace_seconds: 2,
-                    },
-                ),
+                EngineToAppRequest::ReleaseWorkerPane(crate::protocol::ReleaseWorkerPaneInput {
+                    slot_id: 1,
+                    kill_grace_seconds: 2,
+                }),
                 Duration::from_secs(5),
             )
             .await
@@ -467,9 +445,7 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
     let _ = sink.next().await;
 
     // Simulate the app session disconnecting.
-    server_state
-        .drop_app_session_if_matches("session-app")
-        .await;
+    server_state.drop_app_session_if_matches("session-app").await;
 
     let response = send.await.expect("send task panicked").expect("ok");
     match response {
@@ -487,9 +463,7 @@ async fn send_to_app_resolves_app_disconnected_on_session_drop() {
 async fn send_to_app_times_out_when_app_silent() {
     let server_state = test_server_state();
     let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink)
-        .await;
+    server_state.register_app_session("session-app".into(), sink).await;
 
     let result = server_state
         .send_to_app(
@@ -538,9 +512,7 @@ async fn second_register_invalidates_first() {
     // A second registration replaces the first and resolves
     // pending requests as AppDisconnected.
     let second_sink = make_session_sink();
-    server_state
-        .register_app_session("session-2".into(), second_sink)
-        .await;
+    server_state.register_app_session("session-2".into(), second_sink).await;
 
     let response = in_flight.await.expect("send task").expect("ok");
     match response {
@@ -719,10 +691,7 @@ async fn release_worker_pane_releases_matching_worker_pool_slot() {
         "WorkerPool slot must be freed once the libghostty pane is released",
     );
     // And the next claim lands on the same slot.
-    let re_claimed = pool
-        .claim_worker("exec-2", None)
-        .await
-        .expect("slot 1 is free");
+    let re_claimed = pool.claim_worker("exec-2", None).await.expect("slot 1 is free");
     assert_eq!(re_claimed, "worker-1");
 }
 
@@ -762,9 +731,7 @@ async fn release_worker_pane_pool_release_is_idempotent() {
 async fn focus_worker_pane_unknown_run_returns_unknown_run() {
     let server_state = test_server_state();
     let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink)
-        .await;
+    server_state.register_app_session("session-app".into(), sink).await;
     let err = server_state
         .focus_worker_pane("never-allocated")
         .await
@@ -779,9 +746,7 @@ async fn focus_worker_pane_round_trips_to_app() {
     // the registered app session, and surfaces the slot id once
     // the app replies success.
     let server_state = test_server_state();
-    server_state
-        .worker_registry
-        .register_run_slot("run-focus", 5);
+    server_state.worker_registry.register_run_slot("run-focus", 5);
 
     let sink = make_session_sink();
     server_state
@@ -791,15 +756,9 @@ async fn focus_worker_pane_round_trips_to_app() {
     let server_clone = server_state.clone();
     let focus = tokio::spawn(async move { server_clone.focus_worker_pane("run-focus").await });
 
-    let envelope = sink
-        .next()
-        .await
-        .expect("an EngineRequest event should be enqueued");
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let (request_id, request) = match envelope.payload {
-        FrontendEvent::EngineRequest {
-            request_id,
-            request,
-        } => (request_id, request),
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
         other => panic!("expected EngineRequest, got {other:?}"),
     };
     match request {
@@ -826,9 +785,7 @@ async fn focus_worker_pane_round_trips_to_app() {
 #[tokio::test]
 async fn focus_worker_pane_surfaces_app_error() {
     let server_state = test_server_state();
-    server_state
-        .worker_registry
-        .register_run_slot("run-focus", 3);
+    server_state.worker_registry.register_run_slot("run-focus", 3);
 
     let sink = make_session_sink();
     server_state
@@ -865,9 +822,7 @@ async fn focus_worker_pane_surfaces_app_error() {
 async fn send_input_to_worker_unknown_run_returns_unknown_run() {
     let server_state = test_server_state();
     let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink)
-        .await;
+    server_state.register_app_session("session-app".into(), sink).await;
     let err = server_state
         .send_input_to_worker("never-allocated", "/help\n".into())
         .await
@@ -882,9 +837,7 @@ async fn send_input_to_worker_round_trips_to_app() {
     // the text payload to the registered app session, and
     // surfaces the slot id once the app replies success.
     let server_state = test_server_state();
-    server_state
-        .worker_registry
-        .register_run_slot("run-send", 7);
+    server_state.worker_registry.register_run_slot("run-send", 7);
 
     let sink = make_session_sink();
     server_state
@@ -892,21 +845,11 @@ async fn send_input_to_worker_round_trips_to_app() {
         .await;
 
     let server_clone = server_state.clone();
-    let send = tokio::spawn(async move {
-        server_clone
-            .send_input_to_worker("run-send", "/help\n".into())
-            .await
-    });
+    let send = tokio::spawn(async move { server_clone.send_input_to_worker("run-send", "/help\n".into()).await });
 
-    let envelope = sink
-        .next()
-        .await
-        .expect("an EngineRequest event should be enqueued");
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let (request_id, request) = match envelope.payload {
-        FrontendEvent::EngineRequest {
-            request_id,
-            request,
-        } => (request_id, request),
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
         other => panic!("expected EngineRequest, got {other:?}"),
     };
     match request {
@@ -934,9 +877,7 @@ async fn send_input_to_worker_round_trips_to_app() {
 #[tokio::test]
 async fn send_input_to_worker_surfaces_app_error() {
     let server_state = test_server_state();
-    server_state
-        .worker_registry
-        .register_run_slot("run-send", 2);
+    server_state.worker_registry.register_run_slot("run-send", 2);
 
     let sink = make_session_sink();
     server_state
@@ -944,11 +885,7 @@ async fn send_input_to_worker_surfaces_app_error() {
         .await;
 
     let server_clone = server_state.clone();
-    let send = tokio::spawn(async move {
-        server_clone
-            .send_input_to_worker("run-send", "hi\n".into())
-            .await
-    });
+    let send = tokio::spawn(async move { server_clone.send_input_to_worker("run-send", "hi\n".into()).await });
 
     let envelope = sink.next().await.expect("EngineRequest enqueued");
     let request_id = match envelope.payload {
@@ -977,9 +914,7 @@ async fn send_input_to_worker_surfaces_app_error() {
 async fn interrupt_worker_pane_unknown_run_returns_unknown_run() {
     let server_state = test_server_state();
     let sink = make_session_sink();
-    server_state
-        .register_app_session("session-app".into(), sink)
-        .await;
+    server_state.register_app_session("session-app".into(), sink).await;
     let err = server_state
         .interrupt_worker_pane("never-allocated")
         .await
@@ -1002,18 +937,11 @@ async fn interrupt_worker_pane_round_trips_to_app() {
         .await;
 
     let server_clone = server_state.clone();
-    let interrupt =
-        tokio::spawn(async move { server_clone.interrupt_worker_pane("run-int").await });
+    let interrupt = tokio::spawn(async move { server_clone.interrupt_worker_pane("run-int").await });
 
-    let envelope = sink
-        .next()
-        .await
-        .expect("an EngineRequest event should be enqueued");
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let (request_id, request) = match envelope.payload {
-        FrontendEvent::EngineRequest {
-            request_id,
-            request,
-        } => (request_id, request),
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
         other => panic!("expected EngineRequest, got {other:?}"),
     };
     match request {
@@ -1033,10 +961,7 @@ async fn interrupt_worker_pane_round_trips_to_app() {
         )
         .await;
 
-    let slot = interrupt
-        .await
-        .expect("interrupt task")
-        .expect("interrupt ok");
+    let slot = interrupt.await.expect("interrupt task").expect("interrupt ok");
     assert_eq!(slot, 6);
 }
 
@@ -1051,8 +976,7 @@ async fn interrupt_worker_pane_surfaces_app_error() {
         .await;
 
     let server_clone = server_state.clone();
-    let interrupt =
-        tokio::spawn(async move { server_clone.interrupt_worker_pane("run-int").await });
+    let interrupt = tokio::spawn(async move { server_clone.interrupt_worker_pane("run-int").await });
 
     let envelope = sink.next().await.expect("EngineRequest enqueued");
     let request_id = match envelope.payload {
@@ -1070,10 +994,7 @@ async fn interrupt_worker_pane_surfaces_app_error() {
         )
         .await;
 
-    let err = interrupt
-        .await
-        .expect("interrupt task")
-        .expect_err("expect err");
+    let err = interrupt.await.expect("interrupt task").expect_err("expect err");
     match err {
         InterruptPaneError::App(EngineToAppError::UnknownSlot) => {}
         other => panic!("expected App(UnknownSlot), got {other:?}"),
@@ -1110,7 +1031,10 @@ fn set_boss_pid_round_trips() {
 fn server_state_with_app_pid(app_pid: libc::pid_t) -> Arc<ServerState> {
     let temp = tempfile::tempdir().unwrap();
     let cfg = Arc::new(RuntimeConfig::from_parts(
-        crate::config::WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(temp.path().join("state.db")).build(),
+        crate::config::WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(temp.path().join("state.db"))
+            .build(),
         None,
     ));
     std::mem::forget(temp);
@@ -1146,9 +1070,7 @@ fn app_or_boss_admits_worker_descendant() {
     // siblings under the app), even though BossOnly does not.
     let self_pid = std::process::id() as libc::pid_t;
     let server_state = server_state_with_app_pid(self_pid);
-    server_state
-        .worker_registry
-        .register(self_pid, "fake-run".to_owned());
+    server_state.worker_registry.register(self_pid, "fake-run".to_owned());
     assert!(
         server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
         "AppOrBoss must accept worker-pane descendants so `bossctl agents stop` works from a slot",
@@ -1178,18 +1100,9 @@ fn reaped_child_pid() -> libc::pid_t {
 #[test]
 fn pid_is_alive_true_for_self_false_for_reaped_child() {
     let self_pid = std::process::id() as libc::pid_t;
-    assert!(
-        pid_is_alive(self_pid),
-        "the current process must read as alive"
-    );
-    assert!(
-        !pid_is_alive(0),
-        "pid 0 must never read as a live trust root"
-    );
-    assert!(
-        !pid_is_alive(reaped_child_pid()),
-        "a reaped child must read as dead"
-    );
+    assert!(pid_is_alive(self_pid), "the current process must read as alive");
+    assert!(!pid_is_alive(0), "pid 0 must never read as a live trust root");
+    assert!(!pid_is_alive(reaped_child_pid()), "a reaped child must read as dead");
 }
 
 #[test]
@@ -1224,11 +1137,7 @@ fn register_trust_accepts_matching_pid_and_rejects_unknown_live_pid() {
     ));
     // A connection with no observable peer pid against a real trust
     // root is rejected.
-    assert!(!register_app_session_trust_ok(
-        Some(self_pid),
-        None,
-        engine_pid
-    ));
+    assert!(!register_app_session_trust_ok(Some(self_pid), None, engine_pid));
 }
 
 #[cfg(target_os = "macos")]
@@ -1280,9 +1189,7 @@ fn boss_only_rejects_worker_descendant_when_boss_pid_unregistered() {
     // pid in the WorkerRegistry. The auth check walks its own
     // ancestor chain looking for any registered worker pid; the
     // self-as-worker case hits on the first walk step.
-    server_state
-        .worker_registry
-        .register(self_pid, "fake-run".to_owned());
+    server_state.worker_registry.register(self_pid, "fake-run".to_owned());
     assert!(
         !server_state.authorize_rpc(RpcTier::BossOnly, Some(self_pid)),
         "BossOnly must reject callers descending from a registered worker pid",
@@ -1369,9 +1276,7 @@ fn app_or_boss_rejects_worker_descendant_outside_app_subtree() {
     // (launchd/init) would NOT work because all processes descend from it.
     let server_state = server_state_with_app_pid(i32::MAX);
     let self_pid = std::process::id() as libc::pid_t;
-    server_state
-        .worker_registry
-        .register(self_pid, "fake-run".to_owned());
+    server_state.worker_registry.register(self_pid, "fake-run".to_owned());
     assert!(
         !server_state.authorize_rpc(RpcTier::AppOrBoss, Some(self_pid)),
         "AppOrBoss must reject worker descendants even when they sit outside the app/Boss subtrees",
@@ -1386,12 +1291,8 @@ fn queue_probe_mints_unique_probe_ids() {
     assert_ne!(id_one, id_two, "probe ids must be unique per call");
     assert!(id_one.starts_with("probe-"));
     assert!(id_two.starts_with("probe-"));
-    let popped_one = server_state
-        .pop_pending_probe("run-x")
-        .expect("first probe present");
-    let popped_two = server_state
-        .pop_pending_probe("run-x")
-        .expect("second probe present");
+    let popped_one = server_state.pop_pending_probe("run-x").expect("first probe present");
+    let popped_two = server_state.pop_pending_probe("run-x").expect("second probe present");
     assert_eq!(popped_one.probe_id, id_one);
     assert_eq!(popped_one.text, "first");
     assert_eq!(popped_two.probe_id, id_two);
@@ -1432,10 +1333,7 @@ fn extract_last_assistant_text_returns_none_when_no_assistant_turn() {
 #[test]
 fn extract_last_assistant_text_skips_unparseable_lines() {
     let chunk = "this is not json\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"survived\"}]}}\n";
-    assert_eq!(
-        extract_last_assistant_text(chunk).as_deref(),
-        Some("survived"),
-    );
+    assert_eq!(extract_last_assistant_text(chunk).as_deref(), Some("survived"),);
 }
 
 #[tokio::test]
@@ -1483,11 +1381,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let transcript_dir = tempfile::tempdir().unwrap();
     let transcript_path = transcript_dir.path().join("transcript.jsonl");
@@ -1517,9 +1411,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
     // has a target for `SendToPane`. In production BOSS_RUN_ID carries
     // execution.id (exec_*), not run.id (run_*).
-    server_state
-        .worker_registry
-        .register_run_slot(execution.id.clone(), 1);
+    server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
 
     // Subscribe a session to the per-run probe topic and pin the
     // ServerState so probe pushes have somewhere to land.
@@ -1589,12 +1481,8 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     // Append an assistant turn — the worker has now "replied".
     {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&transcript_path)
-            .unwrap();
-        let line =
-            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the answer\"}]}}";
+        let mut file = std::fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        let line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"the answer\"}]}}";
         writeln!(file, "{line}").unwrap();
     }
 
@@ -1613,10 +1501,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     };
     dispatch_probe_reply_on_stop(&server_state, &second_stop).await;
 
-    let envelope = sink
-        .next()
-        .await
-        .expect("ProbeReplied envelope should be published");
+    let envelope = sink.next().await.expect("ProbeReplied envelope should be published");
     match envelope.payload {
         FrontendEvent::ProbeReplied {
             run_id: emitted_run,
@@ -1649,10 +1534,7 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
 /// first.
 #[tokio::test]
 async fn probe_queued_for_idle_worker_dispatches_immediately() {
-    use boss_protocol::{
-        CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity,
-        WorkerEvent,
-    };
+    use boss_protocol::{CreateChoreInput, CreateProductInput, RequestExecutionInput, WorkerActivity, WorkerEvent};
 
     let server_state = test_server_state();
 
@@ -1685,11 +1567,7 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let run = server_state
         .work_db
@@ -1707,16 +1585,10 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         .unwrap();
 
     // Register slot and set activity to Idle (worker between turns).
+    server_state.worker_registry.register_run_slot(run.id.clone(), 1);
     server_state
-        .worker_registry
-        .register_run_slot(run.id.clone(), 1);
-    server_state.live_worker_states.register_spawn(
-        1,
-        run.id.clone(),
-        "claude-opus-4-7",
-        0,
-        None,
-    );
+        .live_worker_states
+        .register_spawn(1, run.id.clone(), "claude-opus-4-7", 0, None);
     // Apply a Stop event to transition Spawning → Idle.
     server_state.live_worker_states.apply_event(
         1,
@@ -1739,10 +1611,7 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
         .await;
     let server_for_app = server_state.clone();
     let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane must arrive for idle worker");
+        let envelope = app_sink.next().await.expect("SendToPane must arrive for idle worker");
         let request_id = match &envelope.payload {
             FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
             other => panic!("expected EngineRequest, got {other:?}"),
@@ -1816,11 +1685,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         .unwrap();
     let execution = server_state
         .work_db
-        .request_execution(
-            RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
-        )
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
         .unwrap();
     let run = server_state
         .work_db
@@ -1837,9 +1702,7 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         })
         .unwrap();
 
-    server_state
-        .worker_registry
-        .register_run_slot(run.id.clone(), 1);
+    server_state.worker_registry.register_run_slot(run.id.clone(), 1);
 
     // Queue a probe manually (simulating what the completion handler does)
     // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.

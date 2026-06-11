@@ -57,12 +57,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Auth { verbose } => commands::auth::run(verbose).await?,
-        Command::Accounts(common) => {
-            commands::accounts::run(common.username.as_deref(), &common.account).await?
-        }
-        Command::Status(common) => {
-            commands::status::run(common.username.as_deref(), &common.account).await?
-        }
+        Command::Accounts(common) => commands::accounts::run(common.username.as_deref(), &common.account).await?,
+        Command::Status(common) => commands::status::run(common.username.as_deref(), &common.account).await?,
         Command::Positions(positions) => {
             commands::positions::run(
                 positions.common.username.as_deref(),
@@ -98,14 +94,7 @@ mod tests {
 
     #[test]
     fn status_allows_overriding_common_flags() {
-        let cli = Cli::parse_from([
-            "hood",
-            "status",
-            "--username",
-            "alice",
-            "--account",
-            "12345678",
-        ]);
+        let cli = Cli::parse_from(["hood", "status", "--username", "alice", "--account", "12345678"]);
 
         match cli.command {
             Command::Status(common) => {

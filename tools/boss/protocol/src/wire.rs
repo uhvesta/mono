@@ -3,22 +3,18 @@ use serde::{Deserialize, Serialize};
 use crate::engine_app::{EngineToAppRequest, EngineToAppResponse};
 use crate::health_wire::EngineHealthReport;
 use crate::host_registry_wire::HostSnapshot;
-use crate::metrics_wire::MetricLiveEntry;
 use crate::live_worker_state::LiveWorkerState;
+use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun,
-    CiBudgetSnapshot, CiRemediation, CommentAnchor, ConflictResolution, CreateAttentionInput,
-    CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateExecutionInput, CreateInvestigationInput, MagicWandDispatch,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRevisionInput, CreateRunInput, CreateTaskInput, DependencyFilter,
-    EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto,
-    LinkExternalRefInput, ListDependenciesInput,
-    PrWorkItemMatch, Product, Project, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment,
-    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationPatch, AutomationRun, CiBudgetSnapshot,
+    CiRemediation, CommentAnchor, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
+    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateRunInput, CreateTaskInput, DependencyFilter, EditorialAction, EngineAttemptListEntry, GitHubAuthStateDto,
+    LinkExternalRefInput, ListDependenciesInput, MagicWandDispatch, PrWorkItemMatch, Product, Project,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
 };
 
@@ -108,11 +104,7 @@ impl FrontendEventEnvelope {
         }
     }
 
-    pub fn response_with_revision(
-        request_id: impl Into<String>,
-        revision: u64,
-        payload: FrontendEvent,
-    ) -> Self {
+    pub fn response_with_revision(request_id: impl Into<String>, revision: u64, payload: FrontendEvent) -> Self {
         Self {
             request_id: Some(request_id.into()),
             revision: Some(revision),
@@ -579,17 +571,23 @@ pub enum FrontendRequest {
     /// effective value the engine uses, and the live
     /// `tasks.ci_attempts_used` counter. Backs the
     /// `boss engine ci budget show <work-item-id>` verb.
-    GetCiBudget { work_item_id: String },
+    GetCiBudget {
+        work_item_id: String,
+    },
 
     /// Read-only: fetch a single `ci_remediations` row by id. Returns
     /// [`FrontendEvent::CiRemediation`] on success and
     /// [`FrontendEvent::WorkError`] when the id is unknown.
-    GetCiRemediation { attempt_id: String },
+    GetCiRemediation {
+        attempt_id: String,
+    },
 
     /// Read-only: fetch a single attempt row by id. Returns
     /// [`FrontendEvent::ConflictResolution`] on success and
     /// [`FrontendEvent::WorkError`] when the id is unknown.
-    GetConflictResolution { attempt_id: String },
+    GetConflictResolution {
+        attempt_id: String,
+    },
 
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
@@ -996,14 +994,18 @@ pub enum FrontendRequest {
     /// lockstep; a direct SQLite write would leave the atomic stale
     /// until the next flush. Replies with
     /// [`FrontendEvent::MetricsResetDone`].
-    MetricsReset { name: Option<String> },
+    MetricsReset {
+        name: Option<String>,
+    },
 
     /// Read a single metric's current in-memory value, bypassing the
     /// 30s flush-staleness window. Used by `bossctl metrics show
     /// --live`. The engine replies with
     /// [`FrontendEvent::MetricsShowLiveResult`]; `entry` is `None`
     /// when no counter or gauge with `name` is registered.
-    MetricsShowLive { name: String },
+    MetricsShowLive {
+        name: String,
+    },
 
     /// App asks the engine to lease a workspace for the given Review-
     /// column work item, fetch the PR branch, and create a fresh jj
@@ -1130,7 +1132,9 @@ pub enum FrontendRequest {
     /// execution list to populate
     /// [`ProjectDesignDocState::Resolved::workspace_path`].
     /// No DB writes; no topic events.
-    ResolveProjectDesignDoc { project_id: String },
+    ResolveProjectDesignDoc {
+        project_id: String,
+    },
 
     /// Inverse of [`Self::DeleteWorkItem`]: clear the `deleted_at`
     /// tombstone on a soft-deleted task, making it visible again. The
@@ -1162,7 +1166,9 @@ pub enum FrontendRequest {
     /// (`pending` / `running`) is rejected. The parent work item is
     /// re-flipped to `blocked: merge_conflict` and the new
     /// `blocked_attempt_id` points at the reset row. See Phase 5 #13.
-    RetryConflictResolution { attempt_id: String },
+    RetryConflictResolution {
+        attempt_id: String,
+    },
 
     /// Boss-tier RPC: ask the macOS app to scroll the kanban to a
     /// specific work item's card and play a short transient highlight.
@@ -1226,7 +1232,10 @@ pub enum FrontendRequest {
     /// ([`FrontendEvent::FeatureFlagSet`]) confirms the persisted
     /// state and is the round-trip "the engine has reloaded" signal
     /// the debug pane uses to render the toggle as committed.
-    SetFeatureFlag { name: String, enabled: bool },
+    SetFeatureFlag {
+        name: String,
+        enabled: bool,
+    },
 
     /// Enable or disable a registered host. Disabled hosts receive no
     /// new work dispatches. Replies with [`FrontendEvent::HostUpdated`]
@@ -1299,7 +1308,10 @@ pub enum FrontendRequest {
     /// `settings.toml` atomically; consumer-side reads see the new
     /// value the moment this returns. The reply
     /// ([`FrontendEvent::SettingSet`]) confirms the persisted value.
-    SetSetting { key: String, enabled: bool },
+    SetSetting {
+        key: String,
+        enabled: bool,
+    },
 
     /// Token-authenticated shutdown. The engine writes a random token
     /// to `~/Library/Application Support/Boss/engine-control.token`
@@ -2032,13 +2044,18 @@ pub enum FrontendEvent {
     /// of every registered engine feature flag plus its current
     /// effective value. Order is registry order so the debug pane
     /// renders flags in a stable, predictable sequence.
-    FeatureFlagsList { flags: Vec<FeatureFlagSnapshot> },
+    FeatureFlagsList {
+        flags: Vec<FeatureFlagSnapshot>,
+    },
     /// Response to [`FrontendRequest::SetFeatureFlag`]: the engine has
     /// updated and persisted the named flag to `enabled`. Receiving
     /// this event is the debug pane's "reload confirmed" signal — the
     /// new value is in effect immediately for all subsequent
     /// consumer-side checks.
-    FeatureFlagSet { name: String, enabled: bool },
+    FeatureFlagSet {
+        name: String,
+        enabled: bool,
+    },
     /// Response to [`FrontendRequest::GetEngineVersion`]: identifies
     /// the running engine binary. `binary_fingerprint` is the most
     /// reliable signal — it is a truncated SHA-256 of the engine
@@ -2063,36 +2080,53 @@ pub enum FrontendEvent {
     },
     /// Response to [`FrontendRequest::GetSettings`]: a snapshot of every
     /// registered per-installation setting and its current value.
-    SettingsList { settings: Vec<SettingSnapshot> },
+    SettingsList {
+        settings: Vec<SettingSnapshot>,
+    },
     /// Response to [`FrontendRequest::SetSetting`]: the engine has
     /// persisted the new value. The macOS Settings window uses this as
     /// the "saved" signal to commit the toggle state.
-    SettingSet { key: String, enabled: bool },
+    SettingSet {
+        key: String,
+        enabled: bool,
+    },
     /// Response to [`FrontendRequest::ListHosts`]: every registered
     /// host (including `local`) with its capabilities.
-    HostsList { hosts: Vec<HostSnapshot> },
+    HostsList {
+        hosts: Vec<HostSnapshot>,
+    },
     /// Response to [`FrontendRequest::GetHost`] or
     /// [`FrontendRequest::AddHost`]: one host with all capabilities.
-    HostResult { host: HostSnapshot },
+    HostResult {
+        host: HostSnapshot,
+    },
     /// Response to [`FrontendRequest::SetHostEnabled`],
     /// [`FrontendRequest::AddHostTag`], or
     /// [`FrontendRequest::RemoveHostTag`]: the updated host snapshot.
-    HostUpdated { host: HostSnapshot },
+    HostUpdated {
+        host: HostSnapshot,
+    },
     /// Response to [`FrontendRequest::RemoveHost`]: the host has been
     /// deleted. `id` is the id that was removed.
-    HostRemoved { id: String },
+    HostRemoved {
+        id: String,
+    },
     /// Response to [`FrontendRequest::MetricsShowLive`]: the
     /// in-memory snapshot for `name`. `entry` is `None` when no
     /// counter or gauge with that name is registered in the current
     /// engine binary.
-    MetricsShowLiveResult { entry: Option<MetricLiveEntry> },
+    MetricsShowLiveResult {
+        entry: Option<MetricLiveEntry>,
+    },
     /// Response to [`FrontendRequest::MetricsListLive`]: every
     /// registered counter and gauge as a flat list, sorted by name.
     /// Stale entries (rehydrated from `state.db` but no matching
     /// handle in the current binary) are included so the debug pane
     /// can surface historical values. Counters and gauges are
     /// interleaved in name order — the `kind` field distinguishes them.
-    MetricsListLiveResult { entries: Vec<MetricLiveEntry> },
+    MetricsListLiveResult {
+        entries: Vec<MetricLiveEntry>,
+    },
     /// Response to [`FrontendRequest::MetricsReset`]. Reports how
     /// many counters and gauges were zeroed so the caller can print a
     /// meaningful confirmation. `name = None` means "all" was
@@ -2107,7 +2141,9 @@ pub enum FrontendEvent {
     /// poller; `false` when the kick was dropped because the engine
     /// has not yet started the poller (race at startup — treat as a
     /// no-op).
-    PrReconcilersKicked { kicked: bool },
+    PrReconcilersKicked {
+        kicked: bool,
+    },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
     /// and, when paused, the epoch-seconds timestamp at which it was set.
@@ -2122,7 +2158,9 @@ pub enum FrontendEvent {
     /// for the named product. The pass runs synchronously; this event
     /// is the "pass started" confirmation rather than a streaming
     /// progress push.
-    ExternalTrackerSyncStarted { product_id: String },
+    ExternalTrackerSyncStarted {
+        product_id: String,
+    },
     /// Response to [`FrontendRequest::ListCiRemediations`]: the
     /// filtered set of `ci_remediations` rows, ordered freshest-first.
     CiRemediationsList {
@@ -2422,17 +2460,13 @@ pub enum TopicEventPayload {
     /// An editorial hook decision was recorded for a product's execution.
     /// Emitted to the `"editorial_actions.<product_id>"` topic so the UI
     /// can badge product cards when actions accumulate.
-    WorkEditorialAction {
-        action: EditorialAction,
-    },
+    WorkEditorialAction { action: EditorialAction },
 }
 
 #[cfg(test)]
 mod editorial_controls_tests {
     use super::*;
-    use crate::types::{
-        BranchNaming, EditorialRules, RedactionKind, RedactionRule, TemplatePolicy, TrailerPolicy,
-    };
+    use crate::types::{BranchNaming, EditorialRules, RedactionKind, RedactionRule, TemplatePolicy, TrailerPolicy};
 
     #[test]
     fn editorial_rules_defaults_deserialize_from_empty_object() {
@@ -2456,7 +2490,9 @@ mod editorial_controls_tests {
                 kind: RedactionKind::Rewrite,
             }],
             template_policy: TemplatePolicy::Enforce,
-            branch_naming: BranchNaming::CustomPrefix { prefix: "bduff/".into() },
+            branch_naming: BranchNaming::CustomPrefix {
+                prefix: "bduff/".into(),
+            },
             commit_trailer_policy: TrailerPolicy::NoAiTrailer,
         };
         let json = serde_json::to_string(&rules).unwrap();
@@ -2606,7 +2642,9 @@ mod editorial_controls_tests {
 
     #[test]
     fn branch_naming_custom_prefix_round_trips() {
-        let naming = BranchNaming::CustomPrefix { prefix: "bduff/".into() };
+        let naming = BranchNaming::CustomPrefix {
+            prefix: "bduff/".into(),
+        };
         let json = serde_json::to_string(&naming).unwrap();
         assert!(json.contains("custom_prefix"), "serialized: {json}");
         assert!(json.contains("bduff/"), "serialized: {json}");
@@ -2638,7 +2676,11 @@ mod editorial_controls_tests {
         assert!(json.contains("\"review_slots\":8"), "serialized: {json}");
         let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            FrontendEvent::EnginePoolConfig { worker_slots, automation_slots, review_slots } => {
+            FrontendEvent::EnginePoolConfig {
+                worker_slots,
+                automation_slots,
+                review_slots,
+            } => {
                 assert_eq!(worker_slots, 8);
                 assert_eq!(automation_slots, 3);
                 assert_eq!(review_slots, 8);
@@ -2658,13 +2700,11 @@ mod editorial_controls_tests {
         // that `editorial_rules: null` from an absent product column
         // deserialises to `None`.
         let json_with = serde_json::json!({ "editorial_rules": rules });
-        let rules_back: EditorialRules =
-            serde_json::from_value(json_with["editorial_rules"].clone()).unwrap();
+        let rules_back: EditorialRules = serde_json::from_value(json_with["editorial_rules"].clone()).unwrap();
         assert_eq!(rules_back, rules);
 
         let json_null = serde_json::json!({ "editorial_rules": null });
-        let opt: Option<EditorialRules> =
-            serde_json::from_value(json_null["editorial_rules"].clone()).unwrap();
+        let opt: Option<EditorialRules> = serde_json::from_value(json_null["editorial_rules"].clone()).unwrap();
         assert!(opt.is_none());
     }
 }
@@ -2773,13 +2813,16 @@ mod feature_flags_wire_tests {
                 stale: true,
             },
         ];
-        let original =
-            FrontendEvent::MetricsListLiveResult { entries: entries.clone() };
+        let original = FrontendEvent::MetricsListLiveResult {
+            entries: entries.clone(),
+        };
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("metrics_list_live_result"), "serialized: {json}");
         let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            FrontendEvent::MetricsListLiveResult { entries: parsed_entries } => {
+            FrontendEvent::MetricsListLiveResult {
+                entries: parsed_entries,
+            } => {
                 assert_eq!(parsed_entries.len(), 2);
                 assert_eq!(parsed_entries[0].name, "a.counter");
                 assert_eq!(parsed_entries[0].value, 7);
@@ -2847,7 +2890,9 @@ mod feature_flags_wire_tests {
             timestamp_ms: 1_700_000_000_000,
             stale: false,
         };
-        let original = FrontendEvent::MetricsShowLiveResult { entry: Some(entry.clone()) };
+        let original = FrontendEvent::MetricsShowLiveResult {
+            entry: Some(entry.clone()),
+        };
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("metrics_show_live_result"), "serialized: {json}");
         let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
@@ -2870,7 +2915,11 @@ mod feature_flags_wire_tests {
         assert!(json.contains("metrics_reset_done"), "serialized: {json}");
         let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            FrontendEvent::MetricsResetDone { name, counters_reset, gauges_reset } => {
+            FrontendEvent::MetricsResetDone {
+                name,
+                counters_reset,
+                gauges_reset,
+            } => {
                 assert_eq!(name.as_deref(), Some("pr_url_capture.primary_path.hit"));
                 assert_eq!(counters_reset, 1);
                 assert_eq!(gauges_reset, 0);
@@ -2933,10 +2982,7 @@ mod feature_flags_wire_tests {
             },
         };
         let json = serde_json::to_string(&original).unwrap();
-        assert!(
-            json.contains("\"kind\":\"missing_anthropic_api_key\""),
-            "{json}"
-        );
+        assert!(json.contains("\"kind\":\"missing_anthropic_api_key\""), "{json}");
         assert!(json.contains("\"severity\":\"warning\""), "{json}");
         let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
         match parsed {
@@ -2983,8 +3029,7 @@ mod sorted_request_variants_test {
         expected.sort_by_key(|s| s.to_ascii_lowercase());
 
         assert_eq!(
-            variants,
-            expected,
+            variants, expected,
             "FrontendRequest variants are not in alphabetical order. \
              Insert new variants in sorted position (do not append to the end)."
         );

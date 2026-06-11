@@ -41,13 +41,9 @@ pub struct GiantStructInfo {
 }
 
 pub fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        attr.path().is_ident("cfg")
-            && attr
-                .parse_args::<syn::Ident>()
-                .ok()
-                .is_some_and(|id| id == "test")
-    })
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") && attr.parse_args::<syn::Ident>().ok().is_some_and(|id| id == "test"))
 }
 
 /// Returns true if the struct carries a clap argument-parser derive.
@@ -58,9 +54,9 @@ pub fn has_clap_derive(attrs: &[syn::Attribute]) -> bool {
         if !attr.path().is_ident("derive") {
             continue;
         }
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) else {
+        let Ok(nested) =
+            attr.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+        else {
             continue;
         };
         for path in &nested {
@@ -68,10 +64,9 @@ pub fn has_clap_derive(attrs: &[syn::Attribute]) -> bool {
             match segs.as_slice() {
                 [seg] if CLAP_TRAITS.contains(&seg.ident.to_string().as_str()) => return true,
                 [krate, trait_seg]
-                    if krate.ident == "clap"
-                        && CLAP_TRAITS.contains(&trait_seg.ident.to_string().as_str()) =>
+                    if krate.ident == "clap" && CLAP_TRAITS.contains(&trait_seg.ident.to_string().as_str()) =>
                 {
-                    return true
+                    return true;
                 }
                 _ => {}
             }
@@ -85,9 +80,9 @@ pub fn has_required_builder(attrs: &[syn::Attribute], builder: &BuilderKind) -> 
         if !attr.path().is_ident("derive") {
             continue;
         }
-        let Ok(nested) = attr.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
-        ) else {
+        let Ok(nested) =
+            attr.parse_args_with(syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated)
+        else {
             continue;
         };
         for path in &nested {
@@ -99,10 +94,7 @@ pub fn has_required_builder(attrs: &[syn::Attribute], builder: &BuilderKind) -> 
                     }
                 }
                 BuilderKind::DeriveBuilder => {
-                    if segs.len() == 2
-                        && segs[0].ident == "derive_builder"
-                        && segs[1].ident == "Builder"
-                    {
+                    if segs.len() == 2 && segs[0].ident == "derive_builder" && segs[1].ident == "Builder" {
                         return true;
                     }
                     // Unqualified Builder is also accepted for derive_builder
@@ -180,10 +172,7 @@ pub fn collect_violations(
 ) -> Vec<String> {
     collect_giant_struct_infos(items, in_test_mod, builder, max_fields)
         .into_iter()
-        .filter(|info| {
-            !matches!(info.kind, GiantStructKind::WithBuilder)
-                && !exclude_structs.contains(&info.name)
-        })
+        .filter(|info| !matches!(info.kind, GiantStructKind::WithBuilder) && !exclude_structs.contains(&info.name))
         .map(|info| info.name)
         .collect()
 }
@@ -195,11 +184,10 @@ pub fn struct_declaration_line(source: &str, struct_name: &str) -> Option<u32> {
     for (i, line) in source.lines().enumerate() {
         let candidate = strip_visibility(line.trim_start());
         if let Some(after) = candidate.strip_prefix(&search)
-            && (after.is_empty()
-                || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '(')))
-            {
-                return Some((i + 1) as u32);
-            }
+            && (after.is_empty() || matches!(after.chars().next(), Some(' ' | '\t' | '<' | '{' | '(')))
+        {
+            return Some((i + 1) as u32);
+        }
     }
     None
 }
@@ -241,14 +229,11 @@ pub fn parse_exclude_files(patterns: Option<&[String]>) -> Result<Option<GlobSet
     }
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        let glob = Glob::new(pattern)
-            .with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
+        let glob = Glob::new(pattern).with_context(|| format!("invalid `exclude_files` pattern: {pattern}"))?;
         builder.add(glob);
     }
     Ok(Some(
-        builder
-            .build()
-            .context("failed to compile `exclude_files` patterns")?,
+        builder.build().context("failed to compile `exclude_files` patterns")?,
     ))
 }
 

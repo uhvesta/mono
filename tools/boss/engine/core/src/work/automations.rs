@@ -7,8 +7,7 @@ use super::*;
 /// Uses the repo builder convention (`bon`) since it carries 8+ fields;
 /// `Option` fields default to `None`, so a caller only sets what applies to
 /// the decision it is recording.
-#[derive(Debug, Clone)]
-#[derive(bon::Builder)]
+#[derive(Debug, Clone, bon::Builder)]
 #[builder(on(String, into))]
 pub struct AutomationFireRecord {
     pub automation_id: String,
@@ -36,10 +35,7 @@ const AUTOMATION_SELECT: &str = "
            last_fired_at, last_outcome, next_due_at
     FROM automations";
 
-pub(crate) fn query_automation(
-    conn: &Connection,
-    id: &str,
-) -> Result<Option<boss_protocol::Automation>> {
+pub(crate) fn query_automation(conn: &Connection, id: &str) -> Result<Option<boss_protocol::Automation>> {
     let sql = format!("{AUTOMATION_SELECT} WHERE id = ?1");
     conn.query_row(&sql, [id], map_automation)
         .optional()
@@ -48,10 +44,7 @@ pub(crate) fn query_automation(
 
 impl WorkDb {
     /// Create a new automation and return the inserted row.
-    pub fn create_automation(
-        &self,
-        input: CreateAutomationInput,
-    ) -> Result<boss_protocol::Automation> {
+    pub fn create_automation(&self, input: CreateAutomationInput) -> Result<boss_protocol::Automation> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         ensure_product_exists(&tx, &input.product_id)?;
@@ -61,9 +54,7 @@ impl WorkDb {
         let short_id = allocate_automation_short_id(&tx, &input.product_id)?;
         let (trigger_kind, trigger_config) = automation_trigger_to_db(&input.trigger)?;
         let repo_remote_url = canonicalize_repo_remote_url(input.repo_remote_url);
-        let created_via = input
-            .created_via
-            .unwrap_or_else(|| CREATED_VIA_UNKNOWN.to_owned());
+        let created_via = input.created_via.unwrap_or_else(|| CREATED_VIA_UNKNOWN.to_owned());
 
         tx.execute(
             "INSERT INTO automations
@@ -89,23 +80,18 @@ impl WorkDb {
             ],
         )?;
 
-        let automation = query_automation(&tx, &id)?
-            .with_context(|| format!("missing automation after insert: {id}"))?;
+        let automation =
+            query_automation(&tx, &id)?.with_context(|| format!("missing automation after insert: {id}"))?;
         tx.commit()?;
         Ok(automation)
     }
 
     /// List all automations for a product, ordered by `created_at ASC`.
-    pub fn list_automations(
-        &self,
-        product_id: &str,
-    ) -> Result<Vec<boss_protocol::Automation>> {
+    pub fn list_automations(&self, product_id: &str) -> Result<Vec<boss_protocol::Automation>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
-        let sql = format!(
-            "{AUTOMATION_SELECT} WHERE product_id = ?1 ORDER BY created_at ASC, id ASC"
-        );
+        let sql = format!("{AUTOMATION_SELECT} WHERE product_id = ?1 ORDER BY created_at ASC, id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([product_id], map_automation)?;
         collect_rows(rows)
@@ -148,11 +134,7 @@ impl WorkDb {
     }
 
     /// Apply a patch to an automation. Only `Some` fields are updated.
-    pub fn update_automation(
-        &self,
-        id: &str,
-        patch: AutomationPatch,
-    ) -> Result<boss_protocol::Automation> {
+    pub fn update_automation(&self, id: &str, patch: AutomationPatch) -> Result<boss_protocol::Automation> {
         let conn = self.connect()?;
         let existing = query_automation(&conn, id).require("automation", id)?;
 
@@ -168,8 +150,7 @@ impl WorkDb {
 
         // Build SET clauses dynamically so we only touch provided fields.
         let mut sets: Vec<String> = vec!["updated_at = ?1".to_owned()];
-        let mut params_raw: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(now.clone())];
+        let mut params_raw: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(now.clone())];
         let mut idx = 2usize;
 
         macro_rules! push_opt {
@@ -212,17 +193,13 @@ impl WorkDb {
         params_raw.push(Box::new(existing.id.clone()));
         let id_idx = idx;
 
-        let sql = format!(
-            "UPDATE automations SET {} WHERE id = ?{id_idx}",
-            sets.join(", ")
-        );
+        let sql = format!("UPDATE automations SET {} WHERE id = ?{id_idx}", sets.join(", "));
 
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_raw.iter().map(|b| b.as_ref() as &dyn rusqlite::ToSql).collect();
         conn.execute(&sql, params_refs.as_slice())?;
 
-        query_automation(&conn, id)?
-            .with_context(|| format!("missing automation after update: {id}"))
+        query_automation(&conn, id)?.with_context(|| format!("missing automation after update: {id}"))
     }
 
     /// Set `enabled = true` on an automation.
@@ -234,8 +211,7 @@ impl WorkDb {
             "UPDATE automations SET enabled = 1, updated_at = ?2 WHERE id = ?1",
             params![id, now],
         )?;
-        query_automation(&conn, id)?
-            .with_context(|| format!("missing automation after enable: {id}"))
+        query_automation(&conn, id)?.with_context(|| format!("missing automation after enable: {id}"))
     }
 
     /// Set `enabled = false` on an automation.
@@ -247,8 +223,7 @@ impl WorkDb {
             "UPDATE automations SET enabled = 0, updated_at = ?2 WHERE id = ?1",
             params![id, now],
         )?;
-        query_automation(&conn, id)?
-            .with_context(|| format!("missing automation after disable: {id}"))
+        query_automation(&conn, id)?.with_context(|| format!("missing automation after disable: {id}"))
     }
 
     /// Hard-delete an automation row. Also removes any `automation_runs` rows
@@ -287,10 +262,7 @@ impl WorkDb {
     }
 
     /// List `automation_runs` rows for an automation, newest first.
-    pub fn list_automation_runs(
-        &self,
-        automation_id: &str,
-    ) -> Result<Vec<boss_protocol::AutomationRun>> {
+    pub fn list_automation_runs(&self, automation_id: &str) -> Result<Vec<boss_protocol::AutomationRun>> {
         let conn = self.connect()?;
         let _existing = query_automation(&conn, automation_id).require("automation", automation_id)?;
 
@@ -307,10 +279,7 @@ impl WorkDb {
 
     /// List tasks produced by an automation (`source_automation_id = ?`),
     /// ordered by `created_at DESC`. Includes non-deleted rows only.
-    pub fn list_tasks_for_automation(
-        &self,
-        automation_id: &str,
-    ) -> Result<Vec<boss_protocol::Task>> {
+    pub fn list_tasks_for_automation(&self, automation_id: &str) -> Result<Vec<boss_protocol::Task>> {
         let conn = self.connect()?;
         let _existing = query_automation(&conn, automation_id).require("automation", automation_id)?;
 
@@ -337,10 +306,7 @@ impl WorkDb {
     /// (`next_due_at <= now_epoch`). Ordered oldest-first for stable
     /// iteration. `now_epoch` is UTC seconds; `next_due_at` is stored as an
     /// epoch-seconds string, so the comparison casts it to INTEGER.
-    pub fn list_due_automations(
-        &self,
-        now_epoch: i64,
-    ) -> Result<Vec<boss_protocol::Automation>> {
+    pub fn list_due_automations(&self, now_epoch: i64) -> Result<Vec<boss_protocol::Automation>> {
         let conn = self.connect()?;
         let sql = format!(
             "{AUTOMATION_SELECT}
@@ -360,11 +326,7 @@ impl WorkDb {
     /// occurrence and parks it here so the next tick can fire on time.
     /// Deliberately does NOT touch `updated_at` (which tracks user/config
     /// edits) or the `last_*` fire bookkeeping.
-    pub fn initialize_automation_next_due_at(
-        &self,
-        id: &str,
-        next_due_epoch: i64,
-    ) -> Result<()> {
+    pub fn initialize_automation_next_due_at(&self, id: &str, next_due_epoch: i64) -> Result<()> {
         let conn = self.connect()?;
         conn.execute(
             "UPDATE automations SET next_due_at = ?2 WHERE id = ?1",
@@ -434,10 +396,7 @@ impl WorkDb {
     /// decision. `next_due_at` advances only when `record.next_due_at` is
     /// `Some` — a transient pre-start failure passes `None` to *hold* the
     /// occurrence for retry rather than skip past it.
-    pub fn record_automation_run_and_advance(
-        &self,
-        record: AutomationFireRecord,
-    ) -> Result<()> {
+    pub fn record_automation_run_and_advance(&self, record: AutomationFireRecord) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
 
@@ -516,11 +475,7 @@ impl WorkDb {
                     "UPDATE automations
                         SET last_fired_at = ?2, last_outcome = ?3
                       WHERE id = ?1",
-                    params![
-                        record.automation_id,
-                        record.started_at.to_string(),
-                        record.outcome,
-                    ],
+                    params![record.automation_id, record.started_at.to_string(), record.outcome,],
                 )?;
             }
         }
@@ -553,10 +508,7 @@ impl WorkDb {
     /// Used by the dispatcher to route automation-produced task executions to
     /// the automation pool. Returns `Ok(None)` rather than an error when the
     /// id is not found in `tasks` (e.g. it references a project or product).
-    pub fn source_automation_id_for_work_item(
-        &self,
-        work_item_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn source_automation_id_for_work_item(&self, work_item_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT source_automation_id FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
@@ -589,8 +541,7 @@ impl WorkDb {
         let conn = self.connect()?;
         let id = next_id("exec");
         let now = now_string();
-        let branch_naming_json =
-            serde_json::to_string(&boss_protocol::BranchNaming::default()).unwrap_or_default();
+        let branch_naming_json = serde_json::to_string(&boss_protocol::BranchNaming::default()).unwrap_or_default();
         // Column list mirrors `insert_execution`; every column it omits has a
         // schema DEFAULT (pre_start_failure_count=0, dispatch_not_before=NULL,
         // transient_failure_count=0, host_id='local', …).
@@ -610,8 +561,7 @@ impl WorkDb {
                 branch_naming_json,
             ],
         )?;
-        query_execution(&conn, &id)?
-            .with_context(|| format!("missing automation triage execution after insert: {id}"))
+        query_execution(&conn, &id)?.with_context(|| format!("missing automation triage execution after insert: {id}"))
     }
 
     /// Fetch the `automation_runs` row whose triage `work_execution` is
@@ -679,13 +629,7 @@ impl WorkDb {
                     detail = COALESCE(?4, detail),
                     finished_at = ?5
               WHERE id = ?1",
-            params![
-                run_id,
-                outcome,
-                produced_task_id,
-                detail,
-                now_epoch.to_string()
-            ],
+            params![run_id, outcome, produced_task_id, detail, now_epoch.to_string()],
         )?;
         tx.execute(
             "UPDATE automations SET last_outcome = ?2 WHERE id = ?1",
@@ -728,11 +672,7 @@ impl WorkDb {
     /// Only transitions from `failed_will_retry` (the pessimistic initial
     /// state the scheduler writes) so it is idempotent: a second call while
     /// still throttled is a no-op. Returns `true` when a row was updated.
-    pub fn update_automation_run_for_pool_throttle(
-        &self,
-        triage_execution_id: &str,
-        detail: &str,
-    ) -> Result<bool> {
+    pub fn update_automation_run_for_pool_throttle(&self, triage_execution_id: &str, detail: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let rows_changed = tx.execute(
@@ -760,10 +700,7 @@ impl WorkDb {
     /// updates `automations.last_outcome`. Transitions from `pool_throttled`
     /// (if the run was previously queued) or `failed_will_retry` (if it was
     /// dispatched immediately). Returns `true` when a row was updated.
-    pub fn mark_automation_run_triage_started(
-        &self,
-        triage_execution_id: &str,
-    ) -> Result<bool> {
+    pub fn mark_automation_run_triage_started(&self, triage_execution_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let rows_changed = tx.execute(
@@ -803,12 +740,7 @@ impl WorkDb {
     ///
     /// Returns an error (surfaced to the agent) when the cap is already met,
     /// so the marker the agent then emits can be reconciled by the detector.
-    pub fn create_automation_task(
-        &self,
-        automation_id: &str,
-        name: &str,
-        description: Option<&str>,
-    ) -> Result<Task> {
+    pub fn create_automation_task(&self, automation_id: &str, name: &str, description: Option<&str>) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let automation = query_automation(&tx, automation_id).require("automation", automation_id)?;

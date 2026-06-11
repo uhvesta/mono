@@ -3,9 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
-use crate::coordinator::{
-    DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE,
-};
+use crate::coordinator::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
 /// Default value for [`WorkConfig::max_review_cycles`]. Matches the
 /// "~3 cycles at worst" mental model from P992 design §7.
@@ -127,9 +125,8 @@ impl WorkConfig {
         let min_review_changed_lines = std::env::var("BOSS_MIN_REVIEW_CHANGED_LINES")
             .ok()
             .map(|raw| {
-                raw.parse::<u64>().with_context(|| {
-                    format!("could not parse BOSS_MIN_REVIEW_CHANGED_LINES: {raw}")
-                })
+                raw.parse::<u64>()
+                    .with_context(|| format!("could not parse BOSS_MIN_REVIEW_CHANGED_LINES: {raw}"))
             })
             .transpose()?
             .unwrap_or(DEFAULT_MIN_REVIEW_CHANGED_LINES);
@@ -202,10 +199,7 @@ impl RuntimeConfig {
         if let Some(agent) = agent {
             let _ = cell.set(Arc::new(agent));
         }
-        Self {
-            work,
-            agent_cell: cell,
-        }
+        Self { work, agent_cell: cell }
     }
 
     pub fn agent(&self) -> Result<Arc<AgentConfig>> {
@@ -216,11 +210,7 @@ impl RuntimeConfig {
         let arc = Arc::new(loaded);
         match self.agent_cell.set(arc.clone()) {
             Ok(()) => Ok(arc),
-            Err(_) => Ok(self
-                .agent_cell
-                .get()
-                .expect("OnceLock set after failed insert")
-                .clone()),
+            Err(_) => Ok(self.agent_cell.get().expect("OnceLock set after failed insert").clone()),
         }
     }
 }
@@ -239,12 +229,13 @@ impl RuntimeConfig {
 /// PATH naturally. This bundle-relative lookup is engine-only.
 fn resolve_cube_command() -> String {
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            let candidate = dir.join(DEFAULT_CUBE_COMMAND);
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(DEFAULT_CUBE_COMMAND);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
         }
+    }
     DEFAULT_CUBE_COMMAND.to_owned()
 }
 
@@ -268,8 +259,7 @@ fn log_cube_resolution(command: &str) {
 }
 
 fn parse_command_line(env_var: &str, command_line: String) -> Result<(String, Vec<String>)> {
-    let parts = shlex::split(&command_line)
-        .with_context(|| format!("could not parse {env_var}: {command_line}"))?;
+    let parts = shlex::split(&command_line).with_context(|| format!("could not parse {env_var}: {command_line}"))?;
 
     let Some((command, args)) = parts.split_first() else {
         bail!("{env_var} resolved to an empty command");
@@ -301,8 +291,7 @@ fn default_db_path() -> Result<PathBuf> {
 mod tests {
     use super::{
         DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MIN_REVIEW_CHANGED_LINES,
-        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig,
-        resolve_runtime_cwd,
+        DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE, WorkConfig, resolve_runtime_cwd,
     };
     use std::path::PathBuf;
 
@@ -465,10 +454,7 @@ mod tests {
             std::env::set_var("BOSS_DB_PATH", &db_path);
         }
         let config = WorkConfig::load_from_env().expect("config loads");
-        assert_eq!(
-            config.min_review_changed_lines,
-            DEFAULT_MIN_REVIEW_CHANGED_LINES
-        );
+        assert_eq!(config.min_review_changed_lines, DEFAULT_MIN_REVIEW_CHANGED_LINES);
 
         unsafe {
             std::env::set_var("BOSS_MIN_REVIEW_CHANGED_LINES", "10");
@@ -537,10 +523,7 @@ mod tests {
             std::env::set_var("BOSS_DB_PATH", &db_path);
         }
         let config = WorkConfig::load_from_env().expect("config loads");
-        assert_eq!(
-            config.max_review_embed_diff_lines,
-            DEFAULT_MAX_EMBED_DIFF_LINES
-        );
+        assert_eq!(config.max_review_embed_diff_lines, DEFAULT_MAX_EMBED_DIFF_LINES);
 
         unsafe {
             std::env::set_var("BOSS_MAX_EMBED_DIFF_LINES", "200");

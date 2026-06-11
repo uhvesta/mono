@@ -38,9 +38,7 @@ impl DefaultsConfig {
 
     pub fn validate(&self) -> Result<(), RepobinError> {
         if self.version != SUPPORTED_VERSION {
-            return Err(RepobinError::UnsupportedDefaultsVersion {
-                version: self.version,
-            });
+            return Err(RepobinError::UnsupportedDefaultsVersion { version: self.version });
         }
         for (name, tool) in &self.tools {
             if tool.repo.trim().is_empty() {
@@ -50,10 +48,7 @@ impl DefaultsConfig {
             }
             if let Some(sha) = &tool.sha {
                 let sha = sha.trim();
-                if sha.is_empty()
-                    || sha.len() > 40
-                    || !sha.chars().all(|c| c.is_ascii_hexdigit())
-                {
+                if sha.is_empty() || sha.len() > 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
                     return Err(RepobinError::InvalidDefaults(format!(
                         "tool `{name}` has an invalid sha `{sha}` — must be a hex string of 1–40 characters"
                     )));
@@ -82,11 +77,10 @@ pub fn load_defaults_at(path: &Path) -> Result<Option<LoadedDefaults>, RepobinEr
             });
         }
     };
-    let config: DefaultsConfig =
-        serde_yaml::from_str(&raw).map_err(|source| RepobinError::ParseDefaults {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let config: DefaultsConfig = serde_yaml::from_str(&raw).map_err(|source| RepobinError::ParseDefaults {
+        path: path.to_path_buf(),
+        source,
+    })?;
     config.validate()?;
     Ok(Some(LoadedDefaults {
         path: path.to_path_buf(),
@@ -101,11 +95,10 @@ pub fn load_defaults_for_exe(repobin_exe: &Path) -> Result<Option<LoadedDefaults
 
 pub fn write_defaults(path: &Path, config: &DefaultsConfig) -> Result<(), RepobinError> {
     config.validate()?;
-    let serialized =
-        serde_yaml::to_string(config).map_err(|source| RepobinError::SerializeDefaults {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let serialized = serde_yaml::to_string(config).map_err(|source| RepobinError::SerializeDefaults {
+        path: path.to_path_buf(),
+        source,
+    })?;
     std::fs::write(path, serialized).map_err(|source| RepobinError::WriteDefaults {
         path: path.to_path_buf(),
         source,
@@ -120,18 +113,12 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{
-        DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, defaults_path, load_defaults_at,
-        write_defaults,
-    };
+    use super::{DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, defaults_path, load_defaults_at, write_defaults};
 
     #[test]
     fn defaults_path_sits_next_to_binary() {
         let path = defaults_path(std::path::Path::new("/Users/test/bin/repobin"));
-        assert_eq!(
-            path,
-            std::path::Path::new("/Users/test/bin").join(DEFAULTS_FILE_NAME)
-        );
+        assert_eq!(path, std::path::Path::new("/Users/test/bin").join(DEFAULTS_FILE_NAME));
     }
 
     #[test]
@@ -199,7 +186,11 @@ mod tests {
     fn accepts_short_sha() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("repobin.yaml");
-        fs::write(&path, "version: 1\ntools:\n  boss:\n    repo: https://x.git\n    sha: \"4baa8fa\"\n").unwrap();
+        fs::write(
+            &path,
+            "version: 1\ntools:\n  boss:\n    repo: https://x.git\n    sha: \"4baa8fa\"\n",
+        )
+        .unwrap();
         let loaded = load_defaults_at(&path).unwrap().unwrap();
         assert_eq!(loaded.config.tools["boss"].sha.as_deref(), Some("4baa8fa"));
     }
@@ -208,12 +199,13 @@ mod tests {
     fn rejects_invalid_sha() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("repobin.yaml");
-        fs::write(&path, "version: 1\ntools:\n  boss:\n    repo: https://x.git\n    sha: \"not-hex!\"\n").unwrap();
+        fs::write(
+            &path,
+            "version: 1\ntools:\n  boss:\n    repo: https://x.git\n    sha: \"not-hex!\"\n",
+        )
+        .unwrap();
         let err = load_defaults_at(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid sha"),
-            "got error: {err}"
-        );
+        assert!(err.to_string().contains("invalid sha"), "got error: {err}");
     }
 
     #[test]
@@ -222,10 +214,7 @@ mod tests {
         let path = temp.path().join("repobin.yaml");
         fs::write(&path, "version: 1\ntools:\n  boss:\n    repo: \"\"\n").unwrap();
         let err = load_defaults_at(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("non-empty repo URL"),
-            "got error: {err}"
-        );
+        assert!(err.to_string().contains("non-empty repo URL"), "got error: {err}");
     }
 
     #[test]

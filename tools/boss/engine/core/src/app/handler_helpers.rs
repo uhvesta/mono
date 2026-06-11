@@ -58,11 +58,7 @@ pub(super) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_sin
 /// them — persistence failure is non-fatal (the in-memory set still
 /// honours the toggle until restart).
 pub(super) fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u8]) -> Result<()> {
-    let joined = slot_ids
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    let joined = slot_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",");
     work_db.set_metadata(META_LIVE_STATUS_DISABLED_SLOTS, &joined)?;
     Ok(())
 }
@@ -76,9 +72,7 @@ pub(super) fn persist_live_status_disabled_slots(work_db: &WorkDb, slot_ids: &[u
 /// the shape is the list-of-issues form the chore brief asked for so
 /// subsequent missing-config surfaces (engine socket, cube binary,
 /// etc.) can be added without bumping the wire format.
-pub(super) fn build_engine_health_report(
-    server_state: &Arc<ServerState>,
-) -> boss_protocol::EngineHealthReport {
+pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> boss_protocol::EngineHealthReport {
     use boss_protocol::{EngineHealthIssue, EngineHealthReport};
 
     let anthropic_api_key_present = server_state.anthropic_api_key.is_some();
@@ -169,8 +163,7 @@ pub(super) fn build_live_status_debug_report(
     let store = manager.debug_store();
     let store_snapshots = store.snapshot_all();
     let active_slots = manager.active_slot_ids();
-    let disabled_set: std::collections::HashSet<u8> =
-        manager.disabled_snapshot().into_iter().collect();
+    let disabled_set: std::collections::HashSet<u8> = manager.disabled_snapshot().into_iter().collect();
 
     // Union of every slot id we have *any* signal for — live state,
     // diagnostic snapshot, or active task. Sorted ascending so the
@@ -200,10 +193,7 @@ pub(super) fn build_live_status_debug_report(
         // the column populated.
         let transcript_path = snap.transcript_path.clone().or_else(|| {
             let execution_id = live.map(|s| s.run_id.as_str())?;
-            work_db
-                .transcript_path_for_execution(execution_id)
-                .ok()
-                .flatten()
+            work_db.transcript_path_for_execution(execution_id).ok().flatten()
         });
         slots.push(LiveStatusSlotDebug {
             slot_id,
@@ -213,9 +203,7 @@ pub(super) fn build_live_status_debug_report(
             last_trigger_at: snap.last_trigger_at_epoch_s.map(format_epoch_iso8601),
             last_real_trigger_kind: snap.last_real_trigger_kind.clone(),
             last_real_trigger_at: snap.last_real_trigger_at_epoch_s.map(format_epoch_iso8601),
-            last_synthetic_trigger_at: snap
-                .last_synthetic_trigger_at_epoch_s
-                .map(format_epoch_iso8601),
+            last_synthetic_trigger_at: snap.last_synthetic_trigger_at_epoch_s.map(format_epoch_iso8601),
             last_outcome_tag: snap.last_outcome_tag.clone(),
             last_outcome_detail: snap.last_outcome_detail.clone(),
             last_outcome_at: snap.last_outcome_at_epoch_s.map(format_epoch_iso8601),
@@ -230,10 +218,8 @@ pub(super) fn build_live_status_debug_report(
     let dispatcher_stats = boss_protocol::DispatcherStatsReport {
         hook_events_total: stats.hook_events_total,
         hook_events_dropped_missing_run_id: stats.hook_events_dropped_missing_run_id,
-        hook_events_with_transcript_path_in_payload: stats
-            .hook_events_with_transcript_path_in_payload,
-        hook_events_without_transcript_path_in_payload: stats
-            .hook_events_without_transcript_path_in_payload,
+        hook_events_with_transcript_path_in_payload: stats.hook_events_with_transcript_path_in_payload,
+        hook_events_without_transcript_path_in_payload: stats.hook_events_without_transcript_path_in_payload,
         transcript_path_persist_updated: stats.transcript_path_persist_updated,
         transcript_path_persist_noop: stats.transcript_path_persist_noop,
         transcript_path_persist_row_missing: stats.transcript_path_persist_row_missing,
@@ -241,10 +227,7 @@ pub(super) fn build_live_status_debug_report(
         transcript_path_persist_from_cache: stats.transcript_path_persist_from_cache,
         last_hook_run_id: stats.last_hook.as_ref().map(|h| h.run_id.clone()),
         last_hook_kind: stats.last_hook.as_ref().map(|h| h.kind.clone()),
-        last_hook_at: stats
-            .last_hook
-            .as_ref()
-            .map(|h| format_epoch_iso8601(h.epoch_s)),
+        last_hook_at: stats.last_hook.as_ref().map(|h| format_epoch_iso8601(h.epoch_s)),
     };
 
     LiveStatusDebugReport {
@@ -292,9 +275,7 @@ pub(super) fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
     let Ok(Some(raw)) = work_db.get_metadata(META_LIVE_STATUS_DISABLED_SLOTS) else {
         return Vec::new();
     };
-    raw.split(',')
-        .filter_map(|s| s.trim().parse::<u8>().ok())
-        .collect()
+    raw.split(',').filter_map(|s| s.trim().parse::<u8>().ok()).collect()
 }
 
 /// Read the persisted dispatch-pause state from the metadata KV. Returns
@@ -336,18 +317,10 @@ pub(super) fn duplicate_or_work_error(err: anyhow::Error) -> FrontendEvent {
 }
 
 pub(super) fn send_response(sink: &SessionSink, request_id: &str, payload: FrontendEvent) {
-    sink.enqueue(FrontendEventEnvelope::response(
-        request_id.to_owned(),
-        payload,
-    ));
+    sink.enqueue(FrontendEventEnvelope::response(request_id.to_owned(), payload));
 }
 
-pub(super) fn send_response_with_revision(
-    sink: &SessionSink,
-    request_id: &str,
-    revision: u64,
-    payload: FrontendEvent,
-) {
+pub(super) fn send_response_with_revision(sink: &SessionSink, request_id: &str, revision: u64, payload: FrontendEvent) {
     sink.enqueue(FrontendEventEnvelope::response_with_revision(
         request_id.to_owned(),
         revision,
@@ -369,10 +342,7 @@ pub(super) async fn publish_work_invalidation(
     item_ids: Vec<String>,
 ) -> u64 {
     if let Some(product_id) = product_id.as_deref() {
-        match server_state
-            .work_db
-            .reconcile_product_executions(product_id)
-        {
+        match server_state.work_db.reconcile_product_executions(product_id) {
             Ok(result) => {
                 if !result.created.is_empty() || !result.updated.is_empty() {
                     tracing::info!(
@@ -415,18 +385,12 @@ pub(super) async fn publish_work_invalidation(
             continue;
         }
         let mut event = event.clone();
-        if let FrontendEvent::TopicEvent {
-            topic: event_topic, ..
-        } = &mut event
-        {
+        if let FrontendEvent::TopicEvent { topic: event_topic, .. } = &mut event {
             *event_topic = topic.clone();
         }
         server_state
             .topic_broker
-            .publish(
-                &topic,
-                FrontendEventEnvelope::push_with_revision(revision, event),
-            )
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
             .await;
     }
 
@@ -462,10 +426,7 @@ pub(super) async fn publish_comment_invalidation(
     };
     server_state
         .topic_broker
-        .publish(
-            &topic,
-            FrontendEventEnvelope::push_with_revision(revision, event),
-        )
+        .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
         .await;
     revision
 }
@@ -491,10 +452,7 @@ pub(super) async fn publish_batch_work_invalidation(
     }
 
     for product_id in by_product.keys() {
-        match server_state
-            .work_db
-            .reconcile_product_executions(product_id)
-        {
+        match server_state.work_db.reconcile_product_executions(product_id) {
             Ok(result) => {
                 if !result.created.is_empty() || !result.updated.is_empty() {
                     tracing::info!(
@@ -535,10 +493,7 @@ pub(super) async fn publish_batch_work_invalidation(
         };
         server_state
             .topic_broker
-            .publish(
-                &topic,
-                FrontendEventEnvelope::push_with_revision(revision, event),
-            )
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
             .await;
     }
 
@@ -563,20 +518,8 @@ pub(super) async fn handle_create_many(
     match db_result {
         Ok(rows) => {
             let items: Vec<WorkItem> = rows.into_iter().map(wrap).collect();
-            let revision = publish_batch_work_invalidation(
-                server_state,
-                session_id,
-                request_id,
-                reason,
-                &items,
-            )
-            .await;
-            send_response_with_revision(
-                sink,
-                request_id,
-                revision,
-                FrontendEvent::WorkItemsCreated { items },
-            );
+            let revision = publish_batch_work_invalidation(server_state, session_id, request_id, reason, &items).await;
+            send_response_with_revision(sink, request_id, revision, FrontendEvent::WorkItemsCreated { items });
         }
         Err(err) => {
             send_response(sink, request_id, duplicate_or_work_error(err));
@@ -677,15 +620,7 @@ pub(super) async fn open_review_terminal_async(
 /// `design_detector::do_scan_pr` but requests only the one field we need.
 pub(super) async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
     let output = TokioCommand::new("gh")
-        .args([
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "headRefName",
-            "--jq",
-            ".headRefName",
-        ])
+        .args(["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -714,10 +649,7 @@ pub(super) async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
 /// always set the field explicitly, so `unknown` here only fires for
 /// off-the-beaten-path callers — exactly the case we want to flag in
 /// the database rather than mislabel.
-pub(super) async fn transport_default_created_via(
-    server_state: &Arc<ServerState>,
-    session_id: &str,
-) -> String {
+pub(super) async fn transport_default_created_via(server_state: &Arc<ServerState>, session_id: &str) -> String {
     let app_session_id = server_state
         .app_session
         .lock()
@@ -754,9 +686,7 @@ pub(super) fn validate_external_tracker_config(kind: &str, config: &serde_json::
             }
             match config.get("project_number") {
                 None => {
-                    return Err(
-                        "missing required field 'project_number' for kind=github".to_owned()
-                    );
+                    return Err("missing required field 'project_number' for kind=github".to_owned());
                 }
                 Some(v) if !v.is_number() => {
                     return Err("'project_number' must be a number for kind=github".to_owned());
@@ -818,10 +748,7 @@ pub(super) fn work_item_needs_dispatch(work_db: &WorkDb, work_item_id: &str) -> 
 /// True iff `item` is a task/chore whose status just flipped from
 /// something other than `active` to `active`. Re-applying an `active`
 /// status on top of `active` (idempotent client retry) does not count.
-pub(super) fn task_transitioned_to_active(
-    previous_status: &Option<TaskStatus>,
-    item: &WorkItem,
-) -> bool {
+pub(super) fn task_transitioned_to_active(previous_status: &Option<TaskStatus>, item: &WorkItem) -> bool {
     let task = match item {
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return false,
@@ -952,10 +879,7 @@ pub(super) fn active_to_todo_execution(
 /// does not touch, but loading the `WorkItem` itself goes through paths
 /// that filter out `deleted_at` rows. The delete handler captures the
 /// `WorkItem` before deleting and passes it here.
-pub(super) fn live_execution_for_deleted_item(
-    work_db: &WorkDb,
-    item: &WorkItem,
-) -> Option<String> {
+pub(super) fn live_execution_for_deleted_item(work_db: &WorkDb, item: &WorkItem) -> Option<String> {
     let task = match item {
         WorkItem::Task(t) | WorkItem::Chore(t) => t,
         _ => return None,
@@ -1005,9 +929,7 @@ pub(super) fn active_chore_run_id(server_state: &ServerState, item: &WorkItem) -
     if task.status != TaskStatus::Active {
         return None;
     }
-    server_state
-        .live_worker_states
-        .run_id_for_work_item(&task.id)
+    server_state.live_worker_states.run_id_for_work_item(&task.id)
 }
 
 /// Build the `[chore-update]` notice text. Returns `None` when neither
@@ -1120,10 +1042,7 @@ pub(super) fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &s
     // in hand. `bossctl` passes `exec_*`; programmatic callers may
     // pass `run_*`.
     let run_lookup = server_state.work_db.get_run(run_id).ok();
-    if let Some(transcript_path) = run_lookup
-        .as_ref()
-        .and_then(|run| run.transcript_path.clone())
-    {
+    if let Some(transcript_path) = run_lookup.as_ref().and_then(|run| run.transcript_path.clone()) {
         return TranscriptResolution::Found { transcript_path };
     }
     let exec_path = server_state
@@ -1156,16 +1075,15 @@ pub(super) fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &s
         // task), so pointing the user at transcript tail is misleading —
         // instead surface a clear "never dispatched" message.
         if !run_known && execution_known {
-            let has_any_run = server_state
-                .work_db
-                .has_run_row_for_execution(run_id)
-                .unwrap_or(true); // on DB error, default to "yes" → fall through to KnownNoTranscript
+            let has_any_run = server_state.work_db.has_run_row_for_execution(run_id).unwrap_or(true); // on DB error, default to "yes" → fall through to KnownNoTranscript
             if !has_any_run {
                 let status = execution
                     .as_ref()
                     .map(|e| e.status.as_str().to_owned())
                     .unwrap_or_else(|| "unknown".to_owned());
-                return TranscriptResolution::NeverDispatched { execution_status: status };
+                return TranscriptResolution::NeverDispatched {
+                    execution_status: status,
+                };
             }
         }
         return TranscriptResolution::KnownNoTranscript;
@@ -1175,9 +1093,7 @@ pub(super) fn resolve_transcript_for_tail(server_state: &ServerState, run_id: &s
 
 /// Convert an internal `TranscriptSegment` from the converter crate to the
 /// wire-protocol `TranscriptSegment` that travels over the RPC socket.
-pub(super) fn segment_to_wire(
-    s: crate::transcript_markdown::TranscriptSegment,
-) -> boss_protocol::TranscriptSegment {
+pub(super) fn segment_to_wire(s: crate::transcript_markdown::TranscriptSegment) -> boss_protocol::TranscriptSegment {
     use crate::transcript_markdown::SegmentRole;
     boss_protocol::TranscriptSegment {
         seq: s.seq,
@@ -1201,10 +1117,7 @@ pub(super) fn segment_to_wire(
     }
 }
 
-pub(super) async fn read_transcript_tail(
-    transcript_path: &str,
-    lines: usize,
-) -> std::io::Result<(Vec<String>, bool)> {
+pub(super) async fn read_transcript_tail(transcript_path: &str, lines: usize) -> std::io::Result<(Vec<String>, bool)> {
     let contents = tokio::fs::read_to_string(transcript_path).await?;
     Ok(tail_lines_from_content(&contents, lines))
 }
@@ -1224,11 +1137,7 @@ pub(super) fn tail_lines_from_content(contents: &str, lines: usize) -> (Vec<Stri
     let total = split_lines.len();
     let take = lines.min(total);
     let truncated = total > take;
-    let tail = split_lines
-        .into_iter()
-        .skip(total - take)
-        .map(str::to_owned)
-        .collect();
+    let tail = split_lines.into_iter().skip(total - take).map(str::to_owned).collect();
     (tail, truncated)
 }
 
@@ -1414,7 +1323,10 @@ mod tests {
     #[test]
     fn transitioned_previous_none_is_true() {
         // No prior row seen → treat as a real transition into active.
-        assert!(task_transitioned_to_active(&None, &task_with_status(TaskStatus::Active)));
+        assert!(task_transitioned_to_active(
+            &None,
+            &task_with_status(TaskStatus::Active)
+        ));
     }
 
     #[test]

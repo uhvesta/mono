@@ -66,16 +66,9 @@ stale_exclusion_severity = "off"
     .expect("write config");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver
-        .resolve_for_file(Path::new("a.rs"))
-        .expect("resolve checks");
-    let check = checks
-        .get("rust-giant-structs-use-builder")
-        .expect("check present");
-    assert_eq!(
-        check.policy.stale_exclusion_mode,
-        Some(StaleExclusionMode::Off)
-    );
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let check = checks.get("rust-giant-structs-use-builder").expect("check present");
+    assert_eq!(check.policy.stale_exclusion_mode, Some(StaleExclusionMode::Off));
 }
 
 #[test]
@@ -94,9 +87,7 @@ id = "rust-giant-structs-use-builder"
     .expect("write config");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
-    let checks = resolver
-        .resolve_for_file(Path::new("a.rs"))
-        .expect("resolve checks");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
     let diagnostics: Vec<_> = checks.diagnostics().collect();
     assert!(
         diagnostics
@@ -131,10 +122,7 @@ id = "spelling-typos"
 
     let enabled: Vec<_> = checks.enabled().map(|check| check.id.as_str()).collect();
     assert_eq!(enabled, vec!["file-size", "spelling-typos"]);
-    assert_eq!(
-        checks.get("file-size").expect("file-size present").check,
-        "file-size"
-    );
+    assert_eq!(checks.get("file-size").expect("file-size present").check, "file-size");
     assert_eq!(
         checks
             .get("file-size")
@@ -278,10 +266,7 @@ enabled = false
         .resolve_for_file(Path::new("backend/generated/output.rs"))
         .expect("resolve checks");
 
-    let enabled_map: BTreeMap<_, _> = checks
-        .iter()
-        .map(|check| (check.id.as_str(), check.enabled))
-        .collect();
+    let enabled_map: BTreeMap<_, _> = checks.iter().map(|check| (check.id.as_str(), check.enabled)).collect();
     assert_eq!(enabled_map.get("file-size"), Some(&false));
     assert_eq!(checks.enabled().count(), 0);
 }
@@ -726,10 +711,7 @@ bypass_name = "BYPASS_FILE_SIZE_LIMIT"
 
     assert_eq!(check.policy.severity, Some(Severity::Error));
     assert_eq!(check.policy.allow_bypass, Some(true));
-    assert_eq!(
-        check.policy.bypass_name.as_deref(),
-        Some("BYPASS_FILE_SIZE_LIMIT")
-    );
+    assert_eq!(check.policy.bypass_name.as_deref(), Some("BYPASS_FILE_SIZE_LIMIT"));
 }
 
 #[test]
@@ -754,10 +736,7 @@ bypass_name = "domain-typo"
         .expect("resolve checks");
     let check = checks.get("domain-typo").expect("check exists");
 
-    assert_eq!(
-        check.policy.bypass_name.as_deref(),
-        Some("BYPASS_DOMAIN_TYPO")
-    );
+    assert_eq!(check.policy.bypass_name.as_deref(), Some("BYPASS_DOMAIN_TYPO"));
 }
 
 #[test]
@@ -800,10 +779,7 @@ bypass_name = "BYPASS_CUSTOM_CHILD"
 
     assert_eq!(check.policy.severity, Some(Severity::Error));
     assert_eq!(check.policy.allow_bypass, Some(true));
-    assert_eq!(
-        check.policy.bypass_name.as_deref(),
-        Some("BYPASS_CUSTOM_CHILD")
-    );
+    assert_eq!(check.policy.bypass_name.as_deref(), Some("BYPASS_CUSTOM_CHILD"));
 }
 
 #[test]
@@ -958,26 +934,14 @@ config = { max_lines = [1, 2 }
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].check_id, "checks-config");
     assert_eq!(diagnostics[0].location.path, Path::new("CHECKS.toml"));
-    assert!(
-        diagnostics[0]
-            .message
-            .contains("failed to parse checks config")
-    );
+    assert!(diagnostics[0].message.contains("failed to parse checks config"));
 }
 
 #[test]
 fn coexisting_yaml_and_toml_produces_violation() {
     let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.yaml"),
-        "checks:\n  - id: file-size\n",
-    )
-    .expect("write CHECKS.yaml");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        "[[checks]]\nid = \"file-size\"\n",
-    )
-    .expect("write CHECKS.toml");
+    fs::write(temp.path().join("CHECKS.yaml"), "checks:\n  - id: file-size\n").expect("write CHECKS.yaml");
+    fs::write(temp.path().join("CHECKS.toml"), "[[checks]]\nid = \"file-size\"\n").expect("write CHECKS.toml");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
     let checks = resolver
@@ -1002,11 +966,7 @@ fn coexisting_yaml_and_toml_produces_violation() {
 #[test]
 fn single_config_file_produces_no_coexistence_violation() {
     let temp = tempdir().expect("create temp dir");
-    fs::write(
-        temp.path().join("CHECKS.toml"),
-        "[[checks]]\nid = \"file-size\"\n",
-    )
-    .expect("write CHECKS.toml");
+    fs::write(temp.path().join("CHECKS.toml"), "[[checks]]\nid = \"file-size\"\n").expect("write CHECKS.toml");
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
     let checks = resolver
@@ -1071,11 +1031,7 @@ fn exec_paths_yaml_wins_over_toml_when_both_present() {
     let temp = tempdir().expect("create temp dir");
     let defs_dir = temp.path().join("checks/dual-format-check");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(
-        defs_dir.join("check.yaml"),
-        "id: dual-format-check\n",
-    )
-    .expect("write yaml def");
+    fs::write(defs_dir.join("check.yaml"), "id: dual-format-check\n").expect("write yaml def");
     fs::write(
         defs_dir.join("check.toml"),
         r#"

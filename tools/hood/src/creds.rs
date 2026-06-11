@@ -17,27 +17,15 @@ pub type Result<T> = std::result::Result<T, CredentialsError>;
 #[derive(Debug, Error)]
 pub enum CredentialsError {
     #[error("failed to open keychain entry for `{username}`")]
-    OpenOauthEntry {
-        username: String,
-        source: keyring::Error,
-    },
+    OpenOauthEntry { username: String, source: keyring::Error },
     #[error("failed to open metadata keychain entry for `{key}`")]
-    OpenMetadataEntry {
-        key: &'static str,
-        source: keyring::Error,
-    },
+    OpenMetadataEntry { key: &'static str, source: keyring::Error },
     #[error("failed to serialize credentials")]
     SerializeCredentials { source: serde_json::Error },
     #[error("failed to write credentials to keychain for `{username}`")]
-    WriteCredentials {
-        username: String,
-        source: keyring::Error,
-    },
+    WriteCredentials { username: String, source: keyring::Error },
     #[error("failed to read credentials from keychain for `{username}`")]
-    ReadCredentials {
-        username: String,
-        source: keyring::Error,
-    },
+    ReadCredentials { username: String, source: keyring::Error },
     #[error("failed to parse credentials from keychain for `{username}`")]
     ParseCredentials {
         username: String,
@@ -48,20 +36,11 @@ pub enum CredentialsError {
     #[error("could not resolve config directory (XDG_CONFIG_HOME or HOME)")]
     MissingConfigDirectory,
     #[error("failed to create config directory `{path}`")]
-    CreateConfigDirectory {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    CreateConfigDirectory { path: PathBuf, source: std::io::Error },
     #[error("failed to write most recent username file `{path}`")]
-    WriteLatestUsernameFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    WriteLatestUsernameFile { path: PathBuf, source: std::io::Error },
     #[error("failed to read most recent username file `{path}`")]
-    ReadLatestUsernameFile {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    ReadLatestUsernameFile { path: PathBuf, source: std::io::Error },
     #[error("most recent username file `{path}` is empty")]
     EmptyLatestUsernameFile { path: PathBuf },
     #[error("failed to load credentials for `{username}`")]
@@ -79,8 +58,8 @@ pub enum CredentialsError {
 
 pub fn store_credentials(username: &str, token: &Value) -> Result<()> {
     let entry = oauth_entry(username)?;
-    let serialized = serde_json::to_string(token)
-        .map_err(|source| CredentialsError::SerializeCredentials { source })?;
+    let serialized =
+        serde_json::to_string(token).map_err(|source| CredentialsError::SerializeCredentials { source })?;
 
     entry
         .set_password(&serialized)
@@ -122,11 +101,9 @@ pub fn load_access_token(username: Option<&str>) -> Result<(String, String)> {
                 username: username.to_string(),
                 source: Box::new(source),
             })?,
-        None => {
-            load_latest_credentials().map_err(|source| CredentialsError::LoadLatestCredentials {
-                source: Box::new(source),
-            })?
-        }
+        None => load_latest_credentials().map_err(|source| CredentialsError::LoadLatestCredentials {
+            source: Box::new(source),
+        })?,
     };
 
     let access_token = extract_access_token(&credentials)
@@ -146,8 +123,7 @@ fn oauth_entry(username: &str) -> Result<Entry> {
 }
 
 fn metadata_entry(key: &'static str) -> Result<Entry> {
-    Entry::new(KEYRING_METADATA_SERVICE, key)
-        .map_err(|source| CredentialsError::OpenMetadataEntry { key, source })
+    Entry::new(KEYRING_METADATA_SERVICE, key).map_err(|source| CredentialsError::OpenMetadataEntry { key, source })
 }
 
 fn store_last_username(username: &str) -> Result<()> {
@@ -179,22 +155,17 @@ fn store_last_username_in_file(username: &str) -> Result<()> {
         .map(PathBuf::from)
         .ok_or(CredentialsError::MissingConfigDirectory)?;
 
-    fs::create_dir_all(&parent).map_err(|source| CredentialsError::CreateConfigDirectory {
-        path: parent,
-        source,
-    })?;
+    fs::create_dir_all(&parent).map_err(|source| CredentialsError::CreateConfigDirectory { path: parent, source })?;
 
-    fs::write(&path, username)
-        .map_err(|source| CredentialsError::WriteLatestUsernameFile { path, source })
+    fs::write(&path, username).map_err(|source| CredentialsError::WriteLatestUsernameFile { path, source })
 }
 
 fn load_last_username_from_file() -> Result<String> {
     let path = latest_username_file_path()?;
-    let username =
-        fs::read_to_string(&path).map_err(|source| CredentialsError::ReadLatestUsernameFile {
-            path: path.clone(),
-            source,
-        })?;
+    let username = fs::read_to_string(&path).map_err(|source| CredentialsError::ReadLatestUsernameFile {
+        path: path.clone(),
+        source,
+    })?;
     let username = username.trim();
 
     if username.is_empty() {
@@ -206,9 +177,7 @@ fn load_last_username_from_file() -> Result<String> {
 
 fn latest_username_file_path() -> Result<PathBuf> {
     if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(config_home)
-            .join(APP_CONFIG_DIR)
-            .join(LAST_USERNAME_FILE));
+        return Ok(PathBuf::from(config_home).join(APP_CONFIG_DIR).join(LAST_USERNAME_FILE));
     }
 
     if let Some(home) = env::var_os("HOME") {

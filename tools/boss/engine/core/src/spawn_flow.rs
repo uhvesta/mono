@@ -26,8 +26,7 @@ use tokio::time::Duration;
 
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
-    EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
-    SpawnWorkerPaneResult,
+    EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
 };
 use crate::worker_registry::WorkerRegistry;
 use crate::worker_setup::{WorkerKind, WorkerSetupInput, WrittenFiles, write_workspace_files};
@@ -300,15 +299,16 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     // callbacks resolve the bundled copies. Unset in dev mode (no bundle
     // bin/ directory) — workers fall back to PATH as today.
     if let Ok(boss_bin_dir) = std::env::var("BOSS_BIN_DIR")
-        && !boss_bin_dir.is_empty() {
-            env.push(EnvVar {
-                key: "BOSS_BIN_DIR".into(),
-                value: boss_bin_dir.clone(),
-            });
-            if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
-                path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
-            }
+        && !boss_bin_dir.is_empty()
+    {
+        env.push(EnvVar {
+            key: "BOSS_BIN_DIR".into(),
+            value: boss_bin_dir.clone(),
+        });
+        if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
+            path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
         }
+    }
 
     let claimed_slot = input.slot_id;
     let response = spawner
@@ -358,9 +358,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         .worker_registry()
         .register_run_slot(input.run_id.clone(), slot_id);
     if shell_pid > 0 {
-        spawner
-            .worker_registry()
-            .register(shell_pid, input.run_id.clone());
+        spawner.worker_registry().register(shell_pid, input.run_id.clone());
     } else {
         tracing::info!(
             slot_id,
@@ -543,8 +541,7 @@ mod tests {
             }),
         };
 
-        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await;
+        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
         assert!(matches!(
             result,
             Err(StartWorkerError::AppError(EngineToAppError::NoAvailableSlot))
@@ -605,13 +602,9 @@ mod tests {
             }),
         };
 
-        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
-            .await;
+        let result = start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1)).await;
         assert!(
-            matches!(
-                result,
-                Err(StartWorkerError::AppError(EngineToAppError::SlotBusy))
-            ),
+            matches!(result, Err(StartWorkerError::AppError(EngineToAppError::SlotBusy))),
             "expected SlotBusy app error, got {result:?}",
         );
         assert!(
@@ -683,11 +676,16 @@ mod tests {
             .1
             .clone();
         assert_eq!(path, WORKER_SANITIZED_PATH);
-        assert!(!path.contains("/Users/"), "sanitized PATH must not contain user bin dir");
+        assert!(
+            !path.contains("/Users/"),
+            "sanitized PATH must not contain user bin dir"
+        );
         assert!(!path.contains(".cargo"), "sanitized PATH must not contain cargo bin");
 
         assert_eq!(
-            env.iter().find(|(k, _)| k == "BOSS_EVENTS_SOCKET").map(|(_, v)| v.as_str()),
+            env.iter()
+                .find(|(k, _)| k == "BOSS_EVENTS_SOCKET")
+                .map(|(_, v)| v.as_str()),
             Some("/tmp/events.sock"),
         );
         assert_eq!(

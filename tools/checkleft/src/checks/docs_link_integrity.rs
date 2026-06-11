@@ -64,8 +64,7 @@ impl ConfiguredCheck for DocsLinkIntegrityCheck {
                     if matched.start() > 0 && line.as_bytes()[matched.start() - 1] == b'!' {
                         continue;
                     }
-                    let Some(target) = captures.get(1).map(|capture| capture.as_str().trim())
-                    else {
+                    let Some(target) = captures.get(1).map(|capture| capture.as_str().trim()) else {
                         continue;
                     };
                     if should_skip_link_target(target) {
@@ -83,10 +82,7 @@ impl ConfiguredCheck for DocsLinkIntegrityCheck {
                             line: Some((line_index + 1) as u32),
                             column: Some((matched.start() + 1) as u32),
                         }),
-                        remediations: vec![
-                            "Fix or remove the broken link target in this markdown file."
-                                .to_owned(),
-                        ],
+                        remediations: vec!["Fix or remove the broken link target in this markdown file.".to_owned()],
                         suggested_fix: None,
                     });
                 }
@@ -119,11 +115,7 @@ fn link_target_exists(
     tree: &dyn SourceTree,
     changeset_paths: &HashSet<&Path>,
 ) -> bool {
-    let path_part = target
-        .split_once('#')
-        .map(|(path, _)| path)
-        .unwrap_or(target)
-        .trim();
+    let path_part = target.split_once('#').map(|(path, _)| path).unwrap_or(target).trim();
     if path_part.is_empty() {
         return true;
     }
@@ -257,11 +249,7 @@ mod tests {
     async fn checks_markdown_files_outside_docs_directory() {
         let temp = tempdir().expect("create temp dir");
         fs::create_dir_all(temp.path().join("guides")).expect("create guides dir");
-        fs::write(
-            temp.path().join("guides/setup.md"),
-            "[Missing](missing.md)\n",
-        )
-        .expect("write guide");
+        fs::write(temp.path().join("guides/setup.md"), "[Missing](missing.md)\n").expect("write guide");
 
         let check = DocsLinkIntegrityCheck;
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");

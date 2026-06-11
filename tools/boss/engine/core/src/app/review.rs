@@ -34,9 +34,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
             }
         };
         let (pr_url, task_status) = match &item {
-            WorkItem::Task(task) | WorkItem::Chore(task) => {
-                (task.pr_url.clone(), task.status.clone())
-            }
+            WorkItem::Task(task) | WorkItem::Chore(task) => (task.pr_url.clone(), task.status.clone()),
             _ => {
                 send_response(
                     &sink,
@@ -53,9 +51,7 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 &sink,
                 &request_id,
                 FrontendEvent::WorkError {
-                    message: format!(
-                        "merge_when_ready: task is not in review (status: {task_status})"
-                    ),
+                    message: format!("merge_when_ready: task is not in review (status: {task_status})"),
                 },
             );
             return;
@@ -200,14 +196,7 @@ pub(super) async fn handle_open_review_terminal(ctx: Dispatch, req: FrontendRequ
         let request_id2 = request_id.clone();
         let work_item_id2 = work_item_id.clone();
         tokio::spawn(async move {
-            match open_review_terminal_async(
-                &cube_client,
-                &repo_remote_url,
-                &pr_url,
-                &work_item_id2,
-            )
-            .await
-            {
+            match open_review_terminal_async(&cube_client, &repo_remote_url, &pr_url, &work_item_id2).await {
                 Ok((workspace_path, lease_id)) => {
                     send_response(
                         &sink2,

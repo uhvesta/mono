@@ -36,11 +36,8 @@ fn sync_project_design_doc_from_detector_skips_when_pointer_set() {
     let db = WorkDb::open(path.clone()).unwrap();
     let (_product, project) = seed_project_for_design_doc(&db);
 
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/manual.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/manual.md"))
+        .unwrap();
 
     let wrote = db
         .sync_project_design_doc_from_detector(
@@ -82,11 +79,8 @@ fn audit_records_first_set_as_old_null_new_value() {
     let db = WorkDb::open(path.clone()).unwrap();
     let (_product, project) = seed_project_for_design_doc(&db);
 
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/foo.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/foo.md"))
+        .unwrap();
 
     let audit = db.list_project_property_audit(&project.id).unwrap();
     assert_eq!(
@@ -96,10 +90,7 @@ fn audit_records_first_set_as_old_null_new_value() {
     );
     assert_eq!(audit[0].property, "design_doc_path");
     assert!(audit[0].old_value.is_none());
-    assert_eq!(
-        audit[0].new_value.as_deref(),
-        Some("tools/boss/docs/designs/foo.md"),
-    );
+    assert_eq!(audit[0].new_value.as_deref(), Some("tools/boss/docs/designs/foo.md"),);
     assert_eq!(audit[0].actor, AUDIT_ACTOR_HUMAN);
     assert_eq!(audit[0].project_id, project.id);
 
@@ -186,10 +177,7 @@ fn audit_records_unset_as_old_value_new_null() {
             entry.old_value.is_some(),
             "unset row should retain the prior value as old_value",
         );
-        assert!(
-            entry.new_value.is_none(),
-            "unset row should record new_value as NULL",
-        );
+        assert!(entry.new_value.is_none(), "unset row should record new_value as NULL",);
         assert_eq!(entry.actor, AUDIT_ACTOR_HUMAN);
     }
 
@@ -213,10 +201,7 @@ fn audit_records_detector_actor_on_sync() {
     assert!(wrote);
 
     let audit = db.list_project_property_audit(&project.id).unwrap();
-    assert!(
-        !audit.is_empty(),
-        "detector sync should emit at least one audit row",
-    );
+    assert!(!audit.is_empty(), "detector sync should emit at least one audit row",);
     for entry in &audit {
         assert_eq!(
             entry.actor, AUDIT_ACTOR_DESIGN_DETECTOR,
@@ -258,11 +243,8 @@ fn surface_design_doc_conflict_on_approve_silent_when_pointer_matches() {
     let (product, project) = seed_project_for_design_doc(&db);
     let execution = seed_execution_for(&db, &product.id, &project.id);
 
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/foo.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/foo.md"))
+        .unwrap();
 
     // Approved doc matches: same path, inherits same repo, default
     // branch matches the resolved default.
@@ -287,11 +269,8 @@ fn surface_design_doc_conflict_on_approve_emits_attention_item_when_pointer_diff
     let (product, project) = seed_project_for_design_doc(&db);
     let execution = seed_execution_for(&db, &product.id, &project.id);
 
-    db.set_project_design_doc(set_design_doc_input(
-        &project.id,
-        "tools/boss/docs/designs/manual.md",
-    ))
-    .unwrap();
+    db.set_project_design_doc(set_design_doc_input(&project.id, "tools/boss/docs/designs/manual.md"))
+        .unwrap();
 
     let item = db
         .surface_design_doc_conflict_on_approve(
@@ -1122,19 +1101,14 @@ fn product_default_model_set_and_clear() {
         .unwrap();
     assert!(product.default_model.is_none());
 
-    let with_model = db
-        .set_product_default_model(&product.id, Some("sonnet"))
-        .unwrap();
+    let with_model = db.set_product_default_model(&product.id, Some("sonnet")).unwrap();
     assert_eq!(with_model.default_model.as_deref(), Some("sonnet"));
 
     // Verbatim — engine does not normalise the slug.
     let verbatim = db
         .set_product_default_model(&product.id, Some("an-unreleased-model-2099"))
         .unwrap();
-    assert_eq!(
-        verbatim.default_model.as_deref(),
-        Some("an-unreleased-model-2099"),
-    );
+    assert_eq!(verbatim.default_model.as_deref(), Some("an-unreleased-model-2099"),);
 
     let cleared = db.set_product_default_model(&product.id, Some("")).unwrap();
     assert!(cleared.default_model.is_none());
@@ -1184,8 +1158,7 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
     {
         let conn = db.connect().unwrap();
         // Drop the new columns to simulate a pre-migration DB.
-        conn.execute("ALTER TABLE tasks DROP COLUMN effort_level", [])
-            .unwrap();
+        conn.execute("ALTER TABLE tasks DROP COLUMN effort_level", []).unwrap();
         conn.execute("ALTER TABLE tasks DROP COLUMN model_override", [])
             .unwrap();
         conn.execute("ALTER TABLE products DROP COLUMN default_model", [])
@@ -1204,18 +1177,14 @@ fn migration_re_adds_effort_and_model_columns_on_upgrade() {
     assert!(table_has_column(&conn, "products", "default_model").unwrap());
 
     let chore_effort: Option<String> = conn
-        .query_row(
-            "SELECT effort_level FROM tasks WHERE id = ?1",
-            [&chore.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT effort_level FROM tasks WHERE id = ?1", [&chore.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     let chore_model: Option<String> = conn
-        .query_row(
-            "SELECT model_override FROM tasks WHERE id = ?1",
-            [&chore.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT model_override FROM tasks WHERE id = ?1", [&chore.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     let product_model: Option<String> = conn
         .query_row(
@@ -1302,18 +1271,14 @@ fn migration_leaves_existing_rows_with_null_effort_and_model() {
     let db = WorkDb::open(path.clone()).unwrap();
     let conn = db.connect().unwrap();
     let chore_effort: Option<String> = conn
-        .query_row(
-            "SELECT effort_level FROM tasks WHERE id = ?1",
-            [&chore.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT effort_level FROM tasks WHERE id = ?1", [&chore.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     let chore_model: Option<String> = conn
-        .query_row(
-            "SELECT model_override FROM tasks WHERE id = ?1",
-            [&chore.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT model_override FROM tasks WHERE id = ?1", [&chore.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     let product_model: Option<String> = conn
         .query_row(
@@ -1401,11 +1366,9 @@ fn migrate_null_redundant_task_repo_remote_urls_clears_mirrors_and_preserves_div
     // All mirrored rows must now have repo_remote_url = NULL.
     for id in &mirrored_ids {
         let val: Option<String> = conn2
-            .query_row(
-                "SELECT repo_remote_url FROM tasks WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT repo_remote_url FROM tasks WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert!(
             val.is_none(),
@@ -1576,10 +1539,8 @@ fn allocator_per_product_sequences_are_independent() {
 
     let conn = db.connect().unwrap();
     let short = |id: &str| -> i64 {
-        conn.query_row("SELECT short_id FROM tasks WHERE id = ?1", [id], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        conn.query_row("SELECT short_id FROM tasks WHERE id = ?1", [id], |row| row.get(0))
+            .unwrap()
     };
     assert_eq!(short(&b1.id), 1);
     assert_eq!(short(&b2.id), 2);
@@ -1644,11 +1605,8 @@ fn migrate_short_id_backfill_is_deterministic_and_merges_tasks_and_projects() {
         }
 
         // Wipe the prior counter so the backfill replays from 1.
-        conn.execute(
-            "DELETE FROM short_id_sequences WHERE product_id = 'prod_a'",
-            [],
-        )
-        .unwrap();
+        conn.execute("DELETE FROM short_id_sequences WHERE product_id = 'prod_a'", [])
+            .unwrap();
         migrate_short_id_columns(&conn).unwrap();
 
         let mut pairs: Vec<(String, i64)> = Vec::new();
@@ -1656,9 +1614,7 @@ fn migrate_short_id_backfill_is_deterministic_and_merges_tasks_and_projects() {
             let sql = format!("SELECT id, short_id FROM {table} WHERE product_id = 'prod_a'");
             let mut stmt = conn.prepare(&sql).unwrap();
             let rows = stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
                 .unwrap();
             for r in rows {
                 pairs.push(r.unwrap());
@@ -1672,10 +1628,7 @@ fn migrate_short_id_backfill_is_deterministic_and_merges_tasks_and_projects() {
     let path_b = temp_db_path("short-id-backfill-b");
     let run_a = seed_and_backfill(&path_a);
     let run_b = seed_and_backfill(&path_b);
-    assert_eq!(
-        run_a, run_b,
-        "two independent runs must produce identical short_ids"
-    );
+    assert_eq!(run_a, run_b, "two independent runs must produce identical short_ids");
 
     let expected: Vec<(String, i64)> = vec![
         ("proj_a".into(), 3),
@@ -1724,11 +1677,9 @@ fn unique_short_id_index_rejects_manual_duplicate() {
         .unwrap();
     let existing_short: i64 = {
         let conn = db.connect().unwrap();
-        conn.query_row(
-            "SELECT short_id FROM tasks WHERE id = ?1",
-            [&chore.id],
-            |row| row.get(0),
-        )
+        conn.query_row("SELECT short_id FROM tasks WHERE id = ?1", [&chore.id], |row| {
+            row.get(0)
+        })
         .unwrap()
     };
 
@@ -1806,11 +1757,9 @@ fn create_project_assigns_short_ids_to_project_and_design_task() {
 
     let conn = db.connect().unwrap();
     let project_short: i64 = conn
-        .query_row(
-            "SELECT short_id FROM projects WHERE id = ?1",
-            [&project.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT short_id FROM projects WHERE id = ?1", [&project.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     let design_short: i64 = conn
         .query_row(
@@ -1860,11 +1809,7 @@ fn create_chore_protocol_struct_carries_short_id() {
             force_duplicate: false,
         })
         .unwrap();
-    assert_eq!(
-        chore.short_id,
-        Some(1),
-        "first chore in product gets short_id 1"
-    );
+    assert_eq!(chore.short_id, Some(1), "first chore in product gets short_id 1");
 
     // A second chore in the same product gets the next number.
     let chore2 = db
@@ -2268,24 +2213,18 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
     assert_eq!(all[0].id, r3.id);
 
     // Filter by product.
-    let by_product = db
-        .list_ci_remediations(Some(&product.id), &[], None, None)
-        .unwrap();
+    let by_product = db.list_ci_remediations(Some(&product.id), &[], None, None).unwrap();
     assert_eq!(by_product.len(), 3);
 
     // Filter by work item.
-    let by_item = db
-        .list_ci_remediations(None, &[], Some(&chore_a.id), None)
-        .unwrap();
+    let by_item = db.list_ci_remediations(None, &[], Some(&chore_a.id), None).unwrap();
     assert_eq!(by_item.len(), 2);
     for row in &by_item {
         assert_eq!(row.work_item_id, chore_a.id);
     }
 
     // Filter by status: `failed` matches only r1.
-    let failed_rows = db
-        .list_ci_remediations(None, &["failed".into()], None, None)
-        .unwrap();
+    let failed_rows = db.list_ci_remediations(None, &["failed".into()], None, None).unwrap();
     assert_eq!(failed_rows.len(), 1);
     assert_eq!(failed_rows[0].id, r1.id);
 
@@ -2295,12 +2234,7 @@ fn list_ci_remediations_filters_and_orders_freshest_first() {
 
     // Compound: product + work_item + status, intersected.
     let intersect = db
-        .list_ci_remediations(
-            Some(&product.id),
-            &["pending".into()],
-            Some(&chore_a.id),
-            None,
-        )
+        .list_ci_remediations(Some(&product.id), &["pending".into()], Some(&chore_a.id), None)
         .unwrap();
     assert_eq!(intersect.len(), 1);
     assert_eq!(intersect[0].id, r2.id);
@@ -2351,17 +2285,11 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
     assert_eq!(snap.blocked_reason, None);
 
     // Override path: `set_ci_attempt_budget` clamps to `0..=10`.
-    let snap = db
-        .set_ci_attempt_budget(&chore.id, Some(7))
-        .unwrap()
-        .unwrap();
+    let snap = db.set_ci_attempt_budget(&chore.id, Some(7)).unwrap().unwrap();
     assert_eq!(snap.per_pr_override, Some(7));
     assert_eq!(snap.effective, 7);
     // Out-of-range value clamps.
-    let snap = db
-        .set_ci_attempt_budget(&chore.id, Some(25))
-        .unwrap()
-        .unwrap();
+    let snap = db.set_ci_attempt_budget(&chore.id, Some(25)).unwrap().unwrap();
     assert_eq!(snap.per_pr_override, Some(10));
     assert_eq!(snap.effective, 10);
     // Clear path → product default applies.
@@ -2370,11 +2298,7 @@ fn ci_budget_snapshot_combines_override_and_product_default() {
     assert_eq!(snap.effective, 3);
 
     // Unknown work item.
-    assert!(
-        db.ci_budget_snapshot("chr_does_not_exist")
-            .unwrap()
-            .is_none()
-    );
+    assert!(db.ci_budget_snapshot("chr_does_not_exist").unwrap().is_none());
 
     let _ = std::fs::remove_file(path);
 }
@@ -2416,17 +2340,12 @@ fn migration_normalises_empty_effort_level_to_null() {
     // Manually write an empty string to simulate a legacy row.
     {
         let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE tasks SET effort_level = '' WHERE id = ?1",
-            [&chore.id],
-        )
-        .unwrap();
+        conn.execute("UPDATE tasks SET effort_level = '' WHERE id = ?1", [&chore.id])
+            .unwrap();
         let raw: Option<String> = conn
-            .query_row(
-                "SELECT effort_level FROM tasks WHERE id = ?1",
-                [&chore.id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT effort_level FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(raw.as_deref(), Some(""), "pre-condition: row has ''");
     }
@@ -2436,11 +2355,9 @@ fn migration_normalises_empty_effort_level_to_null() {
     let db = WorkDb::open(path.clone()).unwrap();
     let conn = db.connect().unwrap();
     let after: Option<String> = conn
-        .query_row(
-            "SELECT effort_level FROM tasks WHERE id = ?1",
-            [&chore.id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT effort_level FROM tasks WHERE id = ?1", [&chore.id], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(after.is_none(), "empty effort_level should be NULL after migration");
 
@@ -2507,10 +2424,7 @@ fn mark_ci_remediation_retriggered_records_flaky_signal_without_blocking() {
     // The attempt is now terminal, so `active_ci_remediation_for_work_item`
     // (pending/running only) no longer returns it — the on-Stop catch-all
     // finalizer becomes a no-op and cannot re-mark it failed.
-    assert!(db
-        .active_ci_remediation_for_work_item(&chore)
-        .unwrap()
-        .is_none());
+    assert!(db.active_ci_remediation_for_work_item(&chore).unwrap().is_none());
 
     // Idempotent: a duplicate marker is a no-op (row already terminal).
     assert!(db.mark_ci_remediation_retriggered(&attempt.id).unwrap().is_none());
@@ -2625,11 +2539,8 @@ fn effective_ci_budget_resolves_override_default_and_clamps() {
     // ignores the product column and hard-codes 3 would be caught.
     {
         let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE products SET ci_attempt_budget = 5 WHERE id = ?1",
-            [&product_id],
-        )
-        .unwrap();
+        conn.execute("UPDATE products SET ci_attempt_budget = 5 WHERE id = ?1", [&product_id])
+            .unwrap();
     }
     assert_eq!(
         db.effective_ci_budget(&chore).unwrap(),
@@ -2652,11 +2563,8 @@ fn effective_ci_budget_resolves_override_default_and_clamps() {
     // exercise the read-side clamp inside `effective_ci_budget` itself.
     {
         let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE tasks SET ci_attempt_budget = 99 WHERE id = ?1",
-            [&chore],
-        )
-        .unwrap();
+        conn.execute("UPDATE tasks SET ci_attempt_budget = 99 WHERE id = ?1", [&chore])
+            .unwrap();
     }
     assert_eq!(
         db.effective_ci_budget(&chore).unwrap(),
@@ -2665,11 +2573,8 @@ fn effective_ci_budget_resolves_override_default_and_clamps() {
     );
     {
         let conn = db.connect().unwrap();
-        conn.execute(
-            "UPDATE tasks SET ci_attempt_budget = -4 WHERE id = ?1",
-            [&chore],
-        )
-        .unwrap();
+        conn.execute("UPDATE tasks SET ci_attempt_budget = -4 WHERE id = ?1", [&chore])
+            .unwrap();
     }
     assert_eq!(
         db.effective_ci_budget(&chore).unwrap(),
@@ -2685,9 +2590,7 @@ fn effective_ci_budget_resolves_override_default_and_clamps() {
         "an unknown work item returns the hard default budget of 3",
     );
     assert!(
-        db.ci_budget_snapshot("chr_does_not_exist")
-            .unwrap()
-            .is_none(),
+        db.ci_budget_snapshot("chr_does_not_exist").unwrap().is_none(),
         "ci_budget_snapshot diverges: it returns None for the same unknown item",
     );
 }

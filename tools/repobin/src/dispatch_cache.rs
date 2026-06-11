@@ -89,12 +89,13 @@ pub fn record_in(
         })?;
     }
 
-    let serialized = serde_json::to_vec(&cache).map_err(io::Error::other).map_err(
-        |source| RepobinError::WriteCacheMetadata {
-            path: entry_path.clone(),
-            source,
-        },
-    )?;
+    let serialized =
+        serde_json::to_vec(&cache)
+            .map_err(io::Error::other)
+            .map_err(|source| RepobinError::WriteCacheMetadata {
+                path: entry_path.clone(),
+                source,
+            })?;
 
     write_atomic(&entry_path, &serialized)
 }
@@ -175,11 +176,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RepobinError> {
             path: path.to_path_buf(),
             source,
         })?;
-    tmp.persist(path)
-        .map_err(|err| RepobinError::WriteCacheMetadata {
-            path: path.to_path_buf(),
-            source: err.error,
-        })?;
+    tmp.persist(path).map_err(|err| RepobinError::WriteCacheMetadata {
+        path: path.to_path_buf(),
+        source: err.error,
+    })?;
     Ok(())
 }
 
@@ -191,9 +191,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{
-        BuildWitness, CACHE_VERSION, CacheFile, entry_path, lookup_in, package_dir_for, record_in,
-    };
+    use super::{BuildWitness, CACHE_VERSION, CacheFile, entry_path, lookup_in, package_dir_for, record_in};
 
     fn touch(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -214,10 +212,7 @@ mod tests {
             package_dir_for("//tools/boss/cli:boss").as_deref(),
             Some("tools/boss/cli")
         );
-        assert_eq!(
-            package_dir_for("//tools/boss/cli").as_deref(),
-            Some("tools/boss/cli")
-        );
+        assert_eq!(package_dir_for("//tools/boss/cli").as_deref(), Some("tools/boss/cli"));
         assert_eq!(package_dir_for("//:boss").as_deref(), Some(""));
         assert_eq!(package_dir_for("not-a-label"), None);
     }
@@ -401,13 +396,7 @@ mod tests {
         touch(&build_b, "b");
         record_in(&cache_root, &repo_b, target, &exe_b, &[]).expect("record b");
 
-        assert_eq!(
-            lookup_in(&cache_root, &repo_a, target).unwrap(),
-            exe_a
-        );
-        assert_eq!(
-            lookup_in(&cache_root, &repo_b, target).unwrap(),
-            exe_b
-        );
+        assert_eq!(lookup_in(&cache_root, &repo_a, target).unwrap(), exe_a);
+        assert_eq!(lookup_in(&cache_root, &repo_b, target).unwrap(), exe_b);
     }
 }

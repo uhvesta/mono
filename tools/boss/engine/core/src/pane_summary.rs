@@ -131,11 +131,7 @@ pub fn local_fallback(name: &str) -> Option<String> {
 /// the 7-word UI guidance. If the task name is empty the shorter
 /// `"resolving merge conflicts"` is returned instead.
 pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
-    let short: Vec<String> = task_name
-        .split_whitespace()
-        .take(3)
-        .map(|w| w.to_lowercase())
-        .collect();
+    let short: Vec<String> = task_name.split_whitespace().take(3).map(|w| w.to_lowercase()).collect();
     if short.is_empty() {
         Some("resolving merge conflicts".to_owned())
     } else {
@@ -148,11 +144,7 @@ pub fn conflict_resolution_summary(task_name: &str) -> Option<String> {
 /// <task-name>"` (or the shorter `"fixing CI"` when the task name is
 /// empty / unavailable).
 pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
-    let short: Vec<String> = task_name
-        .split_whitespace()
-        .take(3)
-        .map(|w| w.to_lowercase())
-        .collect();
+    let short: Vec<String> = task_name.split_whitespace().take(3).map(|w| w.to_lowercase()).collect();
     if short.is_empty() {
         Some("fixing CI".to_owned())
     } else {
@@ -164,11 +156,7 @@ pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
 /// falling through to Claude only on a miss or basis change. Errors
 /// are swallowed — this function never blocks worker spawn — and a
 /// `None` return tells the caller to display the run id as before.
-pub async fn get_or_generate(
-    db: &WorkDb,
-    api_key: Option<&str>,
-    work_item: &WorkItem,
-) -> Option<String> {
+pub async fn get_or_generate(db: &WorkDb, api_key: Option<&str>, work_item: &WorkItem) -> Option<String> {
     let (name, description) = name_and_description(work_item);
     let basis = compute_basis(name, description);
     let id = item_id(work_item);
@@ -319,11 +307,7 @@ fn http_client() -> &'static reqwest::Client {
 /// POST to the Anthropic Messages API and pull the first text block
 /// out of the response. Errors are bucketed into `anyhow` because
 /// the caller (`get_or_generate`) only logs them.
-pub async fn claude_short_summary(
-    api_key: &str,
-    name: &str,
-    description: &str,
-) -> Result<String> {
+pub async fn claude_short_summary(api_key: &str, name: &str, description: &str) -> Result<String> {
     let client = http_client();
     let prompt = build_prompt(name, description);
     let body = ClaudeRequest {
@@ -523,10 +507,7 @@ mod tests {
 
     #[test]
     fn clean_summary_strips_quotes_and_periods() {
-        assert_eq!(
-            clean_summary("\"fixing fencer scraper.\""),
-            "fixing fencer scraper",
-        );
+        assert_eq!(clean_summary("\"fixing fencer scraper.\""), "fixing fencer scraper",);
         assert_eq!(
             clean_summary("  fixing the pane titlebar  "),
             "fixing the pane titlebar",
@@ -538,10 +519,7 @@ mod tests {
         // Sonnet sometimes capitalizes despite the lowercase rule —
         // make sure the first character is forced lowercase so the
         // phrase reads mid-sentence after "<Name> is ".
-        assert_eq!(
-            clean_summary("Fixing the bossctl stubs"),
-            "fixing the bossctl stubs",
-        );
+        assert_eq!(clean_summary("Fixing the bossctl stubs"), "fixing the bossctl stubs",);
     }
 
     #[test]
@@ -549,14 +527,8 @@ mod tests {
         // Defensive: if the model echoed the framing back at us
         // ("is fixing X"), the surrounding sentence would read
         // "<Name> is is fixing X". Strip the leading copula.
-        assert_eq!(
-            clean_summary("is fixing the bossctl stubs"),
-            "fixing the bossctl stubs",
-        );
-        assert_eq!(
-            clean_summary("Is fixing the bossctl stubs"),
-            "fixing the bossctl stubs",
-        );
+        assert_eq!(clean_summary("is fixing the bossctl stubs"), "fixing the bossctl stubs",);
+        assert_eq!(clean_summary("Is fixing the bossctl stubs"), "fixing the bossctl stubs",);
     }
 
     #[test]
@@ -593,8 +565,7 @@ mod tests {
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let item = sample_task("task-1", "Fix fencer scraper", "desc");
         let basis = compute_basis("Fix fencer scraper", "desc");
-        db.set_pane_summary("task-1", "fixing fencer scraper", &basis)
-            .unwrap();
+        db.set_pane_summary("task-1", "fixing fencer scraper", &basis).unwrap();
 
         // No API key, but there IS a cache hit — the cached gerund
         // summary is returned. Cache is checked before the key path,
@@ -609,8 +580,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
         let stale_basis = compute_basis("old name", "old desc");
-        db.set_pane_summary("task-1", "stale summary", &stale_basis)
-            .unwrap();
+        db.set_pane_summary("task-1", "stale summary", &stale_basis).unwrap();
 
         // Same id, different name → cache should miss. With no API
         // key, get_or_generate now returns None (the engine passes

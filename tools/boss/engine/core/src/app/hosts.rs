@@ -38,13 +38,7 @@ fn fetch_snapshot(work_db: &crate::work::WorkDb, id: &str) -> anyhow::Result<Hos
 }
 
 fn send_error_msg(sink: &super::SessionSink, request_id: &str, msg: impl Into<String>) {
-    send_response(
-        sink,
-        request_id,
-        FrontendEvent::Error {
-            message: msg.into(),
-        },
-    );
+    send_response(sink, request_id, FrontendEvent::Error { message: msg.into() });
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -233,11 +227,7 @@ pub(super) async fn handle_remove_host_tag(ctx: Dispatch, req: FrontendRequest) 
 /// Push the boss-remote-run wrapper to the remote host. On failure the host is
 /// disabled with `last_error_text` set; the caller reads the updated snapshot
 /// to surface the result to the UI (disabled + error text = add failed).
-async fn eager_push_wrapper_rpc(
-    work_db: &crate::work::WorkDb,
-    host_id: &str,
-    ssh_target: &str,
-) {
+async fn eager_push_wrapper_rpc(work_db: &crate::work::WorkDb, host_id: &str, ssh_target: &str) {
     use crate::ssh_transport::{SshTransport, default_control_socket_dir};
     use crate::wrapper_distribution::{WrapperPushOutcome, push_wrapper, subclass_label};
 

@@ -14,8 +14,8 @@ use crate::driver::AgentDriver;
 use crate::effort::{SpawnConfig, resolve_spawn_config};
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
-use crate::worker_setup::WorkerKind;
 use crate::work::{CiRemediation, ConflictResolution, Project, Task, WorkDb, WorkExecution, WorkItem};
+use crate::worker_setup::WorkerKind;
 use boss_protocol::{EditorialRules, ExecutionKind, ExecutionStatus, TemplatePolicy, WorkItemBinding};
 #[cfg(test)]
 use boss_protocol::{TaskKind, TaskStatus};
@@ -73,9 +73,7 @@ impl RunWaitState {
     pub fn release_workspace(self) -> bool {
         matches!(
             self,
-            RunWaitState::Terminal
-                | RunWaitState::WaitingDependency
-                | RunWaitState::CancelledDuringSpawn
+            RunWaitState::Terminal | RunWaitState::WaitingDependency | RunWaitState::CancelledDuringSpawn
         )
     }
 }
@@ -197,9 +195,8 @@ impl PaneSpawnRunner {
         let workspace = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
         let env_override = std::env::var_os("BOSS_EVENT_BIN").map(PathBuf::from);
         let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
-        let stable_bin_dir = std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h).join("Library/Application Support/Boss/bin")
-        });
+        let stable_bin_dir =
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Boss/bin"));
         resolve_boss_event_binary(
             &engine_path,
             workspace.as_deref(),
@@ -317,10 +314,7 @@ pub(crate) fn resolve_boss_event_binary(
 /// (`~/Library/Application Support/Boss/bin/`). Returns the stable path
 /// on success. If `source_shim` is already inside `stable_bin_dir`,
 /// returns `Ok(source_shim)` without copying (no-op for installed mode).
-pub(crate) fn install_boss_event_to_stable_bin(
-    source_shim: &Path,
-    stable_bin_dir: &Path,
-) -> io::Result<PathBuf> {
+pub(crate) fn install_boss_event_to_stable_bin(source_shim: &Path, stable_bin_dir: &Path) -> io::Result<PathBuf> {
     let stable_path = stable_bin_dir.join("boss-event");
     if stable_path == source_shim {
         return Ok(stable_path);
@@ -405,8 +399,7 @@ impl ExecutionRunner for PaneSpawnRunner {
 
         let prompt_path = workspace_path.join(".claude").join("initial-prompt.txt");
         if let Some(parent) = prompt_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         std::fs::write(&prompt_path, &prompt_text)
             .with_context(|| format!("writing initial prompt to {}", prompt_path.display()))?;
@@ -419,20 +412,19 @@ impl ExecutionRunner for PaneSpawnRunner {
         // reads + validates it. Best-effort: a prepare failure is non-fatal
         // (the worker falls back to the transcript-scrape contract).
         let structured_output_dir = crate::structured_output::default_dir();
-        let structured_output_path =
-            match crate::structured_output::prepare(&structured_output_dir, &execution.id) {
-                Ok(path) => Some(path.display().to_string()),
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        dir = %structured_output_dir.display(),
-                        ?err,
-                        "spawn: could not prepare structured-output dir; worker will rely on \
-                         the transcript-scrape fallback",
-                    );
-                    None
-                }
-            };
+        let structured_output_path = match crate::structured_output::prepare(&structured_output_dir, &execution.id) {
+            Ok(path) => Some(path.display().to_string()),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    dir = %structured_output_dir.display(),
+                    ?err,
+                    "spawn: could not prepare structured-output dir; worker will rely on \
+                     the transcript-scrape fallback",
+                );
+                None
+            }
+        };
 
         // Scrub ANTHROPIC_API_KEY from the worker shell's environment before
         // invoking claude. The engine needs the var in its own process for
@@ -445,8 +437,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // The worker's session settings (boss-event hooks, deny rules)
         // live outside the workspace tree; point claude at them with
         // `--settings`. `write_workspace_files` writes the same path.
-        let worker_settings_path =
-            crate::worker_setup::worker_settings_path(workspace_path);
+        let worker_settings_path = crate::worker_setup::worker_settings_path(workspace_path);
         // Re-prepend BOSS_BIN_DIR to PATH in the worker's first shell line,
         // mirroring the Boss/coordinator pane (see BossPaneModel.swift and
         // the feba26d2 fix). `spawn_flow` already sets PATH with
@@ -480,11 +471,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // resolve the API key lazily and let the helper handle every
         // failure mode (missing key, API error, cache miss) so a
         // slow or unreachable Anthropic never blocks the spawn.
-        let api_key = self
-            .cfg
-            .agent()
-            .ok()
-            .and_then(|agent| agent.anthropic_api_key.clone());
+        let api_key = self.cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         let title_summary = if execution.kind == ExecutionKind::CiRemediation {
             pane_summary::ci_remediation_summary(work_item_name(work_item))
         } else {
@@ -508,12 +495,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 boss_event_path: self.boss_event_binary(),
                 initial_input,
                 extra_env: structured_output_path
-                    .map(|p| {
-                        vec![(
-                            crate::structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
-                            p,
-                        )]
-                    })
+                    .map(|p| vec![(crate::structured_output::STRUCTURED_OUTPUT_ENV.to_owned(), p)])
                     .unwrap_or_default(),
                 title_summary,
                 task_title: Some(work_item_name(work_item).to_owned()),
@@ -625,9 +607,7 @@ pub(crate) struct ComposedWorkerSpawn {
 /// a [`crate::pr_review::PrReviewContext`] on success. Returns `None` on any
 /// network or parse error — callers fall back to the URL-only prompt
 /// gracefully without blocking the spawn.
-async fn fetch_pr_review_context(
-    pr_url: &str,
-) -> Option<crate::pr_review::PrReviewContext> {
+async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrReviewContext> {
     use std::process::Stdio;
 
     #[derive(serde::Deserialize)]
@@ -647,13 +627,7 @@ async fn fetch_pr_review_context(
     let pr_number: u64 = pr_url.split('/').next_back()?.parse().ok()?;
 
     let output = tokio::process::Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "baseRefOid,headRefOid,files",
-        ])
+        .args(["pr", "view", pr_url, "--json", "baseRefOid,headRefOid,files"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -847,12 +821,9 @@ pub(crate) async fn compose_worker_spawn(
         match work_item {
             WorkItem::Task(task) | WorkItem::Chore(task) => {
                 let product = work_db.get_product(&task.product_id).ok().flatten();
-                let editorial_rules =
-                    product.as_ref().and_then(|p| p.editorial_rules.clone());
-                let product_default_model =
-                    product.as_ref().and_then(|p| p.default_model.clone());
-                let dispatch_preamble =
-                    product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
+                let editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
+                let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
+                let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
                 (
                     editorial_rules,
                     task.effort_level,
@@ -869,11 +840,7 @@ pub(crate) async fn compose_worker_spawn(
         _ => "",
     };
     let pr_template_lease_id = execution.cube_lease_id.as_deref().unwrap_or("");
-    let pr_template_set = crate::pr_template::load(
-        pr_template_product_id,
-        pr_template_lease_id,
-        workspace_path,
-    );
+    let pr_template_set = crate::pr_template::load(pr_template_product_id, pr_template_lease_id, workspace_path);
     // Maint task 6: an `automation_triage` execution renders the triage
     // preamble (decision-marker contract + "do not do the work / do not
     // open a PR" guardrails) instead of the ordinary implementer prompt.
@@ -1007,8 +974,7 @@ pub(crate) async fn compose_worker_spawn(
             // scope accurately, instead of always defaulting to Code.
             let scope = match &pr_review_context {
                 Some(ctx) => {
-                    let files: Vec<&str> =
-                        ctx.changed_files.iter().map(String::as_str).collect();
+                    let files: Vec<&str> = ctx.changed_files.iter().map(String::as_str).collect();
                     crate::pr_review::classify_changed_files(&files)
                 }
                 None => crate::pr_review::ReviewScope::Code,
@@ -1061,7 +1027,10 @@ pub(crate) async fn compose_worker_spawn(
     // Empty / null preamble → today's behaviour, no change.
     let prompt_text = match product_dispatch_preamble {
         Some(preamble) => {
-            format!("[product-preamble]\n{}\n[/product-preamble]\n\n{}", preamble, prompt_text)
+            format!(
+                "[product-preamble]\n{}\n[/product-preamble]\n\n{}",
+                preamble, prompt_text
+            )
         }
         None => prompt_text,
     };
@@ -1107,20 +1076,19 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // attempt-kind-specific playbook (rebase-first for `fix`, just the
     // retrigger CLI for `retrigger`).
     if execution.kind == ExecutionKind::CiRemediation
-        && let Some(attempt) = ci_attempt {
-            return compose_ci_remediation_prompt(
-                execution,
-                work_item,
-                workspace_path,
-                cube_change_id,
-                attempt,
-                /* test_command */ None,
-            );
-        }
+        && let Some(attempt) = ci_attempt
+    {
+        return compose_ci_remediation_prompt(
+            execution,
+            work_item,
+            workspace_path,
+            cube_change_id,
+            attempt,
+            /* test_command */ None,
+        );
+    }
     let mut prompt = String::new();
-    prompt.push_str(
-        "You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n",
-    );
+    prompt.push_str("You are a reusable Boss worker running one execution inside a dedicated repo workspace.\n");
     prompt.push_str("The current session cwd is already set to that workspace.\n");
     prompt.push_str("Do the work directly in the repository checkout before ending this run.\n");
     prompt.push_str("Avoid asking the human for permission during this pass; when you need review or direction, stop and summarize it clearly.\n\n");
@@ -1130,7 +1098,9 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     // workspace-rules default of `jj git fetch && jj new main`.
     let existing_pr_url = work_item_pr_url(work_item);
     if let Some(pr_url) = existing_pr_url {
-        let pr_number = extract_pr_number(pr_url).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+        let pr_number = extract_pr_number(pr_url)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into());
         prompt.push_str(&format!(
             "## RESUME EXISTING PR\n\
              \n\
@@ -1249,7 +1219,13 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
             prompt.push_str(&compose_investigation_directive());
         }
         ExecutionKind::RevisionImplementation => {
-            prompt.push_str(&compose_revision_directive(execution, work_item, workspace_path, conflict_attempt, ci_attempt));
+            prompt.push_str(&compose_revision_directive(
+                execution,
+                work_item,
+                workspace_path,
+                conflict_attempt,
+                ci_attempt,
+            ));
         }
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation => {
             prompt.push_str(
@@ -1278,13 +1254,16 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
     if matches!(
         execution.kind,
         ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
-    )
-        && let Some(gate) = bazel_prepush_gate_block(workspace_path) {
-            prompt.push_str(&gate);
-        }
+    ) && let Some(gate) = bazel_prepush_gate_block(workspace_path)
+    {
+        prompt.push_str(&gate);
+    }
     if matches!(
         execution.kind,
-        ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation | ExecutionKind::ProjectDesign | ExecutionKind::InvestigationImplementation
+        ExecutionKind::TaskImplementation
+            | ExecutionKind::ChoreImplementation
+            | ExecutionKind::ProjectDesign
+            | ExecutionKind::InvestigationImplementation
     ) {
         // Acceptance criterion: the engine watches for a PR URL on the
         // run's branch when claude stops. If the worker stops without
@@ -1306,7 +1285,9 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // creating a new one. The engine's staged-URL detector captures
         // the URL from `gh pr view` output at the end of the run.
         if let Some(pr_url) = existing_pr_url {
-            let pr_number = extract_pr_number(pr_url).map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+            let pr_number = extract_pr_number(pr_url)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into());
             prompt.push_str(&format!(
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
                  - Push your commits to the existing PR branch (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
@@ -1434,9 +1415,7 @@ fn render_editorial_rules_block(
     let instructions = editorial_rules
         .and_then(|r| r.instructions.as_deref())
         .filter(|s| !s.is_empty());
-    let template_policy = editorial_rules
-        .map(|r| r.template_policy.clone())
-        .unwrap_or_default();
+    let template_policy = editorial_rules.map(|r| r.template_policy.clone()).unwrap_or_default();
     let is_configured = instructions.is_some() || !matches!(template_policy, TemplatePolicy::Off);
 
     let mut out = String::new();
@@ -1483,11 +1462,7 @@ fn render_editorial_rules_block(
                 .as_ref()
                 .map(|t| t.source_path.display().to_string())
                 .or_else(|| {
-                    let mut stems: Vec<&str> = pr_template_set
-                        .named_templates
-                        .keys()
-                        .map(String::as_str)
-                        .collect();
+                    let mut stems: Vec<&str> = pr_template_set.named_templates.keys().map(String::as_str).collect();
                     stems.sort();
                     stems
                         .first()
@@ -1501,14 +1476,10 @@ fn render_editorial_rules_block(
                      regardless of the final-response sectioning rules.\n",
                 );
                 let has_multiple = pr_template_set.named_templates.len() > 1
-                    || (pr_template_set.default_template.is_some()
-                        && !pr_template_set.named_templates.is_empty());
+                    || (pr_template_set.default_template.is_some() && !pr_template_set.named_templates.is_empty());
                 for tmpl in pr_template_set.all_templates() {
                     if has_multiple {
-                        out.push_str(&format!(
-                            "\nTemplate (`{}`):\n",
-                            tmpl.source_path.display()
-                        ));
+                        out.push_str(&format!("\nTemplate (`{}`):\n", tmpl.source_path.display()));
                     }
                     out.push_str("\n```\n");
                     out.push_str(tmpl.text.trim_end());
@@ -1542,7 +1513,9 @@ fn render_editorial_rules_block(
 fn pr_terminal_directive() -> String {
     let mut out = String::new();
     out.push_str("\n## Important: PR creation is your terminal act\n\n");
-    out.push_str("Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n");
+    out.push_str(
+        "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
+    );
     out.push_str("You will NOT get another turn after `gh pr create` / `cube pr ensure`. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (subagent workflows, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
@@ -1581,11 +1554,7 @@ fn ci_monitoring_directive(execution: &WorkExecution) -> String {
         let owner = slug.split('/').next().unwrap_or("");
         let names = crate::merge_poller::review_signal_checks_for_owner(owner);
         if !names.is_empty() {
-            let rendered = names
-                .iter()
-                .map(|n| format!("`{n}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let rendered = names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ");
             out.push_str(&format!(
                 "This PR's org (`{owner}`) ships required check(s) that are human-gated and never auto-resolve from CI: {rendered}. The engine's CI-completion check treats them as NOT blocking — they stay pending until a human approves. You must do the same: their pending/running state is not a reason to keep this run alive.\n\n",
             ));
@@ -1743,18 +1712,14 @@ fn compose_revision_directive(
     let pr_number = boss_github::pr_url::pr_number_from_url(parent_pr_url)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "?".into());
-    let repo_slug = crate::completion::parse_repo_slug(&execution.repo_remote_url)
-        .unwrap_or_else(|_| "<owner/repo>".to_owned());
+    let repo_slug =
+        crate::completion::parse_repo_slug(&execution.repo_remote_url).unwrap_or_else(|_| "<owner/repo>".to_owned());
 
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
     out.push_str("- This is a **REVISION** task. Your deliverable is an update to an EXISTING pull request — typically a new commit on the PR branch, or a rebase if that is all that is needed. Do NOT open a new PR. Do NOT create a `boss/exec_*` bookmark.\n");
-    out.push_str(&format!(
-        "- The parent PR is #{pr_number} at {parent_pr_url}.\n"
-    ));
-    out.push_str(&format!(
-        "- What this revision should change: {description}\n"
-    ));
+    out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
+    out.push_str(&format!("- What this revision should change: {description}\n"));
     // Issue #804: revision chores (T30–T34 on PR #250) were the worst
     // offenders for pushing red code. Apply the same pre-push build gate
     // when the workspace is a Bazel workspace.
@@ -1765,7 +1730,9 @@ fn compose_revision_directive(
     out.push_str("## Workspace state\n");
     out.push_str("The engine pre-positioned this workspace via `cube workspace lease --resume_pr`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
     out.push('\n');
-    out.push_str("**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n");
+    out.push_str(
+        "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",
+    );
     out.push_str("```\n");
     out.push_str("jj git fetch\n");
     out.push_str("# Find the PR branch bookmark (look for boss/exec_... ending in @origin):\n");
@@ -1785,7 +1752,9 @@ fn compose_revision_directive(
     out.push_str("   # Advance the local bookmark:\n");
     out.push_str("   jj bookmark set <parent-branch-name> -r @\n");
     out.push_str("   ```\n");
-    out.push_str("4. `jj git push -b <parent-branch-name>`   # NO --allow-new; NO GIT_DIR prefix; the branch already exists.\n");
+    out.push_str(
+        "4. `jj git push -b <parent-branch-name>`   # NO --allow-new; NO GIT_DIR prefix; the branch already exists.\n",
+    );
     out.push_str("5. **Update the PR description** — this is a required step, not optional:\n");
     out.push_str(&format!(
         "   a. Read the current description: `gh pr view {pr_number} -R {repo_slug} --json body -q .body`\n"
@@ -1795,7 +1764,9 @@ fn compose_revision_directive(
     out.push_str(&format!(
         "      `body=$(mktemp) && <write corrected body to $body> && gh pr edit {pr_number} --body-file \"$body\" -R {repo_slug}`\n"
     ));
-    out.push_str("      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n");
+    out.push_str(
+        "      Never pass the body as an inline `--body` argument — the shell evaluates backticks and `$(...)`.\n",
+    );
     out.push_str("   d. What to write: rewrite the description so it is accurate and self-contained for reviewers NOW. The main summary must describe the CURRENT state — what the PR does, not what it used to do. Do NOT append a changelog that leaves a contradictory original summary above it; instead correct the summary in place. A brief \"Changes in this revision\" note may follow the corrected summary if it adds context, but it must never contradict or overshadow the corrected summary.\n");
     out.push_str("   e. A revision may skip steps c–d ONLY if it changes ZERO source files (e.g. a PR-description-only fix or a pure markdown/comment edit) AND involves no rebase, merge, or conflict resolution. Rebase and conflict-resolution revisions do NOT qualify for this skip — they touch compiled output and must go through the full description review.\n");
     out.push('\n');
@@ -1843,7 +1814,12 @@ fn compose_revision_directive(
 /// `kind = 'design'` rows, but the runner stays defensive.
 fn canonical_design_doc_path_line(parent_project: Option<&Project>) -> Option<String> {
     let project = parent_project?;
-    if let Some(path) = project.design_doc_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(path) = project
+        .design_doc_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         return Some(format!(
             "- the canonical path for this design doc is `{path}` (set on the project's `design_doc_path` pointer). Write the doc there.\n",
         ));
@@ -1966,9 +1942,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
 /// bespoke `compose_ci_remediation_prompt` except that the branch/push spine
 /// is already covered by the shared revision directive.
 fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
-    let is_rebounce = attempt
-        .failure_kind
-        .as_deref() == Some("merge_queue_rebounce");
+    let is_rebounce = attempt.failure_kind.as_deref() == Some("merge_queue_rebounce");
 
     let mut out = String::new();
     out.push_str("\n---\n\n");
@@ -1998,16 +1972,10 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     if !attempt.head_branch.is_empty() {
         out.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
     }
-    if is_rebounce
-        && let Some(ref sha) = attempt.before_commit_sha {
-            out.push_str(&format!(
-                "**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",
-            ));
-        }
-    out.push_str(&format!(
-        "**Head sha at trigger**: `{}`\n",
-        attempt.head_sha_at_trigger,
-    ));
+    if is_rebounce && let Some(ref sha) = attempt.before_commit_sha {
+        out.push_str(&format!("**Synthetic merge SHA** (fetch CI logs from here): `{sha}`\n",));
+    }
+    out.push_str(&format!("**Head sha at trigger**: `{}`\n", attempt.head_sha_at_trigger,));
     out.push_str(&format!("**Attempt id**: `{}`\n\n", attempt.id));
 
     out.push_str("### Failing required checks\n\n");
@@ -2093,10 +2061,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
 
         out.push_str("**Step 2 — Read the log, classify, fix, push.**\n\n");
         if is_rebounce {
-            let sha_hint = attempt
-                .before_commit_sha
-                .as_deref()
-                .unwrap_or("<synthetic-merge-sha>");
+            let sha_hint = attempt.before_commit_sha.as_deref().unwrap_or("<synthetic-merge-sha>");
             out.push_str(&format!(
                 "Fetch CI logs from the **synthetic merge SHA `{sha_hint}`**, not the PR head \
                  (whose checks are green). Use the per-provider CLI:\n\n\
@@ -2131,9 +2096,7 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 `boss engine ci mark-failed --attempt-id <attempt-id> --reason <reason>` \
                 and stop. Do NOT push.\n",
         );
-        out.push_str(
-            "2. No `test_command` context is available here; rely on CI to verify the push.\n",
-        );
+        out.push_str("2. No `test_command` context is available here; rely on CI to verify the push.\n");
         out.push_str(&format!(
             "3. Push your fix via step 5 of the revision directive (push to the parent branch \
                 `{branch}`). The merge-poller will observe the new head sha and re-evaluate CI on \
@@ -2169,7 +2132,6 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     out
 }
 
-
 /// Templated prompt for the `ci_remediation` execution kind, retrigger path
 /// only. `fix`-kind CI attempts now dispatch through the revision substrate
 /// (`revision_implementation`); only `retrigger` (design Q6: no commit,
@@ -2194,20 +2156,14 @@ fn compose_ci_remediation_prompt(
     if !attempt.head_branch.is_empty() {
         prompt.push_str(&format!("**Branch**: `{}`\n", attempt.head_branch));
     }
-    prompt.push_str(&format!(
-        "**Head sha at trigger**: `{}`\n",
-        attempt.head_sha_at_trigger,
-    ));
+    prompt.push_str(&format!("**Head sha at trigger**: `{}`\n", attempt.head_sha_at_trigger,));
     prompt.push_str(&format!("**Workspace**: `{}`\n", workspace_path.display()));
     prompt.push_str(&format!("**Attempt id**: `{}`\n", attempt.id));
     prompt.push_str(&format!("**Execution id**: `{}`\n", execution.id));
     if let Some(change) = cube_change_id {
         prompt.push_str(&format!("**Local change**: `{change}`\n"));
     }
-    prompt.push_str(&format!(
-        "**Work item**: `{}`\n\n",
-        work_item_name(work_item),
-    ));
+    prompt.push_str(&format!("**Work item**: `{}`\n\n", work_item_name(work_item),));
 
     // Failing-check list — same JSON the engine seeded on the row at
     // detection time. Rendered as a bulleted summary; the worker has the
@@ -2279,9 +2235,7 @@ fn render_bk_log_commands(failed_checks_json: &str) -> Option<String> {
         let Some(build_num) = parse_buildkite_build_id(&e.target_url) else {
             continue;
         };
-        commands.push_str(&format!(
-            "bk build view {build_num} --pipeline {pipeline}\n",
-        ));
+        commands.push_str(&format!("bk build view {build_num} --pipeline {pipeline}\n",));
         match e.provider_job_id.as_deref() {
             Some(job_id) => {
                 commands.push_str(&format!(
@@ -2558,12 +2512,12 @@ fn task_details(task: &Task) -> Option<String> {
         lines.push(format!("  - description: {}", task.description.trim()));
     }
     if let Some(pr_url) = task.pr_url.as_deref()
-        && !pr_url.trim().is_empty() {
-            lines.push(format!("  - pr_url: {}", pr_url.trim()));
-        }
+        && !pr_url.trim().is_empty()
+    {
+        lines.push(format!("  - pr_url: {}", pr_url.trim()));
+    }
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
-
 
 #[cfg(test)]
 mod compose_prompt_tests {
@@ -2967,10 +2921,7 @@ mod compose_prompt_tests {
 
     #[test]
     fn extract_pr_number_parses_standard_github_url() {
-        assert_eq!(
-            extract_pr_number("https://github.com/org/repo/pull/123"),
-            Some(123),
-        );
+        assert_eq!(extract_pr_number("https://github.com/org/repo/pull/123"), Some(123),);
     }
 
     #[test]
@@ -2982,37 +2933,25 @@ mod compose_prompt_tests {
     #[test]
     fn extract_pr_url_from_text_finds_bare_url() {
         let s = "see https://github.com/org/repo/pull/42 for context";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
+        assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
     }
 
     #[test]
     fn extract_pr_url_from_text_strips_trailing_punctuation() {
         let s = "follow-up on https://github.com/org/repo/pull/42.";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
+        assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
     }
 
     #[test]
     fn extract_pr_url_from_text_strips_subpath() {
         let s = "see https://github.com/org/repo/pull/42/files";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
+        assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
     }
 
     #[test]
     fn extract_pr_url_from_text_handles_markdown_link() {
         let s = "[PR](https://github.com/org/repo/pull/7) is in review";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/7"),
-        );
+        assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/7"),);
     }
 
     #[test]
@@ -3041,10 +2980,7 @@ mod compose_prompt_tests {
         // The same PR mentioned twice (once bare, once with /files) is
         // still one match.
         let s = "PR https://github.com/org/repo/pull/42 also at https://github.com/org/repo/pull/42/files";
-        assert_eq!(
-            extract_pr_url_from_text(s),
-            Some("https://github.com/org/repo/pull/42"),
-        );
+        assert_eq!(extract_pr_url_from_text(s), Some("https://github.com/org/repo/pull/42"),);
     }
 
     #[test]
@@ -3054,10 +2990,7 @@ mod compose_prompt_tests {
             WorkItem::Chore(t) => t,
             _ => unreachable!(),
         };
-        assert_eq!(
-            task_bound_pr_url(task),
-            Some("https://github.com/org/repo/pull/99"),
-        );
+        assert_eq!(task_bound_pr_url(task), Some("https://github.com/org/repo/pull/99"),);
     }
 
     #[test]
@@ -3108,8 +3041,7 @@ mod compose_prompt_tests {
         // mentioning a PR must not generate a RESUME EXISTING PR block.
         let chore = match chore_without_pr() {
             WorkItem::Chore(mut task) => {
-                task.description =
-                    "Ref: https://github.com/linkedin-multiproduct/dev-infra/pull/250".into();
+                task.description = "Ref: https://github.com/linkedin-multiproduct/dev-infra/pull/250".into();
                 WorkItem::Chore(task)
             }
             other => other,
@@ -3386,10 +3318,7 @@ mod compose_prompt_tests {
 
     #[test]
     fn revision_directive_with_conflict_provenance_injects_conflict_fragment() {
-        let work_item = revision_task_with_created_via(
-            None,
-            "merge-conflict:crz_frag_01",
-        );
+        let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
         let attempt = sample_conflict_attempt();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
@@ -3429,10 +3358,7 @@ mod compose_prompt_tests {
 
     #[test]
     fn revision_directive_with_ci_fix_provenance_injects_ci_fragment() {
-        let work_item = revision_task_with_created_via(
-            None,
-            "ci-fix:crm_frag_01",
-        );
+        let work_item = revision_task_with_created_via(None, "ci-fix:crm_frag_01");
         let attempt = sample_ci_attempt();
         let prompt = compose_execution_prompt(
             ExecutionPromptParams::builder()
@@ -3650,9 +3576,7 @@ mod compose_prompt_tests {
                 .editorial_enabled(true)
                 .build(),
         );
-        let editorial_pos = prompt
-            .find("[editorial-rules]")
-            .expect("editorial-rules block missing");
+        let editorial_pos = prompt.find("[editorial-rules]").expect("editorial-rules block missing");
         let directive_pos = prompt
             .find("Expected outcome for this run:")
             .expect("per-kind directive missing");
@@ -3993,14 +3917,13 @@ mod pane_spawn_tests {
     //! lives in `coordinator.rs` tests.
     use super::*;
     use crate::app::SendToAppError;
-    use crate::protocol::{
-        EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput,
-        SpawnWorkerPaneResult,
-    };
     use crate::live_worker_state::LiveWorkerStateRegistry;
+    use crate::protocol::{
+        EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
+    };
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
-        CreateTaskInput, EffortLevel, Task, WorkExecution, WorkItem,
+        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput, CreateTaskInput, EffortLevel,
+        Task, WorkExecution, WorkItem,
     };
     use crate::worker_registry::WorkerRegistry;
     use std::sync::Mutex as StdMutex;
@@ -4056,10 +3979,7 @@ mod pane_spawn_tests {
                     let slot_id = input.slot_id;
                     *self.last.lock().unwrap() = Some(input);
                     Ok(EngineToAppResponse::SpawnWorkerPane {
-                        result: Ok(SpawnWorkerPaneResult {
-                            slot_id,
-                            shell_pid: 0,
-                        }),
+                        result: Ok(SpawnWorkerPaneResult { slot_id, shell_pid: 0 }),
                     })
                 }
                 other => panic!("unexpected request kind: {other:?}"),
@@ -4121,10 +4041,7 @@ mod pane_spawn_tests {
     /// the boss-event binary so the test is independent of host
     /// filesystem layout / env vars. Pass `None` for tests that don't
     /// inspect the hook command.
-    async fn run_once(
-        workspace: &TempDir,
-        boss_event_path: Option<&Path>,
-    ) -> Result<Arc<CapturingSpawner>> {
+    async fn run_once(workspace: &TempDir, boss_event_path: Option<&Path>) -> Result<Arc<CapturingSpawner>> {
         // We need a Weak<dyn WorkerSpawner> the runner can upgrade.
         // Box-leak the Arc so it lives for the test's duration; the
         // tempdir guards the workspace lifetime.
@@ -4133,7 +4050,10 @@ mod pane_spawn_tests {
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
 
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4165,11 +4085,7 @@ mod pane_spawn_tests {
         let _spawner = run_once(&workspace, None).await.unwrap();
 
         let prompt_path = workspace.path().join(".claude").join("initial-prompt.txt");
-        assert!(
-            prompt_path.exists(),
-            "expected {} to exist",
-            prompt_path.display()
-        );
+        assert!(prompt_path.exists(), "expected {} to exist", prompt_path.display());
         let prompt = std::fs::read_to_string(&prompt_path).unwrap();
         // Spot-check: the prompt should mention the work item title and
         // execution id so the worker actually has its task in hand.
@@ -4189,10 +4105,7 @@ mod pane_spawn_tests {
         // doesn't waste a round-trip discovering it from the probe.
         let workspace = TempDir::new().unwrap();
         let _spawner = run_once(&workspace, None).await.unwrap();
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
         assert!(
             prompt.contains("the deliverable is a PR URL"),
             "implementation prompt must state the PR-URL acceptance criterion: {prompt}",
@@ -4223,15 +4136,9 @@ mod pane_spawn_tests {
     async fn implementation_prompt_dictates_engine_supplied_branch_name() {
         let workspace = TempDir::new().unwrap();
         let _spawner = run_once(&workspace, None).await.unwrap();
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
-        let expected_branch = crate::completion::expected_branch_name(
-            "exec-test-1",
-            &boss_protocol::BranchNaming::BossExecPrefix,
-            None,
-        );
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+        let expected_branch =
+            crate::completion::expected_branch_name("exec-test-1", &boss_protocol::BranchNaming::BossExecPrefix, None);
         assert!(
             prompt.contains(&expected_branch),
             "prompt must name the engine-supplied branch `{expected_branch}`, got: {prompt}",
@@ -4263,9 +4170,9 @@ mod pane_spawn_tests {
         // shim the login-shell init re-prepends), then unsets the API key
         // and invokes claude. See the comment at the construction site.
         assert!(
-            input
-                .initial_input
-                .starts_with("[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude"),
+            input.initial_input.starts_with(
+                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude"
+            ),
             "expected initial_input to re-prepend BOSS_BIN_DIR, unset ANTHROPIC_API_KEY, and invoke claude, got: {:?}",
             input.initial_input
         );
@@ -4284,7 +4191,10 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4300,9 +4210,7 @@ mod pane_spawn_tests {
             })
             .unwrap();
         if let Some(model) = product_default_model {
-            work_db
-                .set_product_default_model(&product.id, Some(model))
-                .unwrap();
+            work_db.set_product_default_model(&product.id, Some(model)).unwrap();
         }
         let mut chore_input = chore_input;
         chore_input.product_id = product.id.clone();
@@ -4353,9 +4261,7 @@ mod pane_spawn_tests {
             model_override: None,
             force_duplicate: false,
         };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         // The worker settings file lives outside the workspace; the
@@ -4374,10 +4280,7 @@ mod pane_spawn_tests {
 
         // No addendum prepended — the existing implementation framing
         // must be the first thing the worker sees.
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
         assert!(
             prompt.starts_with("You are a reusable Boss worker"),
             "untagged-row prompt must start with the original framing, got: {prompt:?}",
@@ -4413,15 +4316,11 @@ mod pane_spawn_tests {
             model_override: None,
             force_duplicate: false,
         };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         assert!(
-            input
-                .initial_input
-                .contains("--model sonnet"),
+            input.initial_input.contains("--model sonnet"),
             "trivial row must spawn Sonnet (#746: never Haiku), got: {:?}",
             input.initial_input,
         );
@@ -4446,10 +4345,7 @@ mod pane_spawn_tests {
             input.initial_input,
         );
 
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
         assert!(
             !prompt.starts_with("Sketch") && !prompt.starts_with("Begin with"),
             "trivial row prompt must have no addendum prepended, got: {prompt:?}",
@@ -4477,9 +4373,7 @@ mod pane_spawn_tests {
             model_override: Some("opus".to_owned()),
             force_duplicate: false,
         };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4503,10 +4397,7 @@ mod pane_spawn_tests {
             input.initial_input,
         );
 
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
         assert!(
             prompt.starts_with("Sketch a brief plan before you start editing."),
             "medium addendum must be prepended verbatim, got: {prompt:?}",
@@ -4530,9 +4421,7 @@ mod pane_spawn_tests {
             model_override: None,
             force_duplicate: false,
         };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4556,10 +4445,7 @@ mod pane_spawn_tests {
             input.initial_input,
         );
 
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
         assert!(
             prompt.starts_with("Begin with a written plan."),
             "large addendum must be prepended verbatim, got: {prompt:?}",
@@ -4586,10 +4472,9 @@ mod pane_spawn_tests {
             model_override: None,
             force_duplicate: false,
         };
-        let (spawner, _chore) =
-            run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
-                .await
-                .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -4626,7 +4511,10 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4707,9 +4595,7 @@ mod pane_spawn_tests {
             model_override: None,
             force_duplicate: false,
         };
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None)
-            .await
-            .unwrap();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
         let input = spawner.spawn_input();
 
         // The forbidden list from design §Q2 plus the obvious
@@ -4751,17 +4637,11 @@ mod pane_spawn_tests {
         );
 
         assert!(
-            input
-                .env
-                .iter()
-                .any(|EnvVar { key, .. }| key == "BOSS_LEASE_ID"),
+            input.env.iter().any(|EnvVar { key, .. }| key == "BOSS_LEASE_ID"),
             "expected BOSS_LEASE_ID to be set"
         );
         assert!(
-            input
-                .env
-                .iter()
-                .any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
+            input.env.iter().any(|EnvVar { key, .. }| key == "BOSS_EVENTS_SOCKET"),
             "expected BOSS_EVENTS_SOCKET to be set"
         );
     }
@@ -4781,7 +4661,12 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).worker_pool_size(8).automation_pool_size(3).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .worker_pool_size(8)
+                .automation_pool_size(3)
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4859,7 +4744,10 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4921,13 +4809,7 @@ mod pane_spawn_tests {
 
         let chore_item = work_db.get_work_item(&chore.id).unwrap();
         let outcome = runner
-            .run_execution(
-                "worker-1",
-                &execution,
-                &chore_item,
-                workspace.path(),
-                Some("change-1"),
-            )
+            .run_execution("worker-1", &execution, &chore_item, workspace.path(), Some("change-1"))
             .await
             .unwrap();
 
@@ -4962,7 +4844,10 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -4986,14 +4871,8 @@ mod pane_spawn_tests {
             .create_project(CreateProjectInput {
                 product_id: product.id.clone(),
                 name: "Engine dispatch instrumentation".to_owned(),
-                description: Some(
-                    "Instrument the auto-dispatcher so every spawn decision is traceable."
-                        .to_owned(),
-                ),
-                goal: Some(
-                    "Operators can answer 'why did this task spawn now' from logs alone."
-                        .to_owned(),
-                ),
+                description: Some("Instrument the auto-dispatcher so every spawn decision is traceable.".to_owned()),
+                goal: Some("Operators can answer 'why did this task spawn now' from logs alone.".to_owned()),
                 autostart: false,
                 no_design_task: false,
             })
@@ -5035,10 +4914,7 @@ mod pane_spawn_tests {
             .await
             .unwrap();
 
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
         assert!(
             prompt.contains("parent project: `Engine dispatch instrumentation`"),
             "prompt missing parent project name line:\n{prompt}",
@@ -5067,7 +4943,10 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -5087,13 +4966,9 @@ mod pane_spawn_tests {
                 product_id: product.id.clone(),
                 name: "Worker live-status dashboard".to_owned(),
                 description: Some(
-                    "Surface every running worker's live state on the kanban without polling."
-                        .to_owned(),
+                    "Surface every running worker's live state on the kanban without polling.".to_owned(),
                 ),
-                goal: Some(
-                    "Operators can see what every active worker is doing without opening panes."
-                        .to_owned(),
-                ),
+                goal: Some("Operators can see what every active worker is doing without opening panes.".to_owned()),
                 autostart: false,
                 no_design_task: false,
             })
@@ -5129,10 +5004,7 @@ mod pane_spawn_tests {
             .await
             .unwrap();
 
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
 
         // The deliverable directive must be unmistakable.
         assert!(
@@ -5174,9 +5046,7 @@ mod pane_spawn_tests {
         // The parent project's goal must come through verbatim — that
         // is the whole point of pulling project context at spawn time.
         assert!(
-            prompt.contains(
-                "Operators can see what every active worker is doing without opening panes."
-            ),
+            prompt.contains("Operators can see what every active worker is doing without opening panes."),
             "design prompt must surface the parent project's goal verbatim:\n{prompt}",
         );
 
@@ -5203,7 +5073,10 @@ mod pane_spawn_tests {
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
         let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
-            crate::config::WorkConfig::builder().cwd(workspace.path().to_path_buf()).db_path(workspace.path().join("state.db")).build(),
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
             None,
         ));
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
@@ -5267,10 +5140,7 @@ mod pane_spawn_tests {
             .await
             .unwrap();
 
-        let prompt = std::fs::read_to_string(
-            workspace.path().join(".claude").join("initial-prompt.txt"),
-        )
-        .unwrap();
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
 
         assert!(
             prompt.contains("`tools/boss/docs/designs/merge-poller-cadence.md`"),

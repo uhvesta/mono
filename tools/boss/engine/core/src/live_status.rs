@@ -150,9 +150,7 @@ impl SummarizerOutcome {
                     clip
                 }
             }
-            SummarizerOutcome::NoApiKey => {
-                "ANTHROPIC_API_KEY not configured on the engine".to_owned()
-            }
+            SummarizerOutcome::NoApiKey => "ANTHROPIC_API_KEY not configured on the engine".to_owned(),
             SummarizerOutcome::EmptyAfterRedaction => {
                 "transcript empty after deny-list + secret-pattern redaction".to_owned()
             }
@@ -174,14 +172,9 @@ impl SummarizerOutcome {
 ///
 /// The caller keeps the prior `live_status` value on every non-success
 /// outcome.
-pub async fn summarize_transcript(
-    api_key: Option<&str>,
-    transcript_lines: &[Value],
-) -> SummarizerOutcome {
+pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Value]) -> SummarizerOutcome {
     let Some(api_key) = api_key else {
-        tracing::error!(
-            "live_status: summarizer skipped — ANTHROPIC_API_KEY not configured",
-        );
+        tracing::error!("live_status: summarizer skipped — ANTHROPIC_API_KEY not configured",);
         return SummarizerOutcome::NoApiKey;
     };
     let redacted = redact_and_assemble(transcript_lines);
@@ -192,9 +185,7 @@ pub async fn summarize_transcript(
     match claude_one_sentence(api_key, &redacted).await {
         Ok(ClaudeReply::Success(summary)) => SummarizerOutcome::Success(summary),
         Ok(ClaudeReply::PostFilterDropped) => {
-            tracing::warn!(
-                "live_status: post-filter dropped the model reply",
-            );
+            tracing::warn!("live_status: post-filter dropped the model reply",);
             SummarizerOutcome::PostFilterDropped
         }
         Err(SummarizerCallError::Api { status, body }) => {
@@ -244,9 +235,7 @@ fn clip_str(s: &str, max: usize) -> String {
 /// can't confuse two adjacent tool calls.
 pub fn redact_and_assemble(transcript_lines: &[Value]) -> String {
     let mut rendered: Vec<String> = Vec::new();
-    let start = transcript_lines
-        .len()
-        .saturating_sub(MAX_TRANSCRIPT_ENTRIES);
+    let start = transcript_lines.len().saturating_sub(MAX_TRANSCRIPT_ENTRIES);
     for line in &transcript_lines[start..] {
         if live_status_redact::should_drop_entry(line) {
             continue;
@@ -274,10 +263,7 @@ pub fn redact_and_assemble(transcript_lines: &[Value]) -> String {
 /// across message kinds; we only need to surface the rough action
 /// shape (assistant text, tool use, tool result).
 fn render_entry(line: &Value) -> String {
-    let entry_type = line
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
+    let entry_type = line.get("type").and_then(Value::as_str).unwrap_or("unknown");
     match entry_type {
         "user" => {
             // User-side payloads usually wrap a tool_result; we want
@@ -309,8 +295,7 @@ fn render_assistant(line: &Value) -> String {
                     }
                 }
                 "tool_use" => {
-                    let name =
-                        obj.get("name").and_then(Value::as_str).unwrap_or("Tool");
+                    let name = obj.get("name").and_then(Value::as_str).unwrap_or("Tool");
                     // For Bash, surface the first ~80 chars of the
                     // command. For other tools, the name alone is
                     // typically enough signal — the model just needs
@@ -588,8 +573,7 @@ mod tests {
 
     #[test]
     fn render_entry_summarises_bash_tool_use_with_command_prefix() {
-        let line =
-            assistant_tool_use("Bash", json!({"command": "cargo test -p boss-engine"}));
+        let line = assistant_tool_use("Bash", json!({"command": "cargo test -p boss-engine"}));
         let s = render_entry(&line);
         assert!(s.contains("Bash"), "got {s}");
         assert!(s.contains("cargo test"), "got {s}");
@@ -597,10 +581,7 @@ mod tests {
 
     #[test]
     fn render_entry_summarises_edit_tool_use_with_file_path() {
-        let line = assistant_tool_use(
-            "Edit",
-            json!({"file_path": "tools/boss/engine/src/app.rs"}),
-        );
+        let line = assistant_tool_use("Edit", json!({"file_path": "tools/boss/engine/src/app.rs"}));
         let s = render_entry(&line);
         assert!(s.contains("Edit"));
         assert!(s.contains("app.rs"));
@@ -620,9 +601,7 @@ mod tests {
 
     #[test]
     fn redact_and_assemble_applies_secret_pattern_to_assistant_text() {
-        let lines = vec![assistant_text(
-            "Token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 from env",
-        )];
+        let lines = vec![assistant_text("Token is ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345 from env")];
         let out = redact_and_assemble(&lines);
         assert!(out.contains("<redacted>"));
         assert!(!out.contains("ghp_"));
@@ -717,19 +696,17 @@ mod tests {
         // The chore's debug-verb contract names these four outcomes
         // explicitly: success / no_api_key / api_error / empty_after_redaction.
         // The strings are part of the public-facing JSON, so pin them.
-        assert_eq!(
-            SummarizerOutcome::Success("running tests".into()).tag(),
-            "success"
-        );
+        assert_eq!(SummarizerOutcome::Success("running tests".into()).tag(), "success");
         assert_eq!(SummarizerOutcome::NoApiKey.tag(), "no_api_key");
         assert_eq!(
-            SummarizerOutcome::ApiError { status: 429, snippet: "rate limited".into() }.tag(),
+            SummarizerOutcome::ApiError {
+                status: 429,
+                snippet: "rate limited".into()
+            }
+            .tag(),
             "api_error"
         );
-        assert_eq!(
-            SummarizerOutcome::EmptyAfterRedaction.tag(),
-            "empty_after_redaction"
-        );
+        assert_eq!(SummarizerOutcome::EmptyAfterRedaction.tag(), "empty_after_redaction");
     }
 
     #[tokio::test]
@@ -780,10 +757,7 @@ mod tests {
             .find(|b| b.block_type == "text")
             .unwrap()
             .text;
-        assert_eq!(
-            clean_summary(&text),
-            "running tests after the redactor lands",
-        );
+        assert_eq!(clean_summary(&text), "running tests after the redactor lands",);
     }
 
     #[tokio::test]

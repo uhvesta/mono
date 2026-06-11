@@ -150,16 +150,10 @@ fn unshallow(root: &Path) -> Result<()> {
 
 /// `jj git import` — sync jj's op log after deepening the underlying git repo.
 fn import_jj_git(root: &Path) -> Result<()> {
-    let output = Command::new("jj")
-        .args(["git", "import"])
-        .current_dir(root)
-        .output()?;
+    let output = Command::new("jj").args(["git", "import"]).current_dir(root).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "`jj git import` failed after history deepening: {}",
-            stderr.trim()
-        );
+        bail!("`jj git import` failed after history deepening: {}", stderr.trim());
     }
     info!("ran `jj git import` to sync after history deepening");
     Ok(())
@@ -210,7 +204,10 @@ fn deepen_until_reachable(root: &Path, base_ref: &str) -> Result<bool> {
     // An explicit refspec overrides the clone's restricted fetch config.
     let origin_branch = base_ref.strip_prefix("origin/");
     if let Some(branch) = origin_branch {
-        info!(base_ref, "fetching base branch explicitly to bypass single-branch fetch config");
+        info!(
+            base_ref,
+            "fetching base branch explicitly to bypass single-branch fetch config"
+        );
         if !fetch_origin_branch(root, branch)? {
             // Branch doesn't exist on the remote; nothing more we can do.
             info!(base_ref, "explicit fetch failed: branch not present on remote");
@@ -252,23 +249,16 @@ fn deepen_until_reachable(root: &Path, base_ref: &str) -> Result<bool> {
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()?;
+    let output = Command::new("git").args(args).current_dir(root).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
-    String::from_utf8(output.stdout)
-        .map_err(|e| anyhow::anyhow!("git output was not valid utf-8: {e}"))
+    String::from_utf8(output.stdout).map_err(|e| anyhow::anyhow!("git output was not valid utf-8: {e}"))
 }
 
 fn run_git(root: &Path, args: &[&str]) -> Result<()> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()?;
+    let output = Command::new("git").args(args).current_dir(root).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git {} failed: {}", args.join(" "), stderr.trim());
@@ -420,14 +410,10 @@ mod tests {
 
         // Point origin at the local remote.
         // (The clone already has origin set to the remote path by `git clone`.)
-        assert!(
-            is_shallow(clone_path).expect("is_shallow"),
-            "clone must start shallow"
-        );
+        assert!(is_shallow(clone_path).expect("is_shallow"), "clone must start shallow");
 
         // After ensure_history with MergeQueue, HEAD^1 must be reachable.
-        ensure_history(clone_path, VcsKind::Git, "HEAD^1", &Scenario::MergeQueue)
-            .expect("ensure_history MergeQueue");
+        ensure_history(clone_path, VcsKind::Git, "HEAD^1", &Scenario::MergeQueue).expect("ensure_history MergeQueue");
 
         assert!(
             git_ok(clone_path, &["rev-parse", "HEAD^1"]),

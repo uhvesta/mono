@@ -153,25 +153,19 @@ pub struct ExternalCheckArtifactProvenance {
 }
 
 pub trait ExternalCheckPackageProvider: Send + Sync {
-    fn resolve(
-        &self,
-        implementation_ref: &ExternalCheckImplementationRef,
-    ) -> Result<Option<ExternalCheckPackage>>;
+    fn resolve(&self, implementation_ref: &ExternalCheckImplementationRef) -> Result<Option<ExternalCheckPackage>>;
 }
 
 mod bundled;
 pub use bundled::{BundledExternalCheckPackageProvider, bundled_check_names};
 mod provider;
 pub use provider::{
-    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
-    FileExternalCheckPackageProvider, GeneratedExternalCheckPackageProvider,
-    NoopExternalCheckPackageProvider,
+    CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider, FileExternalCheckPackageProvider,
+    GeneratedExternalCheckPackageProvider, NoopExternalCheckPackageProvider,
 };
 mod component_bindings;
 mod runtime;
-pub use runtime::{
-    ComponentAotCache, DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor,
-};
+pub use runtime::{ComponentAotCache, DefaultExternalCheckExecutor, ExternalCheckExecutor, NoopExternalCheckExecutor};
 pub mod sandbox;
 pub use sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
 
@@ -231,20 +225,13 @@ impl RawDeclarativeCheckManifest {
         let api_version = required_non_empty("api_version", self.api_version)?;
 
         if self.mode != "declarative" {
-            bail!(
-                "declarative manifest `mode` must be `declarative`, got `{}`",
-                self.mode
-            );
+            bail!("declarative manifest `mode` must be `declarative`, got `{}`", self.mode);
         }
         if runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
-            bail!(
-                "unsupported runtime `{runtime}` (expected `{EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1}`)"
-            );
+            bail!("unsupported runtime `{runtime}` (expected `{EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1}`)");
         }
         if api_version != EXTERNAL_CHECK_API_V1 {
-            bail!(
-                "unsupported api_version `{api_version}` (expected `{EXTERNAL_CHECK_API_V1}`)"
-            );
+            bail!("unsupported api_version `{api_version}` (expected `{EXTERNAL_CHECK_API_V1}`)");
         }
 
         let declarative_fields = declarative::RawDeclarativeFields {
@@ -362,9 +349,9 @@ impl RawExternalCheckPackage {
                 reject_if_present("limits", limits.as_ref())?;
                 reject_if_present_list("checks", &checks)?;
                 reject_if_present("provenance", provenance.as_ref())?;
-                ExternalCheckPackageImplementation::Declarative(
-                    declarative::validate_declarative_implementation(declarative)?,
-                )
+                ExternalCheckPackageImplementation::Declarative(declarative::validate_declarative_implementation(
+                    declarative,
+                )?)
             }
         };
 
@@ -389,11 +376,7 @@ fn validate_component_implementation(
         timeout_ms: raw.timeout_ms,
         max_memory_mb: raw.max_memory_mb,
     });
-    let checks_allowlist = if checks.is_empty() {
-        None
-    } else {
-        Some(checks)
-    };
+    let checks_allowlist = if checks.is_empty() { None } else { Some(checks) };
     Ok(ExternalCheckComponentPackage {
         artifact_path: required_some_relative_path_string("artifact_path", artifact_path)?,
         artifact_sha256: required_some_sha256("artifact_sha256", artifact_sha256)?,
@@ -419,9 +402,7 @@ fn validate_runtime_for_mode(mode: RawExternalCheckMode, runtime: &str) -> Resul
 /// Reject declarative-only fields in non-declarative modes.
 fn reject_declarative_fields(declarative: &declarative::RawDeclarativeFields) -> Result<()> {
     if !declarative.is_empty() {
-        bail!(
-            "fields `applies_to`/`needs`/`invocations` are only allowed in `declarative` mode"
-        );
+        bail!("fields `applies_to`/`needs`/`invocations` are only allowed in `declarative` mode");
     }
     Ok(())
 }
@@ -473,14 +454,9 @@ fn required_non_empty(field_name: &str, value: String) -> Result<String> {
 
 fn required_sha256(field_name: &str, value: String) -> Result<String> {
     let normalized = required_non_empty(field_name, value)?;
-    let is_valid = normalized.len() == 64
-        && normalized
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let is_valid = normalized.len() == 64 && normalized.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     if !is_valid {
-        bail!(
-            "field `{field_name}` must be a canonical sha256 digest (64 lowercase hex characters)"
-        );
+        bail!("field `{field_name}` must be a canonical sha256 digest (64 lowercase hex characters)");
     }
     Ok(normalized)
 }

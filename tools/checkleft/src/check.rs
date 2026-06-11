@@ -49,20 +49,11 @@ pub trait Check: Send + Sync {
     /// Like `configure`, but also passes the CHECKS file directory (repo-root-relative).
     /// Checks that need to scope exclusions to the config subtree should override this.
     /// The default delegates to `configure`, ignoring the scope.
-    fn configure_scoped(
-        &self,
-        config: &toml::Value,
-        _config_dir: Option<&Path>,
-    ) -> Result<Arc<dyn ConfiguredCheck>> {
+    fn configure_scoped(&self, config: &toml::Value, _config_dir: Option<&Path>) -> Result<Arc<dyn ConfiguredCheck>> {
         self.configure(config)
     }
 
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        tree: &dyn SourceTree,
-        config: &toml::Value,
-    ) -> Result<CheckResult> {
+    async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree, config: &toml::Value) -> Result<CheckResult> {
         self.configure(config)?.run(changeset, tree).await
     }
 }

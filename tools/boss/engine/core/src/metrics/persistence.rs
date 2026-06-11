@@ -40,22 +40,12 @@ pub fn seed_from_db(registry: &Registry, work_db: &WorkDb) -> Result<()> {
     let (counters, gauges) = work_db.metrics_load_all()?;
     for row in counters {
         if !registry.seed_counter(&row.name, row.value, row.updated_at_ms) {
-            registry.insert_stale_counter(
-                &row.name,
-                &row.description,
-                row.value,
-                row.updated_at_ms,
-            );
+            registry.insert_stale_counter(&row.name, &row.description, row.value, row.updated_at_ms);
         }
     }
     for row in gauges {
         if !registry.seed_gauge(&row.name, row.value, row.observed_at_ms) {
-            registry.insert_stale_gauge(
-                &row.name,
-                &row.description,
-                row.value,
-                row.observed_at_ms,
-            );
+            registry.insert_stale_gauge(&row.name, &row.description, row.value, row.observed_at_ms);
         }
     }
     Ok(())
@@ -225,9 +215,7 @@ mod tests {
         flush_all(&registry_two, &db).expect("flush 2");
         let (counters, _) = db.metrics_load_all().expect("load");
         assert!(
-            counters
-                .iter()
-                .any(|r| r.name == "test_persist.removed_counter"),
+            counters.iter().any(|r| r.name == "test_persist.removed_counter"),
             "stale row must survive subsequent flushes",
         );
     }
@@ -311,8 +299,7 @@ mod tests {
         TEST_PERSIST_GAUGE.set(&registry, 77);
         flush_all(&registry, &db).expect("flush");
 
-        let (counter_count, gauge_count) =
-            db.metrics_reset_all(8888).expect("reset all");
+        let (counter_count, gauge_count) = db.metrics_reset_all(8888).expect("reset all");
         assert_eq!(counter_count, 1);
         assert_eq!(gauge_count, 1);
 

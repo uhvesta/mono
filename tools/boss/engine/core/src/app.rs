@@ -13,38 +13,30 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
-    CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler,
-    WorkerPaneReleaser,
+    CommandPrDetector, PaneReleaseOutcome, PrDetector, ProbeQueuer, WorkerCompletionHandler, WorkerPaneReleaser,
 };
 use crate::config::RuntimeConfig;
-use crate::coordinator::{
-    CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool,
-};
+use crate::coordinator::{CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool};
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::github_oauth::{
-    DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore,
-    probe_and_record_org_state,
+    DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
 };
 use crate::ipc_log::IpcLogger;
-use crate::live_status_loop::{
-    LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger,
-};
+use crate::live_status_loop::{LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
-    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto,
-    InterruptWorkerPaneInput, OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput,
-    RevealWorkItemInput, SendToPaneInput, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS,
-    TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
-    execution_topic, magic_wand_dispatch_topic, probe_topic, work_product_topic,
+    FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, InterruptWorkerPaneInput,
+    OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
+    TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
+    editorial_actions_topic, execution_topic, magic_wand_dispatch_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
-    ActionedAttentionGroup, COMMENT_STATUS_DISPATCHED, CreateChoreInput, DuplicateTaskError,
-    ExecutionStatus, GhPrStateChecker, SetRunTranscriptPathOutcome, Task, TaskStatus, WorkDb,
-    WorkItem,
+    ActionedAttentionGroup, COMMENT_STATUS_DISPATCHED, CreateChoreInput, DuplicateTaskError, ExecutionStatus,
+    GhPrStateChecker, SetRunTranscriptPathOutcome, Task, TaskStatus, WorkDb, WorkItem,
 };
 use crate::worker_registry::WorkerRegistry;
 use async_trait::async_trait;
@@ -61,6 +53,7 @@ mod engine_meta;
 mod executions;
 mod external_tracker;
 mod github_auth;
+mod handler_helpers;
 mod hosts;
 mod live_status;
 mod metrics;
@@ -68,53 +61,42 @@ mod panes;
 mod products;
 mod projects;
 mod review;
+mod server;
 mod sessions;
 mod subscriptions;
-mod work_items;
-mod handler_helpers;
-mod server;
-mod worker_events;
 #[cfg(test)]
 mod tests;
+mod work_items;
+mod worker_events;
 
 // Re-export public items from server module for external callers.
-pub use server::{run, serve, process_is_alive};
+pub use server::{process_is_alive, run, serve};
 
 // Re-import server-internal helpers so child modules can access them via `use super::*`.
 use server::{
-    reap_worker_process_tree, register_app_session_trust_ok,
-    resolve_status_actor,
-    constant_time_eq, is_descendant_of_any, signal_shell_pids,
+    constant_time_eq, is_descendant_of_any, reap_worker_process_tree, register_app_session_trust_ok,
+    resolve_status_actor, signal_shell_pids,
 };
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{
-    dispatch_live_worker_state, dispatch_editorial_on_pretooluse,
-    dispatch_probe_on_stop, dispatch_urgent_probe_on_post_tool_use,
-    dispatch_probe_if_idle, dispatch_probe_reply_on_stop,
-    dispatch_completion_on_stop,
+    dispatch_completion_on_stop, dispatch_editorial_on_pretooluse, dispatch_live_worker_state, dispatch_probe_if_idle,
+    dispatch_probe_on_stop, dispatch_probe_reply_on_stop, dispatch_urgent_probe_on_post_tool_use,
 };
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
-    build_effort_audit_report, persist_live_status_disabled_slots,
-    build_engine_health_report, build_live_status_debug_report,
-    load_live_status_disabled_slots, load_dispatch_paused_state,
-    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
-    duplicate_or_work_error,
-    send_response, send_response_with_revision, send_push,
-    publish_work_invalidation, publish_comment_invalidation,
-    handle_create_many, open_review_terminal_async,
-    transport_default_created_via, work_item_id, validate_external_tracker_config,
-    work_item_product_id, task_status_for_id, work_item_needs_dispatch,
-    task_transitioned_to_active, terminal_chore_execution, in_review_chore_execution,
-    active_to_todo_execution, live_execution_for_deleted_item,
-    task_name_description_for_id, active_chore_run_id,
-    build_chore_update_message, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution,
-    resolve_transcript_for_tail, segment_to_wire, read_transcript_tail,
-    tail_lines_from_content,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
+    TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
+    build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
+    handle_create_many, in_review_chore_execution, live_execution_for_deleted_item, load_dispatch_paused_state,
+    load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
+    publish_comment_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
+    segment_to_wire, send_push, send_response, send_response_with_revision, tail_lines_from_content,
+    task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
+    transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    work_item_product_id,
 };
-
 
 /// Per-request handler context: the connection-scoped state every
 /// [`FrontendRequest`] handler needs. Built once per request in
@@ -235,10 +217,7 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
 
     fn start_live_status_slot(&self, slot_id: u8, run_id: &str) {
         let Some(arc_self) = self._self_weak.upgrade() else {
-            tracing::debug!(
-                slot_id,
-                "start_live_status_slot: ServerState already dropped",
-            );
+            tracing::debug!(slot_id, "start_live_status_slot: ServerState already dropped",);
             return;
         };
         // Snapshot the API key once at slot start — picking it up
@@ -563,8 +542,7 @@ struct ServerState {
     /// Resolves credentials for external-tracker sync. Uses
     /// `KeychainOAuthResolver` in production so a stored OAuth token
     /// takes precedence over ambient `gh` auth.
-    tracker_credential_resolver:
-        Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver>,
+    tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver>,
     /// Shared kick signal for the merge-poller loop. The macOS app
     /// fires [`FrontendRequest::KickPrReconcilers`] on window
     /// activation; the handler calls `notify_one()` here so the
@@ -735,10 +713,7 @@ impl ServerState {
         control_token: Option<Arc<String>>,
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
-        let anthropic_api_key = cfg
-            .agent()
-            .ok()
-            .and_then(|agent| agent.anthropic_api_key.clone());
+        let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
         // One-time startup signal so the missing-API-key case is
         // immediately visible in engine stderr — the chore calls out
         // that the summarizer used to drop this silently and the user
@@ -909,9 +884,7 @@ impl ServerState {
 
         let mut tracker_registry = crate::external_tracker::TrackerRegistry::new();
         tracker_registry
-            .register(Arc::new(
-                crate::external_tracker::github::GitHubTracker::new(),
-            ))
+            .register(Arc::new(crate::external_tracker::github::GitHubTracker::new()))
             .expect("github tracker is the only registered kind; duplicate is impossible");
         let tracker_registry = Arc::new(tracker_registry);
         let tracker_registry_for_state = tracker_registry.clone();
@@ -925,13 +898,10 @@ impl ServerState {
         );
         let github_auth_for_state = Arc::new(github_auth_controller);
 
-        let tracker_credential_resolver: Arc<
-            dyn crate::external_tracker::credentials::TrackerCredentialResolver,
-        > = Arc::new(
-            crate::external_tracker::credentials::KeychainOAuthResolver::new(
+        let tracker_credential_resolver: Arc<dyn crate::external_tracker::credentials::TrackerCredentialResolver> =
+            Arc::new(crate::external_tracker::credentials::KeychainOAuthResolver::new(
                 crate::external_tracker::github_oauth::KeychainTokenStore::new(),
-            ),
-        );
+            ));
         let ci_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
@@ -967,9 +937,8 @@ impl ServerState {
         // Dispatch-event JSONL stream lands next to state.db /
         // events.sock under the same `state_root` resolved above.
         let dispatch_event_root: PathBuf = state_root.clone();
-        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> = Arc::new(
-            crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()),
-        );
+        let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
+            Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
         let dispatch_events_for_state = dispatch_events.clone();
         let dispatch_event_root_for_state = dispatch_event_root.clone();
         let ipc_logger = IpcLogger::new(&dispatch_event_root);
@@ -999,8 +968,7 @@ impl ServerState {
             // execution transitions to `running`, the completion
             // handler captures the bound chore PR's head SHA into
             // `work_executions.pr_head_before`.
-            execution_coordinator_inner
-                .set_execution_started_hook(completion_handler_for_coordinator.clone());
+            execution_coordinator_inner.set_execution_started_hook(completion_handler_for_coordinator.clone());
             // Install the SSH-capable provider so the dispatch loop can
             // build a per-host adapter (local vs SSH-remote) for whichever
             // host the scheduler selects. `local` returns the coordinator's
@@ -1034,9 +1002,7 @@ impl ServerState {
                 worker_registry: WorkerRegistry::new(),
                 live_worker_states: Arc::new(LiveWorkerStateRegistry::new()),
                 live_status_manager: Arc::new(LiveStatusManager::new()),
-                dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new(
-                    metrics_for_dispatcher,
-                )),
+                dispatcher_stats: Arc::new(crate::live_status_loop::DispatcherStats::new(metrics_for_dispatcher)),
                 transcript_path_cache: Arc::new(crate::live_status_loop::TranscriptPathCache::new()),
                 staged_pr_urls,
                 editorial_deny_tracker: Arc::new(crate::editorial_hook::DenyTracker::new()),
@@ -1081,12 +1047,8 @@ impl ServerState {
         // counter totals span engine restarts. Failures are logged
         // and the registry is left at zero — better than refusing to
         // start because the metrics table is corrupted.
-        if let Err(err) = crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db)
-        {
-            tracing::warn!(
-                ?err,
-                "metrics: seed_from_db failed; starting from zeroed counters",
-            );
+        if let Err(err) = crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db) {
+            tracing::warn!(?err, "metrics: seed_from_db failed; starting from zeroed counters",);
         }
 
         // Late-bind the runner to the Arc<ServerState>. Going through
@@ -1109,16 +1071,13 @@ impl ServerState {
         // engine metadata KV — survives restarts of the engine
         // process. Empty on first boot.
         let persisted = load_live_status_disabled_slots(&server_state.work_db);
-        server_state
-            .live_status_manager
-            .set_initial_disabled_slots(persisted);
+        server_state.live_status_manager.set_initial_disabled_slots(persisted);
 
         // Seed the dispatch-pause flag from the engine metadata KV.
         // A persisted pause survives an engine restart — the flag is set
         // here before any scheduler kicks so no executions slip through
         // the gap between boot and pause restoration.
-        let (dispatch_paused, dispatch_paused_since) =
-            load_dispatch_paused_state(&server_state.work_db);
+        let (dispatch_paused, dispatch_paused_since) = load_dispatch_paused_state(&server_state.work_db);
         if dispatch_paused {
             server_state
                 .execution_coordinator
@@ -1319,10 +1278,7 @@ impl ServerState {
             tracing::info!("shutdown_workers: no live workers to release");
             return;
         }
-        tracing::info!(
-            count = snapshot.len(),
-            "shutdown_workers: releasing live worker panes",
-        );
+        tracing::info!(count = snapshot.len(), "shutdown_workers: releasing live worker panes",);
         let mut set = tokio::task::JoinSet::new();
         for state in &snapshot {
             let server = Arc::clone(self);
@@ -1356,9 +1312,7 @@ impl ServerState {
         let request = EngineToAppRequest::FocusWorkerPane(FocusWorkerPaneInput { slot_id });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::FocusWorkerPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::FocusWorkerPane { result: Err(err) }) => {
-                Err(FocusPaneError::App(err))
-            }
+            Ok(EngineToAppResponse::FocusWorkerPane { result: Err(err) }) => Err(FocusPaneError::App(err)),
             Ok(other) => Err(FocusPaneError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(FocusPaneError::Send(err)),
         }
@@ -1370,20 +1324,14 @@ impl ServerState {
     /// which pane was targeted (useful when the agent reference was a
     /// crew name). Mirrors [`focus_worker_pane`] in shape; the only
     /// behavioural difference is the engine→app request kind.
-    pub async fn send_input_to_worker(
-        &self,
-        run_id: &str,
-        text: String,
-    ) -> Result<u8, SendInputError> {
+    pub async fn send_input_to_worker(&self, run_id: &str, text: String) -> Result<u8, SendInputError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(SendInputError::UnknownRun);
         };
         let request = EngineToAppRequest::SendToPane(SendToPaneInput { slot_id, text });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::SendToPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => {
-                Err(SendInputError::App(err))
-            }
+            Ok(EngineToAppResponse::SendToPane { result: Err(err) }) => Err(SendInputError::App(err)),
             Ok(other) => Err(SendInputError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(SendInputError::Send(err)),
         }
@@ -1403,12 +1351,8 @@ impl ServerState {
         let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
-            Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => {
-                Err(InterruptPaneError::App(err))
-            }
-            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!(
-                "{other:?}"
-            ))),
+            Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => Err(InterruptPaneError::App(err)),
+            Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(InterruptPaneError::Send(err)),
         }
     }
@@ -1440,9 +1384,7 @@ impl ServerState {
         });
         match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::RevealWorkItem { result: Ok(_) }) => Ok(canonical_id),
-            Ok(EngineToAppResponse::RevealWorkItem { result: Err(err) }) => {
-                Err(RevealItemError::App(err))
-            }
+            Ok(EngineToAppResponse::RevealWorkItem { result: Err(err) }) => Err(RevealItemError::App(err)),
             Ok(other) => Err(RevealItemError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(RevealItemError::Send(err)),
         }
@@ -1471,14 +1413,13 @@ impl ServerState {
     async fn drop_app_session_if_matches(&self, session_id: &str) {
         let mut guard = self.app_session.lock().await;
         let take = matches!(guard.as_ref(), Some(handle) if handle.session_id == session_id);
-        if take
-            && let Some(prior) = guard.take() {
-                for (_, tx) in prior.pending {
-                    let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
-                        result: Err(EngineToAppError::AppDisconnected),
-                    });
-                }
+        if take && let Some(prior) = guard.take() {
+            for (_, tx) in prior.pending {
+                let _ = tx.send(EngineToAppResponse::SpawnWorkerPane {
+                    result: Err(EngineToAppError::AppDisconnected),
+                });
             }
+        }
     }
 
     /// Snapshot of every allocated worker slot's live runtime state.
@@ -1492,9 +1433,7 @@ impl ServerState {
     pub async fn broadcast_live_worker_states(&self) {
         let states = self.live_worker_states.snapshot();
         let envelope = FrontendEventEnvelope::push(FrontendEvent::WorkerLiveStatesList { states });
-        self.topic_broker
-            .publish(TOPIC_WORKER_LIVE_STATES, envelope)
-            .await;
+        self.topic_broker.publish(TOPIC_WORKER_LIVE_STATES, envelope).await;
     }
 
     /// Push the current GitHub OAuth auth state on the `github.auth` topic.
@@ -1547,10 +1486,7 @@ impl ServerState {
             text,
             urgent,
         };
-        let mut guard = self
-            .pending_probes
-            .lock()
-            .expect("pending_probes mutex poisoned");
+        let mut guard = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = guard.entry(run_id).or_default();
         if urgent {
             queue.push_front(probe);
@@ -1574,19 +1510,13 @@ impl ServerState {
     }
 
     fn allocate_probe_id(&self) -> String {
-        format!(
-            "probe-{}",
-            self.next_probe_id.fetch_add(1, Ordering::Relaxed)
-        )
+        format!("probe-{}", self.next_probe_id.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Pop the next pending probe for `run_id`, if any. Called from
     /// the events-socket consumer when a `Stop` event arrives.
     fn pop_pending_probe(&self, run_id: &str) -> Option<PendingProbe> {
-        let mut guard = self
-            .pending_probes
-            .lock()
-            .expect("pending_probes mutex poisoned");
+        let mut guard = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = guard.get_mut(run_id)?;
         let probe = queue.pop_front();
         if queue.is_empty() {
@@ -1689,8 +1619,7 @@ impl ServerState {
                 // (boss_pid descendant), the app shell (app_pid
                 // descendant), or a worker pane (also app_pid descendant
                 // — workers are siblings under the app).
-                let trust_set: Vec<libc::pid_t> =
-                    [app_pid, boss_pid].into_iter().flatten().collect();
+                let trust_set: Vec<libc::pid_t> = [app_pid, boss_pid].into_iter().flatten().collect();
                 if !trust_set.is_empty() && is_descendant_of_any(peer_pid, &trust_set) {
                     return true;
                 }
@@ -1734,27 +1663,16 @@ impl ServerState {
 
     /// Route an `EngineResponse` from the app back to the waiting
     /// `send_to_app` caller.
-    async fn deliver_app_response(
-        &self,
-        session_id: &str,
-        request_id: &str,
-        response: EngineToAppResponse,
-    ) {
+    async fn deliver_app_response(&self, session_id: &str, request_id: &str, response: EngineToAppResponse) {
         self.ipc_logger.log_response(request_id, &response);
 
         let mut guard = self.app_session.lock().await;
         let Some(handle) = guard.as_mut() else {
-            tracing::warn!(
-                request_id,
-                "engine_response dropped: no registered app session",
-            );
+            tracing::warn!(request_id, "engine_response dropped: no registered app session",);
             return;
         };
         if handle.session_id != session_id {
-            tracing::warn!(
-                request_id,
-                "engine_response dropped: came from non-app session",
-            );
+            tracing::warn!(request_id, "engine_response dropped: came from non-app session",);
             return;
         }
         match handle.pending.remove(request_id) {
@@ -1762,19 +1680,13 @@ impl ServerState {
                 let _ = tx.send(response);
             }
             None => {
-                tracing::warn!(
-                    request_id,
-                    "engine_response dropped: no pending request matches",
-                );
+                tracing::warn!(request_id, "engine_response dropped: no pending request matches",);
             }
         }
     }
 
     fn allocate_session_id(&self) -> String {
-        format!(
-            "session-{}",
-            self.next_session_id.fetch_add(1, Ordering::Relaxed)
-        )
+        format!("session-{}", self.next_session_id.fetch_add(1, Ordering::Relaxed))
     }
 
     fn current_work_revision(&self) -> u64 {
@@ -1832,10 +1744,7 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
             },
         };
         self.topic_broker
-            .publish(
-                &topic,
-                FrontendEventEnvelope::push_with_revision(revision, event),
-            )
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
             .await;
     }
 
@@ -1854,10 +1763,7 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
             },
         };
         self.topic_broker
-            .publish(
-                &topic,
-                FrontendEventEnvelope::push_with_revision(revision, event),
-            )
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
             .await;
     }
 
@@ -1865,10 +1771,7 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
         let revision = self.work_revision.fetch_add(1, Ordering::SeqCst) + 1;
         let topic = work_product_topic(product_id);
         self.topic_broker
-            .publish(
-                &topic,
-                FrontendEventEnvelope::push_with_revision(revision, event),
-            )
+            .publish(&topic, FrontendEventEnvelope::push_with_revision(revision, event))
             .await;
     }
 
@@ -1881,12 +1784,7 @@ impl ExecutionPublisher for BrokerExecutionPublisher {
 
 #[async_trait::async_trait]
 impl crate::external_tracker::reconcile::WorkInvalidationPublisher for ServerState {
-    async fn publish_work_item_invalidated(
-        &self,
-        product_id: &str,
-        work_item_id: &str,
-        reason: &str,
-    ) {
+    async fn publish_work_item_invalidated(&self, product_id: &str, work_item_id: &str, reason: &str) {
         self.publisher
             .publish_work_item_changed(product_id, work_item_id, reason)
             .await;
@@ -2358,246 +2256,124 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::AbandonConflictResolution { .. } => {
                 conflict_resolution::handle_abandon_conflict_resolution(ctx, r).await
             }
-            r @ FrontendRequest::ActionAttentionGroup { .. } => {
-                attentions::handle_action_attention_group(ctx, r).await
-            }
-            r @ FrontendRequest::AddDependency { .. } => {
-                dependencies::handle_add_dependency(ctx, r).await
-            }
+            r @ FrontendRequest::ActionAttentionGroup { .. } => attentions::handle_action_attention_group(ctx, r).await,
+            r @ FrontendRequest::AddDependency { .. } => dependencies::handle_add_dependency(ctx, r).await,
             r @ FrontendRequest::AddHost { .. } => hosts::handle_add_host(ctx, r).await,
             r @ FrontendRequest::AddHostTag { .. } => hosts::handle_add_host_tag(ctx, r).await,
-            r @ FrontendRequest::AnswerAttention { .. } => {
-                attentions::handle_answer_attention(ctx, r).await
-            }
-            r @ FrontendRequest::AuditProductEffort { .. } => {
-                effort::handle_audit_product_effort(ctx, r).await
-            }
-            r @ FrontendRequest::CancelExecution { .. } => {
-                executions::handle_cancel_execution(ctx, r).await
-            }
+            r @ FrontendRequest::AnswerAttention { .. } => attentions::handle_answer_attention(ctx, r).await,
+            r @ FrontendRequest::AuditProductEffort { .. } => effort::handle_audit_product_effort(ctx, r).await,
+            r @ FrontendRequest::CancelExecution { .. } => executions::handle_cancel_execution(ctx, r).await,
             r @ FrontendRequest::ClassifyCiRemediation { .. } => {
                 ci_remediation::handle_classify_ci_remediation(ctx, r).await
             }
             r @ FrontendRequest::CommentsApplyMagicWand { .. } => {
                 comments::handle_comments_apply_magic_wand(ctx, r).await
             }
-            r @ FrontendRequest::CommentsCreate { .. } => {
-                comments::handle_comments_create(ctx, r).await
-            }
+            r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
             r @ FrontendRequest::CommentsDiscardMagicWand { .. } => {
                 comments::handle_comments_discard_magic_wand(ctx, r).await
             }
-            r @ FrontendRequest::CommentsDismiss { .. } => {
-                comments::handle_comments_dismiss(ctx, r).await
-            }
+            r @ FrontendRequest::CommentsDismiss { .. } => comments::handle_comments_dismiss(ctx, r).await,
             r @ FrontendRequest::CommentsDispatchMagicWand { .. } => {
                 comments::handle_comments_dispatch_magic_wand(ctx, r).await
             }
-            r @ FrontendRequest::CommentsList { .. } => {
-                comments::handle_comments_list(ctx, r).await
-            }
-            r @ FrontendRequest::CommentsResolve { .. } => {
-                comments::handle_comments_resolve(ctx, r).await
-            }
-            r @ FrontendRequest::CommentsSetStatus { .. } => {
-                comments::handle_comments_set_status(ctx, r).await
-            }
-            r @ FrontendRequest::CommentsUpdateAnchor { .. } => {
-                comments::handle_comments_update_anchor(ctx, r).await
-            }
-            r @ FrontendRequest::CreateAttention { .. } => {
-                attentions::handle_create_attention(ctx, r).await
-            }
-            r @ FrontendRequest::CreateAttentionItem { .. } => {
-                attentions::handle_create_attention_item(ctx, r).await
-            }
-            r @ FrontendRequest::CreateAutomation { .. } => {
-                automations::handle_create_automation(ctx, r).await
-            }
+            r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
+            r @ FrontendRequest::CommentsResolve { .. } => comments::handle_comments_resolve(ctx, r).await,
+            r @ FrontendRequest::CommentsSetStatus { .. } => comments::handle_comments_set_status(ctx, r).await,
+            r @ FrontendRequest::CommentsUpdateAnchor { .. } => comments::handle_comments_update_anchor(ctx, r).await,
+            r @ FrontendRequest::CreateAttention { .. } => attentions::handle_create_attention(ctx, r).await,
+            r @ FrontendRequest::CreateAttentionItem { .. } => attentions::handle_create_attention_item(ctx, r).await,
+            r @ FrontendRequest::CreateAutomation { .. } => automations::handle_create_automation(ctx, r).await,
             r @ FrontendRequest::CreateAutomationTask { .. } => {
                 automations::handle_create_automation_task(ctx, r).await
             }
-            r @ FrontendRequest::CreateChore { .. } => {
-                work_items::handle_create_chore(ctx, r).await
-            }
-            r @ FrontendRequest::CreateExecution { .. } => {
-                executions::handle_create_execution(ctx, r).await
-            }
-            r @ FrontendRequest::CreateInvestigation { .. } => {
-                work_items::handle_create_investigation(ctx, r).await
-            }
-            r @ FrontendRequest::CreateManyChores { .. } => {
-                work_items::handle_create_many_chores(ctx, r).await
-            }
-            r @ FrontendRequest::CreateManyTasks { .. } => {
-                work_items::handle_create_many_tasks(ctx, r).await
-            }
-            r @ FrontendRequest::CreateProduct { .. } => {
-                products::handle_create_product(ctx, r).await
-            }
-            r @ FrontendRequest::CreateProject { .. } => {
-                projects::handle_create_project(ctx, r).await
-            }
-            r @ FrontendRequest::CreateRevision { .. } => {
-                work_items::handle_create_revision(ctx, r).await
-            }
+            r @ FrontendRequest::CreateChore { .. } => work_items::handle_create_chore(ctx, r).await,
+            r @ FrontendRequest::CreateExecution { .. } => executions::handle_create_execution(ctx, r).await,
+            r @ FrontendRequest::CreateInvestigation { .. } => work_items::handle_create_investigation(ctx, r).await,
+            r @ FrontendRequest::CreateManyChores { .. } => work_items::handle_create_many_chores(ctx, r).await,
+            r @ FrontendRequest::CreateManyTasks { .. } => work_items::handle_create_many_tasks(ctx, r).await,
+            r @ FrontendRequest::CreateProduct { .. } => products::handle_create_product(ctx, r).await,
+            r @ FrontendRequest::CreateProject { .. } => projects::handle_create_project(ctx, r).await,
+            r @ FrontendRequest::CreateRevision { .. } => work_items::handle_create_revision(ctx, r).await,
             r @ FrontendRequest::CreateRun { .. } => executions::handle_create_run(ctx, r).await,
             r @ FrontendRequest::CreateTask { .. } => work_items::handle_create_task(ctx, r).await,
             r @ FrontendRequest::DebugLiveStatusPipeline => {
                 live_status::handle_debug_live_status_pipeline(ctx, r).await
             }
-            r @ FrontendRequest::DeleteAutomation { .. } => {
-                automations::handle_delete_automation(ctx, r).await
-            }
-            r @ FrontendRequest::DeleteWorkItem { .. } => {
-                work_items::handle_delete_work_item(ctx, r).await
-            }
-            r @ FrontendRequest::DisableAutomation { .. } => {
-                automations::handle_disable_automation(ctx, r).await
-            }
-            r @ FrontendRequest::DismissAttention { .. } => {
-                attentions::handle_dismiss_attention(ctx, r).await
-            }
-            r @ FrontendRequest::EnableAutomation { .. } => {
-                automations::handle_enable_automation(ctx, r).await
-            }
-            r @ FrontendRequest::EngineResponse { .. } => {
-                sessions::handle_engine_response(ctx, r).await
-            }
-            r @ FrontendRequest::ExecutionTranscript { .. } => {
-                executions::handle_execution_transcript(ctx, r).await
-            }
-            r @ FrontendRequest::FindWorkItemsByPr { .. } => {
-                work_items::handle_find_work_items_by_pr(ctx, r).await
-            }
-            r @ FrontendRequest::FocusWorkerPane { .. } => {
-                panes::handle_focus_worker_pane(ctx, r).await
-            }
-            r @ FrontendRequest::GetAttentionGroup { .. } => {
-                attentions::handle_get_attention_group(ctx, r).await
-            }
-            r @ FrontendRequest::GetAttentionItem { .. } => {
-                attentions::handle_get_attention_item(ctx, r).await
-            }
-            r @ FrontendRequest::GetAutomation { .. } => {
-                automations::handle_get_automation(ctx, r).await
-            }
+            r @ FrontendRequest::DeleteAutomation { .. } => automations::handle_delete_automation(ctx, r).await,
+            r @ FrontendRequest::DeleteWorkItem { .. } => work_items::handle_delete_work_item(ctx, r).await,
+            r @ FrontendRequest::DisableAutomation { .. } => automations::handle_disable_automation(ctx, r).await,
+            r @ FrontendRequest::DismissAttention { .. } => attentions::handle_dismiss_attention(ctx, r).await,
+            r @ FrontendRequest::EnableAutomation { .. } => automations::handle_enable_automation(ctx, r).await,
+            r @ FrontendRequest::EngineResponse { .. } => sessions::handle_engine_response(ctx, r).await,
+            r @ FrontendRequest::ExecutionTranscript { .. } => executions::handle_execution_transcript(ctx, r).await,
+            r @ FrontendRequest::FindWorkItemsByPr { .. } => work_items::handle_find_work_items_by_pr(ctx, r).await,
+            r @ FrontendRequest::FocusWorkerPane { .. } => panes::handle_focus_worker_pane(ctx, r).await,
+            r @ FrontendRequest::GetAttentionGroup { .. } => attentions::handle_get_attention_group(ctx, r).await,
+            r @ FrontendRequest::GetAttentionItem { .. } => attentions::handle_get_attention_item(ctx, r).await,
+            r @ FrontendRequest::GetAutomation { .. } => automations::handle_get_automation(ctx, r).await,
             r @ FrontendRequest::GetAutomationOpenTaskCount { .. } => {
                 automations::handle_get_automation_open_task_count(ctx, r).await
             }
-            r @ FrontendRequest::GetCiBudget { .. } => {
-                ci_remediation::handle_get_ci_budget(ctx, r).await
-            }
-            r @ FrontendRequest::GetCiRemediation { .. } => {
-                ci_remediation::handle_get_ci_remediation(ctx, r).await
-            }
+            r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
+            r @ FrontendRequest::GetCiRemediation { .. } => ci_remediation::handle_get_ci_remediation(ctx, r).await,
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
-            r @ FrontendRequest::GetDispatchState => {
-                engine_meta::handle_get_dispatch_state(ctx, r).await
-            }
-            r @ FrontendRequest::GetEngineHealth => {
-                engine_meta::handle_get_engine_health(ctx, r).await
-            }
-            r @ FrontendRequest::GetEngineVersion => {
-                engine_meta::handle_get_engine_version(ctx, r).await
-            }
-            r @ FrontendRequest::GetExecution { .. } => {
-                executions::handle_get_execution(ctx, r).await
-            }
+            r @ FrontendRequest::GetDispatchState => engine_meta::handle_get_dispatch_state(ctx, r).await,
+            r @ FrontendRequest::GetEngineHealth => engine_meta::handle_get_engine_health(ctx, r).await,
+            r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
+            r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
             r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
-            r @ FrontendRequest::GetTaskRuntime { .. } => {
-                executions::handle_get_task_runtime(ctx, r).await
-            }
-            r @ FrontendRequest::GetWorkItem { .. } => {
-                work_items::handle_get_work_item(ctx, r).await
-            }
+            r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
+            r @ FrontendRequest::GetWorkItem { .. } => work_items::handle_get_work_item(ctx, r).await,
             r @ FrontendRequest::GetWorkItemByShortId { .. } => {
                 work_items::handle_get_work_item_by_short_id(ctx, r).await
             }
-            r @ FrontendRequest::GetWorkTree { .. } => {
-                work_items::handle_get_work_tree(ctx, r).await
-            }
-            r @ FrontendRequest::GitHubAuthCancel => {
-                github_auth::handle_git_hub_auth_cancel(ctx, r).await
-            }
-            r @ FrontendRequest::GitHubAuthDisconnect => {
-                github_auth::handle_git_hub_auth_disconnect(ctx, r).await
-            }
-            r @ FrontendRequest::GitHubAuthStart => {
-                github_auth::handle_git_hub_auth_start(ctx, r).await
-            }
-            r @ FrontendRequest::GitHubAuthStatus => {
-                github_auth::handle_git_hub_auth_status(ctx, r).await
-            }
-            r @ FrontendRequest::InterruptWorkerPane { .. } => {
-                panes::handle_interrupt_worker_pane(ctx, r).await
-            }
-            r @ FrontendRequest::KickPrReconcilers => {
-                engine_meta::handle_kick_pr_reconcilers(ctx, r).await
-            }
+            r @ FrontendRequest::GetWorkTree { .. } => work_items::handle_get_work_tree(ctx, r).await,
+            r @ FrontendRequest::GitHubAuthCancel => github_auth::handle_git_hub_auth_cancel(ctx, r).await,
+            r @ FrontendRequest::GitHubAuthDisconnect => github_auth::handle_git_hub_auth_disconnect(ctx, r).await,
+            r @ FrontendRequest::GitHubAuthStart => github_auth::handle_git_hub_auth_start(ctx, r).await,
+            r @ FrontendRequest::GitHubAuthStatus => github_auth::handle_git_hub_auth_status(ctx, r).await,
+            r @ FrontendRequest::InterruptWorkerPane { .. } => panes::handle_interrupt_worker_pane(ctx, r).await,
+            r @ FrontendRequest::KickPrReconcilers => engine_meta::handle_kick_pr_reconcilers(ctx, r).await,
             r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
                 external_tracker::handle_link_work_item_external_ref(ctx, r).await
             }
-            r @ FrontendRequest::ListAttentionGroups { .. } => {
-                attentions::handle_list_attention_groups(ctx, r).await
-            }
-            r @ FrontendRequest::ListAttentionItems { .. } => {
-                attentions::handle_list_attention_items(ctx, r).await
-            }
+            r @ FrontendRequest::ListAttentionGroups { .. } => attentions::handle_list_attention_groups(ctx, r).await,
+            r @ FrontendRequest::ListAttentionItems { .. } => attentions::handle_list_attention_items(ctx, r).await,
             r @ FrontendRequest::ListAttentionItemsForWorkItem { .. } => {
                 attentions::handle_list_attention_items_for_work_item(ctx, r).await
             }
-            r @ FrontendRequest::ListAutomationRuns { .. } => {
-                automations::handle_list_automation_runs(ctx, r).await
-            }
-            r @ FrontendRequest::ListAutomations { .. } => {
-                automations::handle_list_automations(ctx, r).await
-            }
-            r @ FrontendRequest::ListAutomationTasks { .. } => {
-                automations::handle_list_automation_tasks(ctx, r).await
-            }
+            r @ FrontendRequest::ListAutomationRuns { .. } => automations::handle_list_automation_runs(ctx, r).await,
+            r @ FrontendRequest::ListAutomations { .. } => automations::handle_list_automations(ctx, r).await,
+            r @ FrontendRequest::ListAutomationTasks { .. } => automations::handle_list_automation_tasks(ctx, r).await,
             r @ FrontendRequest::ListChores { .. } => work_items::handle_list_chores(ctx, r).await,
-            r @ FrontendRequest::ListCiRemediations { .. } => {
-                ci_remediation::handle_list_ci_remediations(ctx, r).await
-            }
+            r @ FrontendRequest::ListCiRemediations { .. } => ci_remediation::handle_list_ci_remediations(ctx, r).await,
             r @ FrontendRequest::ListConflictResolutions { .. } => {
                 conflict_resolution::handle_list_conflict_resolutions(ctx, r).await
             }
-            r @ FrontendRequest::ListDependencies { .. } => {
-                dependencies::handle_list_dependencies(ctx, r).await
-            }
+            r @ FrontendRequest::ListDependencies { .. } => dependencies::handle_list_dependencies(ctx, r).await,
             r @ FrontendRequest::ListDependenciesDetailed { .. } => {
                 dependencies::handle_list_dependencies_detailed(ctx, r).await
             }
             r @ FrontendRequest::ListEditorialActions { .. } => {
                 automations::handle_list_editorial_actions(ctx, r).await
             }
-            r @ FrontendRequest::ListEngineAttempts { .. } => {
-                executions::handle_list_engine_attempts(ctx, r).await
-            }
-            r @ FrontendRequest::ListExecutions { .. } => {
-                executions::handle_list_executions(ctx, r).await
-            }
-            r @ FrontendRequest::ListFeatureFlags => {
-                engine_meta::handle_list_feature_flags(ctx, r).await
-            }
+            r @ FrontendRequest::ListEngineAttempts { .. } => executions::handle_list_engine_attempts(ctx, r).await,
+            r @ FrontendRequest::ListExecutions { .. } => executions::handle_list_executions(ctx, r).await,
+            r @ FrontendRequest::ListFeatureFlags => engine_meta::handle_list_feature_flags(ctx, r).await,
             r @ FrontendRequest::ListHosts => hosts::handle_list_hosts(ctx, r).await,
             r @ FrontendRequest::ListLiveStatusDisabledSlots => {
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }
             r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
-            r @ FrontendRequest::ListProjects { .. } => {
-                projects::handle_list_projects(ctx, r).await
-            }
+            r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
             r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
             r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
-            r @ FrontendRequest::ListWorkerLiveStates => {
-                panes::handle_list_worker_live_states(ctx, r).await
-            }
+            r @ FrontendRequest::ListWorkerLiveStates => panes::handle_list_worker_live_states(ctx, r).await,
             r @ FrontendRequest::MarkCiRemediationFailed { .. } => {
                 ci_remediation::handle_mark_ci_remediation_failed(ctx, r).await
             }
@@ -2610,77 +2386,37 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::MarkConflictResolutionFailed { .. } => {
                 conflict_resolution::handle_mark_conflict_resolution_failed(ctx, r).await
             }
-            r @ FrontendRequest::MergeWhenReady { .. } => {
-                review::handle_merge_when_ready(ctx, r).await
-            }
+            r @ FrontendRequest::MergeWhenReady { .. } => review::handle_merge_when_ready(ctx, r).await,
             r @ FrontendRequest::MetricsListLive => metrics::handle_metrics_list_live(ctx, r).await,
             r @ FrontendRequest::MetricsReset { .. } => metrics::handle_metrics_reset(ctx, r).await,
-            r @ FrontendRequest::MetricsShowLive { .. } => {
-                metrics::handle_metrics_show_live(ctx, r).await
-            }
-            r @ FrontendRequest::OpenReviewTerminal { .. } => {
-                review::handle_open_review_terminal(ctx, r).await
-            }
+            r @ FrontendRequest::MetricsShowLive { .. } => metrics::handle_metrics_show_live(ctx, r).await,
+            r @ FrontendRequest::OpenReviewTerminal { .. } => review::handle_open_review_terminal(ctx, r).await,
             r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,
             r @ FrontendRequest::ReapRun { .. } => executions::handle_reap_run(ctx, r).await,
-            r @ FrontendRequest::RecordEffortEscalation { .. } => {
-                effort::handle_record_effort_escalation(ctx, r).await
-            }
-            r @ FrontendRequest::RegisterAppSession => {
-                sessions::handle_register_app_session(ctx, r).await
-            }
-            r @ FrontendRequest::RegisterBossSession { .. } => {
-                sessions::handle_register_boss_session(ctx, r).await
-            }
-            r @ FrontendRequest::ReleaseReviewTerminal { .. } => {
-                review::handle_release_review_terminal(ctx, r).await
-            }
-            r @ FrontendRequest::RemoveDependency { .. } => {
-                dependencies::handle_remove_dependency(ctx, r).await
-            }
+            r @ FrontendRequest::RecordEffortEscalation { .. } => effort::handle_record_effort_escalation(ctx, r).await,
+            r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
+            r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
+            r @ FrontendRequest::ReleaseReviewTerminal { .. } => review::handle_release_review_terminal(ctx, r).await,
+            r @ FrontendRequest::RemoveDependency { .. } => dependencies::handle_remove_dependency(ctx, r).await,
             r @ FrontendRequest::RemoveHost { .. } => hosts::handle_remove_host(ctx, r).await,
-            r @ FrontendRequest::RemoveHostTag { .. } => {
-                hosts::handle_remove_host_tag(ctx, r).await
-            }
-            r @ FrontendRequest::ReorderProjectTasks { .. } => {
-                projects::handle_reorder_project_tasks(ctx, r).await
-            }
-            r @ FrontendRequest::RequestExecution { .. } => {
-                executions::handle_request_execution(ctx, r).await
-            }
+            r @ FrontendRequest::RemoveHostTag { .. } => hosts::handle_remove_host_tag(ctx, r).await,
+            r @ FrontendRequest::ReorderProjectTasks { .. } => projects::handle_reorder_project_tasks(ctx, r).await,
+            r @ FrontendRequest::RequestExecution { .. } => executions::handle_request_execution(ctx, r).await,
             r @ FrontendRequest::ResolveProjectDesignDoc { .. } => {
                 projects::handle_resolve_project_design_doc(ctx, r).await
             }
-            r @ FrontendRequest::RestoreWorkItem { .. } => {
-                work_items::handle_restore_work_item(ctx, r).await
-            }
-            r @ FrontendRequest::RetryCiRemediation { .. } => {
-                ci_remediation::handle_retry_ci_remediation(ctx, r).await
-            }
+            r @ FrontendRequest::RestoreWorkItem { .. } => work_items::handle_restore_work_item(ctx, r).await,
+            r @ FrontendRequest::RetryCiRemediation { .. } => ci_remediation::handle_retry_ci_remediation(ctx, r).await,
             r @ FrontendRequest::RetryConflictResolution { .. } => {
                 conflict_resolution::handle_retry_conflict_resolution(ctx, r).await
             }
-            r @ FrontendRequest::RevealWorkItem { .. } => {
-                work_items::handle_reveal_work_item(ctx, r).await
-            }
-            r @ FrontendRequest::RunAutomation { .. } => {
-                automations::handle_run_automation(ctx, r).await
-            }
-            r @ FrontendRequest::SendInputToWorker { .. } => {
-                panes::handle_send_input_to_worker(ctx, r).await
-            }
-            r @ FrontendRequest::SetCiBudget { .. } => {
-                ci_remediation::handle_set_ci_budget(ctx, r).await
-            }
-            r @ FrontendRequest::SetDispatchPaused { .. } => {
-                engine_meta::handle_set_dispatch_paused(ctx, r).await
-            }
-            r @ FrontendRequest::SetFeatureFlag { .. } => {
-                engine_meta::handle_set_feature_flag(ctx, r).await
-            }
-            r @ FrontendRequest::SetHostEnabled { .. } => {
-                hosts::handle_set_host_enabled(ctx, r).await
-            }
+            r @ FrontendRequest::RevealWorkItem { .. } => work_items::handle_reveal_work_item(ctx, r).await,
+            r @ FrontendRequest::RunAutomation { .. } => automations::handle_run_automation(ctx, r).await,
+            r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
+            r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
+            r @ FrontendRequest::SetDispatchPaused { .. } => engine_meta::handle_set_dispatch_paused(ctx, r).await,
+            r @ FrontendRequest::SetFeatureFlag { .. } => engine_meta::handle_set_feature_flag(ctx, r).await,
+            r @ FrontendRequest::SetHostEnabled { .. } => hosts::handle_set_host_enabled(ctx, r).await,
             r @ FrontendRequest::SetLiveStatusEnabled { .. } => {
                 live_status::handle_set_live_status_enabled(ctx, r).await
             }
@@ -2696,9 +2432,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SetProductExternalTracker { .. } => {
                 external_tracker::handle_set_product_external_tracker(ctx, r).await
             }
-            r @ FrontendRequest::SetProjectDesignDoc { .. } => {
-                projects::handle_set_project_design_doc(ctx, r).await
-            }
+            r @ FrontendRequest::SetProjectDesignDoc { .. } => projects::handle_set_project_design_doc(ctx, r).await,
             r @ FrontendRequest::SetSetting { .. } => engine_meta::handle_set_setting(ctx, r).await,
             r @ FrontendRequest::Shutdown { .. } => sessions::handle_shutdown(ctx, r).await,
             r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
@@ -2706,27 +2440,15 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SyncProductExternalTracker { .. } => {
                 external_tracker::handle_sync_product_external_tracker(ctx, r).await
             }
-            r @ FrontendRequest::TailRunTranscript { .. } => {
-                executions::handle_tail_run_transcript(ctx, r).await
-            }
+            r @ FrontendRequest::TailRunTranscript { .. } => executions::handle_tail_run_transcript(ctx, r).await,
             r @ FrontendRequest::UnlinkWorkItemExternalRef { .. } => {
                 external_tracker::handle_unlink_work_item_external_ref(ctx, r).await
             }
-            r @ FrontendRequest::Unsubscribe { .. } => {
-                subscriptions::handle_unsubscribe(ctx, r).await
-            }
-            r @ FrontendRequest::UpdateAutomation { .. } => {
-                automations::handle_update_automation(ctx, r).await
-            }
-            r @ FrontendRequest::UpdateWorkItem { .. } => {
-                work_items::handle_update_work_item(ctx, r).await
-            }
-            r @ FrontendRequest::UpdateWorkerShellPid { .. } => {
-                sessions::handle_update_worker_shell_pid(ctx, r).await
-            }
-            r @ FrontendRequest::WorkspacePoolSummary => {
-                engine_meta::handle_workspace_pool_summary(ctx, r).await
-            }
+            r @ FrontendRequest::Unsubscribe { .. } => subscriptions::handle_unsubscribe(ctx, r).await,
+            r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
+            r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
+            r @ FrontendRequest::UpdateWorkerShellPid { .. } => sessions::handle_update_worker_shell_pid(ctx, r).await,
+            r @ FrontendRequest::WorkspacePoolSummary => engine_meta::handle_workspace_pool_summary(ctx, r).await,
         }
     }
 
@@ -2736,4 +2458,3 @@ async fn handle_frontend_connection(
     let _ = writer_task.await;
     Ok(())
 }
-

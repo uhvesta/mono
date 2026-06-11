@@ -65,8 +65,7 @@ impl WorkDb {
     /// regardless of which trigger surfaced the problem.
     pub fn precheck_dispatch_repo(&self, work_item_id: &str) -> Result<()> {
         let mut conn = self.connect()?;
-        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?
-            .unwrap_or_else(|| work_item_id.to_owned());
+        let resolved = resolve_friendly_work_item_id(&conn, work_item_id)?.unwrap_or_else(|| work_item_id.to_owned());
         ensure_dispatch_repo_resolvable(&mut conn, &resolved)
     }
 
@@ -110,10 +109,8 @@ impl WorkDb {
                        WHERE we.work_item_id = t.id
                    )",
             )?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut healed = Vec::new();
         let now = now_string();
@@ -203,10 +200,7 @@ impl WorkDb {
     /// execution is treated as stale and re-dispatched. Tests that
     /// don't stand up a live registry can pass `|_| true` to keep the
     /// pre-live-check semantics.
-    pub fn reconcile_active_dispatch<F: Fn(&str) -> bool>(
-        &self,
-        is_live: F,
-    ) -> Result<Vec<String>> {
+    pub fn reconcile_active_dispatch<F: Fn(&str) -> bool>(&self, is_live: F) -> Result<Vec<String>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         // Active, non-deleted task/chore rows are the candidate set.
@@ -311,10 +305,8 @@ impl WorkDb {
                  WHERE status = 'active' AND deleted_at IS NULL
                  ORDER BY updated_at ASC, id ASC",
             )?;
-            stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+            stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut redispatched = Vec::new();
         for (work_item_id, autostart) in candidates {
@@ -446,11 +438,7 @@ impl WorkDb {
     /// `failed`) the work item has produced within the trailing
     /// `since_epoch_secs` window. Used by the orphan-active churn
     /// guard to stop auto-redispatching a work item that keeps dying.
-    pub fn count_recent_terminal_executions(
-        &self,
-        work_item_id: &str,
-        since_epoch_secs: i64,
-    ) -> Result<i64> {
+    pub fn count_recent_terminal_executions(&self, work_item_id: &str, since_epoch_secs: i64) -> Result<i64> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT COUNT(*) FROM work_executions
@@ -495,10 +483,7 @@ impl WorkDb {
     /// List all executions for `chain_root_id` plus every revision task in
     /// its chain. Results are ordered chronologically (created_at ASC, id
     /// ASC) across all tasks so the caller sees a unified history.
-    pub fn list_executions_for_chain(
-        &self,
-        chain_root_id: &str,
-    ) -> Result<Vec<WorkExecution>> {
+    pub fn list_executions_for_chain(&self, chain_root_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         let revision_ids = collect_chain_revision_ids(&conn, chain_root_id)?;
         let mut all_ids = vec![chain_root_id.to_owned()];
@@ -517,11 +502,7 @@ impl WorkDb {
             let rows = stmt.query_map([task_id], map_execution)?;
             all_executions.extend(collect_rows(rows)?);
         }
-        all_executions.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
+        all_executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         Ok(all_executions)
     }
 
@@ -544,11 +525,7 @@ impl WorkDb {
     /// newest execution is never its own predecessor, so its own Stop
     /// still finalizes it.
     pub fn execution_superseded_in_workspace(&self, execution: &WorkExecution) -> Result<bool> {
-        let Some(workspace_id) = execution
-            .cube_workspace_id
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        else {
+        let Some(workspace_id) = execution.cube_workspace_id.as_deref().filter(|s| !s.is_empty()) else {
             return Ok(false);
         };
         let conn = self.connect()?;

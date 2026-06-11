@@ -25,8 +25,8 @@
 //!    version contract uses (see [`crate::remote_wrapper`]).
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -65,9 +65,7 @@ pub fn build_time() -> &'static str {
         if !stamped.is_empty() && stamped != "unknown" {
             return stamped.to_owned();
         }
-        binary_mtime_iso8601().unwrap_or_else(|| {
-            format!("unknown (CARGO_PKG_VERSION {})", env!("CARGO_PKG_VERSION"))
-        })
+        binary_mtime_iso8601().unwrap_or_else(|| format!("unknown (CARGO_PKG_VERSION {})", env!("CARGO_PKG_VERSION")))
     })
     .as_str()
 }
@@ -223,9 +221,7 @@ fn format_iso8601_utc(epoch_secs: i64) -> String {
     let minute = (seconds_in_day % 3_600) / 60;
     let second = seconds_in_day % 60;
     let (year, month, day) = ymd_from_days_since_1970(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 fn ymd_from_days_since_1970(days: i64) -> (i64, u32, u32) {

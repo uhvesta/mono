@@ -22,11 +22,7 @@ pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest
         match work_db.create_automation(input) {
             Ok(automation) => {
                 server_state.automation_scheduler_kick.notify_one();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AutomationCreated { automation },
-                );
+                send_response(&sink, &request_id, FrontendEvent::AutomationCreated { automation });
             }
             Err(err) => send_response(
                 &sink,
@@ -52,10 +48,7 @@ pub(super) async fn handle_list_automations(ctx: Dispatch, req: FrontendRequest)
     {
         match work_db.list_automations_with_open_task_counts(&product_id) {
             Ok(rows) => {
-                let open_task_counts = rows
-                    .iter()
-                    .map(|(a, count)| (a.id.clone(), *count))
-                    .collect();
+                let open_task_counts = rows.iter().map(|(a, count)| (a.id.clone(), *count)).collect();
                 let automations = rows.into_iter().map(|(a, _)| a).collect();
                 send_response(
                     &sink,
@@ -90,11 +83,7 @@ pub(super) async fn handle_get_automation(ctx: Dispatch, req: FrontendRequest) {
     };
     {
         match work_db.get_automation(&id) {
-            Ok(Some(automation)) => send_response(
-                &sink,
-                &request_id,
-                FrontendEvent::AutomationResult { automation },
-            ),
+            Ok(Some(automation)) => send_response(&sink, &request_id, FrontendEvent::AutomationResult { automation }),
             Ok(None) => send_response(
                 &sink,
                 &request_id,
@@ -128,11 +117,7 @@ pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest
         match work_db.update_automation(&id, patch) {
             Ok(automation) => {
                 server_state.automation_scheduler_kick.notify_one();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AutomationUpdated { automation },
-                )
+                send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
             Err(err) => send_response(
                 &sink,
@@ -160,11 +145,7 @@ pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest
         match work_db.enable_automation(&id) {
             Ok(automation) => {
                 server_state.automation_scheduler_kick.notify_one();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AutomationUpdated { automation },
-                )
+                send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
             Err(err) => send_response(
                 &sink,
@@ -192,11 +173,7 @@ pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendReques
         match work_db.disable_automation(&id) {
             Ok(automation) => {
                 server_state.automation_scheduler_kick.notify_one();
-                send_response(
-                    &sink,
-                    &request_id,
-                    FrontendEvent::AutomationUpdated { automation },
-                )
+                send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
             Err(err) => send_response(
                 &sink,
@@ -256,10 +233,7 @@ pub(super) async fn handle_get_automation_open_task_count(ctx: Dispatch, req: Fr
             Ok(count) => send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::AutomationOpenTaskCount {
-                    automation_id,
-                    count,
-                },
+                FrontendEvent::AutomationOpenTaskCount { automation_id, count },
             ),
             Err(err) => send_response(
                 &sink,
@@ -287,10 +261,7 @@ pub(super) async fn handle_list_editorial_actions(ctx: Dispatch, req: FrontendRe
             Ok(actions) => send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::EditorialActionsList {
-                    product_id,
-                    actions,
-                },
+                FrontendEvent::EditorialActionsList { product_id, actions },
             ),
             Err(err) => send_response(
                 &sink,
@@ -318,10 +289,7 @@ pub(super) async fn handle_list_automation_runs(ctx: Dispatch, req: FrontendRequ
             Ok(runs) => send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::AutomationRunsList {
-                    automation_id,
-                    runs,
-                },
+                FrontendEvent::AutomationRunsList { automation_id, runs },
             ),
             Err(err) => send_response(
                 &sink,
@@ -349,10 +317,7 @@ pub(super) async fn handle_list_automation_tasks(ctx: Dispatch, req: FrontendReq
             Ok(tasks) => send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::AutomationTasksList {
-                    automation_id,
-                    tasks,
-                },
+                FrontendEvent::AutomationTasksList { automation_id, tasks },
             ),
             Err(err) => send_response(
                 &sink,
@@ -373,11 +338,7 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::RunAutomation {
-        automation_id,
-        force,
-    } = req
-    else {
+    let FrontendRequest::RunAutomation { automation_id, force } = req else {
         unreachable!()
     };
     {
@@ -442,10 +403,8 @@ pub(super) async fn handle_run_automation(ctx: Dispatch, req: FrontendRequest) {
         }
 
         let coord = server_state.execution_coordinator.clone();
-        let dispatcher = crate::automation_triage::EngineTriageDispatcher::new(
-            work_db.clone(),
-            Arc::new(move || coord.kick()),
-        );
+        let dispatcher =
+            crate::automation_triage::EngineTriageDispatcher::new(work_db.clone(), Arc::new(move || coord.kick()));
         let now_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -517,9 +476,9 @@ pub(super) async fn handle_create_automation_task(ctx: Dispatch, req: FrontendRe
                 let dispatch_input = RequestExecutionInput::builder()
                     .work_item_id(work_item_id_for_dispatch.clone())
                     .build();
-                match work_db.request_execution_with_live_check(dispatch_input, |run_id| {
-                    live_states.is_run_live(run_id)
-                }) {
+                match work_db
+                    .request_execution_with_live_check(dispatch_input, |run_id| live_states.is_run_live(run_id))
+                {
                     Ok(_execution) => {
                         server_state.execution_coordinator.kick();
                     }
@@ -543,12 +502,7 @@ pub(super) async fn handle_create_automation_task(ctx: Dispatch, req: FrontendRe
                     vec![work_item_id(&item)],
                 )
                 .await;
-                send_response_with_revision(
-                    &sink,
-                    &request_id,
-                    revision,
-                    FrontendEvent::WorkItemCreated { item },
-                );
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemCreated { item });
             }
             Err(err) => {
                 send_response(&sink, &request_id, duplicate_or_work_error(err));

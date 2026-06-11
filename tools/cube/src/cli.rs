@@ -425,13 +425,7 @@ mod tests {
 
     #[test]
     fn repo_ensure_matches_phase_a_shape() {
-        let cli = Cli::parse_from([
-            "cube",
-            "repo",
-            "ensure",
-            "--origin",
-            "git@github.com:spinyfin/mono.git",
-        ]);
+        let cli = Cli::parse_from(["cube", "repo", "ensure", "--origin", "git@github.com:spinyfin/mono.git"]);
 
         match cli.command {
             Command::Repo {
@@ -461,9 +455,7 @@ mod tests {
 
     #[test]
     fn repo_ensure_rejects_both_or_neither() {
-        let both = Cli::try_parse_from([
-            "cube", "repo", "ensure", "bduff", "--origin", "git@github.com:o/r.git",
-        ]);
+        let both = Cli::try_parse_from(["cube", "repo", "ensure", "bduff", "--origin", "git@github.com:o/r.git"]);
         assert!(both.is_err());
 
         let neither = Cli::try_parse_from(["cube", "repo", "ensure"]);
@@ -472,14 +464,7 @@ mod tests {
 
     #[test]
     fn workspace_lease_matches_docs_shape() {
-        let cli = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "implement parser",
-        ]);
+        let cli = Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "implement parser"]);
 
         match cli.command {
             Command::Workspace {
@@ -552,12 +537,9 @@ mod tests {
 
         match cli.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::Lease {
-                        prefer,
-                        allow_dirty,
-                        ..
-                    },
+                command: WorkspaceCommand::Lease {
+                    prefer, allow_dirty, ..
+                },
             } => {
                 assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
                 assert!(allow_dirty);
@@ -662,7 +644,10 @@ mod tests {
             "--resume-pr",
             "42",
         ]);
-        assert!(result.is_err(), "--allow-dirty and --resume-pr must be mutually exclusive");
+        assert!(
+            result.is_err(),
+            "--allow-dirty and --resume-pr must be mutually exclusive"
+        );
     }
 
     #[test]
@@ -670,13 +655,9 @@ mod tests {
         let by_lease = Cli::parse_from(["cube", "workspace", "release", "--lease", "abc-123"]);
         match by_lease.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::Release {
-                        workspace,
-                        lease,
-                        repo,
-                        ..
-                    },
+                command: WorkspaceCommand::Release {
+                    workspace, lease, repo, ..
+                },
             } => {
                 assert!(workspace.is_none());
                 assert_eq!(lease.as_deref(), Some("abc-123"));
@@ -688,13 +669,9 @@ mod tests {
         let by_id = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004"]);
         match by_id.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::Release {
-                        workspace,
-                        lease,
-                        repo,
-                        ..
-                    },
+                command: WorkspaceCommand::Release {
+                    workspace, lease, repo, ..
+                },
             } => {
                 assert_eq!(workspace.as_deref(), Some("mono-agent-004"));
                 assert!(lease.is_none());
@@ -703,13 +680,10 @@ mod tests {
             _ => panic!("expected release command"),
         }
 
-        let by_id_with_repo = Cli::parse_from([
-            "cube", "workspace", "release", "mono-agent-004", "--repo", "mono",
-        ]);
+        let by_id_with_repo = Cli::parse_from(["cube", "workspace", "release", "mono-agent-004", "--repo", "mono"]);
         match by_id_with_repo.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::Release { workspace, repo, .. },
+                command: WorkspaceCommand::Release { workspace, repo, .. },
             } => {
                 assert_eq!(workspace.as_deref(), Some("mono-agent-004"));
                 assert_eq!(repo.as_deref(), Some("mono"));
@@ -732,10 +706,7 @@ mod tests {
         ]);
         match cli.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::Release {
-                        reason, keep_dirty, ..
-                    },
+                command: WorkspaceCommand::Release { reason, keep_dirty, .. },
             } => {
                 assert_eq!(reason.as_deref(), Some("crash"));
                 assert!(keep_dirty);
@@ -816,14 +787,7 @@ mod tests {
     #[test]
     fn workspace_release_rejects_both_or_neither() {
         // Both forms together
-        let both = Cli::try_parse_from([
-            "cube",
-            "workspace",
-            "release",
-            "mono-agent-004",
-            "--lease",
-            "abc-123",
-        ]);
+        let both = Cli::try_parse_from(["cube", "workspace", "release", "mono-agent-004", "--lease", "abc-123"]);
         assert!(both.is_err());
 
         // Neither
@@ -831,8 +795,7 @@ mod tests {
         assert!(neither.is_err());
 
         // --repo without workspace id is also rejected (requires)
-        let lonely_repo =
-            Cli::try_parse_from(["cube", "workspace", "release", "--repo", "mono"]);
+        let lonely_repo = Cli::try_parse_from(["cube", "workspace", "release", "--repo", "mono"]);
         assert!(lonely_repo.is_err());
     }
 
@@ -852,12 +815,7 @@ mod tests {
 
         match cli.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::List {
-                        repo,
-                        state,
-                        holder,
-                    },
+                command: WorkspaceCommand::List { repo, state, holder },
             } => {
                 assert_eq!(repo.as_deref(), Some("mono"));
                 assert_eq!(state.as_deref(), Some("leased"));
@@ -872,12 +830,7 @@ mod tests {
         let cli = Cli::parse_from(["cube", "workspace", "list"]);
         match cli.command {
             Command::Workspace {
-                command:
-                    WorkspaceCommand::List {
-                        repo,
-                        state,
-                        holder,
-                    },
+                command: WorkspaceCommand::List { repo, state, holder },
             } => {
                 assert!(repo.is_none());
                 assert!(state.is_none());
@@ -941,13 +894,7 @@ mod tests {
 
     #[test]
     fn workspace_remove_accepts_expunge_flag() {
-        let cli = Cli::parse_from([
-            "cube",
-            "workspace",
-            "remove",
-            "mono-agent-004",
-            "--expunge",
-        ]);
+        let cli = Cli::parse_from(["cube", "workspace", "remove", "mono-agent-004", "--expunge"]);
         match cli.command {
             Command::Workspace {
                 command:
@@ -988,14 +935,7 @@ mod tests {
 
     #[test]
     fn workspace_gc_parses_with_workspace_and_dry_run() {
-        let cli = Cli::parse_from([
-            "cube",
-            "workspace",
-            "gc",
-            "--workspace",
-            "mono-agent-001",
-            "--dry-run",
-        ]);
+        let cli = Cli::parse_from(["cube", "workspace", "gc", "--workspace", "mono-agent-001", "--dry-run"]);
         match cli.command {
             Command::Workspace {
                 command: WorkspaceCommand::Gc { workspace, dry_run },
@@ -1063,7 +1003,14 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, body_file, draft }),
+                command:
+                    PrCommand::Ensure(PrEnsureArgs {
+                        branch,
+                        title,
+                        body,
+                        body_file,
+                        draft,
+                    }),
             } => {
                 assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
                 assert_eq!(title.as_deref(), Some("My PR"));
@@ -1081,7 +1028,14 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, body_file, draft }),
+                command:
+                    PrCommand::Ensure(PrEnsureArgs {
+                        branch,
+                        title,
+                        body,
+                        body_file,
+                        draft,
+                    }),
             } => {
                 assert!(branch.is_none());
                 assert!(title.is_none());
@@ -1109,7 +1063,14 @@ mod tests {
 
         match cli.command {
             Command::Pr {
-                command: PrCommand::Ensure(PrEnsureArgs { branch, title, body, body_file, draft }),
+                command:
+                    PrCommand::Ensure(PrEnsureArgs {
+                        branch,
+                        title,
+                        body,
+                        body_file,
+                        draft,
+                    }),
             } => {
                 assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
                 assert_eq!(title.as_deref(), Some("My PR"));
@@ -1123,12 +1084,15 @@ mod tests {
 
     #[test]
     fn pr_push_parses_explicit_pr_and_branch() {
-        let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc123_01",
-        ]);
+        let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc123_01"]);
         match cli.command {
             Command::Pr {
-                command: PrCommand::Push(PrPushArgs { pr, branch, force_with_lease }),
+                command:
+                    PrCommand::Push(PrPushArgs {
+                        pr,
+                        branch,
+                        force_with_lease,
+                    }),
             } => {
                 assert_eq!(pr, Some(42));
                 assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
@@ -1141,11 +1105,23 @@ mod tests {
     #[test]
     fn pr_push_accepts_force_with_lease() {
         let cli = Cli::parse_from([
-            "cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc", "--force-with-lease",
+            "cube",
+            "pr",
+            "push",
+            "--pr",
+            "42",
+            "--branch",
+            "boss/exec_abc",
+            "--force-with-lease",
         ]);
         match cli.command {
             Command::Pr {
-                command: PrCommand::Push(PrPushArgs { pr, branch, force_with_lease }),
+                command:
+                    PrCommand::Push(PrPushArgs {
+                        pr,
+                        branch,
+                        force_with_lease,
+                    }),
             } => {
                 assert_eq!(pr, Some(42));
                 assert_eq!(branch.as_deref(), Some("boss/exec_abc"));
@@ -1160,7 +1136,12 @@ mod tests {
         let cli = Cli::parse_from(["cube", "pr", "push"]);
         match cli.command {
             Command::Pr {
-                command: PrCommand::Push(PrPushArgs { pr, branch, force_with_lease }),
+                command:
+                    PrCommand::Push(PrPushArgs {
+                        pr,
+                        branch,
+                        force_with_lease,
+                    }),
             } => {
                 assert!(pr.is_none());
                 assert!(branch.is_none());

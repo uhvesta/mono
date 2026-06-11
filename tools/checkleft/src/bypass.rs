@@ -84,11 +84,7 @@ pub fn bypass_failure_guidance(bypass_name: &str) -> String {
     )
 }
 
-pub fn bypass_applied_finding(
-    bypass_name: &str,
-    reason: &str,
-    location: Option<Location>,
-) -> Finding {
+pub fn bypass_applied_finding(bypass_name: &str, reason: &str, location: Option<Location>) -> Finding {
     Finding {
         severity: Severity::Warning,
         message: format!("check was bypassed via `{bypass_name}`"),
@@ -135,8 +131,8 @@ fn is_valid_bypass_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id,
-        maybe_bypass_findings, parse_bypass_directives, parse_bypass_directives_from_descriptions,
+        bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id, maybe_bypass_findings,
+        parse_bypass_directives, parse_bypass_directives_from_descriptions,
     };
     use crate::input::{ChangeKind, ChangeSet, ChangedFile};
     use crate::output::{Location, Severity};
@@ -194,10 +190,7 @@ mod tests {
             Some("BYPASS_API_BREAKING_SURFACE=From pr"),
         );
 
-        assert_eq!(
-            parsed.get("BYPASS_API_BREAKING_SURFACE"),
-            Some(&"From pr".to_owned())
-        );
+        assert_eq!(parsed.get("BYPASS_API_BREAKING_SURFACE"), Some(&"From pr".to_owned()));
     }
 
     #[test]
@@ -241,13 +234,8 @@ mod tests {
         ));
         let trigger_files = vec![PathBuf::from("backend/blob/src/v3/auth.rs")];
 
-        let findings = maybe_bypass_findings(
-            &changeset,
-            true,
-            "BYPASS_API_BREAKING_SURFACE",
-            &trigger_files,
-        )
-        .expect("expected bypass findings");
+        let findings = maybe_bypass_findings(&changeset, true, "BYPASS_API_BREAKING_SURFACE", &trigger_files)
+            .expect("expected bypass findings");
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Warning);
@@ -265,14 +253,6 @@ mod tests {
         ));
         let trigger_files = vec![PathBuf::from("backend/blob/src/v3/auth.rs")];
 
-        assert!(
-            maybe_bypass_findings(
-                &changeset,
-                false,
-                "BYPASS_API_BREAKING_SURFACE",
-                &trigger_files
-            )
-            .is_none()
-        );
+        assert!(maybe_bypass_findings(&changeset, false, "BYPASS_API_BREAKING_SURFACE", &trigger_files).is_none());
     }
 }

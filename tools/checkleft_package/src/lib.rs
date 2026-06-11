@@ -17,9 +17,7 @@ const COMPATIBILITY_LEVEL: u32 = 0;
 
 pub fn find_checkleft_repo_root(start: &Path) -> Result<PathBuf> {
     for ancestor in start.ancestors() {
-        if ancestor.join(CHECKLEFT_SUBDIR).join("Cargo.toml").is_file()
-            && ancestor.join("Cargo.toml").is_file()
-        {
+        if ancestor.join(CHECKLEFT_SUBDIR).join("Cargo.toml").is_file() && ancestor.join("Cargo.toml").is_file() {
             return Ok(ancestor.to_path_buf());
         }
     }
@@ -30,73 +28,44 @@ pub fn find_checkleft_repo_root(start: &Path) -> Result<PathBuf> {
     );
 }
 
-pub fn package_checkleft_source_archive(
-    repo_root: &Path,
-    output: Option<PathBuf>,
-) -> Result<PathBuf> {
+pub fn package_checkleft_source_archive(repo_root: &Path, output: Option<PathBuf>) -> Result<PathBuf> {
     let package_root = repo_root.join(CHECKLEFT_SUBDIR);
     if !package_root.is_dir() {
         bail!("expected checkleft sources at `{}`", package_root.display());
     }
 
-    let package_manifest =
-        fs::read_to_string(package_root.join("Cargo.toml")).with_context(|| {
-            format!(
-                "failed to read `{}`",
-                package_root.join("Cargo.toml").display()
-            )
-        })?;
-    let workspace_manifest =
-        fs::read_to_string(repo_root.join("Cargo.toml")).with_context(|| {
-            format!(
-                "failed to read `{}`",
-                repo_root.join("Cargo.toml").display()
-            )
-        })?;
+    let package_manifest = fs::read_to_string(package_root.join("Cargo.toml"))
+        .with_context(|| format!("failed to read `{}`", package_root.join("Cargo.toml").display()))?;
+    let workspace_manifest = fs::read_to_string(repo_root.join("Cargo.toml"))
+        .with_context(|| format!("failed to read `{}`", repo_root.join("Cargo.toml").display()))?;
 
     let flattened_manifest = flatten_checkleft_manifest(&package_manifest, &workspace_manifest)
         .context("failed to flatten Cargo manifest")?;
     let version = package_version(&flattened_manifest)?;
     let package_dir_name = format!("checkleft-{version}-source");
-    let output = output.unwrap_or_else(|| {
-        repo_root
-            .join("dist")
-            .join(format!("{package_dir_name}.tgz"))
-    });
+    let output = output.unwrap_or_else(|| repo_root.join("dist").join(format!("{package_dir_name}.tgz")));
     let output = if output.is_absolute() {
         output
     } else {
         repo_root.join(output)
     };
 
-    let staging_parent = output
-        .parent()
-        .context("output path must have a parent directory")?;
-    fs::create_dir_all(staging_parent)
-        .with_context(|| format!("failed to create `{}`", staging_parent.display()))?;
+    let staging_parent = output.parent().context("output path must have a parent directory")?;
+    fs::create_dir_all(staging_parent).with_context(|| format!("failed to create `{}`", staging_parent.display()))?;
 
-    let staging_root =
-        staging_parent.join(format!(".{package_dir_name}.stage-{}", std::process::id()));
+    let staging_root = staging_parent.join(format!(".{package_dir_name}.stage-{}", std::process::id()));
     if staging_root.exists() {
-        fs::remove_dir_all(&staging_root)
-            .with_context(|| format!("failed to clear `{}`", staging_root.display()))?;
+        fs::remove_dir_all(&staging_root).with_context(|| format!("failed to clear `{}`", staging_root.display()))?;
     }
-    fs::create_dir_all(&staging_root)
-        .with_context(|| format!("failed to create `{}`", staging_root.display()))?;
+    fs::create_dir_all(&staging_root).with_context(|| format!("failed to create `{}`", staging_root.display()))?;
     let package_output_root = staging_root.join(&package_dir_name);
     fs::create_dir_all(&package_output_root)
         .with_context(|| format!("failed to create `{}`", package_output_root.display()))?;
 
-    let stage_result = stage_checkleft_source_tree(
-        repo_root,
-        &package_root,
-        &package_output_root,
-        &flattened_manifest,
-    );
-    let archive_result =
-        stage_result.and_then(|()| create_source_archive(&package_output_root, &output));
-    let cleanup_result = fs::remove_dir_all(&staging_root)
-        .with_context(|| format!("failed to clean `{}`", staging_root.display()));
+    let stage_result = stage_checkleft_source_tree(repo_root, &package_root, &package_output_root, &flattened_manifest);
+    let archive_result = stage_result.and_then(|()| create_source_archive(&package_output_root, &output));
+    let cleanup_result =
+        fs::remove_dir_all(&staging_root).with_context(|| format!("failed to clean `{}`", staging_root.display()));
 
     match (archive_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(output),
@@ -113,14 +82,8 @@ fn stage_checkleft_source_tree(
 ) -> Result<()> {
     write_string(output_root.join("Cargo.toml"), flattened_manifest)?;
     copy_file(repo_root.join("Cargo.lock"), output_root.join("Cargo.lock"))?;
-    copy_if_exists(
-        repo_root.join(".bazelversion"),
-        output_root.join(".bazelversion"),
-    )?;
-    copy_file(
-        package_root.join("README.md"),
-        output_root.join("README.md"),
-    )?;
+    copy_if_exists(repo_root.join(".bazelversion"), output_root.join(".bazelversion"))?;
+    copy_file(package_root.join("README.md"), output_root.join("README.md"))?;
     copy_file(package_root.join("LICENSE"), output_root.join("LICENSE"))?;
     copy_tree(package_root.join("src"), output_root.join("src"))?;
     copy_tree(package_root.join("api"), output_root.join("api"))?;
@@ -130,10 +93,7 @@ fn stage_checkleft_source_tree(
         output_root.join("bazel/defs.bzl"),
         &render_release_bazel_defs(repo_root)?,
     )?;
-    write_string(
-        output_root.join("bazel/BUILD.bazel"),
-        &render_bazel_package_build(),
-    )?;
+    write_string(output_root.join("bazel/BUILD.bazel"), &render_bazel_package_build())?;
     write_string(output_root.join("BUILD.bazel"), &render_build_bazel())?;
     write_string(
         output_root.join("MODULE.bazel"),
@@ -147,8 +107,7 @@ fn stage_checkleft_source_tree(
 }
 
 fn create_source_archive(package_output_root: &Path, output: &Path) -> Result<()> {
-    let archive_file = fs::File::create(output)
-        .with_context(|| format!("failed to create `{}`", output.display()))?;
+    let archive_file = fs::File::create(output).with_context(|| format!("failed to create `{}`", output.display()))?;
     let encoder = GzEncoder::new(archive_file, Compression::default());
     let mut builder = Builder::new(encoder);
     builder.mode(HeaderMode::Deterministic);
@@ -181,8 +140,7 @@ fn create_source_archive(package_output_root: &Path, output: &Path) -> Result<()
             continue;
         }
 
-        let mut file =
-            fs::File::open(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+        let mut file = fs::File::open(path).with_context(|| format!("failed to read `{}`", path.display()))?;
         let metadata = file
             .metadata()
             .with_context(|| format!("failed to stat `{}`", path.display()))?;
@@ -278,16 +236,12 @@ exports_files(["defs.bzl"])
 }
 
 fn render_release_bazel_defs(repo_root: &Path) -> Result<String> {
-    let source = fs::read_to_string(repo_root.join(CHECKLEFT_SUBDIR).join("bazel/defs.bzl"))
-        .with_context(|| {
-            format!(
-                "failed to read `{}`",
-                repo_root
-                    .join(CHECKLEFT_SUBDIR)
-                    .join("bazel/defs.bzl")
-                    .display()
-            )
-        })?;
+    let source = fs::read_to_string(repo_root.join(CHECKLEFT_SUBDIR).join("bazel/defs.bzl")).with_context(|| {
+        format!(
+            "failed to read `{}`",
+            repo_root.join(CHECKLEFT_SUBDIR).join("bazel/defs.bzl").display()
+        )
+    })?;
 
     let needle = "default = \"//tools/checkleft:checkleft\",";
     let replacement = "default = \"//:checkleft\",";
@@ -439,10 +393,7 @@ fn flatten_checkleft_manifest(package_manifest: &str, workspace_manifest: &str) 
     package.insert(
         "workspace".to_owned(),
         Value::Table(Map::from_iter([
-            (
-                "members".to_owned(),
-                Value::Array(vec![Value::String(".".to_owned())]),
-            ),
+            ("members".to_owned(), Value::Array(vec![Value::String(".".to_owned())])),
             ("resolver".to_owned(), Value::String(workspace_resolver)),
         ])),
     );
@@ -496,11 +447,8 @@ fn resolve_workspace_dependencies_in_table(
                     .get(&dependency_name)
                     .cloned()
                     .with_context(|| format!("missing dependency `{dependency_name}`"))?;
-                let resolved = resolve_workspace_dependency(
-                    &dependency_name,
-                    dependency_value,
-                    workspace_dependencies,
-                )?;
+                let resolved =
+                    resolve_workspace_dependency(&dependency_name, dependency_value, workspace_dependencies)?;
                 dependency_table.insert(dependency_name, resolved);
             }
             continue;
@@ -521,10 +469,7 @@ fn resolve_workspace_dependency(
     let Some(table) = dependency_value.as_table() else {
         return Ok(dependency_value);
     };
-    let inherits_workspace = table
-        .get("workspace")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let inherits_workspace = table.get("workspace").and_then(Value::as_bool).unwrap_or(false);
     if !inherits_workspace {
         return Ok(dependency_value);
     }
@@ -532,9 +477,7 @@ fn resolve_workspace_dependency(
     let base = workspace_dependencies
         .get(dependency_name)
         .cloned()
-        .with_context(|| {
-            format!("missing `[workspace.dependencies].{dependency_name}` in root manifest")
-        })?;
+        .with_context(|| format!("missing `[workspace.dependencies].{dependency_name}` in root manifest"))?;
     let mut resolved = match base {
         Value::String(version) => {
             let mut table = Map::new();
@@ -604,10 +547,7 @@ fn parse_toml(contents: &str) -> Result<Map<String, Value>> {
 }
 
 fn is_dependency_table_name(name: &str) -> bool {
-    matches!(
-        name,
-        "dependencies" | "dev-dependencies" | "build-dependencies"
-    )
+    matches!(name, "dependencies" | "dev-dependencies" | "build-dependencies")
 }
 
 fn write_string(path: PathBuf, contents: &str) -> Result<()> {
@@ -615,8 +555,7 @@ fn write_string(path: PathBuf, contents: &str) -> Result<()> {
 }
 
 fn copy_file(from: PathBuf, to: PathBuf) -> Result<()> {
-    fs::copy(&from, &to)
-        .with_context(|| format!("failed to copy `{}` to `{}`", from.display(), to.display()))?;
+    fs::copy(&from, &to).with_context(|| format!("failed to copy `{}` to `{}`", from.display(), to.display()))?;
     Ok(())
 }
 
@@ -643,16 +582,10 @@ fn copy_tree(from: PathBuf, to: PathBuf) -> Result<()> {
         }
 
         if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create `{}`", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("failed to create `{}`", parent.display()))?;
         }
-        fs::copy(source, &destination).with_context(|| {
-            format!(
-                "failed to copy `{}` to `{}`",
-                source.display(),
-                destination.display()
-            )
-        })?;
+        fs::copy(source, &destination)
+            .with_context(|| format!("failed to copy `{}` to `{}`", source.display(), destination.display()))?;
     }
     Ok(())
 }
@@ -672,8 +605,7 @@ mod tests {
     fn packages_standalone_archive_with_flattened_manifest_and_bazel_files() {
         let repo = TempDir::new().expect("tempdir");
         fs::create_dir_all(repo.path().join("tools/checkleft/src")).expect("mkdir src");
-        fs::create_dir_all(repo.path().join("tools/checkleft/api/javascript"))
-            .expect("mkdir api/javascript");
+        fs::create_dir_all(repo.path().join("tools/checkleft/api/javascript")).expect("mkdir api/javascript");
         fs::create_dir_all(repo.path().join("tools/checkleft/bazel")).expect("mkdir bazel");
         fs::write(repo.path().join(".bazelversion"), "8.4.0\n").expect("write bazelversion");
         fs::write(
@@ -729,23 +661,10 @@ walkdir = { workspace = true }
 "#,
         )
         .expect("write package manifest");
-        fs::write(
-            repo.path().join("tools/checkleft/src/lib.rs"),
-            "pub fn library() {}\n",
-        )
-        .expect("write lib");
-        fs::write(
-            repo.path().join("tools/checkleft/src/main.rs"),
-            "fn main() {}\n",
-        )
-        .expect("write main");
-        fs::write(
-            repo.path().join("tools/checkleft/README.md"),
-            "# checkleft\n",
-        )
-        .expect("write readme");
-        fs::write(repo.path().join("tools/checkleft/LICENSE"), "Apache-2.0\n")
-            .expect("write license");
+        fs::write(repo.path().join("tools/checkleft/src/lib.rs"), "pub fn library() {}\n").expect("write lib");
+        fs::write(repo.path().join("tools/checkleft/src/main.rs"), "fn main() {}\n").expect("write main");
+        fs::write(repo.path().join("tools/checkleft/README.md"), "# checkleft\n").expect("write readme");
+        fs::write(repo.path().join("tools/checkleft/LICENSE"), "Apache-2.0\n").expect("write license");
         fs::write(
             repo.path().join("tools/checkleft/api/BUILD.bazel"),
             r#"load("@aspect_rules_js//js:defs.bzl", "js_library")
@@ -781,14 +700,12 @@ npm_package(
         )
         .expect("write api package.json");
         fs::write(
-            repo.path()
-                .join("tools/checkleft/api/javascript/checkleft_exec.mjs"),
+            repo.path().join("tools/checkleft/api/javascript/checkleft_exec.mjs"),
             "export function readRequest() { return {}; }\n",
         )
         .expect("write exec helper");
         fs::write(
-            repo.path()
-                .join("tools/checkleft/api/javascript/checkleft_exec.d.ts"),
+            repo.path().join("tools/checkleft/api/javascript/checkleft_exec.d.ts"),
             "export interface ExecCheckRequest {}\n",
         )
         .expect("write exec helper types");
@@ -807,12 +724,8 @@ npm_package(
         )
         .expect("write bazel defs");
 
-        let archive_path =
-            package_checkleft_source_archive(repo.path(), None).expect("package archive");
-        assert_eq!(
-            archive_path,
-            repo.path().join("dist/checkleft-0.1.2-source.tgz")
-        );
+        let archive_path = package_checkleft_source_archive(repo.path(), None).expect("package archive");
+        assert_eq!(archive_path, repo.path().join("dist/checkleft-0.1.2-source.tgz"));
 
         let archive_file = fs::File::open(&archive_path).expect("open archive");
         let decoder = GzDecoder::new(archive_file);
@@ -822,8 +735,7 @@ npm_package(
         archive.unpack(temp_extract.path()).expect("unpack archive");
 
         let packaged_root = temp_extract.path().join("checkleft-0.1.2-source");
-        let manifest =
-            fs::read_to_string(packaged_root.join("Cargo.toml")).expect("read packaged manifest");
+        let manifest = fs::read_to_string(packaged_root.join("Cargo.toml")).expect("read packaged manifest");
         let manifest_value: Value = toml::from_str(&manifest).expect("parse packaged manifest");
         let package = manifest_value
             .get("package")
@@ -834,10 +746,7 @@ npm_package(
             .get("workspace")
             .and_then(Value::as_table)
             .expect("workspace table");
-        assert_eq!(
-            packaged_workspace.get("resolver").and_then(Value::as_str),
-            Some("2")
-        );
+        assert_eq!(packaged_workspace.get("resolver").and_then(Value::as_str), Some("2"));
         let dependencies = manifest_value
             .get("dependencies")
             .and_then(Value::as_table)
@@ -856,12 +765,7 @@ npm_package(
                 .and_then(Value::as_table)
                 .and_then(|clap| clap.get("features"))
                 .and_then(Value::as_array)
-                .map(|features| {
-                    features
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                }),
+                .map(|features| { features.iter().filter_map(Value::as_str).collect::<Vec<_>>() }),
             Some(vec!["derive"])
         );
         assert_eq!(
@@ -878,19 +782,13 @@ npm_package(
                 .and_then(Value::as_table)
                 .and_then(|tokio| tokio.get("features"))
                 .and_then(Value::as_array)
-                .map(|features| {
-                    features
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                }),
+                .map(|features| { features.iter().filter_map(Value::as_str).collect::<Vec<_>>() }),
             Some(vec!["macros", "rt-multi-thread"])
         );
         assert!(!manifest.contains("workspace = true"));
         assert!(!manifest.contains("workspace = \"../..\""));
 
-        let module_bazel =
-            fs::read_to_string(packaged_root.join("MODULE.bazel")).expect("read MODULE.bazel");
+        let module_bazel = fs::read_to_string(packaged_root.join("MODULE.bazel")).expect("read MODULE.bazel");
         assert!(module_bazel.contains("name = \"checkleft\""));
         assert!(module_bazel.contains("version = \"0.1.2\""));
         assert!(module_bazel.contains("rust_toolchains"));
@@ -898,8 +796,8 @@ npm_package(
         assert!(module_bazel.contains("aspect_rules_js"));
         assert!(module_bazel.contains("BAZEL_CONSUMPTION.md"));
 
-        let consumption_doc = fs::read_to_string(packaged_root.join("BAZEL_CONSUMPTION.md"))
-            .expect("read BAZEL_CONSUMPTION.md");
+        let consumption_doc =
+            fs::read_to_string(packaged_root.join("BAZEL_CONSUMPTION.md")).expect("read BAZEL_CONSUMPTION.md");
         assert!(consumption_doc.contains("register_toolchains"));
         assert!(consumption_doc.contains("archive_override"));
         assert!(consumption_doc.contains("local_path_override"));
@@ -907,21 +805,15 @@ npm_package(
         assert!(consumption_doc.contains("@checkleft//api:checkleft_exec_pkg"));
         assert!(consumption_doc.contains("1.93.1"));
 
-        let build_bazel =
-            fs::read_to_string(packaged_root.join("BUILD.bazel")).expect("read BUILD.bazel");
+        let build_bazel = fs::read_to_string(packaged_root.join("BUILD.bazel")).expect("read BUILD.bazel");
         assert!(build_bazel.contains("package(default_visibility = [\"//visibility:private\"])"));
         assert!(build_bazel.contains("visibility = [\"//visibility:public\"]"));
-        let defs_bzl =
-            fs::read_to_string(packaged_root.join("bazel/defs.bzl")).expect("read defs.bzl");
+        let defs_bzl = fs::read_to_string(packaged_root.join("bazel/defs.bzl")).expect("read defs.bzl");
         assert!(defs_bzl.contains("default = \"//:checkleft\""));
         assert!(!defs_bzl.contains("default = \"//tools/checkleft:checkleft\""));
         assert!(packaged_root.join("api/BUILD.bazel").is_file());
         assert!(packaged_root.join("api/package.json").is_file());
-        assert!(
-            packaged_root
-                .join("api/javascript/checkleft_exec.mjs")
-                .is_file()
-        );
+        assert!(packaged_root.join("api/javascript/checkleft_exec.mjs").is_file());
         assert_eq!(
             fs::read_to_string(packaged_root.join(".bazelversion")).expect("read .bazelversion"),
             "8.4.0\n"

@@ -11,8 +11,7 @@ use crate::input::{ChangeKind, ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 
 use super::rc_parser::{
-    BazelrcEntry, BazelrcEntryKind, ParsedBazelrcClosure, is_bazelrc_root_candidate,
-    parse_bazelrc_closure,
+    BazelrcEntry, BazelrcEntryKind, ParsedBazelrcClosure, is_bazelrc_root_candidate, parse_bazelrc_closure,
 };
 
 #[derive(Debug, Default)]
@@ -175,22 +174,18 @@ impl CompiledRequiredFlagRule {
                 line: None,
                 column: None,
             }),
-            remediations: vec![
-                self.remediation
-                    .clone()
-                    .unwrap_or_else(|| match &self.value {
-                        Some(value) => format!(
-                            "Update the Bazel rc configuration so `{}` declares `--{}={value}`.",
-                            self.commands.join(", "),
-                            self.flag,
-                        ),
-                        None => format!(
-                            "Update the Bazel rc configuration so `{}` declares `--{}`.",
-                            self.commands.join(", "),
-                            self.flag,
-                        ),
-                    }),
-            ],
+            remediations: vec![self.remediation.clone().unwrap_or_else(|| match &self.value {
+                Some(value) => format!(
+                    "Update the Bazel rc configuration so `{}` declares `--{}={value}`.",
+                    self.commands.join(", "),
+                    self.flag,
+                ),
+                None => format!(
+                    "Update the Bazel rc configuration so `{}` declares `--{}`.",
+                    self.commands.join(", "),
+                    self.flag,
+                ),
+            })],
             suggested_fix: None,
         }]
     }
@@ -216,11 +211,7 @@ impl CompiledRequiredFlagRule {
 }
 
 impl CompiledForbiddenFlagRule {
-    fn evaluate(
-        &self,
-        parsed: &ParsedBazelrcClosure,
-        changed_paths: &HashSet<PathBuf>,
-    ) -> Vec<Finding> {
+    fn evaluate(&self, parsed: &ParsedBazelrcClosure, changed_paths: &HashSet<PathBuf>) -> Vec<Finding> {
         parsed
             .entries
             .iter()
@@ -268,8 +259,7 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelrcPoliciesConfig> {
         bail!("bazelrc-policies check config must contain at least one `rules` entry");
     }
 
-    let default_severity =
-        Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
+    let default_severity = Severity::parse_with_default(parsed.severity.as_deref(), Severity::Error);
     let default_remediation = normalize_optional_string(parsed.remediation, "remediation")?;
 
     let mut rules = Vec::with_capacity(parsed.rules.len());
@@ -288,11 +278,8 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelrcPoliciesConfig> {
                 flag: normalize_flag_name(flag, &format!("{field_prefix}.flag"))?,
                 value: normalize_optional_string(value, &format!("{field_prefix}.value"))?,
                 message: normalize_optional_string(message, &format!("{field_prefix}.message"))?,
-                remediation: normalize_optional_string(
-                    remediation,
-                    &format!("{field_prefix}.remediation"),
-                )?
-                .or_else(|| default_remediation.clone()),
+                remediation: normalize_optional_string(remediation, &format!("{field_prefix}.remediation"))?
+                    .or_else(|| default_remediation.clone()),
                 severity: Severity::parse_with_default(severity.as_deref(), default_severity),
             }),
             BazelrcPolicyRuleConfig::ForbiddenFlag {
@@ -305,11 +292,8 @@ fn parse_config(config: &toml::Value) -> Result<CompiledBazelrcPoliciesConfig> {
                 commands: normalize_commands(commands, &format!("{field_prefix}.commands"))?,
                 flag: normalize_flag_name(flag, &format!("{field_prefix}.flag"))?,
                 message: normalize_optional_string(message, &format!("{field_prefix}.message"))?,
-                remediation: normalize_optional_string(
-                    remediation,
-                    &format!("{field_prefix}.remediation"),
-                )?
-                .or_else(|| default_remediation.clone()),
+                remediation: normalize_optional_string(remediation, &format!("{field_prefix}.remediation"))?
+                    .or_else(|| default_remediation.clone()),
                 severity: Severity::parse_with_default(severity.as_deref(), default_severity),
             }),
         });
@@ -371,24 +355,15 @@ fn entry_command_applies_to_requested(entry_command: &str, requested_command: &s
         "always" => entry_command == "always",
         "common" => matches!(entry_command, "common" | "always"),
         "startup" => entry_command == "startup",
-        "coverage" => matches!(
-            entry_command,
-            "coverage" | "test" | "build" | "common" | "always"
-        ),
+        "coverage" => matches!(entry_command, "coverage" | "test" | "build" | "common" | "always"),
         "test" => matches!(entry_command, "test" | "build" | "common" | "always"),
         "run" => matches!(entry_command, "run" | "build" | "common" | "always"),
         "clean" => matches!(entry_command, "clean" | "build" | "common" | "always"),
         "mobile-install" => {
-            matches!(
-                entry_command,
-                "mobile-install" | "build" | "common" | "always"
-            )
+            matches!(entry_command, "mobile-install" | "build" | "common" | "always")
         }
         "info" => matches!(entry_command, "info" | "build" | "common" | "always"),
-        "print_action" => matches!(
-            entry_command,
-            "print_action" | "build" | "common" | "always"
-        ),
+        "print_action" => matches!(entry_command, "print_action" | "build" | "common" | "always"),
         "config" => matches!(entry_command, "config" | "build" | "common" | "always"),
         "cquery" => matches!(entry_command, "cquery" | "build" | "common" | "always"),
         "aquery" => matches!(entry_command, "aquery" | "build" | "common" | "always"),
@@ -524,13 +499,7 @@ mod tests {
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(
-            result.findings[0]
-                .location
-                .as_ref()
-                .and_then(|loc| loc.line),
-            None
-        );
+        assert_eq!(result.findings[0].location.as_ref().and_then(|loc| loc.line), None);
         assert!(result.findings[0].message.contains("downloader_config"));
     }
 
@@ -561,13 +530,7 @@ mod tests {
             .expect("run check");
 
         assert_eq!(result.findings.len(), 1);
-        assert_eq!(
-            result.findings[0]
-                .location
-                .as_ref()
-                .and_then(|loc| loc.line),
-            Some(1)
-        );
+        assert_eq!(result.findings[0].location.as_ref().and_then(|loc| loc.line), Some(1));
         assert!(result.findings[0].message.contains("remote_download_all"));
     }
 

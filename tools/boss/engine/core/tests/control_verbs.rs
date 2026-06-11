@@ -30,8 +30,8 @@ use boss_engine::app::serve;
 use boss_engine::config::{RuntimeConfig, WorkConfig};
 use boss_engine::work::WorkDb;
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent,
-    FrontendRequest, RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
+    CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest,
+    RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
 };
 
 // linux-amd64 CI runners run ~6-7x slower than macOS dev boxes. Under
@@ -52,18 +52,17 @@ impl TestEngine {
         let temp = tempfile::tempdir()?;
         let socket_path = temp.path().join("engine.sock");
         let db_path = temp.path().join("state.db");
-        let work_config = WorkConfig::builder().cwd(temp.path().to_path_buf()).db_path(db_path.clone()).build();
+        let work_config = WorkConfig::builder()
+            .cwd(temp.path().to_path_buf())
+            .db_path(db_path.clone())
+            .build();
         let cfg = Arc::new(RuntimeConfig::from_parts(work_config, None));
 
         let socket_for_serve = socket_path.clone();
-        let join =
-            tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
+        let join = tokio::spawn(async move { serve(cfg, socket_for_serve, None, None, None, None).await });
 
         if !wait_for_socket(socket_path.to_str().unwrap(), STARTUP_TIMEOUT).await {
-            return Err(anyhow!(
-                "engine never bound socket {}",
-                socket_path.display()
-            ));
+            return Err(anyhow!("engine never bound socket {}", socket_path.display()));
         }
 
         Ok(Self {
@@ -152,20 +151,14 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
 
     let execution = match client
         .send_request(&FrontendRequest::RequestExecution {
-            input: RequestExecutionInput::builder()
-                .work_item_id(chore.id.clone())
-                .build(),
+            input: RequestExecutionInput::builder().work_item_id(chore.id.clone()).build(),
         })
         .await?
     {
         FrontendEvent::ExecutionRequested { execution }
         | FrontendEvent::ExecutionResult { execution }
         | FrontendEvent::ExecutionCreated { execution } => execution,
-        other => {
-            return Err(anyhow!(
-                "unexpected response to RequestExecution: {other:?}"
-            ))
-        }
+        other => return Err(anyhow!("unexpected response to RequestExecution: {other:?}")),
     };
     Ok(SeededExecution {
         work_item_id: chore.id,
@@ -333,9 +326,7 @@ async fn agents_transcript_returns_tail_lines() -> Result<()> {
         })
         .await?;
     match response {
-        FrontendEvent::RunTranscriptTail {
-            lines, truncated, ..
-        } => {
+        FrontendEvent::RunTranscriptTail { lines, truncated, .. } => {
             assert_eq!(lines.len(), 3);
             assert!(!truncated);
         }
@@ -433,10 +424,7 @@ async fn agents_transcript_via_execution_id_returns_tail_lines() -> Result<()> {
             assert_eq!(returned_path, transcript_path.display().to_string());
             assert_eq!(
                 lines,
-                vec![
-                    "{\"event\":\"beta\"}".to_owned(),
-                    "{\"event\":\"gamma\"}".to_owned()
-                ]
+                vec!["{\"event\":\"beta\"}".to_owned(), "{\"event\":\"gamma\"}".to_owned()]
             );
             assert!(truncated, "asking for 2 of 3 lines must set truncated");
         }
@@ -498,9 +486,7 @@ async fn workspace_summary_returns_pool_snapshot() -> Result<()> {
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
 
-    let response = client
-        .send_request(&FrontendRequest::WorkspacePoolSummary)
-        .await?;
+    let response = client.send_request(&FrontendRequest::WorkspacePoolSummary).await?;
     match response {
         FrontendEvent::WorkspacePoolSummaryResult { .. } => {}
         FrontendEvent::WorkError { message } => {
@@ -537,8 +523,7 @@ async fn agents_stop_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         FrontendEvent::RunStopped { .. } => {}
         FrontendEvent::Error { message, .. } => {
             assert!(
-                !message.contains("BossOnly")
-                    && !message.contains("requires app or Boss authority"),
+                !message.contains("BossOnly") && !message.contains("requires app or Boss authority"),
                 "stop_run must not reject local callers on auth grounds: {message}"
             );
         }
@@ -570,8 +555,7 @@ async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         FrontendEvent::ProbeQueued { .. } => {}
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             assert!(
-                !message.contains("BossOnly")
-                    && !message.contains("requires app or Boss authority"),
+                !message.contains("BossOnly") && !message.contains("requires app or Boss authority"),
                 "probe_run must not reject local callers on auth grounds: {message}"
             );
         }
@@ -598,8 +582,7 @@ async fn agents_send_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         FrontendEvent::WorkError { .. } => {}
         FrontendEvent::Error { message, .. } => {
             assert!(
-                !message.contains("BossOnly")
-                    && !message.contains("requires app or Boss authority"),
+                !message.contains("BossOnly") && !message.contains("requires app or Boss authority"),
                 "send_input_to_worker must not reject local callers on auth grounds: {message}"
             );
         }
@@ -706,8 +689,7 @@ async fn agents_transcript_does_not_reject_local_caller_as_boss_only() -> Result
         FrontendEvent::WorkError { .. } => {}
         FrontendEvent::Error { message, .. } => {
             assert!(
-                !message.contains("BossOnly")
-                    && !message.contains("requires app or Boss authority"),
+                !message.contains("BossOnly") && !message.contains("requires app or Boss authority"),
                 "tail_run_transcript must not reject local callers on auth grounds: {message}"
             );
         }
@@ -736,8 +718,7 @@ async fn agents_interrupt_does_not_reject_local_caller_as_boss_only() -> Result<
         FrontendEvent::WorkError { .. } => {}
         FrontendEvent::Error { message, .. } => {
             assert!(
-                !message.contains("BossOnly")
-                    && !message.contains("requires app or Boss authority"),
+                !message.contains("BossOnly") && !message.contains("requires app or Boss authority"),
                 "interrupt_worker_pane must not reject local callers on auth grounds: {message}"
             );
         }
@@ -794,9 +775,7 @@ async fn agents_reap_marks_running_execution_orphaned() -> Result<()> {
     // Second reap on the now-terminal row must error rather than
     // silently no-op — same contract as `cancel_execution`.
     let response = client
-        .send_request(&FrontendRequest::ReapRun {
-            run_id: execution_id,
-        })
+        .send_request(&FrontendRequest::ReapRun { run_id: execution_id })
         .await?;
     match response {
         FrontendEvent::WorkError { message } => {
@@ -1117,10 +1096,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
-    let transition: Vec<_> = events
-        .iter()
-        .filter(|e| e.stage == "status_transition")
-        .collect();
+    let transition: Vec<_> = events.iter().filter(|e| e.stage == "status_transition").collect();
     assert_eq!(
         transition.len(),
         1,
@@ -1149,10 +1125,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
         .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
     let events_after = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
-    let transitions_after: Vec<_> = events_after
-        .iter()
-        .filter(|e| e.stage == "status_transition")
-        .collect();
+    let transitions_after: Vec<_> = events_after.iter().filter(|e| e.stage == "status_transition").collect();
     assert_eq!(
         transitions_after.len(),
         1,
@@ -1268,10 +1241,7 @@ async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> R
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
-    let transition: Vec<_> = events
-        .iter()
-        .filter(|e| e.stage == "status_transition")
-        .collect();
+    let transition: Vec<_> = events.iter().filter(|e| e.stage == "status_transition").collect();
     assert_eq!(
         transition.len(),
         1,
@@ -1291,10 +1261,7 @@ async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> R
         "rejection should be tagged; got {:?}",
         transition[0].details
     );
-    let error_message = transition[0]
-        .error_message
-        .as_deref()
-        .unwrap_or_default();
+    let error_message = transition[0].error_message.as_deref().unwrap_or_default();
     assert!(
         error_message.contains("has no repo resolution"),
         "event error_message should name the missing repo; got {error_message:?}"
@@ -1374,19 +1341,14 @@ async fn seed_unresolvable_chore(client: &mut BossClient) -> Result<boss_protoco
     {
         FrontendEvent::WorkItemUpdated { .. } => {}
         other => {
-            return Err(anyhow!(
-                "unexpected response clearing product repo: {other:?}"
-            ));
+            return Err(anyhow!("unexpected response clearing product repo: {other:?}"));
         }
     };
 
     Ok(chore)
 }
 
-async fn list_executions_for(
-    client: &mut BossClient,
-    work_item_id: &str,
-) -> Result<Vec<boss_protocol::WorkExecution>> {
+async fn list_executions_for(client: &mut BossClient, work_item_id: &str) -> Result<Vec<boss_protocol::WorkExecution>> {
     match client
         .send_request(&FrontendRequest::ListExecutions {
             work_item_id: Some(work_item_id.to_owned()),
@@ -1474,10 +1436,7 @@ async fn mark_conflict_resolution_failed_flips_attempt_status() -> Result<()> {
     };
     assert_eq!(flipped.id, attempt.id);
     assert_eq!(flipped.status, "failed");
-    assert_eq!(
-        flipped.failure_reason.as_deref(),
-        Some("product_decision_required"),
-    );
+    assert_eq!(flipped.failure_reason.as_deref(), Some("product_decision_required"),);
     assert!(flipped.finished_at.is_some(), "finished_at must be stamped");
 
     // Idempotency: a second call on a now-terminal row surfaces a
@@ -1749,7 +1708,12 @@ async fn engine_conflicts_abandon_flips_attempt_status() -> Result<()> {
 /// `base_sha_at_trigger` so the UNIQUE key allows both inserts).
 async fn seed_two_conflict_resolutions(
     engine: &TestEngine,
-) -> Result<(boss_protocol::Product, boss_protocol::Task, boss_protocol::ConflictResolution, boss_protocol::ConflictResolution)> {
+) -> Result<(
+    boss_protocol::Product,
+    boss_protocol::Task,
+    boss_protocol::ConflictResolution,
+    boss_protocol::ConflictResolution,
+)> {
     let work_db = WorkDb::open(engine.db_path.clone())?;
     let product = work_db.create_product(CreateProductInput {
         name: "P".to_owned(),
@@ -1821,9 +1785,7 @@ async fn workspace_summary_does_not_reject_caller_on_auth_grounds() -> Result<()
     // now User-tier. This smoke asserts no auth rejection fires.
     let engine = TestEngine::spawn().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let response = client
-        .send_request(&FrontendRequest::WorkspacePoolSummary)
-        .await?;
+    let response = client.send_request(&FrontendRequest::WorkspacePoolSummary).await?;
     match response {
         FrontendEvent::WorkspacePoolSummaryResult { .. } => {}
         // The in-process engine builds a CommandCubeClient which
@@ -1898,7 +1860,7 @@ async fn request_execution_accepts_tnnn_friendly_id() -> Result<()> {
         FrontendEvent::WorkError { message } => {
             return Err(anyhow!(
                 "engine rejected RequestExecution with friendly id {friendly_id}: {message}"
-            ))
+            ));
         }
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }

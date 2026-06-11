@@ -11,9 +11,8 @@ pub fn data_dir() -> Result<PathBuf, CubeError> {
         return Ok(PathBuf::from(path).join("cube"));
     }
 
-    let home = std::env::var_os("HOME").ok_or_else(|| {
-        CubeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))
-    })?;
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| CubeError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")))?;
     Ok(PathBuf::from(home).join(".local/share/cube"))
 }
 

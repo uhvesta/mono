@@ -7,10 +7,7 @@ use super::*;
 /// historical "create-and-dispatch" behaviour is preserved.
 pub(crate) fn migrate_tasks_autostart(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "tasks", "autostart")? {
-        conn.execute(
-            "ALTER TABLE tasks ADD COLUMN autostart INTEGER NOT NULL DEFAULT 1",
-            [],
-        )?;
+        conn.execute("ALTER TABLE tasks ADD COLUMN autostart INTEGER NOT NULL DEFAULT 1", [])?;
     }
     Ok(())
 }
@@ -25,9 +22,7 @@ pub(crate) fn migrate_tasks_autostart(conn: &Connection) -> Result<()> {
 pub(crate) fn migrate_last_status_actor(conn: &Connection) -> Result<()> {
     for table in ["tasks", "projects"] {
         if !table_has_column(conn, table, "last_status_actor")? {
-            let ddl = format!(
-                "ALTER TABLE {table} ADD COLUMN last_status_actor TEXT NOT NULL DEFAULT 'human'"
-            );
+            let ddl = format!("ALTER TABLE {table} ADD COLUMN last_status_actor TEXT NOT NULL DEFAULT 'human'");
             conn.execute(&ddl, [])?;
         }
     }
@@ -84,11 +79,7 @@ pub(crate) fn migrate_tasks_created_via(conn: &Connection) -> Result<()> {
 /// docs-branch defaults when `NULL`. Existing rows keep `NULL` on
 /// all three across the upgrade.
 pub(crate) fn migrate_project_design_doc_columns(conn: &Connection) -> Result<()> {
-    for column in [
-        "design_doc_repo_remote_url",
-        "design_doc_branch",
-        "design_doc_path",
-    ] {
+    for column in ["design_doc_repo_remote_url", "design_doc_branch", "design_doc_path"] {
         if !table_has_column(conn, "projects", column)? {
             let ddl = format!("ALTER TABLE projects ADD COLUMN {column} TEXT");
             conn.execute(&ddl, [])?;
@@ -152,9 +143,7 @@ pub(crate) fn migrate_backfill_project_design_tasks(conn: &Connection) -> Result
          )",
     )?;
     let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     for (project_id, product_id) in rows {
@@ -585,10 +574,7 @@ pub(crate) fn migrate_products_docs_repo(conn: &Connection) -> Result<()> {
 /// keeping the `exec_<id>` suffix that subsystems key off. Idempotent.
 pub(crate) fn migrate_products_worker_branch_prefix(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "products", "worker_branch_prefix")? {
-        conn.execute(
-            "ALTER TABLE products ADD COLUMN worker_branch_prefix TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE products ADD COLUMN worker_branch_prefix TEXT", [])?;
     }
     Ok(())
 }
@@ -600,10 +586,7 @@ pub(crate) fn migrate_products_worker_branch_prefix(conn: &Connection) -> Result
 /// branch name reconstructible from `state.db` alone. Idempotent.
 pub(crate) fn migrate_work_executions_worker_branch_prefix(conn: &Connection) -> Result<()> {
     if !work_executions_has_column(conn, "worker_branch_prefix")? {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN worker_branch_prefix TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_executions ADD COLUMN worker_branch_prefix TEXT", [])?;
     }
     Ok(())
 }
@@ -924,10 +907,7 @@ pub(crate) fn migrate_external_tracker_columns(conn: &Connection) -> Result<()> 
             "external_ref_canonical_id",
             "ALTER TABLE tasks ADD COLUMN external_ref_canonical_id TEXT",
         ),
-        (
-            "external_ref_raw",
-            "ALTER TABLE tasks ADD COLUMN external_ref_raw TEXT",
-        ),
+        ("external_ref_raw", "ALTER TABLE tasks ADD COLUMN external_ref_raw TEXT"),
         (
             "external_ref_synced_at",
             "ALTER TABLE tasks ADD COLUMN external_ref_synced_at TEXT",
@@ -985,10 +965,7 @@ pub(crate) fn migrate_metrics_tables(conn: &Connection) -> Result<()> {
 /// retired without creating a revision.
 pub(crate) fn migrate_conflict_resolutions_revision_task_id(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "conflict_resolutions", "revision_task_id")? {
-        conn.execute(
-            "ALTER TABLE conflict_resolutions ADD COLUMN revision_task_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE conflict_resolutions ADD COLUMN revision_task_id TEXT", [])?;
     }
     Ok(())
 }
@@ -999,10 +976,7 @@ pub(crate) fn migrate_conflict_resolutions_revision_task_id(conn: &Connection) -
 /// design and for `retrigger` kind attempts (which never spawn a revision).
 pub(crate) fn migrate_ci_remediations_revision_task_id(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "ci_remediations", "revision_task_id")? {
-        conn.execute(
-            "ALTER TABLE ci_remediations ADD COLUMN revision_task_id TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE ci_remediations ADD COLUMN revision_task_id TEXT", [])?;
     }
     Ok(())
 }
@@ -1048,9 +1022,7 @@ pub(crate) fn migrate_magic_wand_dispatches_add_chore_id(conn: &Connection) -> R
         .prepare("SELECT 1 FROM pragma_table_info('magic_wand_dispatches') WHERE name = 'chore_id'")?
         .exists([])?;
     if !has_column {
-        conn.execute_batch(
-            "ALTER TABLE magic_wand_dispatches ADD COLUMN chore_id TEXT;",
-        )?;
+        conn.execute_batch("ALTER TABLE magic_wand_dispatches ADD COLUMN chore_id TEXT;")?;
     }
     Ok(())
 }
@@ -1191,16 +1163,10 @@ pub(crate) fn migrate_tasks_source_automation_id(conn: &Connection) -> Result<()
 /// Design: `tools/boss/docs/designs/editorial-controls-for-agent-authored-prs-and-github-comments.md`
 pub(crate) fn migrate_editorial_controls_schema(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "products", "editorial_rules")? {
-        conn.execute(
-            "ALTER TABLE products ADD COLUMN editorial_rules TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE products ADD COLUMN editorial_rules TEXT", [])?;
     }
     if !table_has_column(conn, "work_executions", "branch_naming")? {
-        conn.execute(
-            "ALTER TABLE work_executions ADD COLUMN branch_naming TEXT",
-            [],
-        )?;
+        conn.execute("ALTER TABLE work_executions ADD COLUMN branch_naming TEXT", [])?;
     }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS editorial_actions (
@@ -1310,10 +1276,7 @@ pub(crate) fn migrate_attentions(conn: &Connection) -> Result<()> {
 /// use `NULL` to match the schema intent and to keep SQL queries
 /// (`WHERE effort_level IS NULL`) reliable.
 pub(crate) fn migrate_tasks_empty_effort_to_null(conn: &Connection) -> Result<()> {
-    conn.execute(
-        "UPDATE tasks SET effort_level = NULL WHERE effort_level = ''",
-        [],
-    )?;
+    conn.execute("UPDATE tasks SET effort_level = NULL WHERE effort_level = ''", [])?;
     Ok(())
 }
 

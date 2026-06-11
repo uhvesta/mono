@@ -75,10 +75,7 @@ pub fn resolve_slug_in_place(repos: &[CubeRepoSummary], field: &mut Option<Strin
 /// when nothing looks like a slug, so a URL-valued (or empty) `--repo`
 /// costs no extra cube call. Best-effort: a registry failure logs at
 /// WARN and leaves the fields verbatim.
-pub async fn resolve_repo_slugs(
-    cube_client: &Arc<dyn CubeClient>,
-    fields: &mut [&mut Option<String>],
-) {
+pub async fn resolve_repo_slugs(cube_client: &Arc<dyn CubeClient>, fields: &mut [&mut Option<String>]) {
     let any_slug = fields
         .iter()
         .any(|field| field.as_deref().is_some_and(is_bare_repo_slug));
@@ -125,10 +122,7 @@ mod tests {
             repo_ensure_args("rdev-k8s"),
             vec!["--json", "repo", "ensure", "rdev-k8s"]
         );
-        assert_eq!(
-            repo_ensure_args("bduff"),
-            vec!["--json", "repo", "ensure", "bduff"]
-        );
+        assert_eq!(repo_ensure_args("bduff"), vec!["--json", "repo", "ensure", "bduff"]);
     }
 
     #[test]
@@ -145,13 +139,7 @@ mod tests {
         );
         assert_eq!(
             repo_ensure_args("https://github.com/foo/bar.git"),
-            vec![
-                "--json",
-                "repo",
-                "ensure",
-                "--origin",
-                "https://github.com/foo/bar.git"
-            ]
+            vec!["--json", "repo", "ensure", "--origin", "https://github.com/foo/bar.git"]
         );
         // A bare `owner/name` slug carries a `/`, so it is not a bare cube
         // slug; it flows through `--origin` and cube's GitHub fallback.
@@ -173,10 +161,7 @@ mod tests {
 
     #[test]
     fn resolves_known_slug_to_origin() {
-        let repos = vec![repo(
-            "bduff",
-            "org-132020694@github.com:linkedin-sandbox/bduff.git",
-        )];
+        let repos = vec![repo("bduff", "org-132020694@github.com:linkedin-sandbox/bduff.git")];
         let mut field = Some("bduff".to_owned());
         resolve_slug_in_place(&repos, &mut field);
         assert_eq!(
@@ -205,10 +190,7 @@ mod tests {
     fn leaves_url_value_untouched_even_when_registered() {
         // A full URL is never treated as a slug, so it is passed through
         // verbatim regardless of registry contents.
-        let repos = vec![repo(
-            "bduff",
-            "git@github.com:ls/bduff.git",
-        )];
+        let repos = vec![repo("bduff", "git@github.com:ls/bduff.git")];
         let mut field = Some("git@github.com:ls/bduff.git".to_owned());
         resolve_slug_in_place(&repos, &mut field);
         assert_eq!(field.as_deref(), Some("git@github.com:ls/bduff.git"));
@@ -224,9 +206,7 @@ mod tests {
 
     // ── async wrapper: the create-handler entry point ────────────────────
 
-    use crate::coordinator::{
-        CubeChangeHandle, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus,
-    };
+    use crate::coordinator::{CubeChangeHandle, CubeRepoHandle, CubeWorkspaceLease, CubeWorkspaceStatus};
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use std::path::Path;
@@ -277,11 +257,7 @@ mod tests {
         ) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
-        async fn create_change(
-            &self,
-            _workspace_path: &Path,
-            _title: &str,
-        ) -> Result<CubeChangeHandle> {
+        async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
             unreachable!()
         }
         async fn release_workspace(&self, _lease_id: &str) -> Result<()> {
@@ -317,10 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn skips_registry_round_trip_when_no_field_is_a_slug() {
-        let fake = Arc::new(FakeCube::with_repos(vec![repo(
-            "bduff",
-            "git@github.com:ls/bduff.git",
-        )]));
+        let fake = Arc::new(FakeCube::with_repos(vec![repo("bduff", "git@github.com:ls/bduff.git")]));
         let cube: Arc<dyn CubeClient> = fake.clone();
         // A full URL and a None — neither looks like a bare slug, so cube
         // is never consulted.

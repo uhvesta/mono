@@ -33,8 +33,8 @@ impl PrStateChecker for GhPrStateChecker {
             bail!("`gh pr view` failed for {pr_url}: {stderr}");
         }
         let body = String::from_utf8_lossy(&output.stdout);
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).with_context(|| format!("failed to parse `gh pr view` JSON for {pr_url}"))?;
         let state = v["state"].as_str().unwrap_or("").to_ascii_uppercase();
         match state.as_str() {
             "MERGED" => Ok(PrOpenState::Merged),
@@ -83,11 +83,7 @@ impl FakePrStateChecker {
 #[cfg(test)]
 impl PrStateChecker for FakePrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
-        Ok(self
-            .states
-            .get(pr_url)
-            .cloned()
-            .unwrap_or(self.default.clone()))
+        Ok(self.states.get(pr_url).cloned().unwrap_or(self.default.clone()))
     }
 }
 

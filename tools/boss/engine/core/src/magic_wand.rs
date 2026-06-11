@@ -200,10 +200,11 @@ fn changed_line_fraction(src_lines: &[&str], result: &str) -> f64 {
     let mut unchanged = 0usize;
     for &line in src_lines {
         if let Some(count) = res_counts.get_mut(line)
-            && *count > 0 {
-                *count -= 1;
-                unchanged += 1;
-            }
+            && *count > 0
+        {
+            *count -= 1;
+            unchanged += 1;
+        }
     }
     (src_lines.len() - unchanged) as f64 / src_lines.len() as f64
 }
@@ -257,10 +258,7 @@ pub async fn dispatch(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err((
-            format!("Anthropic API returned {status}: {text}"),
-            ERROR_KIND_API,
-        ));
+        return Err((format!("Anthropic API returned {status}: {text}"), ERROR_KIND_API));
     }
 
     let parsed: ApiResponse = resp
@@ -331,8 +329,14 @@ mod tests {
 
     #[test]
     fn diff_sanity_wholesale_rewrite() {
-        let src = (0..20).map(|i| format!("original line {i}")).collect::<Vec<_>>().join("\n");
-        let result = (0..20).map(|i| format!("totally different {i}")).collect::<Vec<_>>().join("\n");
+        let src = (0..20)
+            .map(|i| format!("original line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = (0..20)
+            .map(|i| format!("totally different {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(check_diff_sanity(&src, &result).is_err());
     }
 

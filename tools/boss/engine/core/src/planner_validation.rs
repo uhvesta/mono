@@ -37,31 +37,22 @@ pub enum ValidationResult {
     /// `tasks.len() > max_tasks`. Silent truncation is forbidden per the
     /// design; the whole proposal is rejected.
     /// Maps to `PLANNER_OUTCOME_REJECTED_TOO_MANY`.
-    RejectedTooMany {
-        count: usize,
-        max: usize,
-    },
+    RejectedTooMany { count: usize, max: usize },
 
     /// A handle appears more than once in the `tasks` list.
     /// Maps to `PLANNER_OUTCOME_REJECTED_CYCLE` (re-uses the "bad graph" bucket).
-    RejectedDuplicateHandle {
-        handle: String,
-    },
+    RejectedDuplicateHandle { handle: String },
 
     /// An edge references a handle not present in the `tasks` list.
     /// Maps to `PLANNER_OUTCOME_REJECTED_CYCLE` (re-uses the "bad graph" bucket).
-    RejectedUnknownHandle {
-        handle: String,
-    },
+    RejectedUnknownHandle { handle: String },
 
     /// The proposed edge set forms a dependency cycle.
     /// Maps to `PLANNER_OUTCOME_REJECTED_CYCLE`.
     /// `cycle` is a representative cycle path expressed as handle names;
     /// the last element is the back-edge target that also appears earlier
     /// in the list, making the loop explicit.
-    RejectedCycle {
-        cycle: Vec<String>,
-    },
+    RejectedCycle { cycle: Vec<String> },
 
     /// All checks passed; the proposal is ready for the Materializer.
     Valid {
@@ -176,7 +167,7 @@ fn detect_cycle<'a>(handles: &HashSet<&'a str>, edges: &'a [ProposedEdge]) -> Op
 
     // Three-colour DFS state.
     const WHITE: u8 = 0; // not yet visited
-    const GRAY: u8 = 1;  // on the current DFS path
+    const GRAY: u8 = 1; // on the current DFS path
     const BLACK: u8 = 2; // fully explored, no cycle through here
 
     let mut color: HashMap<&str, u8> = handles.iter().map(|&h| (h, WHITE)).collect();
@@ -317,12 +308,7 @@ mod tests {
 
     #[test]
     fn rejected_on_duplicate_handle() {
-        let out = output_with(
-            vec![task("alpha"), task("alpha")],
-            vec![],
-            Confidence::High,
-            true,
-        );
+        let out = output_with(vec![task("alpha"), task("alpha")], vec![], Confidence::High, true);
         assert_eq!(
             validate(&out, 30),
             ValidationResult::RejectedDuplicateHandle {
@@ -376,10 +362,7 @@ mod tests {
             Confidence::High,
             true,
         );
-        assert!(matches!(
-            validate(&out, 30),
-            ValidationResult::RejectedCycle { .. }
-        ));
+        assert!(matches!(validate(&out, 30), ValidationResult::RejectedCycle { .. }));
     }
 
     #[test]
@@ -407,16 +390,8 @@ mod tests {
     #[test]
     fn rejected_cycle_self_loop() {
         // A depends on itself.
-        let out = output_with(
-            vec![task("a")],
-            vec![edge("a", "a")],
-            Confidence::High,
-            true,
-        );
-        assert!(matches!(
-            validate(&out, 30),
-            ValidationResult::RejectedCycle { .. }
-        ));
+        let out = output_with(vec![task("a")], vec![edge("a", "a")], Confidence::High, true);
+        assert!(matches!(validate(&out, 30), ValidationResult::RejectedCycle { .. }));
     }
 
     // ---- Valid -------------------------------------------------------------
@@ -424,10 +399,7 @@ mod tests {
     #[test]
     fn valid_dag_single_task_no_edges() {
         let out = output_with(vec![task("schema")], vec![], Confidence::High, true);
-        assert_eq!(
-            validate(&out, 30),
-            ValidationResult::Valid { low_confidence: false }
-        );
+        assert_eq!(validate(&out, 30), ValidationResult::Valid { low_confidence: false });
     }
 
     #[test]
@@ -440,10 +412,7 @@ mod tests {
             Confidence::Medium,
             true,
         );
-        assert_eq!(
-            validate(&out, 30),
-            ValidationResult::Valid { low_confidence: false }
-        );
+        assert_eq!(validate(&out, 30), ValidationResult::Valid { low_confidence: false });
     }
 
     #[test]
@@ -456,10 +425,7 @@ mod tests {
             Confidence::High,
             true,
         );
-        assert_eq!(
-            validate(&out, 30),
-            ValidationResult::Valid { low_confidence: false }
-        );
+        assert_eq!(validate(&out, 30), ValidationResult::Valid { low_confidence: false });
     }
 
     // ---- Low confidence ----------------------------------------------------
@@ -467,19 +433,13 @@ mod tests {
     #[test]
     fn valid_with_low_confidence_flag_set() {
         let out = output_with(vec![task("t1")], vec![], Confidence::Low, true);
-        assert_eq!(
-            validate(&out, 30),
-            ValidationResult::Valid { low_confidence: true }
-        );
+        assert_eq!(validate(&out, 30), ValidationResult::Valid { low_confidence: true });
     }
 
     #[test]
     fn valid_medium_confidence_not_flagged() {
         let out = output_with(vec![task("t1")], vec![], Confidence::Medium, true);
-        assert_eq!(
-            validate(&out, 30),
-            ValidationResult::Valid { low_confidence: false }
-        );
+        assert_eq!(validate(&out, 30), ValidationResult::Valid { low_confidence: false });
     }
 
     // ---- Ordering: breakdown_found takes priority over empty tasks ---------

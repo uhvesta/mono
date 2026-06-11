@@ -42,10 +42,7 @@ pub enum RepobinError {
         "tool `{tool}` is not configured locally and no default repo is set in `{}`",
         defaults_path.display()
     )]
-    ToolNotConfiguredAnywhere {
-        tool: String,
-        defaults_path: PathBuf,
-    },
+    ToolNotConfiguredAnywhere { tool: String, defaults_path: PathBuf },
     #[error("failed to read defaults file `{}`", path.display())]
     ReadDefaults {
         path: PathBuf,
@@ -210,10 +207,7 @@ impl RepobinError {
     }
 
     fn allows_default_fallback(&self) -> bool {
-        matches!(
-            self,
-            Self::ConfigNotFound { .. } | Self::ToolNotConfigured { .. }
-        )
+        matches!(self, Self::ConfigNotFound { .. } | Self::ToolNotConfigured { .. })
     }
 }
 
@@ -242,8 +236,7 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
         CliCommand::Install(args) => {
             let repo_config = load_repo_config(cwd)?;
             let home_dir = current_home_dir();
-            let bin_dir =
-                resolve_bin_dir(args.bin_dir.bin_dir.as_deref(), cwd, home_dir.as_deref())?;
+            let bin_dir = resolve_bin_dir(args.bin_dir.bin_dir.as_deref(), cwd, home_dir.as_deref())?;
             let report = install(
                 current_executable,
                 &repo_config,
@@ -260,8 +253,7 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
         CliCommand::Doctor(args) => {
             let repo_config = load_repo_config(cwd)?;
             let home_dir = current_home_dir();
-            let bin_dir =
-                resolve_bin_dir(args.bin_dir.bin_dir.as_deref(), cwd, home_dir.as_deref())?;
+            let bin_dir = resolve_bin_dir(args.bin_dir.bin_dir.as_deref(), cwd, home_dir.as_deref())?;
             let on_path = crate::shell::bin_dir_on_path(&bin_dir, env::var_os("PATH").as_deref());
 
             println!("Repo root: {}", repo_config.repo_root.display());
@@ -291,11 +283,8 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
             }
 
             if !on_path {
-                let fragment = crate::shell::path_update_fragment(
-                    &bin_dir,
-                    env::var_os("SHELL").as_deref(),
-                    home_dir.as_deref(),
-                );
+                let fragment =
+                    crate::shell::path_update_fragment(&bin_dir, env::var_os("SHELL").as_deref(), home_dir.as_deref());
                 println!("Suggested PATH fragment:");
                 println!("{}", fragment.fragment);
             }
@@ -319,10 +308,7 @@ fn run_cli(cwd: &Path, current_executable: &Path, cli: Cli) -> Result<ExitCode, 
 fn print_install_report(report: &InstallReport) {
     println!("Installed repobin to {}", report.installed_binary.display());
     for tool in &report.installed_tools {
-        println!(
-            "Installed {} -> repobin",
-            report.bin_dir.join(tool).display()
-        );
+        println!("Installed {} -> repobin", report.bin_dir.join(tool).display());
     }
     if let Some(path) = &report.defaults_written {
         println!("Updated defaults at {}", path.display());
@@ -359,13 +345,7 @@ fn dispatch_tool(
         return Err(local_err);
     }
 
-    let plan = match prepare_default_plan(
-        &bazel,
-        current_executable,
-        cwd,
-        tool_name,
-        forwarded_args,
-    )? {
+    let plan = match prepare_default_plan(&bazel, current_executable, cwd, tool_name, forwarded_args)? {
         Some(plan) => plan,
         None => return Err(local_err),
     };
@@ -404,22 +384,11 @@ fn prepare_default_plan<B: crate::bazel::BazelAdapter>(
     print_default_notice(tool_name, &tool.repo, &outcome, forwarded_args);
 
     let cached_repo_config = load_repo_config(&checkout)?;
-    let plan = prepare_dispatch_from_repo_config(
-        bazel,
-        cached_repo_config,
-        cwd,
-        tool_name,
-        forwarded_args,
-    )?;
+    let plan = prepare_dispatch_from_repo_config(bazel, cached_repo_config, cwd, tool_name, forwarded_args)?;
     Ok(Some(plan))
 }
 
-fn print_default_notice(
-    tool_name: &str,
-    repo: &str,
-    outcome: &EnsureOutcome,
-    forwarded_args: &[OsString],
-) {
+fn print_default_notice(tool_name: &str, repo: &str, outcome: &EnsureOutcome, forwarded_args: &[OsString]) {
     if !should_emit_default_notice(outcome, forwarded_args, repobin_verbose()) {
         return;
     }
@@ -439,11 +408,7 @@ fn args_request_json(args: &[OsString]) -> bool {
     args.iter().any(|arg| arg == "--json")
 }
 
-fn should_emit_default_notice(
-    _outcome: &EnsureOutcome,
-    forwarded_args: &[OsString],
-    verbose: bool,
-) -> bool {
+fn should_emit_default_notice(_outcome: &EnsureOutcome, forwarded_args: &[OsString], verbose: bool) -> bool {
     // --json is a strong signal the caller is parsing output; suppress on both
     // streams regardless of verbosity so `boss --json … 2>&1 | jq` is safe.
     if args_request_json(forwarded_args) {
@@ -489,10 +454,7 @@ mod tests {
     use crate::cache::EnsureOutcome;
     use crate::defaults::{DEFAULTS_FILE_NAME, DefaultsConfig, DefaultsTool, write_defaults};
 
-    use super::{
-        RepobinError, args_request_json, invocation_name, prepare_default_plan,
-        should_emit_default_notice,
-    };
+    use super::{RepobinError, args_request_json, invocation_name, prepare_default_plan, should_emit_default_notice};
 
     struct UnreachableBazel;
 
@@ -501,48 +463,27 @@ mod tests {
             panic!("bazel build should not be invoked in this test")
         }
 
-        fn resolve_executable(
-            &self,
-            _repo_root: &Path,
-            _target: &str,
-        ) -> Result<PathBuf, RepobinError> {
+        fn resolve_executable(&self, _repo_root: &Path, _target: &str) -> Result<PathBuf, RepobinError> {
             panic!("bazel cquery should not be invoked in this test")
         }
 
-        fn resolve_source_files(
-            &self,
-            _repo_root: &Path,
-            _target: &str,
-        ) -> Result<Vec<PathBuf>, RepobinError> {
+        fn resolve_source_files(&self, _repo_root: &Path, _target: &str) -> Result<Vec<PathBuf>, RepobinError> {
             panic!("bazel query should not be invoked in this test")
         }
     }
 
     #[test]
     fn invocation_name_uses_basename() {
-        assert_eq!(
-            invocation_name(&OsString::from("/Users/test/bin/boss")),
-            "boss"
-        );
+        assert_eq!(invocation_name(&OsString::from("/Users/test/bin/boss")), "boss");
         assert_eq!(invocation_name(&OsString::from("repobin")), "repobin");
-        assert_eq!(
-            invocation_name(&OsString::from(Path::new("").as_os_str())),
-            "repobin"
-        );
+        assert_eq!(invocation_name(&OsString::from(Path::new("").as_os_str())), "repobin");
     }
 
     #[test]
     fn prepare_default_plan_returns_none_when_yaml_missing() {
         let temp = TempDir::new().unwrap();
         let exe = temp.path().join("repobin");
-        let plan = prepare_default_plan(
-            &UnreachableBazel,
-            &exe,
-            temp.path(),
-            "boss",
-            &[],
-        )
-        .expect("returns Ok");
+        let plan = prepare_default_plan(&UnreachableBazel, &exe, temp.path(), "boss", &[]).expect("returns Ok");
         assert!(plan.is_none());
     }
 
@@ -623,14 +564,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = prepare_default_plan(
-            &UnreachableBazel,
-            &exe,
-            temp.path(),
-            "boss",
-            &[],
-        )
-        .expect_err("expected ToolNotConfiguredAnywhere");
+        let err = prepare_default_plan(&UnreachableBazel, &exe, temp.path(), "boss", &[])
+            .expect_err("expected ToolNotConfiguredAnywhere");
         match err {
             RepobinError::ToolNotConfiguredAnywhere { tool, defaults_path } => {
                 assert_eq!(tool, "boss");

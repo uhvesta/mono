@@ -59,9 +59,7 @@ pub fn audit_path_override() -> Option<PathBuf> {
 /// `<state_root>/engine-trace.jsonl`.
 pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf {
     match source {
-        LogSource::Audit => {
-            audit_path_override().unwrap_or_else(|| state_root.join(ENGINE_AUDIT_FILENAME))
-        }
+        LogSource::Audit => audit_path_override().unwrap_or_else(|| state_root.join(ENGINE_AUDIT_FILENAME)),
         LogSource::EngineTrace => state_root.join(ENGINE_TRACE_FILENAME),
     }
 }

@@ -27,9 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::dispatch_events::{
-    DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage,
-};
+use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
 
 /// Per-stage stalled-detection thresholds. The watchdog used to apply
 /// a single global threshold to every stage, but the cube-lease
@@ -64,10 +62,7 @@ impl StageThresholds {
     }
 
     pub fn for_stage(&self, stage: &str) -> u128 {
-        self.overrides
-            .get(stage)
-            .copied()
-            .unwrap_or(self.default_ms)
+        self.overrides.get(stage).copied().unwrap_or(self.default_ms)
     }
 
     pub fn default_ms(&self) -> u128 {
@@ -91,9 +86,7 @@ pub fn current_path(root: &Path) -> PathBuf {
 
 /// Path to the per-execution mirror under `root`.
 pub fn execution_path(root: &Path, execution_id: &str) -> PathBuf {
-    root.join("executions")
-        .join(execution_id)
-        .join("dispatch.jsonl")
+    root.join("executions").join(execution_id).join("dispatch.jsonl")
 }
 
 /// Read every event currently in `current.jsonl`, in file order.
@@ -169,11 +162,7 @@ pub struct GhostActiveEntry {
 /// execution_id directory. The `current.jsonl` could be used too,
 /// but the per-execution mirrors are cheaper to bucket and survive
 /// rotation of the flat stream (if we ever add that).
-pub fn ghost_active(
-    root: &Path,
-    now_ms: u128,
-    stalled_threshold_ms: u128,
-) -> Result<Vec<GhostActiveEntry>> {
+pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Result<Vec<GhostActiveEntry>> {
     let executions_dir = root.join("executions");
     let read_dir = match fs::read_dir(&executions_dir) {
         Ok(rd) => rd,
@@ -267,8 +256,7 @@ pub fn stage_durations_ms(events: &[DispatchEvent], now_ms: u128) -> Vec<u128> {
 pub fn count_by_stage_outcome(events: &[DispatchEvent]) -> BTreeMap<(String, String), usize> {
     let mut out = BTreeMap::new();
     for event in events {
-        *out.entry((event.stage.clone(), event.outcome.clone()))
-            .or_insert(0) += 1;
+        *out.entry((event.stage.clone(), event.outcome.clone())).or_insert(0) += 1;
     }
     out
 }
@@ -298,11 +286,7 @@ pub struct StalledStage {
 /// `thresholds`. To avoid duplicate `stage_stalled` lines for the
 /// same wedge, we skip executions whose timeline already contains a
 /// `stage_stalled` line referencing the current stalled stage.
-pub fn pending_stalls(
-    root: &Path,
-    now_ms: u128,
-    thresholds: &StageThresholds,
-) -> Result<Vec<StalledStage>> {
+pub fn pending_stalls(root: &Path, now_ms: u128, thresholds: &StageThresholds) -> Result<Vec<StalledStage>> {
     let executions_dir = root.join("executions");
     let read_dir = match fs::read_dir(&executions_dir) {
         Ok(rd) => rd,
@@ -327,9 +311,7 @@ pub fn pending_stalls(
             continue;
         }
         let events = read_jsonl(&dispatch_path)?;
-        let Some(stall) =
-            stall_to_emit_for(execution_id, &events, now_ms, thresholds)
-        else {
+        let Some(stall) = stall_to_emit_for(execution_id, &events, now_ms, thresholds) else {
             continue;
         };
         out.push(stall);
@@ -463,21 +445,9 @@ mod tests {
     async fn read_current_returns_events_in_file_order() {
         let dir = TempDir::new().unwrap();
         let sink = JsonlFileSink::new(dir.path());
-        write(
-            &sink,
-            DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1"),
-        )
-        .await;
-        write(
-            &sink,
-            DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-1"),
-        )
-        .await;
-        write(
-            &sink,
-            DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-1"),
-        )
-        .await;
+        write(&sink, DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1")).await;
+        write(&sink, DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-1")).await;
+        write(&sink, DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-1")).await;
 
         let events = read_current(dir.path()).unwrap();
         assert_eq!(events.len(), 3);
@@ -489,21 +459,9 @@ mod tests {
     async fn read_execution_filters_to_one_mirror() {
         let dir = TempDir::new().unwrap();
         let sink = JsonlFileSink::new(dir.path());
-        write(
-            &sink,
-            DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-a"),
-        )
-        .await;
-        write(
-            &sink,
-            DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-b"),
-        )
-        .await;
-        write(
-            &sink,
-            DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-a"),
-        )
-        .await;
+        write(&sink, DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-a")).await;
+        write(&sink, DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-b")).await;
+        write(&sink, DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-a")).await;
 
         let a = read_execution(dir.path(), "exec-a").unwrap();
         let b = read_execution(dir.path(), "exec-b").unwrap();
@@ -734,8 +692,8 @@ mod tests {
         b.ts_epoch_ms = 0;
         write(&sink, b).await;
 
-        let thresholds = StageThresholds::new(Duration::from_secs(120))
-            .with_override("worker_claimed", Duration::from_secs(30));
+        let thresholds =
+            StageThresholds::new(Duration::from_secs(120)).with_override("worker_claimed", Duration::from_secs(30));
         let stalls = pending_stalls(dir.path(), 35_000, &thresholds).unwrap();
         assert_eq!(stalls.len(), 1);
         assert_eq!(stalls[0].execution_id, "exec-claimed");
@@ -744,8 +702,7 @@ mod tests {
 
     #[test]
     fn stage_thresholds_falls_back_to_default_for_unknown_stages() {
-        let t = StageThresholds::new(Duration::from_secs(120))
-            .with_override("worker_claimed", Duration::from_secs(30));
+        let t = StageThresholds::new(Duration::from_secs(120)).with_override("worker_claimed", Duration::from_secs(30));
         assert_eq!(t.for_stage("worker_claimed"), 30_000);
         assert_eq!(t.for_stage("cube_repo_ensured"), 120_000);
         assert_eq!(t.for_stage("anything_else"), 120_000);

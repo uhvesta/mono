@@ -171,14 +171,21 @@ impl Finding {
 
     /// Attach a file/line location to this finding.
     pub fn at(mut self, path: impl Into<String>, line: u32) -> Self {
-        self.location = Some(Location { path: path.into(), line: Some(line), column: None });
+        self.location = Some(Location {
+            path: path.into(),
+            line: Some(line),
+            column: None,
+        });
         self
     }
 
     /// Attach a file/line/column location to this finding.
     pub fn at_column(mut self, path: impl Into<String>, line: u32, column: u32) -> Self {
-        self.location =
-            Some(Location { path: path.into(), line: Some(line), column: Some(column) });
+        self.location = Some(Location {
+            path: path.into(),
+            line: Some(line),
+            column: Some(column),
+        });
         self
     }
 
