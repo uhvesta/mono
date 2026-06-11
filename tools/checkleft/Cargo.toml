@@ -44,6 +44,7 @@ required-features = ["benchmarking"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+directories = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 globset = { workspace = true }
 jaq-core = { workspace = true }
@@ -71,5 +72,6 @@ wasmtime = { version = "42.0.1", default-features = false, features = ["anyhow",
 wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
+filetime = "0.2"
 wat = { workspace = true }
 wiremock = { workspace = true }

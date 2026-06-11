@@ -248,7 +248,11 @@ impl DefaultExternalCheckExecutor {
         let engine = Arc::new(build_wasmtime_engine()?);
         let ticker = EpochTicker::start(Arc::clone(&engine));
 
-        let cache_dir = root.join(".checkleft-cwasm");
+        // Prefer the platform user cache dir (or env override) so `.cwasm` files
+        // are not written into the repository working tree.  Fall back to an
+        // in-tree `.checkleft-cwasm/` directory only when no platform cache dir
+        // is available (e.g. no home directory in a minimal container).
+        let cache_dir = cwasm_cache::default_cache_dir().unwrap_or_else(|| root.join(".checkleft-cwasm"));
         let component_cache = ComponentAotCache::open(&cache_dir).map(Some).unwrap_or_else(|_| {
             tracing::warn!(
                 "failed to open .cwasm cache at {}; component-v1 will use JIT compilation",

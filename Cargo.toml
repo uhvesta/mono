@@ -45,6 +45,7 @@ bon = "3.9.1"
 chrono = { version = "0.4.39", default-features = false, features = ["std"] }
 chrono-tz = "0.10.1"
 clap = "4.5.39"
+directories = "5.0"
 flate2 = "1.1.5"
 fs4 = "0.13"
 comfy-table = "7.2.2"
