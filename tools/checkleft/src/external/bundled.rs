@@ -85,6 +85,14 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         limits: None,
     },
     BundledCheckDef {
+        check_names: &["clippy"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/clippy/check.yaml"),
+        },
+        limits: None,
+    },
+    BundledCheckDef {
         check_names: &["rust-giant-structs-use-builder"],
         kind: BundledCheckDefKind::Component {
             // Bytes come from the checkleft_wasm_bundle micro-library so the

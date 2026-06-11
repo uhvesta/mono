@@ -812,3 +812,77 @@ async fn stale_exclusion_severity_off_disables_audit() {
 
 include!("tests_policy.rs");
 include!("tests_external.rs");
+
+// ── change-scope finding filter ─────────────────────────────────────────────────
+
+fn scoped_changeset() -> ChangeSet {
+    ChangeSet::new(vec![ChangedFile {
+        path: Path::new("crate/src/changed.rs").to_path_buf(),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }])
+}
+
+fn finding_at(path: Option<&str>) -> Finding {
+    Finding {
+        severity: Severity::Warning,
+        message: "msg".to_owned(),
+        location: path.map(|p| Location {
+            path: Path::new(p).to_path_buf(),
+            line: Some(1),
+            column: None,
+        }),
+        remediations: vec![],
+        suggested_fix: None,
+    }
+}
+
+/// A tool that over-reports relative to the change scope (e.g. clippy diagnosing
+/// a whole crate when one file changed) has its out-of-scope findings dropped by
+/// the framework; in-scope and location-less findings survive.
+#[test]
+fn scope_filter_drops_findings_outside_changeset() {
+    let mut result = CheckResult {
+        check_id: "clippy".to_owned(),
+        findings: vec![
+            finding_at(Some("crate/src/changed.rs")),
+            finding_at(Some("crate/src/unchanged_sibling.rs")),
+            finding_at(None),
+        ],
+    };
+    super::scope_findings_to_changeset(&mut result, &scoped_changeset());
+
+    assert_eq!(result.findings.len(), 2, "got: {:?}", result.findings);
+    assert_eq!(
+        result.findings[0].location.as_ref().map(|l| l.path.clone()),
+        Some(Path::new("crate/src/changed.rs").to_path_buf())
+    );
+    assert!(result.findings[1].location.is_none(), "location-less findings survive");
+}
+
+/// In `--all` mode the changeset is every file in the repo, so the filter keeps
+/// everything — the per-file membership check is the only mechanism; no mode flag.
+#[test]
+fn scope_filter_is_noop_when_all_files_are_in_changeset() {
+    let all = ChangeSet::new(vec![
+        ChangedFile {
+            path: Path::new("crate/src/changed.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("crate/src/unchanged_sibling.rs").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+    let mut result = CheckResult {
+        check_id: "clippy".to_owned(),
+        findings: vec![
+            finding_at(Some("crate/src/changed.rs")),
+            finding_at(Some("crate/src/unchanged_sibling.rs")),
+        ],
+    };
+    super::scope_findings_to_changeset(&mut result, &all);
+    assert_eq!(result.findings.len(), 2);
+}

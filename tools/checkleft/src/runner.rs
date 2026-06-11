@@ -691,11 +691,29 @@ fn is_checks_config_file(path: &std::path::Path) -> bool {
     file_name == Some(OsStr::new("CHECKS.yaml")) || file_name == Some(OsStr::new("CHECKS.toml"))
 }
 
+/// Drop findings located on files outside the run's change scope.
+///
+/// Tools may over-report relative to the changed-file set — clippy diagnoses a
+/// whole crate when one of its files changed, rustfmt recurses into module
+/// children — so the framework guarantees scope here rather than per check: a
+/// finding survives only if it has no location (check-level errors) or its path
+/// is one of the run's changed files. In `--all` mode the changeset *is* every
+/// file in the repo (`all_files_changeset`), so this is naturally a no-op there.
+fn scope_findings_to_changeset(result: &mut CheckResult, changeset: &ChangeSet) {
+    let changed: HashSet<&Path> = changeset.changed_files.iter().map(|file| file.path.as_path()).collect();
+    result.findings.retain(|finding| match &finding.location {
+        None => true,
+        Some(location) => changed.contains(location.path.as_path()),
+    });
+}
+
 fn apply_policy_to_result(
     mut result: CheckResult,
     policy: &EffectiveCheckPolicy,
     changeset: &ChangeSet,
 ) -> CheckResult {
+    scope_findings_to_changeset(&mut result, changeset);
+
     if result.findings.is_empty() {
         return result;
     }

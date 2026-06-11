@@ -60,3 +60,5 @@ checks:
   - id: rustfmt
     policy:
       severity: error
+
+  - id: clippy

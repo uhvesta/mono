@@ -19,7 +19,10 @@ use globset::{Glob, GlobSetBuilder};
 use crate::input::{ChangeKind, ChangeSet};
 use crate::output::{CheckResult, Finding};
 
-use super::{ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationMode, resolve};
+use super::{
+    ArtifactFormat, BazelAspectInvocation, ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationKind,
+    InvocationMode, ToolInvocation, resolve,
+};
 
 /// Run a declarative check end-to-end. `repo_root` is the working directory
 /// invocations run from (and the Bazel workspace, when the `bazel` resolver is used).
@@ -38,7 +41,17 @@ pub fn run_declarative_check(
         });
     }
 
-    let binaries = resolve::resolve_all(repo_root, &package.needs, config)?;
+    // Resolution is only needed for tool invocations; bazel_aspect invocations
+    // delegate to bazel and declare no binaries (needs may be empty).
+    let binaries = if package
+        .invocations
+        .iter()
+        .any(|invocation| matches!(invocation.kind, InvocationKind::Tool(_)))
+    {
+        resolve::resolve_all(repo_root, &package.needs, config)?
+    } else {
+        BTreeMap::new()
+    };
 
     let mut findings = Vec::new();
     for invocation in &package.invocations {
@@ -86,14 +99,13 @@ fn dedup_findings(findings: Vec<Finding>) -> Vec<Finding> {
 /// tools may receive absolute paths (e.g. when the hermetic Bazel toolchain wrapper
 /// canonicalizes inputs) and echo them back — the framework normalises before the
 /// finding reaches the runner.
-fn normalize_finding_paths(findings: &mut Vec<Finding>, repo_root: &Path) {
+fn normalize_finding_paths(findings: &mut [Finding], repo_root: &Path) {
     for finding in findings.iter_mut() {
-        if let Some(location) = &mut finding.location {
-            if location.path.is_absolute() {
-                if let Ok(relative) = location.path.strip_prefix(repo_root) {
-                    location.path = relative.to_path_buf();
-                }
-            }
+        if let Some(location) = &mut finding.location
+            && location.path.is_absolute()
+            && let Ok(relative) = location.path.strip_prefix(repo_root)
+        {
+            location.path = relative.to_path_buf();
         }
     }
 }
@@ -125,29 +137,9 @@ fn run_invocation(
     invocation: &Invocation,
     files: &[String],
 ) -> Result<Vec<Finding>> {
-    let binary = binaries.get(&invocation.run).ok_or_else(|| {
-        anyhow::anyhow!(
-            "invocation `{}` binary `{}` was not resolved",
-            invocation.id,
-            invocation.run
-        )
-    })?;
-
-    let mut findings = match invocation.mode {
-        InvocationMode::Batch => {
-            let args = expand_batch_args(repo_root, &invocation.args, files);
-            let output = spawn(repo_root, binary, &args, &invocation.id)?;
-            classify_and_project(invocation, &output, None)?
-        }
-        InvocationMode::PerFile => {
-            let mut findings = Vec::new();
-            for file in files {
-                let args = expand_per_file_args(repo_root, &invocation.args, file);
-                let output = spawn(repo_root, binary, &args, &invocation.id)?;
-                findings.extend(classify_and_project(invocation, &output, Some(file))?);
-            }
-            findings
-        }
+    let mut findings = match &invocation.kind {
+        InvocationKind::Tool(tool) => run_tool_invocation(repo_root, binaries, invocation, tool, files)?,
+        InvocationKind::BazelAspect(aspect) => run_bazel_aspect_invocation(repo_root, invocation, aspect, files)?,
     };
 
     // Normalize absolute paths to repo-relative. Tools invoked via the hermetic
@@ -155,6 +147,192 @@ fn run_invocation(
     // the framework strips the repo root prefix before the finding reaches the runner.
     normalize_finding_paths(&mut findings, repo_root);
     Ok(findings)
+}
+
+fn run_tool_invocation(
+    repo_root: &Path,
+    binaries: &BTreeMap<String, PathBuf>,
+    invocation: &Invocation,
+    tool: &ToolInvocation,
+    files: &[String],
+) -> Result<Vec<Finding>> {
+    let binary = binaries
+        .get(&tool.run)
+        .ok_or_else(|| anyhow::anyhow!("invocation `{}` binary `{}` was not resolved", invocation.id, tool.run))?;
+
+    match tool.mode {
+        InvocationMode::Batch => {
+            let args = expand_batch_args(repo_root, &tool.args, files);
+            let output = spawn(repo_root, binary, &args, &invocation.id)?;
+            classify_and_project(invocation, &output, None)
+        }
+        InvocationMode::PerFile => {
+            let mut findings = Vec::new();
+            for file in files {
+                let args = expand_per_file_args(repo_root, &tool.args, file);
+                let output = spawn(repo_root, binary, &args, &invocation.id)?;
+                findings.extend(classify_and_project(invocation, &output, Some(file))?);
+            }
+            Ok(findings)
+        }
+    }
+}
+
+/// Run a bazel_aspect invocation: map the matched files to their owning targets,
+/// build those targets with the declared aspect, then read the output-group
+/// artifacts and project each through the transform.
+///
+/// The build is fully cached by bazel: when CI (or the developer) has already run
+/// a build with the same aspect and flags, every action is a cache hit and this
+/// reduces to artifact lookup. Freshness is bazel's guarantee — checkleft never
+/// reads an artifact bazel did not just account for.
+fn run_bazel_aspect_invocation(
+    repo_root: &Path,
+    invocation: &Invocation,
+    aspect: &BazelAspectInvocation,
+    files: &[String],
+) -> Result<Vec<Finding>> {
+    let bazel = PathBuf::from("bazel");
+
+    // 1. Map changed files to the targets that own them. `same_pkg_direct_rdeps`
+    //    resolves each source file to the rule(s) listing it in srcs. Files that
+    //    bazel does not know (not in any package) would fail the query; tolerate
+    //    partial results via --keep_going (exit 3 = partial success).
+    let set = files
+        .iter()
+        .map(|file| format!("'{}'", file.replace('\'', "")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!("same_pkg_direct_rdeps(set({set}))");
+    let query_args = vec![
+        "query".to_owned(),
+        "--keep_going".to_owned(),
+        "--output=label".to_owned(),
+        query,
+    ];
+    let query_output = spawn(repo_root, &bazel, &query_args, &invocation.id)?;
+    if !matches!(query_output.exit_code, Some(0) | Some(3)) {
+        bail!(
+            "bazel_aspect invocation `{}`: target query failed (exit {}): {}",
+            invocation.id,
+            describe_exit(query_output.exit_code),
+            String::from_utf8_lossy(&query_output.stderr).trim()
+        );
+    }
+    let mut targets: Vec<String> = String::from_utf8_lossy(&query_output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("//") || line.starts_with('@'))
+        .map(str::to_owned)
+        .collect();
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. Build the targets with the aspect. Exit semantics from the manifest
+    //    classify the build's exit code (typically `0 → findings, default → error`).
+    let aspect_flags = [
+        format!("--aspects={}", aspect.aspect),
+        format!("--output_groups={}", aspect.output_groups.join(",")),
+    ];
+    let mut build_args: Vec<String> = vec!["build".to_owned()];
+    build_args.extend(aspect_flags.iter().cloned());
+    build_args.extend(aspect.build_flags.iter().cloned());
+    build_args.extend(targets.iter().cloned());
+    let build_output = spawn(repo_root, &bazel, &build_args, &invocation.id)?;
+    match invocation.exit.classify(build_output.exit_code) {
+        ExitOutcome::Ok => return Ok(Vec::new()),
+        ExitOutcome::Findings => {}
+        ExitOutcome::Error => bail!(
+            "bazel_aspect invocation `{}`: bazel build exited with status {} (treated as error by exit semantics): {}",
+            invocation.id,
+            describe_exit(build_output.exit_code),
+            String::from_utf8_lossy(&build_output.stderr).trim()
+        ),
+    }
+
+    // 3. Discover the artifact files the output groups produced. cquery with the
+    //    same aspect/flags prints one workspace-relative path per line. Unlike
+    //    `build`, cquery takes a single query EXPRESSION — multiple positional
+    //    targets are a parse error — so the targets are wrapped in `set(...)`.
+    let mut cquery_args: Vec<String> = vec!["cquery".to_owned()];
+    cquery_args.extend(aspect_flags.iter().cloned());
+    cquery_args.extend(aspect.build_flags.iter().cloned());
+    cquery_args.push("--output=files".to_owned());
+    cquery_args.push(format!("set({})", targets.join(" ")));
+    let cquery_output = spawn(repo_root, &bazel, &cquery_args, &invocation.id)?;
+    if cquery_output.exit_code != Some(0) {
+        bail!(
+            "bazel_aspect invocation `{}`: artifact discovery (cquery --output=files) failed (exit {}): {}",
+            invocation.id,
+            describe_exit(cquery_output.exit_code),
+            String::from_utf8_lossy(&cquery_output.stderr).trim()
+        );
+    }
+
+    // 4. Read each artifact and project it through the transform. Empty artifacts
+    //    are clean results (e.g. a crate with no clippy diagnostics).
+    let mut findings = Vec::new();
+    for artifact in String::from_utf8_lossy(&cquery_output.stdout).lines() {
+        let artifact = artifact.trim();
+        if artifact.is_empty() {
+            continue;
+        }
+        let path = repo_root.join(artifact);
+        let contents = std::fs::read(&path).with_context(|| {
+            format!(
+                "bazel_aspect invocation `{}`: failed to read artifact `{}`",
+                invocation.id,
+                path.display()
+            )
+        })?;
+        if contents.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let document = match aspect.artifact_format {
+            ArtifactFormat::Json => contents,
+            ArtifactFormat::JsonLines => jsonl_to_array(&contents).with_context(|| {
+                format!(
+                    "bazel_aspect invocation `{}`: artifact `{}` is not valid JSONL",
+                    invocation.id,
+                    path.display()
+                )
+            })?,
+        };
+        findings.extend(invocation.transform.apply(&document, Some(0), None).with_context(|| {
+            format!(
+                "transform for invocation `{}` failed on artifact `{}`",
+                invocation.id, artifact
+            )
+        })?);
+    }
+    Ok(findings)
+}
+
+/// Normalise a JSONL document (one JSON value per non-empty line) into a single
+/// JSON array, so `json` transforms can select over it with `.[] | ...`.
+pub(super) fn jsonl_to_array(contents: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(contents).context("artifact is not valid UTF-8")?;
+    let mut values = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(line).with_context(|| format!("line {} is not valid JSON: {line:?}", index + 1))?;
+        values.push(value);
+    }
+    serde_json::to_vec(&serde_json::Value::Array(values)).context("failed to serialise JSONL array")
+}
+
+fn describe_exit(code: Option<i32>) -> String {
+    match code {
+        Some(code) => code.to_string(),
+        None => "signal".to_owned(),
+    }
 }
 
 /// In batch mode the standalone `{{files}}` arg expands to N file args.
@@ -166,7 +344,7 @@ fn expand_batch_args(repo_root: &Path, args: &[String], files: &[String]) -> Vec
         if arg == "{{files}}" {
             expanded.extend(files.iter().cloned());
         } else {
-            expanded.push(arg.replace("{{repo_root}}", &*repo_root_str));
+            expanded.push(arg.replace("{{repo_root}}", &repo_root_str));
         }
     }
     expanded
@@ -177,7 +355,7 @@ fn expand_batch_args(repo_root: &Path, args: &[String], files: &[String]) -> Vec
 fn expand_per_file_args(repo_root: &Path, args: &[String], file: &str) -> Vec<String> {
     let repo_root_str = repo_root.to_string_lossy();
     args.iter()
-        .map(|arg| arg.replace("{{file}}", file).replace("{{repo_root}}", &*repo_root_str))
+        .map(|arg| arg.replace("{{file}}", file).replace("{{repo_root}}", &repo_root_str))
         .collect()
 }
 

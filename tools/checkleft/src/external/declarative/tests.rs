@@ -28,7 +28,10 @@ use crate::output::{Finding, Severity};
 
 use super::selector::Selector;
 use super::template::{RenderContext, Template};
-use super::{ExitOutcome, ExitSemantics, ExternalCheckDeclarativePackage, InvocationMode};
+use super::{
+    ExitOutcome, ExitSemantics, ExternalCheckDeclarativePackage, Invocation, InvocationKind, InvocationMode,
+    ToolInvocation,
+};
 
 // The committed manifest — the single source of truth for the buildifier
 // declarative check definition. Tests source from this file so the test and the
@@ -61,6 +64,14 @@ fn parse_package() -> ExternalCheckDeclarativePackage {
     }
 }
 
+/// Unwrap a tool-kind invocation's fields for assertion convenience.
+fn tool(invocation: &Invocation) -> &ToolInvocation {
+    match &invocation.kind {
+        InvocationKind::Tool(tool) => tool,
+        other => panic!("expected tool invocation, got {other:?}"),
+    }
+}
+
 // ── manifest parsing ───────────────────────────────────────────────────────────
 
 #[test]
@@ -68,9 +79,9 @@ fn manifest_parses_into_two_invocations() {
     let package = parse_package();
     assert_eq!(package.invocations.len(), 2);
     assert_eq!(package.invocations[0].id, "format");
-    assert_eq!(package.invocations[0].mode, InvocationMode::Batch);
+    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::Batch);
     assert_eq!(package.invocations[1].id, "lint");
-    assert_eq!(package.invocations[1].mode, InvocationMode::PerFile);
+    assert_eq!(tool(&package.invocations[1]).mode, InvocationMode::PerFile);
     assert!(package.needs.contains_key("buildifier"));
     // exit `0 -> findings`, everything else -> error.
     assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Findings);
@@ -591,7 +602,7 @@ fn rustfmt_manifest_parses_correctly() {
     let package = parse_rustfmt_package();
     assert_eq!(package.invocations.len(), 1);
     assert_eq!(package.invocations[0].id, "format");
-    assert_eq!(package.invocations[0].mode, InvocationMode::PerFile);
+    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::PerFile);
     assert!(package.needs.contains_key("rustfmt"));
     // With --check mode: exit 0 = ok (already formatted), exit 1 = findings
     // (needs formatting, filename on stdout) or operational error (no stdout).
@@ -603,7 +614,7 @@ fn rustfmt_manifest_parses_correctly() {
 #[test]
 fn rustfmt_config_path_arg_is_present() {
     let package = parse_rustfmt_package();
-    let args = &package.invocations[0].args;
+    let args = &tool(&package.invocations[0]).args;
     assert!(
         args.iter().any(|a| a == "--config-path={{repo_root}}"),
         "expected --config-path={{{{repo_root}}}} in rustfmt args to pin config to repo root regardless of cwd; got: {args:?}"
@@ -613,7 +624,7 @@ fn rustfmt_config_path_arg_is_present() {
 #[test]
 fn rustfmt_check_flag_is_present() {
     let package = parse_rustfmt_package();
-    let args = &package.invocations[0].args;
+    let args = &tool(&package.invocations[0]).args;
     assert!(
         args.iter().any(|a| a == "--check"),
         "expected --check flag for stable-compatible invocation; got: {args:?}"
@@ -625,7 +636,7 @@ fn rustfmt_list_flag_is_present() {
     // -l prints filenames needing formatting to stdout — required by the linelist
     // transform to distinguish violations (stdout non-empty) from parse errors (empty).
     let package = parse_rustfmt_package();
-    let args = &package.invocations[0].args;
+    let args = &tool(&package.invocations[0]).args;
     assert!(
         args.iter().any(|a| a == "-l"),
         "expected -l flag so violated filenames appear on stdout; got: {args:?}"
@@ -637,7 +648,7 @@ fn rustfmt_no_unstable_features_flag() {
     // --unstable-features only exists on nightly rustfmt; stable rejects it.
     // The check must not pass this flag.
     let package = parse_rustfmt_package();
-    let args = &package.invocations[0].args;
+    let args = &tool(&package.invocations[0]).args;
     assert!(
         !args.iter().any(|a| a == "--unstable-features"),
         "--unstable-features must not be in rustfmt args (stable rustfmt rejects it); got: {args:?}"
@@ -1029,5 +1040,208 @@ fn linelist_remediations_substitute_input_file() {
     assert!(
         !remediation.contains("{{"),
         "remediation must not contain unsubstituted template vars; got: {remediation}"
+    );
+}
+
+// ── bazel_aspect invocation kind ────────────────────────────────────────────────
+
+const CLIPPY_MANIFEST: &str = include_str!("../../../checks/clippy/check.yaml");
+
+fn parse_clippy_package() -> ExternalCheckDeclarativePackage {
+    let package = parse_declarative_check_manifest(CLIPPY_MANIFEST).expect("clippy manifest must parse");
+    assert_eq!(package.id, "clippy");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
+        other => panic!("expected declarative implementation, got {other:?}"),
+    }
+}
+
+fn aspect(invocation: &Invocation) -> &super::BazelAspectInvocation {
+    match &invocation.kind {
+        InvocationKind::BazelAspect(aspect) => aspect,
+        other => panic!("expected bazel_aspect invocation, got {other:?}"),
+    }
+}
+
+#[test]
+fn clippy_manifest_parses_as_bazel_aspect() {
+    let package = parse_clippy_package();
+    assert_eq!(package.invocations.len(), 1);
+    let invocation = &package.invocations[0];
+    assert_eq!(invocation.id, "clippy");
+    let spec = aspect(invocation);
+    assert_eq!(spec.aspect, "@rules_rust//rust:defs.bzl%rust_clippy_aspect");
+    assert_eq!(spec.output_groups, vec!["clippy_checks".to_owned()]);
+    assert_eq!(spec.artifact_format, super::ArtifactFormat::JsonLines);
+    // capture_clippy_output is load-bearing: without it the build FAILS on
+    // violations instead of writing them to the artifact.
+    assert!(
+        spec.build_flags
+            .iter()
+            .any(|f| f.contains("capture_clippy_output=true")),
+        "clippy aspect must capture output; got {:?}",
+        spec.build_flags
+    );
+    assert!(
+        spec.build_flags.iter().any(|f| f.contains("clippy_error_format=json")),
+        "clippy aspect must emit json diagnostics; got {:?}",
+        spec.build_flags
+    );
+    // A clippy-clean build exits 0 and we read (possibly empty) artifacts.
+    assert_eq!(invocation.exit.classify(Some(0)), ExitOutcome::Findings);
+    assert_eq!(invocation.exit.classify(Some(1)), ExitOutcome::Error);
+    // bazel_aspect packages need no binaries: bazel runs the tool.
+    assert!(package.needs.is_empty());
+}
+
+#[test]
+fn clippy_transform_projects_diagnostics_and_skips_summary_rows() {
+    let package = parse_clippy_package();
+    let invocation = &package.invocations[0];
+
+    // Two real diagnostics + the trailing "warnings emitted" summary row (null
+    // code, no spans), as produced by clippy_error_format=json.
+    let jsonl = br#"{"$message_type":"diagnostic","message":"unneeded `return` statement","code":{"code":"clippy::needless_return"},"level":"warning","spans":[{"file_name":"lib/rust/git_utils/src/gh_cli.rs","line_start":132,"column_start":5}]}
+{"$message_type":"diagnostic","message":"equality checks against true are unnecessary","code":{"code":"clippy::bool_comparison"},"level":"warning","spans":[{"file_name":"lib/rust/git_utils/src/gh_cli.rs","line_start":131,"column_start":8}]}
+{"$message_type":"diagnostic","message":"2 warnings emitted","code":null,"level":"warning","spans":[]}"#;
+
+    let document = super::executor::jsonl_to_array(jsonl).expect("valid jsonl");
+    let findings = invocation
+        .transform
+        .apply(&document, Some(0), None)
+        .expect("transform must project diagnostics");
+
+    assert_eq!(findings.len(), 2, "summary row must be skipped: {findings:?}");
+    let first = &findings[0];
+    let location = first.location.as_ref().expect("diagnostic finding has a location");
+    assert_eq!(location.path, Path::new("lib/rust/git_utils/src/gh_cli.rs"));
+    assert_eq!(location.line, Some(132));
+    assert_eq!(location.column, Some(5));
+    assert!(first.message.contains("clippy::needless_return"));
+    assert!(first.message.contains("unneeded `return` statement"));
+    assert_eq!(first.severity, Severity::Warning);
+    assert!(
+        first
+            .remediations
+            .iter()
+            .any(|r| r.contains("#[allow(clippy::needless_return)]")),
+        "remediation should name the lint: {:?}",
+        first.remediations
+    );
+}
+
+#[test]
+fn jsonl_to_array_rejects_invalid_lines_and_skips_blanks() {
+    let array = super::executor::jsonl_to_array(b"{\"a\":1}\n\n{\"b\":2}\n").expect("valid jsonl");
+    let value: Value = serde_json::from_slice(&array).unwrap();
+    assert_eq!(value.as_array().map(Vec::len), Some(2));
+
+    let err = super::executor::jsonl_to_array(b"{\"a\":1}\nnot-json\n").unwrap_err();
+    assert!(
+        err.to_string().contains("line 2"),
+        "error should name the line: {err:#}"
+    );
+}
+
+#[test]
+fn bazel_aspect_invocation_rejects_tool_fields() {
+    let manifest = r#"
+id: bad
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+invocations:
+  - id: bad
+    kind: bazel_aspect
+    aspect: "@x//:y.bzl%z"
+    output_groups: [g]
+    run: sometool
+    exit: {"0": findings, default: error}
+    transform: {kind: passthrough}
+"#;
+    let err = parse_declarative_check_manifest(manifest).unwrap_err();
+    assert!(err.to_string().contains("must not set `run`"), "got: {err:#}");
+}
+
+#[test]
+fn bazel_aspect_invocation_requires_aspect_and_output_groups() {
+    let manifest = r#"
+id: bad
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+invocations:
+  - id: bad
+    kind: bazel_aspect
+    output_groups: [g]
+    exit: {"0": findings, default: error}
+    transform: {kind: passthrough}
+"#;
+    let err = parse_declarative_check_manifest(manifest).unwrap_err();
+    assert!(err.to_string().contains("must set `aspect`"), "got: {err:#}");
+
+    let manifest = r#"
+id: bad
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+invocations:
+  - id: bad
+    kind: bazel_aspect
+    aspect: "@x//:y.bzl%z"
+    exit: {"0": findings, default: error}
+    transform: {kind: passthrough}
+"#;
+    let err = parse_declarative_check_manifest(manifest).unwrap_err();
+    assert!(err.to_string().contains("non-empty `output_groups`"), "got: {err:#}");
+}
+
+#[test]
+fn tool_invocation_rejects_bazel_aspect_fields() {
+    let manifest = r#"
+id: bad
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+needs:
+  t:
+    default: {path: t}
+invocations:
+  - id: bad
+    run: t
+    mode: batch
+    args: ["{{files}}"]
+    aspect: "@x//:y.bzl%z"
+    exit: {"0": findings, default: error}
+    transform: {kind: passthrough}
+"#;
+    let err = parse_declarative_check_manifest(manifest).unwrap_err();
+    assert!(err.to_string().contains("must not set `aspect`"), "got: {err:#}");
+}
+
+#[test]
+fn tool_invocations_still_require_needs() {
+    let manifest = r#"
+id: bad
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.rs"]
+invocations:
+  - id: bad
+    run: t
+    mode: batch
+    args: ["{{files}}"]
+    exit: {"0": findings, default: error}
+    transform: {kind: passthrough}
+"#;
+    let err = parse_declarative_check_manifest(manifest).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown binary `t`") || err.to_string().contains("must declare at least one binary"),
+        "got: {err:#}"
     );
 }

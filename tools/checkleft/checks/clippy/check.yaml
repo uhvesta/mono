@@ -1,0 +1,65 @@
+id: clippy
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/*.rs"
+
+# clippy via the rules_rust aspect — bazel runs clippy, checkleft reads the
+# artifacts. This is a `bazel_aspect` invocation: the framework maps the changed
+# .rs files to their owning targets (`same_pkg_direct_rdeps`), builds them with
+# the clippy aspect, then reads the output-group artifacts and projects each
+# diagnostic into a finding.
+#
+# Why the aspect instead of invoking clippy directly:
+#   - bazel caches the clippy actions: a CI pipeline (or developer) that already
+#     built with these flags makes this invocation a pure artifact lookup.
+#   - the toolchain clippy matches the build's rustc exactly — no channel skew.
+#
+# The two build flags are load-bearing:
+#   - capture_clippy_output=true writes diagnostics to a per-crate .clippy.out
+#     artifact and caps lints at warnings, so the BUILD succeeds even with
+#     violations — checkleft owns pass/fail policy, not bazel.
+#   - clippy_error_format=json makes the artifact rustc-JSON diagnostics
+#     (one JSON object per line — hence artifact_format: jsonl).
+#
+# Scope note: clippy diagnoses the whole owning crate, so artifacts may carry
+# findings for files that did not change. The runner's change-scope filter
+# drops findings outside the changed-file set (a no-op under --all).
+invocations:
+  - id: clippy
+    kind: bazel_aspect
+    aspect: "@rules_rust//rust:defs.bzl%rust_clippy_aspect"
+    output_groups:
+      - clippy_checks
+    build_flags:
+      - "--@rules_rust//rust/settings:capture_clippy_output=true"
+      - "--@rules_rust//rust/settings:clippy_error_format=json"
+    artifact_format: jsonl
+    # Exit semantics classify the `bazel build` step. With capture_clippy_output
+    # the build succeeds even when clippy reports violations, so 0 → findings
+    # (read the artifacts); any other exit is a build/operational error.
+    exit:
+      "0": findings
+      default: error
+    # Each artifact line is a rustc-JSON diagnostic. Select real diagnostics
+    # (skip the trailing "N warnings emitted" summary rows, which have a null
+    # code and no spans) and reshape to a flat row, since finding templates
+    # navigate object keys only — the jaq selector does the array indexing.
+    transform:
+      kind: json
+      select: >-
+        .[]
+        | select(."$message_type" == "diagnostic")
+        | select(.code != null)
+        | select((.spans | length) > 0)
+        | {file: .spans[0].file_name, line: .spans[0].line_start,
+           column: .spans[0].column_start, code: .code.code, message: .message}
+      finding:
+        path: "{{item.file}}"
+        line: "{{item.line}}"
+        column: "{{item.column}}"
+        message: "{{item.code}}: {{item.message}}"
+        severity: warning
+        remediations:
+          - "Fix the lint, or annotate with a justified `#[allow({{item.code}})]` if the lint is wrong for this code."

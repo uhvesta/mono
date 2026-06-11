@@ -88,21 +88,69 @@ pub enum BinaryBinding {
     Path(String),
 }
 
-/// One self-contained invocation of a declared binary.
+/// One self-contained invocation of a declarative check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
     pub id: String,
+    pub kind: InvocationKind,
+    pub exit: ExitSemantics,
+    pub transform: transform::Transform,
+}
+
+/// How an invocation produces tool output for its transform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvocationKind {
+    /// Run a declared binary directly over the matched files; the transform
+    /// projects its stdout.
+    Tool(ToolInvocation),
+    /// Run `bazel build` with an aspect over the targets that own the matched
+    /// files, then read the artifact files the requested output groups produce;
+    /// the transform projects each artifact's contents. The build system — not
+    /// checkleft — runs the underlying tool, with full caching: if CI or the
+    /// user already built with the same aspect/flags, every action is a cache
+    /// hit and this invocation reduces to artifact lookup.
+    BazelAspect(BazelAspectInvocation),
+}
+
+/// A tool-kind invocation: run a declared binary (key into
+/// [`ExternalCheckDeclarativePackage::needs`]) with templated args.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolInvocation {
     /// Which declared binary (key into [`ExternalCheckDeclarativePackage::needs`]).
     pub run: String,
     pub mode: InvocationMode,
     /// Argument templates. `{{files}}` (batch) expands to the matched file list;
     /// `{{file}}` (per-file) is substituted with the single file.
     pub args: Vec<String>,
-    pub exit: ExitSemantics,
-    pub transform: transform::Transform,
 }
 
-/// Whether an invocation runs once over the whole matched batch or once per file.
+/// A bazel_aspect-kind invocation: build matched files' owning targets with an
+/// aspect and read the output-group artifacts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BazelAspectInvocation {
+    /// The aspect label, e.g. `@rules_rust//rust:defs.bzl%rust_clippy_aspect`.
+    pub aspect: String,
+    /// Output groups whose artifact files carry the tool output.
+    pub output_groups: Vec<String>,
+    /// Extra flags for the `bazel build` / `bazel cquery` invocations (e.g.
+    /// `--@rules_rust//rust/settings:clippy_error_format=json`).
+    pub build_flags: Vec<String>,
+    /// How each artifact file's contents are shaped before the transform.
+    pub artifact_format: ArtifactFormat,
+}
+
+/// The on-disk shape of an output-group artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactFormat {
+    /// A single JSON document.
+    Json,
+    /// One JSON object per line (e.g. rustc/clippy `--error-format=json`
+    /// diagnostics). Normalised to a JSON array before the transform runs, so
+    /// `json` transforms select over it with `.[] | ...`.
+    JsonLines,
+}
+
+/// Whether a tool invocation runs once over the whole matched batch or once per file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvocationMode {
     Batch,
@@ -182,10 +230,27 @@ struct RawBinaryBinding {
 #[serde(deny_unknown_fields)]
 pub(super) struct RawInvocation {
     id: String,
-    run: String,
-    mode: String,
+    /// Invocation kind: `tool` (default) or `bazel_aspect`.
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    run: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     args: Vec<String>,
+    /// bazel_aspect: the aspect label to apply.
+    #[serde(default)]
+    aspect: Option<String>,
+    /// bazel_aspect: output groups whose artifacts carry the tool output.
+    #[serde(default)]
+    output_groups: Vec<String>,
+    /// bazel_aspect: extra `bazel build`/`bazel cquery` flags.
+    #[serde(default)]
+    build_flags: Vec<String>,
+    /// bazel_aspect: `json` (default) or `jsonl`.
+    #[serde(default)]
+    artifact_format: Option<String>,
     exit: BTreeMap<String, String>,
     transform: RawTransform,
 }
@@ -229,9 +294,6 @@ pub(super) fn validate_declarative_implementation(
     if raw.applies_to.is_empty() {
         bail!("declarative package must declare a non-empty `applies_to` glob list");
     }
-    if raw.needs.is_empty() {
-        bail!("declarative package must declare at least one binary in `needs`");
-    }
     if raw.invocations.is_empty() {
         bail!("declarative package must declare at least one `invocations` entry");
     }
@@ -244,6 +306,16 @@ pub(super) fn validate_declarative_implementation(
     let mut invocations = Vec::with_capacity(raw.invocations.len());
     for raw_invocation in raw.invocations {
         invocations.push(validate_invocation(&needs, raw_invocation)?);
+    }
+
+    // `needs` is how tool invocations resolve their binary; bazel_aspect
+    // invocations delegate execution to bazel and declare none. Require needs
+    // exactly when a tool invocation exists.
+    let has_tool_invocation = invocations
+        .iter()
+        .any(|invocation| matches!(invocation.kind, InvocationKind::Tool(_)));
+    if has_tool_invocation && needs.is_empty() {
+        bail!("declarative package with tool invocations must declare at least one binary in `needs`");
     }
 
     Ok(ExternalCheckDeclarativePackage {
@@ -284,27 +356,81 @@ fn parse_binding(name: &str, field: &str, raw: RawBinaryBinding) -> Result<Binar
 
 fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvocation) -> Result<Invocation> {
     let id = non_empty("invocations[].id", raw.id)?;
-    let run = non_empty("invocations[].run", raw.run)?;
-    if !needs.contains_key(&run) {
-        bail!("invocation `{id}` references unknown binary `{run}` (not declared in `needs`)");
-    }
-
-    let mode = match raw.mode.as_str() {
-        "batch" => InvocationMode::Batch,
-        "per_file" => InvocationMode::PerFile,
-        other => bail!("invocation `{id}` has invalid mode `{other}` (expected `batch` or `per_file`)"),
-    };
-
-    validate_args_for_mode(&id, mode, &raw.args)?;
-    validate_arg_template_refs(&id, &raw.args)?;
     let exit = validate_exit(&id, raw.exit)?;
     let transform = validate_transform(&id, raw.transform)?;
 
+    let kind = match raw.kind.as_deref().unwrap_or("tool") {
+        "tool" => {
+            for (field, set) in [
+                ("aspect", raw.aspect.is_some()),
+                ("output_groups", !raw.output_groups.is_empty()),
+                ("build_flags", !raw.build_flags.is_empty()),
+                ("artifact_format", raw.artifact_format.is_some()),
+            ] {
+                if set {
+                    bail!("tool invocation `{id}` must not set `{field}` (bazel_aspect-only field)");
+                }
+            }
+            let run = non_empty(
+                "invocations[].run",
+                raw.run
+                    .ok_or_else(|| anyhow::anyhow!("tool invocation `{id}` must set `run`"))?,
+            )?;
+            if !needs.contains_key(&run) {
+                bail!("invocation `{id}` references unknown binary `{run}` (not declared in `needs`)");
+            }
+            let mode = match raw.mode.as_deref() {
+                Some("batch") => InvocationMode::Batch,
+                Some("per_file") => InvocationMode::PerFile,
+                Some(other) => bail!("invocation `{id}` has invalid mode `{other}` (expected `batch` or `per_file`)"),
+                None => bail!("tool invocation `{id}` must set `mode`"),
+            };
+            validate_args_for_mode(&id, mode, &raw.args)?;
+            validate_arg_template_refs(&id, &raw.args)?;
+            InvocationKind::Tool(ToolInvocation {
+                run,
+                mode,
+                args: raw.args,
+            })
+        }
+        "bazel_aspect" => {
+            for (field, set) in [
+                ("run", raw.run.is_some()),
+                ("mode", raw.mode.is_some()),
+                ("args", !raw.args.is_empty()),
+            ] {
+                if set {
+                    bail!("bazel_aspect invocation `{id}` must not set `{field}` (tool-only field)");
+                }
+            }
+            let aspect = non_empty(
+                "invocations[].aspect",
+                raw.aspect
+                    .ok_or_else(|| anyhow::anyhow!("bazel_aspect invocation `{id}` must set `aspect`"))?,
+            )?;
+            if raw.output_groups.is_empty() {
+                bail!("bazel_aspect invocation `{id}` must declare a non-empty `output_groups` list");
+            }
+            let artifact_format = match raw.artifact_format.as_deref().unwrap_or("json") {
+                "json" => ArtifactFormat::Json,
+                "jsonl" => ArtifactFormat::JsonLines,
+                other => bail!(
+                    "bazel_aspect invocation `{id}` has invalid artifact_format `{other}` (expected `json` or `jsonl`)"
+                ),
+            };
+            InvocationKind::BazelAspect(BazelAspectInvocation {
+                aspect,
+                output_groups: raw.output_groups,
+                build_flags: raw.build_flags,
+                artifact_format,
+            })
+        }
+        other => bail!("invocation `{id}` has unknown kind `{other}` (expected `tool` or `bazel_aspect`)"),
+    };
+
     Ok(Invocation {
         id,
-        run,
-        mode,
-        args: raw.args,
+        kind,
         exit,
         transform,
     })
