@@ -326,7 +326,7 @@ fn human_output_no_findings_includes_elapsed_time() {
         Duration::from_secs(12),
     );
 
-    assert_eq!(output, "checks: no findings (1 checks run in 12s)\n");
+    assert_eq!(output, "checks: no findings (1 checks ran in 12s)\n");
 }
 
 #[test]

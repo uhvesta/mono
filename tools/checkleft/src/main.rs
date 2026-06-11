@@ -669,7 +669,7 @@ fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Du
     let total_findings: usize = results.iter().map(|result| result.findings.len()).sum();
     if total_findings == 0 {
         return format!(
-            "{}: no findings ({} checks run in {}s)\n",
+            "{}: no findings ({} checks ran in {}s)\n",
             style.paint_info("checks"),
             results.len(),
             elapsed.as_secs()
