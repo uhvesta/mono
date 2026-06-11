@@ -465,6 +465,10 @@ async fn resolve_pr_description(
     let repository = repository?;
     let github_token = detect_github_token();
 
+    if github_token.is_none() {
+        eprintln!("{}", github_auth_unavailable_warning(repository));
+    }
+
     // Levels 1 & 2: fetch description using the already-resolved change_id.
     if let Some(change_id) = change_id {
         info!(
@@ -539,13 +543,63 @@ fn init_tracing(verbose: bool) -> Result<()> {
 }
 
 fn detect_github_token() -> Option<String> {
-    [
-        std::env::var(CHECKS_GITHUB_TOKEN_ENV),
-        std::env::var("GH_TOKEN"),
-        std::env::var("GITHUB_TOKEN"),
-    ]
-    .into_iter()
-    .find_map(|value| normalize_optional_description(value.ok()))
+    resolve_github_token_from_sources(
+        std::env::var(CHECKS_GITHUB_TOKEN_ENV).ok().as_deref(),
+        std::env::var("GH_TOKEN").ok().as_deref(),
+        std::env::var("GITHUB_TOKEN").ok().as_deref(),
+        try_gh_auth_token().as_deref(),
+    )
+}
+
+/// Attempt to obtain a GitHub token from the `gh` CLI (`gh auth token`).
+/// Returns `None` if `gh` is not installed, not authenticated, or any error occurs.
+/// Stderr from `gh` is suppressed — failures are handled silently.
+fn try_gh_auth_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let raw = String::from_utf8(output.stdout).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+    } else {
+        None
+    }
+}
+
+/// Resolve a GitHub token from the four possible sources, in priority order:
+/// 1. `checks_github_token` — `CHECKS_GITHUB_TOKEN` env var (highest — explicit CI override)
+/// 2. `gh_token` — `GH_TOKEN` env var
+/// 3. `github_token` — `GITHUB_TOKEN` env var
+/// 4. `gh_cli_token` — result of `gh auth token` (None when gh failed or is absent)
+///
+/// Accepts each source as an explicit parameter so the resolution logic is
+/// testable without manipulating process environment variables.
+fn resolve_github_token_from_sources(
+    checks_github_token: Option<&str>,
+    gh_token: Option<&str>,
+    github_token: Option<&str>,
+    gh_cli_token: Option<&str>,
+) -> Option<String> {
+    [checks_github_token, gh_token, github_token, gh_cli_token]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Build the warning message emitted when no GitHub auth is available but a
+/// repository is known (so API calls would be attempted).
+fn github_auth_unavailable_warning(repository: &str) -> String {
+    format!(
+        "warning: checkleft: PR-description bypass directives may be unavailable for {repository}: \
+         no GitHub token found (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars \
+         and `gh auth token`). Run `gh auth login` or set a token env var to enable \
+         authenticated GitHub API access."
+    )
 }
 
 fn normalize_optional_description(value: Option<String>) -> Option<String> {

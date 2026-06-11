@@ -6,8 +6,9 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 use checkleft::change_detection::environment::CiEnvironment;
 
 use super::{
-    ColorLevel, ExternalProviderMode, OutputStyle, normalize_optional_description, parse_external_provider_mode,
-    parse_github_ref_pr_number, render_human_results, sort_results_for_output,
+    ColorLevel, ExternalProviderMode, OutputStyle, github_auth_unavailable_warning,
+    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_human_results,
+    resolve_github_token_from_sources, sort_results_for_output,
 };
 
 #[test]
@@ -516,4 +517,85 @@ fn detect_current_branch_gha_push_ignores_pull_request_ref() {
     let github_ref = "refs/pull/42/merge";
     let branch = github_ref.strip_prefix("refs/heads/").map(|b| b.to_owned());
     assert_eq!(branch, None, "should not extract branch from pull-request ref");
+}
+
+// --- resolve_github_token_from_sources ---
+
+#[test]
+fn resolve_github_token_checks_github_token_beats_all() {
+    // CHECKS_GITHUB_TOKEN is the highest-priority source; it wins over all others.
+    let token = resolve_github_token_from_sources(
+        Some("checks-token"),
+        Some("gh-token-env"),
+        Some("github-token-env"),
+        Some("gh-cli-token"),
+    );
+    assert_eq!(token.as_deref(), Some("checks-token"));
+}
+
+#[test]
+fn resolve_github_token_gh_token_env_beats_github_token_and_gh_cli() {
+    let token = resolve_github_token_from_sources(
+        None,
+        Some("gh-token-env"),
+        Some("github-token-env"),
+        Some("gh-cli-token"),
+    );
+    assert_eq!(token.as_deref(), Some("gh-token-env"));
+}
+
+#[test]
+fn resolve_github_token_github_token_env_beats_gh_cli() {
+    let token = resolve_github_token_from_sources(None, None, Some("github-token-env"), Some("gh-cli-token"));
+    assert_eq!(token.as_deref(), Some("github-token-env"));
+}
+
+#[test]
+fn resolve_github_token_falls_back_to_gh_cli_when_no_env_vars() {
+    // Simulates a developer workstation where no token env vars are set but
+    // `gh auth login` has been run — the gh cli token should be used.
+    let token = resolve_github_token_from_sources(None, None, None, Some("gh-cli-token"));
+    assert_eq!(token.as_deref(), Some("gh-cli-token"));
+}
+
+#[test]
+fn resolve_github_token_returns_none_when_gh_missing_and_no_env_vars() {
+    // Simulates the gh-missing / unauthenticated path: gh_cli_token is None
+    // (as try_gh_auth_token() returns when gh is absent or unauthenticated)
+    // and no env vars are set. This is the warning path.
+    let token = resolve_github_token_from_sources(None, None, None, None);
+    assert_eq!(token, None);
+}
+
+#[test]
+fn resolve_github_token_ignores_empty_string_source() {
+    // An empty env var (or empty gh output) must not win over a real token.
+    let token = resolve_github_token_from_sources(Some(""), None, None, Some("gh-cli-token"));
+    assert_eq!(token.as_deref(), Some("gh-cli-token"));
+}
+
+#[test]
+fn resolve_github_token_ignores_whitespace_only_source() {
+    let token = resolve_github_token_from_sources(Some("   "), None, None, Some("gh-cli-token"));
+    assert_eq!(token.as_deref(), Some("gh-cli-token"));
+}
+
+#[test]
+fn resolve_github_token_trims_whitespace_from_token() {
+    // gh auth token output may include a trailing newline.
+    let token = resolve_github_token_from_sources(None, None, None, Some("  gh-cli-token\n  "));
+    assert_eq!(token.as_deref(), Some("gh-cli-token"));
+}
+
+// --- github_auth_unavailable_warning ---
+
+#[test]
+fn github_auth_unavailable_warning_names_all_env_vars_and_gh_cli() {
+    let msg = github_auth_unavailable_warning("example/repo");
+    assert!(msg.contains("CHECKS_GITHUB_TOKEN"), "must mention CHECKS_GITHUB_TOKEN");
+    assert!(msg.contains("GH_TOKEN"), "must mention GH_TOKEN");
+    assert!(msg.contains("GITHUB_TOKEN"), "must mention GITHUB_TOKEN");
+    assert!(msg.contains("gh auth token"), "must mention gh auth token");
+    assert!(msg.contains("gh auth login"), "must tell user how to fix it");
+    assert!(msg.contains("example/repo"), "must name the repository");
 }

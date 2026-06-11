@@ -101,7 +101,27 @@ The checks CLI resolves PR description context using a layered fallback:
 
 All network-based resolution (levels 3–4) is best-effort: if no GitHub token is available or no open PR is found, checkleft falls back to commit-description directives only — no error is raised.
 
-GitHub auth is read from `CHECKS_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` (checked in that order). `CHECKS_REPOSITORY` overrides the repository slug if needed; otherwise it is inferred from the git remote.
+### GitHub auth resolution order
+
+checkleft resolves a GitHub token from these sources, in priority order (first non-empty value wins):
+
+1. `CHECKS_GITHUB_TOKEN` env var — highest priority; intended for CI environments that provision explicit tokens.
+2. `GH_TOKEN` env var.
+3. `GITHUB_TOKEN` env var.
+4. **`gh auth token`** — the `gh` CLI, if installed and authenticated. This is the zero-configuration path for developer workstations: once `gh auth login` has been run, checkleft picks up the token automatically with no env configuration needed.
+
+CI environments that set one of the env vars above continue to work unchanged — the env var always wins over `gh`.
+
+**Warning when no auth is available:** if a repository is known (so GitHub API calls would be attempted) and no token is found from any source, checkleft emits a warning to stderr and continues with commit-description directives only:
+
+```
+warning: checkleft: PR-description bypass directives may be unavailable for <repo>:
+no GitHub token found (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars
+and `gh auth token`). Run `gh auth login` or set a token env var to enable
+authenticated GitHub API access.
+```
+
+This is never a hard failure. `CHECKS_REPOSITORY` overrides the repository slug if needed; otherwise it is inferred from the git remote.
 
 ## Policy guidance
 
