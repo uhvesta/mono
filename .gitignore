@@ -26,6 +26,9 @@ node_modules/
 .boss/
 .bk.yaml
 
+# checkleft AOT compilation cache written to repo root when running checkleft locally.
+.checkleft-cwasm/
+
 # repobin installs tool symlinks into bin/ at the workspace root; these are
 # local artifacts, not source files.
 /bin/
