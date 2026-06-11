@@ -11,9 +11,8 @@ use crate::check::{Check, CheckRegistry, ConfiguredCheck};
 use crate::checks::register_builtin_checks;
 use crate::config::ConfigResolver;
 use crate::external::{
-    BundledExternalCheckPackageProvider, DefaultExternalCheckExecutor, ExternalCheckComponentPackage,
-    ExternalCheckExecutor, ExternalCheckImplementationRef, ExternalCheckPackage, ExternalCheckPackageImplementation,
-    ExternalCheckPackageProvider, parse_external_check_package_manifest,
+    ExternalCheckComponentPackage, ExternalCheckExecutor, ExternalCheckImplementationRef, ExternalCheckPackage,
+    ExternalCheckPackageImplementation, ExternalCheckPackageProvider, parse_external_check_package_manifest,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
@@ -690,124 +689,6 @@ check = "capture"
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].check_id, "spelling");
-}
-
-/// Build a temp repo whose `tools/boss/CHECKS.toml` configures the builder check with a
-/// qualified exclusion for `engine/src/app.rs::ServerState`, and writes `app.rs` with the
-/// given body. `settings` is inserted verbatim above the `[[checks]]` block.
-fn boss_repo_with_app(settings: &str, app_source: &str) -> tempfile::TempDir {
-    let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("tools/boss/engine/src")).expect("create dirs");
-    fs::write(
-        temp.path().join("tools/boss/CHECKS.toml"),
-        format!(
-            r#"{settings}
-[[checks]]
-id = "rust/giant-structs"
-
-[checks.config]
-exclude_structs = ["engine/src/app.rs::ServerState"]
-"#
-        ),
-    )
-    .expect("write config");
-    fs::write(temp.path().join("tools/boss/engine/src/app.rs"), app_source).expect("write app");
-    temp
-}
-
-const SERVER_STATE_WITH_BUILDER: &str = r#"
-#[derive(bon::Builder)]
-pub struct ServerState {
-    a: String, b: String, c: String, d: String, e: String, f: String,
-}
-"#;
-
-const SERVER_STATE_WITHOUT_BUILDER: &str = r#"
-pub struct ServerState {
-    a: String, b: String, c: String, d: String, e: String, f: String,
-}
-"#;
-
-async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
-    let mut registry = CheckRegistry::new();
-    register_builtin_checks(&mut registry).expect("register built-ins");
-    // Use the full external stack so bundled component checks resolve and execute.
-    let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
-    let runner = Runner::with_external(
-        Arc::new(registry),
-        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
-        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
-        Arc::new(BundledExternalCheckPackageProvider),
-        Arc::new(executor),
-    );
-    runner
-        .run_changeset(&ChangeSet::new(vec![ChangedFile {
-            path: Path::new("tools/boss/engine/src/app.rs").to_path_buf(),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        }]))
-        .await
-        .expect("run checks")
-}
-
-fn stale_findings(results: &[CheckResult]) -> Vec<&Finding> {
-    results
-        .iter()
-        .flat_map(|result| result.findings.iter())
-        .filter(|finding| finding.message.contains("is no longer needed"))
-        .collect()
-}
-
-#[tokio::test]
-async fn stale_exclusion_surfaced_on_checks_toml_when_struct_gains_builder() {
-    let temp = boss_repo_with_app("", SERVER_STATE_WITH_BUILDER);
-    let results = run_builder_audit(&temp).await;
-
-    let stale = stale_findings(&results);
-    assert_eq!(stale.len(), 1, "expected one stale finding, got {results:?}");
-    let finding = stale[0];
-    // Default severity is a warning.
-    assert_eq!(finding.severity, Severity::Warning);
-    // Reported on the CHECKS.toml entry, not on the changed source file.
-    let location = finding.location.as_ref().expect("finding has a location");
-    assert_eq!(location.path, Path::new("tools/boss/CHECKS.toml").to_path_buf());
-    assert_eq!(location.line, Some(6), "should point at the exclude_structs entry line");
-    assert!(finding.message.contains("engine/src/app.rs::ServerState"));
-}
-
-#[tokio::test]
-async fn load_bearing_exclusion_is_not_flagged() {
-    let temp = boss_repo_with_app("", SERVER_STATE_WITHOUT_BUILDER);
-    let results = run_builder_audit(&temp).await;
-    assert!(
-        stale_findings(&results).is_empty(),
-        "load-bearing exclusion must stay quiet, got {results:?}"
-    );
-}
-
-#[tokio::test]
-async fn stale_exclusion_severity_setting_upgrades_to_error() {
-    let temp = boss_repo_with_app(
-        "[settings]\nstale_exclusion_severity = \"error\"\n",
-        SERVER_STATE_WITH_BUILDER,
-    );
-    let results = run_builder_audit(&temp).await;
-    let stale = stale_findings(&results);
-    assert_eq!(stale.len(), 1, "expected one stale finding, got {results:?}");
-    assert_eq!(stale[0].severity, Severity::Error);
-}
-
-#[tokio::test]
-async fn stale_exclusion_severity_off_disables_audit() {
-    let temp = boss_repo_with_app(
-        "[settings]\nstale_exclusion_severity = \"off\"\n",
-        SERVER_STATE_WITH_BUILDER,
-    );
-    let results = run_builder_audit(&temp).await;
-    assert!(
-        stale_findings(&results).is_empty(),
-        "audit must be disabled when set to off, got {results:?}"
-    );
 }
 
 include!("tests_policy.rs");

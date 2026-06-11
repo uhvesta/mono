@@ -10,7 +10,6 @@ mod ifchange_thenchange;
 mod repo_visibility;
 mod rust_giant_struct_common;
 mod rust_giant_struct_instantiation_use_builder;
-mod rust_giant_structs_use_builder;
 mod rust_test_rule_coverage;
 mod todo_expiry;
 mod typo;
@@ -36,7 +35,6 @@ pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(ifchange_thenchange::IfChangeThenChangeCheck)?;
     registry.register(repo_visibility::RepoVisibilityCheck)?;
     registry.register(rust_giant_struct_instantiation_use_builder::RustGiantStructInstantiationUseBuilderCheck)?;
-    registry.register(rust_giant_structs_use_builder::RustGiantStructsUseBuilderCheck)?;
     registry.register(rust_test_rule_coverage::RustTestRuleCoverageCheck)?;
     registry.register(todo_expiry::TodoExpiryCheck)?;
     registry.register(typo::TypoCheck)?;
