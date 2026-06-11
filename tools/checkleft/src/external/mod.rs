@@ -71,15 +71,21 @@ impl ExternalCheckImplementationRef {
     }
 }
 
-/// A bundled definition is named by a single path segment (the directory under
-/// `tools/checkleft/checks/`). Reject separators / traversal so a `bundled:` ref
-/// can never escape the embedded tree.
+/// A bundled definition is named as `<name>` or `<namespace>/<name>`. Reject
+/// multi-slash paths, backslashes, and dot-traversal so a `bundled:` ref can
+/// never escape the embedded tree.
 pub(crate) fn validate_bundled_name(name: &str) -> Result<()> {
-    if name.contains('/') || name.contains('\\') {
-        bail!("bundled implementation name `{name}` must be a single segment, not a path");
+    if name.contains('\\') {
+        bail!("bundled implementation name `{name}` must not contain backslashes");
     }
-    if name == "." || name == ".." {
-        bail!("bundled implementation name `{name}` is not a valid definition name");
+    let segments: Vec<&str> = name.split('/').collect();
+    if segments.len() > 2 {
+        bail!("bundled implementation name `{name}` must be `<name>` or `<namespace>/<name>`, not a deeper path");
+    }
+    for seg in &segments {
+        if seg.is_empty() || *seg == "." || *seg == ".." {
+            bail!("bundled implementation name `{name}` contains an invalid segment");
+        }
     }
     Ok(())
 }

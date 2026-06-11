@@ -266,8 +266,8 @@ async fn allows_bundled_implementation_from_external_checks_file() {
         &external_path,
         r#"
 checks:
-  - id: buildifier
-    implementation: bundled:buildifier
+  - id: format/bazel
+    implementation: bundled:format/bazel
 "#,
     )
     .expect("write external config");
@@ -285,18 +285,18 @@ checks:
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolution must succeed");
 
-    let check = checks.get("buildifier").expect("check exists");
+    let check = checks.get("format/bazel").expect("check exists");
     assert_eq!(
         check.implementation,
         Some(crate::external::ExternalCheckImplementationRef::Bundled(
-            "buildifier".to_owned()
+            "format/bazel".to_owned()
         ))
     );
 }
 
 #[tokio::test]
 async fn bare_id_in_external_config_resolves_to_bundled() {
-    // A bare `id: buildifier` in an external config resolves to the bundled def
+    // A bare `id: format/bazel` in an external config resolves to the bundled def
     // automatically — no `implementation:` line needed.
     let temp = tempdir().expect("create temp dir");
     let external_path = temp.path().join("shared/CHECKS.yaml");
@@ -305,7 +305,7 @@ async fn bare_id_in_external_config_resolves_to_bundled() {
         &external_path,
         r#"
 checks:
-  - id: buildifier
+  - id: format/bazel
 "#,
     )
     .expect("write external config");
@@ -323,11 +323,11 @@ checks:
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolution must succeed");
 
-    let check = checks.get("buildifier").expect("check exists");
+    let check = checks.get("format/bazel").expect("check exists");
     assert_eq!(
         check.implementation,
         Some(crate::external::ExternalCheckImplementationRef::Bundled(
-            "buildifier".to_owned()
+            "format/bazel".to_owned()
         ))
     );
 }

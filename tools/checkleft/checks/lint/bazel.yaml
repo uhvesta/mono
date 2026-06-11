@@ -1,4 +1,4 @@
-id: buildifier
+id: lint/bazel
 mode: declarative
 runtime: declarative-v1
 api_version: v1
@@ -17,26 +17,6 @@ needs:
       bazel: "@buildifier_prebuilt//:buildifier"
 
 invocations:
-  - id: format
-    run: buildifier
-    mode: batch
-    args:
-      - "--mode=check"
-      - "--format=json"
-      - "{{files}}"
-    exit:
-      "0": findings
-      default: error
-    transform:
-      kind: json
-      select: ".files[] | select(.formatted == false)"
-      finding:
-        path: "{{item.filename}}"
-        message: "file needs buildifier formatting"
-        severity: warning
-        remediations:
-          - "Run `buildifier {{item.filename}}` to auto-format."
-
   - id: lint
     run: buildifier
     mode: per_file

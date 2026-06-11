@@ -132,7 +132,7 @@ exclusions, or `off` to disable the audit:
 stale_exclusion_severity = "error"
 
 [[checks]]
-id = "rust-giant-structs-use-builder"
+id = "rust/giant-structs"
 
 [checks.policy]
 # Per-check override of the global default.

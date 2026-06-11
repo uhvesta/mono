@@ -1,4 +1,4 @@
-id: rustfmt
+id: format/rust
 mode: declarative
 runtime: declarative-v1
 api_version: v1

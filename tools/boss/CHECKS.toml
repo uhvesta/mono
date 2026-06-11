@@ -1,5 +1,5 @@
 [[checks]]
-id = "rust-giant-structs-use-builder"
+id = "rust/giant-structs"
 
 [checks.config]
 builder = "bon"

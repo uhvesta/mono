@@ -104,15 +104,15 @@ First-party checks whose definitions ship inside the `checkleft` binary resolve 
 
 ```yaml
 checks:
-  - id: buildifier
+  - id: format/bazel
 ```
 
 With a custom instance ID:
 
 ```yaml
 checks:
-  - id: my-buildifier
-    check: buildifier
+  - id: my-bazel-format
+    check: format/bazel
 ```
 
 ## Pattern: Always-head definitions from disk (e.g. mono)
@@ -126,7 +126,7 @@ check_definitions:
   allow_override_bundled: true
 
 checks:
-  - id: buildifier   # resolves to tools/checkleft/checks/buildifier/check.yaml
+  - id: format/bazel   # resolves to tools/checkleft/checks/format/bazel.yaml
 ```
 
 ## Pattern: Multiple instances of one implementation

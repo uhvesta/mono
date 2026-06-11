@@ -184,6 +184,19 @@ mod tests {
     }
 
     #[test]
+    fn maps_namespaced_check_id_to_expected_bypass_name() {
+        // Slashes and hyphens both become underscores; result is uppercased.
+        assert_eq!(bypass_name_for_check_id("format/rust"), "BYPASS_FORMAT_RUST");
+        assert_eq!(bypass_name_for_check_id("format/bazel"), "BYPASS_FORMAT_BAZEL");
+        assert_eq!(bypass_name_for_check_id("lint/rust"), "BYPASS_LINT_RUST");
+        assert_eq!(bypass_name_for_check_id("lint/bazel"), "BYPASS_LINT_BAZEL");
+        assert_eq!(
+            bypass_name_for_check_id("rust/giant-structs"),
+            "BYPASS_RUST_GIANT_STRUCTS"
+        );
+    }
+
+    #[test]
     fn pr_description_overrides_commit_description() {
         let parsed = parse_bypass_directives_from_descriptions(
             Some("BYPASS_API_BREAKING_SURFACE=From commit"),

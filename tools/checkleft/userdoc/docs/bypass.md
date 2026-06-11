@@ -41,6 +41,16 @@ Use a single-line directive in commit or PR description:
 BYPASS_<CHECK_NAME>=<specific legitimate reason>
 ```
 
+The bypass name is derived from the check id by uppercasing and replacing all non-alphanumeric characters (slashes, hyphens) with underscores. For namespaced check ids:
+
+| Check id | Bypass name |
+|---|---|
+| `format/rust` | `BYPASS_FORMAT_RUST` |
+| `format/bazel` | `BYPASS_FORMAT_BAZEL` |
+| `lint/rust` | `BYPASS_LINT_RUST` |
+| `lint/bazel` | `BYPASS_LINT_BAZEL` |
+| `rust/giant-structs` | `BYPASS_RUST_GIANT_STRUCTS` |
+
 For `api-breaking-surface`:
 
 ```text

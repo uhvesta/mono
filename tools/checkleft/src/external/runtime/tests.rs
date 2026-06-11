@@ -707,7 +707,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
     let provider = BundledExternalCheckPackageProvider;
     let package = provider
         .resolve(&ExternalCheckImplementationRef::Bundled(
-            "rust-giant-structs-use-builder".to_owned(),
+            "rust/giant-structs".to_owned(),
         ))
         .expect("resolve")
         .expect("bundled package must exist");
@@ -718,7 +718,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
         .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
         .expect("execute");
 
-    assert_eq!(result.check_id, "rust-giant-structs-use-builder");
+    assert_eq!(result.check_id, "rust/giant-structs");
     assert_eq!(result.findings.len(), 1, "expected exactly one finding for GiantStruct");
 
     let finding = &result.findings[0];
@@ -766,7 +766,7 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
     let provider = BundledExternalCheckPackageProvider;
     let package = provider
         .resolve(&ExternalCheckImplementationRef::Bundled(
-            "rust-giant-structs-use-builder".to_owned(),
+            "rust/giant-structs".to_owned(),
         ))
         .expect("resolve")
         .expect("bundled package must exist");
@@ -818,7 +818,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
     let provider = BundledExternalCheckPackageProvider;
     let package = provider
         .resolve(&ExternalCheckImplementationRef::Bundled(
-            "rust-giant-structs-use-builder".to_owned(),
+            "rust/giant-structs".to_owned(),
         ))
         .expect("resolve")
         .expect("bundled package must exist");
@@ -828,7 +828,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
         .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
         .expect("check must complete without fuel exhaustion or timeout on a large file");
 
-    assert_eq!(result.check_id, "rust-giant-structs-use-builder");
+    assert_eq!(result.check_id, "rust/giant-structs");
     assert_eq!(
         result.findings.len(),
         1,

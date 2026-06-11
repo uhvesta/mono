@@ -703,7 +703,7 @@ fn boss_repo_with_app(settings: &str, app_source: &str) -> tempfile::TempDir {
         format!(
             r#"{settings}
 [[checks]]
-id = "rust-giant-structs-use-builder"
+id = "rust/giant-structs"
 
 [checks.config]
 exclude_structs = ["engine/src/app.rs::ServerState"]

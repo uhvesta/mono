@@ -47,9 +47,11 @@ checks:
       severity: error
       allow_bypass: true
 
-  - id: buildifier
+  - id: format/bazel
     policy:
       severity: error
+
+  - id: lint/bazel
 
   - id: rust-test-rule-coverage
 
@@ -57,8 +59,8 @@ checks:
 
   - id: repo-visibility
 
-  - id: rustfmt
+  - id: format/rust
     policy:
       severity: error
 
-  - id: clippy
+  - id: lint/rust

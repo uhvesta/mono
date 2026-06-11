@@ -12,7 +12,7 @@ rust_library(
     # Guests compile for wasm32-wasip2; the SDK must also build for the host
     # target so that unit tests (rust_test below) work without a wasm toolchain.
     visibility = [
-        "//tools/checkleft/checks/rust-giant-structs-use-builder:__pkg__",
+        "//tools/checkleft/checks/rust/giant-structs:__pkg__",
         "//tools/checkleft/sdk/examples:__subpackages__",
     ],
     deps = all_crate_deps(normal = True),

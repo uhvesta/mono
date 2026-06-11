@@ -8,7 +8,7 @@
 //!
 //! ## Adding a bundled declarative definition
 //!
-//! 1. Add the manifest at `tools/checkleft/checks/<name>/check.yaml`.
+//! 1. Add the manifest at `tools/checkleft/checks/<namespace>/<name>.yaml`.
 //! 2. Add a `BundledCheckDef::declarative` entry to [`BUNDLED_CHECK_DEFS`] below.
 //! 3. Add the file to `checkleft_lib`'s `compile_data` in `BUILD.bazel` so the
 //!    bazel build can read it at compile time.
@@ -69,31 +69,39 @@ enum BundledCheckDefKind {
 /// The embedded first-party definitions. To add one, see the module docs.
 static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
     BundledCheckDef {
-        check_names: &["buildifier"],
+        check_names: &["format/bazel"],
         kind: BundledCheckDefKind::Declarative {
             extension: "yaml",
-            contents: include_str!("../../checks/buildifier/check.yaml"),
+            contents: include_str!("../../checks/format/bazel.yaml"),
         },
         limits: None,
     },
     BundledCheckDef {
-        check_names: &["rustfmt"],
+        check_names: &["format/rust"],
         kind: BundledCheckDefKind::Declarative {
             extension: "yaml",
-            contents: include_str!("../../checks/rustfmt/check.yaml"),
+            contents: include_str!("../../checks/format/rust.yaml"),
         },
         limits: None,
     },
     BundledCheckDef {
-        check_names: &["clippy"],
+        check_names: &["lint/rust"],
         kind: BundledCheckDefKind::Declarative {
             extension: "yaml",
-            contents: include_str!("../../checks/clippy/check.yaml"),
+            contents: include_str!("../../checks/lint/rust.yaml"),
         },
         limits: None,
     },
     BundledCheckDef {
-        check_names: &["rust-giant-structs-use-builder"],
+        check_names: &["lint/bazel"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/lint/bazel.yaml"),
+        },
+        limits: None,
+    },
+    BundledCheckDef {
+        check_names: &["rust/giant-structs"],
         kind: BundledCheckDefKind::Component {
             // Bytes come from the checkleft_wasm_bundle micro-library so the
             // generated wasm artifact lives in that target's compile_data, not
@@ -186,13 +194,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_bundled_buildifier_definition() {
+    fn resolves_bundled_format_bazel_definition() {
         let provider = BundledExternalCheckPackageProvider;
         let package = provider
-            .resolve(&ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+            .resolve(&ExternalCheckImplementationRef::Bundled("format/bazel".to_owned()))
             .expect("resolve")
             .expect("package");
-        assert_eq!(package.id, "buildifier");
+        assert_eq!(package.id, "format/bazel");
     }
 
     #[test]
@@ -315,7 +323,7 @@ mod tests {
         let provider = BundledExternalCheckPackageProvider;
         let pkg = provider
             .resolve(&ExternalCheckImplementationRef::Bundled(
-                "rust-giant-structs-use-builder".to_owned(),
+                "rust/giant-structs".to_owned(),
             ))
             .expect("resolve")
             .expect("package must exist");

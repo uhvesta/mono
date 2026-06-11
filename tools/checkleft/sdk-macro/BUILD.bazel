@@ -9,7 +9,7 @@ rust_proc_macro(
     crate_name = "checkleft_check_sdk_macro",
     edition = "2024",
     visibility = [
-        "//tools/checkleft/checks/rust-giant-structs-use-builder:__pkg__",
+        "//tools/checkleft/checks/rust/giant-structs:__pkg__",
         "//tools/checkleft/sdk:__pkg__",
         "//tools/checkleft/sdk/examples/trivial-check:__pkg__",
     ],

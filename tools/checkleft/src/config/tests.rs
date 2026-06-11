@@ -21,7 +21,7 @@ fn stale_exclusion_severity_defaults_to_warn_and_inherits() {
 stale_exclusion_severity = "error"
 
 [[checks]]
-id = "rust-giant-structs-use-builder"
+id = "rust/giant-structs"
 "#,
     )
     .expect("write config");
@@ -37,7 +37,7 @@ id = "rust-giant-structs-use-builder"
     let bare = tempdir().expect("create temp dir");
     fs::write(
         bare.path().join("CHECKS.toml"),
-        "[[checks]]\nid = \"rust-giant-structs-use-builder\"\n",
+        "[[checks]]\nid = \"rust/giant-structs\"\n",
     )
     .expect("write config");
     let bare_resolver = ConfigResolver::new(bare.path()).expect("create resolver");
@@ -57,7 +57,7 @@ fn per_check_stale_exclusion_severity_override_is_parsed() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "rust-giant-structs-use-builder"
+id = "rust/giant-structs"
 
 [checks.policy]
 stale_exclusion_severity = "off"
@@ -67,7 +67,7 @@ stale_exclusion_severity = "off"
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
     let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
-    let check = checks.get("rust-giant-structs-use-builder").expect("check present");
+    let check = checks.get("rust/giant-structs").expect("check present");
     assert_eq!(check.policy.stale_exclusion_mode, Some(StaleExclusionMode::Off));
 }
 
@@ -81,7 +81,7 @@ fn invalid_stale_exclusion_severity_produces_diagnostic() {
 stale_exclusion_severity = "loud"
 
 [[checks]]
-id = "rust-giant-structs-use-builder"
+id = "rust/giant-structs"
 "#,
     )
     .expect("write config");
@@ -339,7 +339,7 @@ fn bare_id_matching_bundled_name_resolves_to_bundled() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "buildifier"
+id = "format/bazel"
 "#,
     )
     .expect("write root config");
@@ -349,11 +349,39 @@ id = "buildifier"
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolve checks");
 
-    let check = checks.get("buildifier").expect("check exists");
-    assert_eq!(check.check, "buildifier");
+    let check = checks.get("format/bazel").expect("check exists");
+    assert_eq!(check.check, "format/bazel");
     assert_eq!(
         check.implementation,
-        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+        Some(ExternalCheckImplementationRef::Bundled("format/bazel".to_owned()))
+    );
+}
+
+#[test]
+fn namespaced_id_resolves_to_bundled() {
+    // A namespaced id (format/bazel, lint/rust, format/rust, etc.) resolves to its bundled def
+    // — the id grammar allows lowercase segments separated by single slashes.
+    let temp = tempdir().expect("create temp dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "lint/rust"
+"#,
+    )
+    .expect("write root config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    let check = checks.get("lint/rust").expect("check exists");
+    assert_eq!(check.check, "lint/rust");
+    assert_eq!(
+        check.implementation,
+        Some(ExternalCheckImplementationRef::Bundled("lint/rust".to_owned()))
     );
 }
 
@@ -366,8 +394,8 @@ fn custom_id_with_bundled_check_name_resolves_to_bundled() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "my-buildifier"
-check = "buildifier"
+id = "my-format-bazel"
+check = "format/bazel"
 "#,
     )
     .expect("write root config");
@@ -377,11 +405,11 @@ check = "buildifier"
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolve checks");
 
-    let check = checks.get("my-buildifier").expect("check exists");
-    assert_eq!(check.check, "buildifier");
+    let check = checks.get("my-format-bazel").expect("check exists");
+    assert_eq!(check.check, "format/bazel");
     assert_eq!(
         check.implementation,
-        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+        Some(ExternalCheckImplementationRef::Bundled("format/bazel".to_owned()))
     );
 }
 
@@ -446,10 +474,10 @@ id = "my-check"
 #[test]
 fn allow_override_bundled_makes_exec_path_win_over_bundled() {
     let temp = tempdir().expect("create temp dir");
-    // Lay down a local copy of the bundled buildifier def.
-    let defs_dir = temp.path().join("tools/checkleft/checks/buildifier");
+    // Lay down a local copy of the bundled format/bazel def using the flat layout.
+    let defs_dir = temp.path().join("tools/checkleft/checks/format");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(defs_dir.join("check.yaml"), "id: buildifier\n").expect("write def");
+    fs::write(defs_dir.join("bazel.yaml"), "id: format/bazel\n").expect("write def");
 
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -459,7 +487,7 @@ exec_paths = ["tools/checkleft/checks"]
 allow_override_bundled = true
 
 [[checks]]
-id = "buildifier"
+id = "format/bazel"
 "#,
     )
     .expect("write root config");
@@ -469,12 +497,12 @@ id = "buildifier"
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolve checks");
 
-    let check = checks.get("buildifier").expect("check exists");
+    let check = checks.get("format/bazel").expect("check exists");
     // The exec-path copy wins over the bundled def.
     assert_eq!(
         check.implementation,
         Some(ExternalCheckImplementationRef::File(
-            Path::new("tools/checkleft/checks/buildifier/check.yaml").to_path_buf()
+            Path::new("tools/checkleft/checks/format/bazel.yaml").to_path_buf()
         ))
     );
 }
@@ -482,10 +510,10 @@ id = "buildifier"
 #[test]
 fn bundled_wins_over_exec_path_by_default() {
     let temp = tempdir().expect("create temp dir");
-    // Lay down a local copy of the bundled buildifier def.
-    let defs_dir = temp.path().join("checks/buildifier");
+    // Lay down a local copy of the bundled format/bazel def using the flat layout.
+    let defs_dir = temp.path().join("checks/format");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(defs_dir.join("check.yaml"), "id: buildifier\n").expect("write def");
+    fs::write(defs_dir.join("bazel.yaml"), "id: format/bazel\n").expect("write def");
 
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -494,7 +522,7 @@ fn bundled_wins_over_exec_path_by_default() {
 exec_paths = ["checks"]
 
 [[checks]]
-id = "buildifier"
+id = "format/bazel"
 "#,
     )
     .expect("write root config");
@@ -504,11 +532,11 @@ id = "buildifier"
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolve checks");
 
-    let check = checks.get("buildifier").expect("check exists");
+    let check = checks.get("format/bazel").expect("check exists");
     // Bundled wins (allow_override_bundled defaults to false).
     assert_eq!(
         check.implementation,
-        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+        Some(ExternalCheckImplementationRef::Bundled("format/bazel".to_owned()))
     );
 }
 
@@ -561,9 +589,9 @@ fn explicit_bundled_ref_still_works() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "my-buildifier"
-check = "buildifier"
-implementation = "bundled:buildifier"
+id = "my-format-bazel"
+check = "format/bazel"
+implementation = "bundled:format/bazel"
 "#,
     )
     .expect("write root config");
@@ -573,10 +601,10 @@ implementation = "bundled:buildifier"
         .resolve_for_file(Path::new("BUILD.bazel"))
         .expect("resolve checks");
 
-    let check = checks.get("my-buildifier").expect("check exists");
+    let check = checks.get("my-format-bazel").expect("check exists");
     assert_eq!(
         check.implementation,
-        Some(ExternalCheckImplementationRef::Bundled("buildifier".to_owned()))
+        Some(ExternalCheckImplementationRef::Bundled("format/bazel".to_owned()))
     );
 }
 
@@ -1027,13 +1055,13 @@ id = "my-component-check"
 
 #[test]
 fn exec_paths_yaml_wins_over_toml_when_both_present() {
-    // check.yaml takes precedence over check.toml in the same directory.
+    // Flat .yaml takes precedence over flat .toml in the same exec_path.
     let temp = tempdir().expect("create temp dir");
-    let defs_dir = temp.path().join("checks/dual-format-check");
+    let defs_dir = temp.path().join("checks");
     fs::create_dir_all(&defs_dir).expect("create def dir");
-    fs::write(defs_dir.join("check.yaml"), "id: dual-format-check\n").expect("write yaml def");
+    fs::write(defs_dir.join("dual-format-check.yaml"), "id: dual-format-check\n").expect("write yaml def");
     fs::write(
-        defs_dir.join("check.toml"),
+        defs_dir.join("dual-format-check.toml"),
         r#"
 id = "dual-format-check"
 mode = "component"
@@ -1063,11 +1091,11 @@ id = "dual-format-check"
         .expect("resolve checks");
 
     let check = checks.get("dual-format-check").expect("check exists");
-    // yaml wins (checked first in find_in_exec_paths)
+    // flat .yaml wins (checked first in find_in_exec_paths)
     assert_eq!(
         check.implementation,
         Some(ExternalCheckImplementationRef::File(
-            Path::new("checks/dual-format-check/check.yaml").to_path_buf()
+            Path::new("checks/dual-format-check.yaml").to_path_buf()
         ))
     );
 }

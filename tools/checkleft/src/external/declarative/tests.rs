@@ -33,10 +33,10 @@ use super::{
     ToolInvocation,
 };
 
-// The committed manifest — the single source of truth for the buildifier
-// declarative check definition. Tests source from this file so the test and the
-// shipped definition cannot drift.
-const BUILDIFIER_MANIFEST: &str = include_str!("../../../checks/buildifier/check.yaml");
+// The committed manifests — source of truth for the declarative bazel checks.
+// Tests source from these files so the tests and shipped definitions cannot drift.
+const BUILDIFIER_MANIFEST: &str = include_str!("../../../checks/format/bazel.yaml");
+const LINT_BAZEL_MANIFEST: &str = include_str!("../../../checks/lint/bazel.yaml");
 
 // Real buildifier 7.3.1 `--mode=check --format=json` output for an unformatted file.
 const REAL_FORMAT_UNFORMATTED: &[u8] =
@@ -55,8 +55,18 @@ const REAL_LINT_CLEAN: &[u8] =
     br#"{"success":true,"files":[{"filename":"a/b/clean.bzl","formatted":true,"valid":true,"warnings":[]}]}"#;
 
 fn parse_package() -> ExternalCheckDeclarativePackage {
-    let package = parse_declarative_check_manifest(BUILDIFIER_MANIFEST).expect("spike manifest must parse");
-    assert_eq!(package.id, "buildifier");
+    let package = parse_declarative_check_manifest(BUILDIFIER_MANIFEST).expect("format/bazel manifest must parse");
+    assert_eq!(package.id, "format/bazel");
+    assert_eq!(package.runtime, "declarative-v1");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
+        other => panic!("expected declarative implementation, got {other:?}"),
+    }
+}
+
+fn parse_lint_bazel_package() -> ExternalCheckDeclarativePackage {
+    let package = parse_declarative_check_manifest(LINT_BAZEL_MANIFEST).expect("lint/bazel manifest must parse");
+    assert_eq!(package.id, "lint/bazel");
     assert_eq!(package.runtime, "declarative-v1");
     match package.implementation {
         ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
@@ -75,18 +85,27 @@ fn tool(invocation: &Invocation) -> &ToolInvocation {
 // ── manifest parsing ───────────────────────────────────────────────────────────
 
 #[test]
-fn manifest_parses_into_two_invocations() {
+fn format_bazel_manifest_parses_single_format_invocation() {
     let package = parse_package();
-    assert_eq!(package.invocations.len(), 2);
+    assert_eq!(package.invocations.len(), 1);
     assert_eq!(package.invocations[0].id, "format");
     assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::Batch);
-    assert_eq!(package.invocations[1].id, "lint");
-    assert_eq!(tool(&package.invocations[1]).mode, InvocationMode::PerFile);
     assert!(package.needs.contains_key("buildifier"));
     // exit `0 -> findings`, everything else -> error.
     assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Findings);
     assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Error);
     assert_eq!(package.invocations[0].exit.classify(None), ExitOutcome::Error);
+}
+
+#[test]
+fn lint_bazel_manifest_parses_single_lint_invocation() {
+    let package = parse_lint_bazel_package();
+    assert_eq!(package.invocations.len(), 1);
+    assert_eq!(package.invocations[0].id, "lint");
+    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::PerFile);
+    assert!(package.needs.contains_key("buildifier"));
+    assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Findings);
+    assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Error);
 }
 
 #[test]
@@ -346,8 +365,8 @@ fn declarative_format_findings(stdout: &[u8]) -> Vec<Finding> {
 }
 
 fn declarative_lint_findings(stdout: &[u8], input_file: &str) -> Vec<Finding> {
-    let package = parse_package();
-    package.invocations[1]
+    let package = parse_lint_bazel_package();
+    package.invocations[0]
         .transform
         .apply(stdout, Some(0), Some(input_file))
         .expect("lint transform")
@@ -576,11 +595,11 @@ fn jaq_deps_compile_and_evaluate() {
 
 // ── rustfmt declarative check ──────────────────────────────────────────────────
 
-const RUSTFMT_MANIFEST: &str = include_str!("../../../checks/rustfmt/check.yaml");
+const RUSTFMT_MANIFEST: &str = include_str!("../../../checks/format/rust.yaml");
 
 fn parse_rustfmt_package() -> ExternalCheckDeclarativePackage {
-    let package = parse_declarative_check_manifest(RUSTFMT_MANIFEST).expect("rustfmt manifest must parse");
-    assert_eq!(package.id, "rustfmt");
+    let package = parse_declarative_check_manifest(RUSTFMT_MANIFEST).expect("format/rust manifest must parse");
+    assert_eq!(package.id, "format/rust");
     match package.implementation {
         ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
         other => panic!("expected declarative implementation, got {other:?}"),
@@ -1045,11 +1064,11 @@ fn linelist_remediations_substitute_input_file() {
 
 // ── bazel_aspect invocation kind ────────────────────────────────────────────────
 
-const CLIPPY_MANIFEST: &str = include_str!("../../../checks/clippy/check.yaml");
+const CLIPPY_MANIFEST: &str = include_str!("../../../checks/lint/rust.yaml");
 
 fn parse_clippy_package() -> ExternalCheckDeclarativePackage {
-    let package = parse_declarative_check_manifest(CLIPPY_MANIFEST).expect("clippy manifest must parse");
-    assert_eq!(package.id, "clippy");
+    let package = parse_declarative_check_manifest(CLIPPY_MANIFEST).expect("lint/rust manifest must parse");
+    assert_eq!(package.id, "lint/rust");
     match package.implementation {
         ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
         other => panic!("expected declarative implementation, got {other:?}"),

@@ -2,7 +2,7 @@
 //! (default 5, meaning 6+) that do not carry the required builder derive.
 //!
 //! This is the Component Model wasm port of the built-in
-//! `rust-giant-structs-use-builder` check. It is authored on the guest SDK so
+//! `rust/giant-structs` check. It is authored on the guest SDK so
 //! it runs inside the checkleft wasm host (T3-T6), reads files via the WASI
 //! filesystem sandbox (T4), and is the acceptance proof for the CM-wasm project
 //! (T10).
@@ -38,7 +38,7 @@ struct Config {
 }
 
 #[check(
-    name = "rust-giant-structs-use-builder",
+    name = "rust/giant-structs",
     description = "flags Rust structs with more than the configured number of named fields that lack a builder derive",
     severity = error
 )]

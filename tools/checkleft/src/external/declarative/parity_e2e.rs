@@ -30,8 +30,11 @@ use crate::external::{
 use crate::input::{ChangeKind, ChangeSet, ChangedFile};
 use crate::output::Finding;
 
-/// The committed manifest — the canonical first-party buildifier definition.
-const MANIFEST: &str = include_str!("../../../checks/buildifier/check.yaml");
+/// The committed format/bazel manifest — handles batch format checking.
+const FORMAT_MANIFEST: &str = include_str!("../../../checks/format/bazel.yaml");
+
+/// The committed lint/bazel manifest — handles per-file lint warnings.
+const LINT_MANIFEST: &str = include_str!("../../../checks/lint/bazel.yaml");
 
 /// Format-clean but carries three lint warnings (module-docstring,
 /// unused-variable, no-effect). Exercises the per-file lint invocation.
@@ -100,9 +103,19 @@ fn run_declarative(
     .findings
 }
 
-fn parse_manifest_package() -> ExternalCheckDeclarativePackage {
-    match parse_declarative_check_manifest(MANIFEST)
-        .expect("committed manifest parses")
+fn parse_format_package() -> ExternalCheckDeclarativePackage {
+    match parse_declarative_check_manifest(FORMAT_MANIFEST)
+        .expect("format/bazel manifest parses")
+        .implementation
+    {
+        ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
+        other => panic!("expected declarative implementation, got {other:?}"),
+    }
+}
+
+fn parse_lint_package() -> ExternalCheckDeclarativePackage {
+    match parse_declarative_check_manifest(LINT_MANIFEST)
+        .expect("lint/bazel manifest parses")
         .implementation
     {
         ExternalCheckPackageImplementation::Declarative(declarative) => declarative,
@@ -128,11 +141,11 @@ fn sorted(mut findings: Vec<Finding>) -> Vec<Finding> {
     findings
 }
 
-/// Full hermetic e2e assertion: materializes both committed fixtures into a temp
-/// workspace, runs the declarative check over the staged buildifier binary, and
-/// asserts expected finding shape (3 lint findings on malformed.bzl + 1 format
-/// finding on unformatted.bzl). If buildifier's defaults change this guards
-/// against a silently-empty result that would pass vacuously.
+/// Full hermetic e2e assertion: runs both the format/bazel and lint/bazel manifests
+/// over both committed fixtures and asserts expected finding shape:
+///   - format/bazel: 1 format finding on unformatted.bzl, 0 on malformed.bzl
+///   - lint/bazel: 3 lint warnings on malformed.bzl, 0 on unformatted.bzl
+/// If buildifier's defaults change this guards against a silently-empty result.
 #[tokio::test]
 async fn declarative_produces_expected_findings_on_committed_fixtures() {
     let Some(buildifier) = buildifier_from_runfiles() else {
@@ -156,48 +169,45 @@ async fn declarative_produces_expected_findings_on_committed_fixtures() {
         },
     ]);
 
-    let package = parse_manifest_package();
-    let findings = sorted(run_declarative(&buildifier, &package, temp.path(), &changeset));
+    let format_package = parse_format_package();
+    let lint_package = parse_lint_package();
+
+    let format_findings = sorted(run_declarative(&buildifier, &format_package, temp.path(), &changeset));
+    let lint_findings = sorted(run_declarative(&buildifier, &lint_package, temp.path(), &changeset));
 
     assert_eq!(
-        findings.len(),
-        4,
-        "expected 4 findings (3 lint on malformed.bzl + 1 format on unformatted.bzl), got {findings:#?}"
+        format_findings.len(),
+        1,
+        "expected 1 format finding on unformatted.bzl, got {format_findings:#?}"
     );
-
-    let format_findings: Vec<_> = findings
-        .iter()
-        .filter(|f| f.location.as_ref().map(|l| l.line.is_none()).unwrap_or(false))
-        .collect();
-    assert_eq!(format_findings.len(), 1, "expected exactly 1 format finding");
     assert!(
         format_findings[0].message.contains("formatting"),
         "format finding message should mention 'formatting': {}",
         format_findings[0].message
     );
 
-    let lint_findings: Vec<_> = findings
-        .iter()
-        .filter(|f| f.location.as_ref().map(|l| l.line.is_some()).unwrap_or(false))
-        .collect();
-    assert_eq!(lint_findings.len(), 3, "expected exactly 3 lint findings");
-    let messages: Vec<&str> = lint_findings.iter().map(|f| f.message.as_str()).collect();
+    assert_eq!(
+        lint_findings.len(),
+        3,
+        "expected 3 lint findings on malformed.bzl, got {lint_findings:#?}"
+    );
+    let lint_messages: Vec<&str> = lint_findings.iter().map(|f| f.message.as_str()).collect();
     assert!(
-        messages.iter().any(|m| m.contains("module-docstring")),
-        "expected a module-docstring warning; got {messages:?}"
+        lint_messages.iter().any(|m| m.contains("module-docstring")),
+        "expected a module-docstring warning; got {lint_messages:?}"
     );
     assert!(
-        messages.iter().any(|m| m.contains("unused-variable")),
-        "expected an unused-variable warning; got {messages:?}"
+        lint_messages.iter().any(|m| m.contains("unused-variable")),
+        "expected an unused-variable warning; got {lint_messages:?}"
     );
     assert!(
-        messages.iter().any(|m| m.contains("no-effect")),
-        "expected a no-effect warning; got {messages:?}"
+        lint_messages.iter().any(|m| m.contains("no-effect")),
+        "expected a no-effect warning; got {lint_messages:?}"
     );
 }
 
-/// Single-file assertion over only the lint fixture — isolates the per-file lint
-/// invocation so a regression there is not masked by the format finding.
+/// Single-file assertion over only the lint fixture — isolates the lint/bazel manifest
+/// so a regression there is not masked by the format finding.
 #[tokio::test]
 async fn declarative_produces_expected_lint_findings_on_malformed_fixture() {
     let Some(buildifier) = buildifier_from_runfiles() else {
@@ -213,7 +223,7 @@ async fn declarative_produces_expected_lint_findings_on_malformed_fixture() {
         old_path: None,
     }]);
 
-    let package = parse_manifest_package();
+    let package = parse_lint_package();
     let findings = run_declarative(&buildifier, &package, temp.path(), &changeset);
 
     assert_eq!(findings.len(), 3, "expected 3 lint findings, got {findings:#?}");

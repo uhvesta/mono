@@ -2,15 +2,16 @@ checks:
   - id: no-usfa-typo
     enabled: false
 
-# ── declarative buildifier check notes ───────────────────────────────────────
+# ── declarative bazel format/lint check notes ────────────────────────────────
 #
-# The buildifier check is now purely declarative (no built-in Rust code).
-# In this repo (mono), the root CHECKS.yaml points at the on-disk definition
-# via check_definitions.exec_paths so changes to checks/buildifier/check.yaml
-# take effect immediately without recompiling the binary.
+# The format/bazel and lint/bazel checks are purely declarative (no built-in
+# Rust code). In this repo (mono), the root CHECKS.yaml points at the on-disk
+# definitions via check_definitions.exec_paths so changes to
+# checks/format/bazel.yaml or checks/lint/bazel.yaml take effect immediately
+# without recompiling the binary.
 #
-# In external repos, `- id: buildifier` with no check_definitions section uses
-# the bundled snapshot compiled into the checkleft binary (zero install).
+# In external repos, `- id: format/bazel` with no check_definitions section
+# uses the bundled snapshot compiled into the checkleft binary (zero install).
 # To use the always-head definition instead, add:
 #
 #   check_definitions:

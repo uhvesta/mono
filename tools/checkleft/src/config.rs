@@ -28,12 +28,11 @@ const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_secs(1);
 const EXTERNAL_CHECKS_FETCH_404_BASE_DELAY: Duration = Duration::from_millis(20);
 const EXTERNAL_CHECKS_MAX_CHAIN_DEPTH: usize = 8;
 /// Canonical manifest filename for declarative-mode definitions within a
-/// definition directory. Used for both the embedded bundle
-/// (`checks/<name>/check.yaml`) and exec-path source directories.
+/// nested definition directory (legacy layout: `checks/<name>/check.yaml`).
 const CHECK_DEF_FILE_NAME_YAML: &str = "check.yaml";
 /// Canonical manifest filename for component-mode (`mode = "component"`)
-/// definitions within a definition directory. `check.yaml` (declarative) is
-/// checked first; `check.toml` (component) is tried when yaml is absent.
+/// definitions within a nested definition directory. `check.yaml` (declarative)
+/// is checked first; `check.toml` (component) is tried when yaml is absent.
 const CHECK_DEF_FILE_NAME_TOML: &str = "check.toml";
 
 /// Resolved `check_definitions` section from a CHECKS file. Controls where
@@ -45,8 +44,9 @@ const CHECK_DEF_FILE_NAME_TOML: &str = "check.toml";
 /// controls precedence when both a bundled def and an exec-path def share a name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedCheckDefinitions {
-    /// Repo-root-relative directories to search for declarative check-definition
-    /// yaml files (`<dir>/<name>/check.yaml`). Empty by default.
+    /// Repo-root-relative directories to search for check-definition files.
+    /// Supports both flat layout (`<dir>/<name>.yaml`) and nested layout
+    /// (`<dir>/<name>/check.yaml`). Flat is tried first. Empty by default.
     pub exec_paths: Vec<PathBuf>,
     /// When `true`, an exec-path def with the same name as a bundled def wins.
     /// Default `false` (bundled wins).
@@ -617,13 +617,31 @@ fn resolve_check_implementation(
     Ok(None)
 }
 
-/// Search `exec_paths` for a `<dir>/<name>/check.yaml` (declarative) or
-/// `<dir>/<name>/check.toml` (component-mode) manifest, returning the
-/// repo-root-relative path if found. YAML is checked before TOML within each
-/// directory, preserving existing behaviour for declarative definitions.
-/// Returns `None` if no match exists in any exec_path.
+/// Search `exec_paths` for a check manifest, returning the repo-root-relative
+/// path if found. Two layouts are tried for each exec_path, flat first:
+///
+/// - Flat layout (preferred): `<exec_path>/<name>.yaml` / `.yml` / `.toml`
+/// - Nested layout (legacy):  `<exec_path>/<name>/check.yaml` / `check.toml`
+///
+/// YAML is checked before TOML in both layouts. Returns `None` if no match
+/// exists in any exec_path.
 fn find_in_exec_paths(exec_paths: &[PathBuf], check_name: &str, repo_root: &Path) -> Result<Option<PathBuf>> {
     for exec_path in exec_paths {
+        // Flat layout: <exec_path>/<check_name>.yaml / .yml / .toml
+        for ext in ["yaml", "yml", "toml"] {
+            let manifest_rel = exec_path.join(format!("{check_name}.{ext}"));
+            let manifest_abs = repo_root.join(&manifest_rel);
+            if manifest_abs.exists() {
+                validate_relative_path(&manifest_rel).with_context(|| {
+                    format!(
+                        "resolved manifest path `{}` is not a safe relative path",
+                        manifest_rel.display()
+                    )
+                })?;
+                return Ok(Some(manifest_rel));
+            }
+        }
+        // Nested layout (legacy): <exec_path>/<check_name>/check.yaml / check.toml
         for filename in [CHECK_DEF_FILE_NAME_YAML, CHECK_DEF_FILE_NAME_TOML] {
             let manifest_rel = exec_path.join(check_name).join(filename);
             let manifest_abs = repo_root.join(&manifest_rel);

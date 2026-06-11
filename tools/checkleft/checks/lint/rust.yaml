@@ -1,4 +1,4 @@
-id: clippy
+id: lint/rust
 mode: declarative
 runtime: declarative-v1
 api_version: v1

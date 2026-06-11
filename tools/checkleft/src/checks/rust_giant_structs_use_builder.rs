@@ -16,7 +16,7 @@ use super::rust_giant_struct_common::{
     parse_exclude_files, struct_declaration_line,
 };
 
-const CHECK_ID: &str = "rust-giant-structs-use-builder";
+const CHECK_ID: &str = "rust/giant-structs";
 
 /// Flags Rust structs with more named fields than `max_fields` (default 5, meaning 6+)
 /// that do not carry the required builder derive. Tuple and unit structs are exempt.
@@ -47,7 +47,7 @@ const CHECK_ID: &str = "rust-giant-structs-use-builder";
 ///   struct in that file.
 ///
 /// For a one-off exception in a PR, use:
-///   BYPASS_RUST_GIANT_STRUCTS_USE_BUILDER=<specific reason>
+///   BYPASS_RUST_GIANT_STRUCTS=<specific reason>
 /// in the PR or commit description (requires `allow_bypass = true` in policy).
 pub struct RustGiantStructsUseBuilderCheck;
 
@@ -285,10 +285,7 @@ impl ConfiguredCheck for ParsedConfig {
 }
 
 fn parse_config(config: &toml::Value, config_dir: Option<&Path>) -> Result<ParsedConfig> {
-    let raw: RawConfig = config
-        .clone()
-        .try_into()
-        .context("invalid rust-giant-structs-use-builder config")?;
+    let raw: RawConfig = config.clone().try_into().context("invalid rust/giant-structs config")?;
 
     let max_fields = match raw.max_fields {
         Some(v) => usize::try_from(v).context("`max_fields` must be a non-negative integer")?,
