@@ -90,14 +90,18 @@ During migration, some checks still honor `allow_bypass` / `bypass_name` under `
 
 ## CI/environment context
 
-The checks CLI can resolve PR description context from:
+The checks CLI resolves PR description context using a layered fallback:
 
-- `CHECKS_PR_DESCRIPTION` (explicit text)
-- `CHECKS_CHANGE_ID` or `CHECKS_PR_NUMBER`
-- `CHECKS_REPOSITORY`
-- GitHub token from `CHECKS_GITHUB_TOKEN` (or `GH_TOKEN` / `GITHUB_TOKEN`)
+1. **`CHECKS_PR_DESCRIPTION`** — explicit description text (highest precedence, no network call).
+2. **`CHECKS_CHANGE_ID` / `CHECKS_PR_NUMBER`** — explicit PR number.
+3. **CI-native env** — resolved automatically, no harness wiring needed:
+   - Buildkite: `BUILDKITE_PULL_REQUEST` (used when not `"false"`; present on PR builds).
+   - GitHub Actions: `GITHUB_REF` parsed as `refs/pull/{N}/merge` (present on `pull_request` events).
+4. **Branch→PR lookup** — when no PR number is available, checkleft detects the current branch (from `BUILDKITE_BRANCH`, `GITHUB_HEAD_REF`, `refs/heads/{branch}` in `GITHUB_REF`, or VCS) and queries the GitHub API for an open PR on that branch. This is what enables bypass directives in the PR description on push-triggered builds (this repo's normal CI flow) without any CI script changes.
 
-In Buildkite, `.buildkite/scripts/run_checks.sh` wires `CHECKS_PR_NUMBER` for PR builds. GitHub auth is read from `GITHUB_TOKEN` / `GH_TOKEN` (or `CHECKS_GITHUB_TOKEN` if set).
+All network-based resolution (levels 3–4) is best-effort: if no GitHub token is available or no open PR is found, checkleft falls back to commit-description directives only — no error is raised.
+
+GitHub auth is read from `CHECKS_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` (checked in that order). `CHECKS_REPOSITORY` overrides the repository slug if needed; otherwise it is inferred from the git remote.
 
 ## Policy guidance
 

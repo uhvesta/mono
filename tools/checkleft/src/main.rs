@@ -22,7 +22,7 @@ use checkleft::input::ChangeSet;
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::runner::Runner;
 use checkleft::source_tree::LocalSourceTree;
-use checkleft::vcs::{BaseRevision, Vcs, github_pull_request_description};
+use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
@@ -245,7 +245,7 @@ async fn dispatch_run(
     )
     .await?;
     info!("resolving changeset for run");
-    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs).await;
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env).await;
     info!(
         changed_files = changeset.changed_files.len(),
         "resolved changeset for run"
@@ -385,13 +385,14 @@ fn parse_external_provider_mode(raw: Option<String>) -> Result<ExternalProviderM
     }
 }
 
-async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs) -> ChangeSet {
+async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs, env: &CiEnvironment) -> ChangeSet {
     info!("attaching commit and PR metadata");
     let commit_description = normalize_optional_description(vcs.current_commit_description().ok());
-    let change_id = resolve_change_id();
+    let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
-    let pr_description =
-        normalize_optional_description(resolve_pr_description(repository.as_deref(), change_id.as_deref()).await);
+    let pr_description = normalize_optional_description(
+        resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await,
+    );
     changeset
         .with_commit_description(commit_description)
         .with_change_id(change_id)
@@ -399,10 +400,48 @@ async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs) -> ChangeSe
         .with_pr_description(pr_description)
 }
 
-fn resolve_change_id() -> Option<String> {
-    [std::env::var(CHECKS_CHANGE_ID_ENV), std::env::var(CHECKS_PR_NUMBER_ENV)]
+/// Resolve the PR/change identifier used to fetch the PR description.
+///
+/// Fallback order (first non-empty value wins):
+/// 1. Explicit CHECKS_CHANGE_ID / CHECKS_PR_NUMBER env vars.
+/// 2. CI-native env: Buildkite's BUILDKITE_PULL_REQUEST (when not "false"),
+///    GitHub Actions' GITHUB_REF parsed as refs/pull/{N}/merge.
+///
+/// Level 3 (branch→PR lookup via GitHub API) is handled inside
+/// `resolve_pr_description` because it is async and may skip the PR-number
+/// intermediary entirely.
+fn resolve_change_id(env: &CiEnvironment) -> Option<String> {
+    // Level 1: explicit CHECKS_* env (highest precedence)
+    let explicit = [std::env::var(CHECKS_CHANGE_ID_ENV), std::env::var(CHECKS_PR_NUMBER_ENV)]
         .into_iter()
-        .find_map(|value| normalize_optional_description(value.ok()))
+        .find_map(|v| normalize_optional_description(v.ok()));
+    if explicit.is_some() {
+        return explicit;
+    }
+
+    // Level 2a: Buildkite — BUILDKITE_PULL_REQUEST is the PR number on PR
+    // builds, or the literal string "false" on push builds.
+    if let Some(pr) = env.buildkite_pull_request.as_deref().filter(|v| *v != "false") {
+        return normalize_optional_description(Some(pr.to_owned()));
+    }
+
+    // Level 2b: GitHub Actions — GITHUB_REF is "refs/pull/{N}/merge" or
+    // "refs/pull/{N}/head" on pull_request events.
+    if let Some(pr_number) = env.github_ref.as_deref().and_then(parse_github_ref_pr_number) {
+        return Some(pr_number);
+    }
+
+    None
+}
+
+/// Extract a PR number string from a GitHub ref like "refs/pull/42/merge".
+/// Returns None if the ref does not match the pull-request pattern.
+fn parse_github_ref_pr_number(github_ref: &str) -> Option<String> {
+    let after_prefix = github_ref.strip_prefix("refs/pull/")?;
+    let number_str = after_prefix.split('/').next()?;
+    // Validate it parses as a positive integer before returning.
+    number_str.parse::<u64>().ok()?;
+    Some(number_str.to_owned())
 }
 
 fn resolve_repository(vcs: &Vcs) -> Option<String> {
@@ -410,7 +449,13 @@ fn resolve_repository(vcs: &Vcs) -> Option<String> {
         .or_else(|| normalize_optional_description(vcs.remote_repo_slug()))
 }
 
-async fn resolve_pr_description(repository: Option<&str>, change_id: Option<&str>) -> Option<String> {
+async fn resolve_pr_description(
+    repository: Option<&str>,
+    change_id: Option<&str>,
+    env: &CiEnvironment,
+    vcs: &Vcs,
+) -> Option<String> {
+    // Explicit override: highest precedence, no network call needed.
     if let Ok(raw) = std::env::var(CHECKS_PR_DESCRIPTION_ENV)
         && !raw.trim().is_empty()
     {
@@ -418,15 +463,69 @@ async fn resolve_pr_description(repository: Option<&str>, change_id: Option<&str
     }
 
     let repository = repository?;
-    let change_id = change_id?;
+    let github_token = detect_github_token();
 
+    // Levels 1 & 2: fetch description using the already-resolved change_id.
+    if let Some(change_id) = change_id {
+        info!(
+            repository = repository,
+            change_id = change_id,
+            "fetching PR description by change id"
+        );
+        if let Some(desc) = github_pull_request_description(repository, change_id, github_token.as_deref()).await {
+            return Some(desc);
+        }
+    }
+
+    // Level 3: no PR number from env — detect the current branch and look up
+    // the open PR via the GitHub API. Best-effort: missing token, no open PR,
+    // or any network failure all silently yield None.
+    let branch = detect_current_branch(env, vcs)?;
     info!(
         repository = repository,
-        change_id = change_id,
-        "fetching PR description"
+        branch = branch,
+        "resolving PR description via branch lookup"
     );
-    let github_token = detect_github_token();
-    github_pull_request_description(repository, change_id, github_token.as_deref()).await
+    let pr_number = github_pr_number_for_branch(repository, &branch, github_token.as_deref()).await?;
+    info!(
+        repository = repository,
+        branch = branch,
+        pr_number = pr_number,
+        "fetching PR description for branch-resolved PR"
+    );
+    github_pull_request_description(repository, &pr_number, github_token.as_deref()).await
+}
+
+/// Detect the name of the current branch for Level 3 PR lookup.
+///
+/// Sources tried in order:
+/// 1. Buildkite: `BUILDKITE_BRANCH` (always set, already the branch name).
+/// 2. GitHub Actions: `GITHUB_HEAD_REF` (PR events) or `refs/heads/{branch}`
+///    parsed from `GITHUB_REF` (push events).
+/// 3. VCS fallback: `git branch --show-current` / jj bookmark.
+fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
+    // Buildkite always exposes the branch; skip merge-queue synthetic branches.
+    if let Some(branch) = env.buildkite_branch.as_deref()
+        .filter(|b| !b.starts_with("gh-readonly-queue/"))
+        .and_then(|b| normalize_optional_description(Some(b.to_owned()))) {
+            return Some(branch);
+        }
+
+    // GitHub Actions: GITHUB_HEAD_REF on pull_request events.
+    if let Some(branch) = normalize_optional_description(env.github_head_ref.clone()) {
+        return Some(branch);
+    }
+
+    // GitHub Actions: parse refs/heads/{branch} from GITHUB_REF on push events.
+    if let Some(branch) = env.github_ref.as_deref()
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .map(|b| b.trim().to_owned())
+        .filter(|b| !b.is_empty()) {
+            return Some(branch);
+        }
+
+    // VCS fallback for local runs and any CI not covered above.
+    normalize_optional_description(vcs.current_branch().ok())
 }
 
 fn init_tracing(verbose: bool) -> Result<()> {

@@ -160,11 +160,44 @@ impl Vcs {
 
         None
     }
+
+    /// Return the name of the current branch/bookmark, if determinable.
+    /// Returns an error (and callers should treat it as None) when on a
+    /// detached HEAD or when the VCS command fails.
+    pub fn current_branch(&self) -> Result<String> {
+        match self.kind {
+            VcsKind::Git => {
+                let output = run_command(&self.root, "git", &["branch", "--show-current"])?;
+                let branch = output.trim().to_owned();
+                if branch.is_empty() {
+                    anyhow::bail!("detached HEAD — no current branch");
+                }
+                Ok(branch)
+            }
+            VcsKind::Jujutsu => {
+                let output = run_command(
+                    &self.root,
+                    "jj",
+                    &["log", "-r", "@", "--no-graph", "-T", "bookmarks.map(|b| b.name()).join(\"\\n\")"],
+                )?;
+                output
+                    .lines()
+                    .map(|l| l.trim().to_owned())
+                    .find(|l| !l.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("no bookmark at @"))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct GithubPullRequestResponse {
     body: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubPullRequestListItem {
+    number: u64,
 }
 
 pub async fn github_pull_request_description(
@@ -192,6 +225,39 @@ pub async fn github_pull_request_description(
     let response_bytes = response.bytes().await.ok()?;
     let payload: GithubPullRequestResponse = serde_json::from_slice(&response_bytes).ok()?;
     normalize_non_empty(payload.body)
+}
+
+/// Look up the open PR number for a branch via the GitHub API.
+/// Returns the PR number as a string (e.g. "42"), or None if no open PR is
+/// found, auth fails, or any error occurs (all failures are best-effort).
+pub async fn github_pr_number_for_branch(
+    repository: &str,
+    branch: &str,
+    github_token: Option<&str>,
+) -> Option<String> {
+    let owner = repository.split('/').next()?;
+    let url = format!(
+        "https://api.github.com/repos/{repository}/pulls?head={owner}:{branch}&state=open&per_page=1"
+    );
+    ensure_rustls_provider();
+    let client = reqwest::Client::new();
+    let mut request = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header(reqwest::header::USER_AGENT, "checkleft-cli");
+
+    if let Some(token) = github_token.filter(|t| !t.trim().is_empty()) {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let bytes = response.bytes().await.ok()?;
+    let prs: Vec<GithubPullRequestListItem> = serde_json::from_slice(&bytes).ok()?;
+    prs.into_iter().next().map(|pr| pr.number.to_string())
 }
 
 fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
