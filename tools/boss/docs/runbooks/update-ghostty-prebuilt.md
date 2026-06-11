@@ -18,7 +18,7 @@ cd tools/boss/app-macos
 bash scripts/bootstrap-ghosttykit.sh
 ```
 
-The script clones/updates ghostty from `https://github.com/ghostty-org/ghostty` (latest `main`), builds the `GhosttyKit.xcframework` (static, arm64), and places it at `ThirdParty/GhosttyKit.xcframework`.
+The script clones/updates ghostty from `https://github.com/ghostty-org/ghostty` (latest `main`), builds the `GhosttyKit.xcframework` (static, arm64, `-Doptimize=ReleaseFast`), and places it at `ThirdParty/GhosttyKit.xcframework`.
 
 Note the ghostty commit SHA:
 

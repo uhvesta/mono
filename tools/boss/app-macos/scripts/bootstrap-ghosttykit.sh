@@ -93,6 +93,7 @@ fi
   SDKROOT="$SDKROOT" \
   MACOSX_DEPLOYMENT_TARGET=15.0 \
   "$ZIG_BIN" build \
+    -Doptimize=ReleaseFast \
     -Dtarget="$TARGET_TRIPLE" \
     -Dapp-runtime=none \
     -Demit-macos-app=false \

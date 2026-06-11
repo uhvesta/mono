@@ -167,6 +167,6 @@ register_toolchains(
 http_archive(
     name = "ghostty_kit",
     build_file = "//tools/boss/app-macos:ghosttykit.BUILD",
-    sha256 = "210c6914395c2222b76857cd63853916313a5c4a10964b934e38f84b8cf64a06",
-    urls = ["https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-b0f827665/GhosttyKit-b0f827665.tar.gz"],
+    sha256 = "82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1",
+    urls = ["https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-5659cef/GhosttyKit-5659cef.tar.gz"],
 )
