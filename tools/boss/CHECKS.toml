@@ -83,7 +83,6 @@ exclude_structs = [
   "engine/core/src/work/audit_misc.rs::ProjectPropertyAuditEntry",
   "engine/core/src/work/mappers.rs::ConflictResolutionInsertInput",
   "engine/core/src/work/mappers.rs::CiRemediationInsertInput",
-  "engine/core/src/worker_setup.rs::WorkerSetupInput",
   "protocol/src/engine_app.rs::SpawnWorkerPaneInput",
   "protocol/src/live_status_debug.rs::LiveStatusDebugReport",
   "protocol/src/live_status_debug.rs::DispatcherStatsReport",

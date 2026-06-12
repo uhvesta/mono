@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../.."
 
 [dependencies]
+bon = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 console = { workspace = true }
 fs4 = { workspace = true }

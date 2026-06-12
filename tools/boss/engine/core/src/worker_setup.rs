@@ -95,7 +95,8 @@ pub enum WorkerKind {
 /// All the inputs a worker-config render needs. The shape is
 /// deliberately minimal — anything more (project-specific guidance,
 /// allowlisted tools) lives in higher layers and is rendered separately.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct WorkerSetupInput {
     /// Run id this spawn corresponds to. Baked into the hook command
     /// in the worker settings file as a `BOSS_RUN_ID=<run_id>` inline-assignment
@@ -530,6 +531,38 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
         ],
     }));
 
+    // Deterministic pre-push checkleft gate (standard implementation
+    // workers only). Matches Bash commands that push (`jj git push` /
+    // `git push`) and blocks the push when the repo's checkleft reports
+    // errors, echoing the findings + bypass guidance. The whole worker
+    // fleet pushes with jj, whose native `jj git push` does not run git's
+    // pre-push hook — so this restores the gate at the harness layer (the
+    // same mechanism as the path guard above).
+    //
+    // Scoped to local standard workers:
+    //   • Reviewer / triage workers cannot push (their deny rules block
+    //     it), so the guard would never fire — omit it.
+    //   • Remote SSH workers skip it for the same reason the path guard
+    //     does: the gate script is materialised next to the local worker
+    //     settings and is never shipped to the remote host. Remote workers
+    //     are still covered for the sanctioned flows by the cube verb
+    //     gates (`cube pr ensure` / `cube pr push`).
+    if sandbox == EngineDataDirSandbox::Enabled && input.worker_kind == WorkerKind::Standard {
+        let guard_command = format!(
+            "python3 {script}",
+            script = shell_escape(&checkleft_push_guard_script_path().display().to_string()),
+        );
+        pre_tool_use_hooks.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": guard_command,
+                }
+            ],
+        }));
+    }
+
     let is_revision =
         input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
     if is_revision {
@@ -809,6 +842,11 @@ const WORKER_SETTINGS_SUBDIR: &str = "boss-worker-settings";
 /// invoked by the `PreToolUse` hook with its absolute path.
 const PATH_GUARD_SCRIPT_NAME: &str = "boss-path-guard.py";
 
+/// Filename of the deterministic pre-push checkleft gate script. Written
+/// next to the worker settings file (same dir, shared fate) and invoked
+/// by the `PreToolUse` hook with its absolute path.
+const CHECKLEFT_PUSH_GUARD_SCRIPT_NAME: &str = "boss-checkleft-push-guard.py";
+
 /// The deterministic Boss-data-dir access gate, run as a `PreToolUse`
 /// hook for every tool call.
 ///
@@ -958,6 +996,201 @@ if __name__ == "__main__":
     main()
 "#;
 
+/// Deterministic pre-push checkleft gate, run as a `PreToolUse` hook on
+/// every Bash tool call for a standard (implementation) worker.
+///
+/// The whole worker fleet pushes with jj, and `jj git push` is a native
+/// implementation that does NOT run git's `pre-push` hook — so an
+/// installed git hook is inert for workers. This script restores the
+/// gate at the harness layer: it inspects the Bash command, and when the
+/// command is a push (`jj git push` or `git push`) it runs the repo's
+/// checkleft against the outgoing changes *before* the push is allowed.
+/// If checkleft reports errors the push is blocked and the findings (plus
+/// the `BYPASS_` guidance) are echoed back so the worker can act.
+///
+/// All policy lives in checkleft: the script shells out and trusts the
+/// exit code (0 = allow, non-zero = block). It is fail-open by
+/// construction — a non-push command, a repo with no checkleft binary
+/// (e.g. no `bin/checkleft` and none on PATH), or any error
+/// resolving/running checkleft all *approve* — so the gate can never
+/// wedge a session; its only deterministic action is to block a push that
+/// checkleft itself rejected. checkleft's own "no CHECKS.yaml → exit 0"
+/// behaviour means repos without convention checks are transparently
+/// allowed.
+///
+/// The checkleft binary is resolved from (in order) `BOSS_CHECKLEFT_BIN`
+/// (an override used by tests), `<repo-root>/bin/checkleft` (the
+/// repobin-installed path), then a `checkleft` on `PATH`.
+const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
+"""Deterministic pre-push checkleft gate (Claude Code PreToolUse hook).
+
+Boss workers push with jj. `jj git push` is a native implementation that does
+not run git's pre-push hook, so an installed git hook is inert for the worker
+fleet. This hook restores the gate at the harness layer: it inspects every Bash
+command and, when the command is a push (`jj git push` or `git push`), runs the
+repository's checkleft against the outgoing changes before the push proceeds.
+If checkleft reports errors the push is blocked and the findings (plus bypass
+guidance) are echoed back so the worker can fix them or add a BYPASS_ directive.
+
+All policy lives in checkleft: this script shells out and trusts the exit code
+(0 = allow, non-zero = block). It is fail-open by construction -- a non-push
+command, a repo with no checkleft binary, or any error resolving/running
+checkleft all approve -- so the gate can never wedge a session; its only
+deterministic action is to block a push that checkleft itself rejected.
+
+The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
+stdout. The checkleft binary is resolved from (in order) the BOSS_CHECKLEFT_BIN
+env var, `<repo-root>/bin/checkleft` (the repobin-installed path), and a
+`checkleft` on PATH.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+# Warm-cache checkleft runs are seconds; cap the wait so a wedged checkleft can
+# never hang a push attempt. On timeout we fail open (approve) rather than
+# strand the session -- the cube verb gates are the belt for that rare case.
+CHECKLEFT_TIMEOUT_SECONDS = 240
+
+ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+DELIMS = {"&&", "||", ";", "|", "&"}
+
+
+def emit(decision, reason=None):
+    out = {"decision": decision}
+    if reason is not None:
+        out["reason"] = reason
+    sys.stdout.write(json.dumps(out))
+    sys.exit(0)
+
+
+def command_groups(command):
+    try:
+        tokens = shlex.split(command, posix=True)
+    except Exception:
+        tokens = command.split()
+    groups = []
+    cur = []
+    for tok in tokens:
+        if tok in DELIMS:
+            if cur:
+                groups.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def is_push_command(command):
+    # shlex tokenisation means a push phrase inside a quoted argument (a commit
+    # message, a --body string) is a single token and never matches, so
+    # `jj describe -m "git push the fix"` is correctly not treated as a push.
+    for group in command_groups(command):
+        i = 0
+        while i < len(group) and ENV_ASSIGN_RE.match(group[i]):
+            i += 1
+        rest = group[i:]
+        if not rest:
+            continue
+        prog = os.path.basename(rest[0])
+        if prog == "jj":
+            for j in range(1, len(rest) - 1):
+                if rest[j] == "git" and rest[j + 1] == "push":
+                    return True
+        elif prog == "git":
+            if "push" in rest[1:]:
+                return True
+    return False
+
+
+def find_repo_root(start):
+    cur = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(cur, ".jj")) or os.path.exists(os.path.join(cur, ".git")):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return os.path.abspath(start)
+        cur = parent
+
+
+def resolve_checkleft(root):
+    override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
+    if override:
+        return override if os.path.exists(override) else None
+    candidate = os.path.join(root, "bin", "checkleft")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    return shutil.which("checkleft")
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        emit("approve")
+    if not isinstance(payload, dict):
+        emit("approve")
+    if (payload.get("tool_name") or "") != "Bash":
+        emit("approve")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        emit("approve")
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command.strip():
+        emit("approve")
+    if not is_push_command(command):
+        emit("approve")
+
+    cwd = payload.get("cwd") or os.getcwd()
+    root = find_repo_root(cwd)
+    checkleft = resolve_checkleft(root)
+    if not checkleft:
+        # No checkleft available -> nothing to enforce (repo may not use it).
+        emit("approve")
+
+    try:
+        proc = subprocess.run(
+            [checkleft, "run"],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=CHECKLEFT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        # Could not run checkleft (timeout / exec error) -> fail open.
+        emit("approve")
+
+    if proc.returncode == 0:
+        emit("approve")
+
+    findings = (proc.stdout or "").strip()
+    extra = (proc.stderr or "").strip()
+    detail = findings if findings else extra
+    reason = (
+        "Push blocked: checkleft found errors that must be fixed before "
+        "pushing to GitHub.\n\n"
+        + detail
+        + "\n\nFix the findings above and retry the push. If a finding is a "
+        "genuine false positive, add a `BYPASS_<CHECK_NAME>=<reason>` line to "
+        "your commit message (jj describe) or the PR description, then retry. "
+        "Do not bypass without a real justification."
+    )
+    emit("block", reason)
+
+
+if __name__ == "__main__":
+    main()
+"#;
+
 /// Directory holding all per-workspace worker settings files. The
 /// engine writes into it at spawn time and heals stale `boss-event`
 /// paths in it on restart ([`heal_worker_settings_json`]).
@@ -1001,6 +1234,25 @@ pub fn ensure_path_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(PATH_GUARD_SCRIPT_NAME);
     std::fs::write(&path, PATH_GUARD_SCRIPT)?;
+    Ok(path)
+}
+
+/// Absolute path to the deterministic pre-push checkleft gate script.
+/// Shared across every session (the script resolves the repo + checkleft
+/// binary at invocation time), so it lives once in the
+/// [`worker_settings_dir`] alongside the per-workspace settings files.
+pub fn checkleft_push_guard_script_path() -> PathBuf {
+    worker_settings_dir().join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME)
+}
+
+/// Write the [`CHECKLEFT_PUSH_GUARD_SCRIPT`] into `dir`, creating it if
+/// needed. Idempotent: overwrites any existing copy with the current
+/// source so a stale script from an older engine build is refreshed.
+/// Returns the path written.
+pub fn ensure_checkleft_push_guard_script_in(dir: &Path) -> io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME);
+    std::fs::write(&path, CHECKLEFT_PUSH_GUARD_SCRIPT)?;
     Ok(path)
 }
 
@@ -1299,10 +1551,11 @@ pub fn write_workspace_files(input: &WorkerSetupInput) -> io::Result<WrittenFile
     let settings_path = worker_settings_path(&input.workspace_path);
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
-        // The PreToolUse gate script lives next to the settings file
-        // (same dir, shared fate) and the hook invokes it by absolute
-        // path; write it whenever we materialise the settings file.
+        // The PreToolUse gate scripts live next to the settings file
+        // (same dir, shared fate) and the hooks invoke them by absolute
+        // path; write them whenever we materialise the settings file.
         ensure_path_guard_script_in(parent)?;
+        ensure_checkleft_push_guard_script_in(parent)?;
     }
     std::fs::write(&settings_path, render_settings_json(input))?;
 
@@ -1373,14 +1626,21 @@ pub fn heal_worker_settings_json(settings_dir: &Path, new_boss_event_path: &Path
     };
 
     // The settings dir exists, so live workers may have PreToolUse hooks
-    // pointing at the gate script in it. Refresh the script (TMPDIR churn
-    // or an older engine build may have removed/staled it) so the gate
-    // survives an engine restart, not just a fresh spawn.
+    // pointing at the gate scripts in it. Refresh them (TMPDIR churn or an
+    // older engine build may have removed/staled them) so the gates
+    // survive an engine restart, not just a fresh spawn.
     if let Err(err) = ensure_path_guard_script_in(settings_dir) {
         tracing::warn!(
             dir = %settings_dir.display(),
             ?err,
             "failed to refresh path-guard script during settings heal",
+        );
+    }
+    if let Err(err) = ensure_checkleft_push_guard_script_in(settings_dir) {
+        tracing::warn!(
+            dir = %settings_dir.display(),
+            ?err,
+            "failed to refresh checkleft push-guard script during settings heal",
         );
     }
 

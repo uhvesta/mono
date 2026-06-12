@@ -13,7 +13,6 @@ exclude_files = []
 # struct only in that exact file. TODO: convert each to `#[derive(bon::Builder)]` and
 # delete its entry.
 exclude_structs = [
-  "src/app.rs::ReconciledRow",
   "src/metadata.rs::RepoRecord",
   "src/metadata.rs::WorkspaceRecord",
   "src/metadata.rs::ChangeRecord",

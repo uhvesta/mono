@@ -12,6 +12,7 @@ pub mod exclusion;
 pub mod external;
 pub mod ifchange;
 pub mod input;
+pub mod install;
 pub mod output;
 pub mod path;
 pub mod runner;

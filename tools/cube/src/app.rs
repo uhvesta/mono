@@ -2224,6 +2224,75 @@ fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dy
     }
 }
 
+/// Run the repository's checkleft against the outgoing changes before a
+/// push, refusing the push when checkleft reports errors.
+///
+/// This is the ergonomic, sanctioned-flow half of the "run checkleft
+/// before every PR push" guard — the same enforcement the Boss runtime
+/// applies to raw `jj git push` is applied here for `cube pr ensure` /
+/// `cube pr push`. Single source of truth: it shells out to checkleft and
+/// trusts its exit code (0 = clean, non-zero = errors) — no policy logic
+/// is duplicated. checkleft's own "no CHECKS.yaml → exit 0" behaviour
+/// means repos without convention checks pass transparently.
+///
+/// Bypass is checkleft's own `BYPASS_<CHECK>=<reason>` directives in the
+/// commit message / PR description; there is no separate cube-level
+/// override.
+///
+/// Fail-open by construction: when no checkleft binary is found the gate
+/// is a no-op (the repo may not use checkleft, or the repobin-installed
+/// `bin/checkleft` may not be present in this checkout). The only refusal
+/// is a checkleft that actually reported errors. The binary is resolved
+/// from `CUBE_CHECKLEFT_BIN` (an override) then `<cwd>/bin/checkleft` (the
+/// repobin-installed path).
+fn run_checkleft_gate(cwd: &Path) -> Result<()> {
+    let Some(checkleft) = resolve_checkleft_bin(cwd) else {
+        return Ok(());
+    };
+
+    let output = std::process::Command::new(&checkleft)
+        .arg("run")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        // Could not execute checkleft at all — fail open rather than block
+        // a push on an infrastructure problem unrelated to the change.
+        Err(_) => return Ok(()),
+    };
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // checkleft prints its findings to stdout; the CommandFailed path of
+    // the shared runner only keeps stderr, so we run checkleft directly to
+    // surface the findings in the refusal.
+    let findings = String::from_utf8_lossy(&output.stdout);
+    let findings = findings.trim();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = if findings.is_empty() { stderr.trim() } else { findings };
+    Err(CubeError::InvalidArgument(format!(
+        "checkleft found errors that must be fixed before pushing to GitHub:\n\n{detail}\n\n\
+         Fix the findings above and retry. If a finding is a genuine false positive, add a \
+         `BYPASS_<CHECK_NAME>=<reason>` line to your commit message or the PR description \
+         (the PR description wins), then retry."
+    )))
+}
+
+/// Resolve the checkleft binary to run for the push gate. Returns `None`
+/// when no checkleft is available (the gate then no-ops). Resolution
+/// order: `CUBE_CHECKLEFT_BIN` env override → `<cwd>/bin/checkleft` (the
+/// repobin-installed path).
+fn resolve_checkleft_bin(cwd: &Path) -> Option<PathBuf> {
+    if let Some(override_path) = std::env::var_os("CUBE_CHECKLEFT_BIN") {
+        let path = PathBuf::from(override_path);
+        return path.is_file().then_some(path);
+    }
+    let candidate = cwd.join("bin").join("checkleft");
+    candidate.is_file().then_some(candidate)
+}
+
 /// Create or reuse a GitHub PR for the current jj bookmark.
 ///
 /// Pushes the branch via `jj git push` and then uses `gh pr create -R
@@ -2258,6 +2327,11 @@ fn ensure_pr(args: PrEnsureArgs, runner: &dyn CommandRunner) -> Result<RunResult
     // Refuse to push a `pr/<n>` bookmark — those are local-only cube
     // bookkeeping and must never reach a remote.
     pr_bookmark::assert_not_pr_bookmark(&branch).map_err(CubeError::InvalidArgument)?;
+
+    // Run checkleft against the outgoing changes before pushing. Refuses
+    // (with the findings) if checkleft reports errors — no PR push reaches
+    // GitHub with a known convention violation.
+    run_checkleft_gate(&cwd)?;
 
     // Push the branch to the GitHub remote by name (--allow-new is
     // idempotent: fine when the remote bookmark already exists).
@@ -2549,6 +2623,11 @@ fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
         }
     }
 
+    // Run checkleft against the outgoing changes before either push path
+    // (fast-forward or force-with-lease). Refuses with the findings when
+    // checkleft reports errors.
+    run_checkleft_gate(&cwd)?;
+
     // For force-with-lease: skip the descendant check (lease verification is the safety instead).
     // For normal push: @ must be a descendant of pr/<n> (fast-forward enforcement).
     if args.force_with_lease {
@@ -2666,8 +2745,7 @@ fn resolve_pr_push_target(
             let head_branch = bm_out
                 .lines()
                 .map(str::trim)
-                .filter(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
-                .next()
+                .find(|s| !s.is_empty() && !pr_bookmark::is_pr_bookmark(s))
                 .ok_or_else(|| {
                     CubeError::InvalidArgument(format!(
                         "no head branch found co-located with `{pr_bm}`; pass --branch explicitly"
@@ -2729,10 +2807,10 @@ fn resolve_pr_push_target(
             let mut head_branch: Option<String> = None;
             for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
                 if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n_str) = name.strip_prefix("pr/") {
-                        if let Ok(n) = n_str.parse::<u64>() {
-                            pr_number = Some(n);
-                        }
+                    if let Some(n_str) = name.strip_prefix("pr/")
+                        && let Ok(n) = n_str.parse::<u64>()
+                    {
+                        pr_number = Some(n);
                     }
                 } else {
                     head_branch = Some(name.to_string());
@@ -4305,7 +4383,8 @@ fn cleanup_workspace_logs(workspace_id: &str) -> Result<()> {
 /// Summary of a workspace row touched by the missing-directory reconciler.
 /// Surfaced through `cube workspace list --json` and also fed to per-row
 /// audit events so the operator has a paper trail.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[builder(on(String, into))]
 struct ReconciledRow {
     repo: String,
     workspace_id: String,
@@ -4318,15 +4397,15 @@ struct ReconciledRow {
 
 impl ReconciledRow {
     fn from_record(record: &WorkspaceRecord) -> Self {
-        Self {
-            repo: record.repo.clone(),
-            workspace_id: record.workspace_id.clone(),
-            workspace_path: record.workspace_path.clone(),
-            prior_state: record.state,
-            lease_id: record.lease_id.clone(),
-            holder: record.holder.clone(),
-            lease_expires_at_epoch_s: record.lease_expires_at_epoch_s,
-        }
+        ReconciledRow::builder()
+            .repo(record.repo.clone())
+            .workspace_id(record.workspace_id.clone())
+            .workspace_path(record.workspace_path.clone())
+            .prior_state(record.state)
+            .maybe_lease_id(record.lease_id.clone())
+            .maybe_holder(record.holder.clone())
+            .maybe_lease_expires_at_epoch_s(record.lease_expires_at_epoch_s)
+            .build()
     }
 }
 
@@ -4801,9 +4880,55 @@ mod tests {
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
         current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_stdin_path,
-        render_boss_infra_exclude_block, resolve_body_file, run_with_context, run_with_dependencies,
-        upsert_managed_exclude,
+        render_boss_infra_exclude_block, resolve_body_file, run_checkleft_gate, run_with_context,
+        run_with_dependencies, upsert_managed_exclude,
     };
+
+    /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
+    /// prints `stdout` and exits with `exit_code`.
+    fn write_fake_checkleft(root: &std::path::Path, exit_code: i32, stdout: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("checkleft");
+        let script = format!("#!/bin/sh\ncat <<'CHECKLEFT_EOF'\n{stdout}\nCHECKLEFT_EOF\nexit {exit_code}\n");
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[test]
+    fn checkleft_gate_passes_when_no_checkleft_binary() {
+        // A workspace without bin/checkleft must not block the push.
+        let dir = TempDir::new().unwrap();
+        assert!(
+            run_checkleft_gate(dir.path()).is_ok(),
+            "gate must be a no-op when no checkleft binary is present",
+        );
+    }
+
+    #[test]
+    fn checkleft_gate_proceeds_when_checkleft_clean() {
+        let dir = TempDir::new().unwrap();
+        write_fake_checkleft(dir.path(), 0, "checks: no findings");
+        assert!(
+            run_checkleft_gate(dir.path()).is_ok(),
+            "gate must proceed when checkleft exits 0",
+        );
+    }
+
+    #[test]
+    fn checkleft_gate_refuses_with_findings_when_checkleft_fails() {
+        let dir = TempDir::new().unwrap();
+        write_fake_checkleft(dir.path(), 1, "error[rustfmt]: file needs formatting");
+        let err = run_checkleft_gate(dir.path()).expect_err("gate must refuse when checkleft exits non-zero");
+        let CubeError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(msg.contains("error[rustfmt]"), "refusal must echo the findings: {msg}");
+        assert!(msg.contains("BYPASS_"), "refusal must include bypass guidance: {msg}");
+    }
 
     fn with_database_path() -> (TempDir, std::path::PathBuf) {
         let tempdir = tempfile::tempdir().expect("tempdir");

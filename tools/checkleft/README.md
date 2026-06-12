@@ -94,6 +94,27 @@ The flags below exist as **escape hatches** for unusual situations:
 `checkleft` looks for `CHECKS.yaml` or `CHECKS.toml` files from the repository
 root down to the file being evaluated.
 
+### Run before every push
+
+`checkleft install` drops a git `pre-push` hook that runs `checkleft run`
+against the outgoing changes before each push, so a convention violation is
+caught locally instead of on CI:
+
+```bash
+checkleft install      # install the pre-push hook (idempotent)
+checkleft uninstall    # remove it (alias: checkleft install --remove)
+```
+
+The hook is recognised by a marker line, so re-running `install` is a no-op,
+and `install` / `uninstall` never touch a `pre-push` hook you wrote yourself.
+When a check fires, fix the finding or add a `BYPASS_<CHECK>=<reason>` directive
+to the commit message or PR description (see the bypass docs).
+
+> **jujutsu note.** `jj git push` is a native implementation that does **not**
+> run git hooks, so this hook does not fire for jj-driven pushes. In a
+> jj-based workflow, run `checkleft run` before pushing (or wire it into your
+> push tooling) rather than relying on the git hook.
+
 The root config can also set `settings.external_checks_url` to merge an
 externally hosted root config before applying local root and child overrides.
 The CLI flag `--external-checks-url` provides the same behavior for repos that

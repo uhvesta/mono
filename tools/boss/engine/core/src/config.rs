@@ -319,22 +319,25 @@ mod tests {
         assert_eq!(config.worker_pool_size, MAX_WORKER_POOL_SIZE);
     }
 
+    // Default-and-override are checked in a single test (rather than the
+    // two-test pattern) so the two cases can't run in parallel and race on
+    // the shared process-global `BOSS_AUTOMATION_POOL_SIZE`: `config::tests`
+    // all land in the multi-threaded `engine_lib_test_rest` shard. (Same
+    // rationale as `review_pool_size_defaults_and_reads_from_env` below.)
     #[test]
-    fn automation_pool_size_defaults_to_max_when_env_unset() {
+    fn automation_pool_size_defaults_and_reads_from_env() {
         let tempdir = tempfile::tempdir().unwrap();
         let db_path_str = tempdir.path().join("state.db");
+
+        // Absent → falls back to the max default.
         let config = WorkConfig::load_from(|k| match k {
             "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
             _ => None,
         })
         .expect("config loads");
         assert_eq!(config.automation_pool_size, MAX_AUTOMATION_POOL_SIZE);
-    }
 
-    #[test]
-    fn automation_pool_size_reads_from_env() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let db_path_str = tempdir.path().join("state.db");
+        // Set → the env value wins.
         let config = WorkConfig::load_from(|k| match k {
             "BOSS_AUTOMATION_POOL_SIZE" => Some(OsString::from("2")),
             "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),

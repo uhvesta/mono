@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 use std::io::stderr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,6 +19,9 @@ use checkleft::external::{
     NoopExternalCheckPackageProvider,
 };
 use checkleft::input::ChangeSet;
+use checkleft::install::{
+    InstallOutcome, UninstallOutcome, install_pre_push_hook, pre_push_path, uninstall_pre_push_hook,
+};
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
 use checkleft::runner::Runner;
 use checkleft::source_tree::LocalSourceTree;
@@ -79,6 +82,16 @@ enum Commands {
         #[arg(long)]
         default_branch: Option<String>,
     },
+    /// Install a git `pre-push` hook that runs `checkleft run` against the
+    /// outgoing changes before each push.
+    Install {
+        /// Remove the installed hook instead of installing it
+        /// (equivalent to `checkleft uninstall`).
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Remove the git `pre-push` hook installed by `checkleft install`.
+    Uninstall,
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -213,7 +226,120 @@ async fn run_cli() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Some(Commands::Install { remove }) => dispatch_install(&root, remove),
+        Some(Commands::Uninstall) => dispatch_install(&root, true),
     }
+}
+
+/// Install or remove the git `pre-push` hook. `remove == true` is the
+/// `checkleft uninstall` / `checkleft install --remove` path.
+///
+/// Output is plain and confident; the only mention of jj's native-push
+/// caveat lives in the userdoc (README), not here.
+fn dispatch_install(root: &Path, remove: bool) -> Result<ExitCode> {
+    let Some(hooks_dir) = resolve_git_hooks_dir(root) else {
+        eprintln!(
+            "checkleft: not a git repository (no git hooks directory found under {}). \
+             Git hooks can only be installed inside a git repository.",
+            root.display(),
+        );
+        return Ok(ExitCode::from(1));
+    };
+    if !hooks_dir.exists() {
+        eprintln!(
+            "checkleft: no git hooks directory at {}. Create it (or re-initialise \
+             the repository), then retry.",
+            hooks_dir.display(),
+        );
+        return Ok(ExitCode::from(1));
+    }
+    let hook_path = pre_push_path(&hooks_dir);
+
+    if remove {
+        match uninstall_pre_push_hook(&hooks_dir)? {
+            UninstallOutcome::Removed => {
+                println!("Removed checkleft pre-push hook from {}.", hook_path.display());
+            }
+            UninstallOutcome::NotInstalled => {
+                println!(
+                    "No checkleft pre-push hook found at {}; nothing to remove.",
+                    hook_path.display(),
+                );
+            }
+            UninstallOutcome::RefusedForeign => {
+                println!(
+                    "{} is not managed by checkleft; leaving it untouched.",
+                    hook_path.display(),
+                );
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let checkleft_bin = current_checkleft_bin();
+    match install_pre_push_hook(&hooks_dir, &checkleft_bin)? {
+        InstallOutcome::Installed => {
+            println!("Installed checkleft pre-push hook at {}.", hook_path.display());
+        }
+        InstallOutcome::Refreshed => {
+            println!("Updated checkleft pre-push hook at {}.", hook_path.display());
+        }
+        InstallOutcome::AlreadyCurrent => {
+            println!("checkleft pre-push hook already installed at {}.", hook_path.display());
+        }
+        InstallOutcome::RefusedForeign => {
+            eprintln!(
+                "checkleft: {} already exists and was not installed by checkleft. \
+                 Remove or merge it, then re-run `checkleft install`.",
+                hook_path.display(),
+            );
+            return Ok(ExitCode::from(1));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Absolute path to the currently-running checkleft binary, for embedding
+/// in the installed hook. Falls back to a bare `checkleft` (PATH lookup at
+/// push time) if the executable path cannot be resolved.
+fn current_checkleft_bin() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "checkleft".to_owned())
+}
+
+/// Run `git` in `root` and return trimmed stdout, or `None` if the command
+/// fails or produces no output.
+fn git_output(root: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let trimmed = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Resolve the git hooks directory for the repository at `root`. Returns
+/// `None` when `root` is not inside a git repository. Honours an explicit
+/// `core.hooksPath` config, falling back to the standard `<git-dir>/hooks`.
+fn resolve_git_hooks_dir(root: &Path) -> Option<PathBuf> {
+    // Must be inside a git repository.
+    git_output(root, &["rev-parse", "--git-dir"])?;
+    // Honour an explicit core.hooksPath override.
+    if let Some(hooks_path) = git_output(root, &["config", "--get", "core.hooksPath"]) {
+        let path = PathBuf::from(&hooks_path);
+        return Some(if path.is_absolute() { path } else { root.join(path) });
+    }
+    let hooks = git_output(root, &["rev-parse", "--git-path", "hooks"])?;
+    let path = PathBuf::from(&hooks);
+    Some(if path.is_absolute() { path } else { root.join(path) })
 }
 
 async fn dispatch_run(
