@@ -91,7 +91,7 @@ fn find_by_pr_excludes_soft_deleted_owner() {
 }
 
 /// The same PR number can exist in more than one repo. The engine
-/// returns every owner; the CLI disambiguates by repo.
+/// returns every owner; the CLI displays all of them.
 #[test]
 fn find_by_pr_returns_multiple_when_number_shared_across_repos() {
     let db = WorkDb::open(temp_db_path("by-pr-ambiguous")).unwrap();
@@ -102,6 +102,46 @@ fn find_by_pr_returns_multiple_when_number_shared_across_repos() {
 
     let matches = db.find_work_items_by_pr(500).unwrap();
     assert_eq!(matches.len(), 2, "same number in two repos => two owners");
+}
+
+/// Same-repo same-PR multiplicity is valid: a chore owner and a revision that
+/// each carry the PR URL (e.g. after the double-spawn race recovery path binds
+/// the parent PR to an active revision task) must both surface as owners.
+/// The CLI must display all of them rather than erroring.
+#[test]
+fn find_by_pr_returns_multiple_for_same_repo_same_pr() {
+    let db = WorkDb::open(temp_db_path("by-pr-same-repo-multi")).unwrap();
+    let product_id = make_revision_product(&db, "same-repo-multi");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1475";
+
+    // Primary owner: a chore in review.
+    let chore_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    // Simulate the exceptional state: a revision that also carries the PR URL
+    // (as produced by the double-spawn race recovery binding the parent's PR
+    // URL to an active revision task). We insert the revision in `active`
+    // state with pr_url set directly, bypassing the normal create path.
+    let conn = db.connect().unwrap();
+    let revision_id = next_id("task");
+    let now = now_string();
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, pr_url, \
+         created_at, updated_at, parent_task_id) \
+         VALUES (?1, ?2, 'revision', 'CI fix revision', '', 'active', ?3, ?4, ?4, ?5)",
+        rusqlite::params![revision_id, product_id, pr_url, now, chore_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let matches = db.find_work_items_by_pr(1475).unwrap();
+    assert_eq!(
+        matches.len(),
+        2,
+        "same-repo same-PR chore + revision => two owners, got {matches:?}"
+    );
+    let owner_ids: Vec<&str> = matches.iter().map(|m| m.owner.id.as_str()).collect();
+    assert!(owner_ids.contains(&chore_id.as_str()), "chore must be an owner");
+    assert!(owner_ids.contains(&revision_id.as_str()), "revision must be an owner");
 }
 
 // ── automation CRUD ──────────────────────────────────────────────────────────

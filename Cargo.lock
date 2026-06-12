@@ -241,6 +241,7 @@ name = "boss"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
  "boss-client",
  "boss-editorial",
  "boss-engine",

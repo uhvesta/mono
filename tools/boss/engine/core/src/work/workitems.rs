@@ -508,14 +508,19 @@ impl WorkDb {
     /// a chore- or revision-backed PR is just as findable as a project
     /// task. The PR number is parsed from each row's stored `pr_url`
     /// using the same parser the merge poller uses, so query strings and
-    /// fragments are tolerated. Revisions carry no `pr_url`, so they
-    /// never appear as an owner; they surface only inside a matched
-    /// owner's `revisions` list.
+    /// fragments are tolerated. Revision tasks normally carry no
+    /// `pr_url` (they surface inside a matched owner's `revisions`
+    /// list), but may have one in exceptional engine recovery paths
+    /// (e.g. the double-spawn race recovery), in which case they appear
+    /// as owners too.
     ///
     /// Soft-deleted rows are excluded from both owners and revisions.
     /// Returns an empty vec when no row is bound to the PR number. More
-    /// than one element means the PR number is shared across repos —
-    /// the caller disambiguates by repo.
+    /// than one element may mean the same PR number exists in multiple
+    /// repos, or that same-repo same-PR multiplicity occurred (e.g. a
+    /// chore owner and a revision that each carry the URL). The caller
+    /// must display all matches; `--repo` is an optional filter, not a
+    /// required disambiguator.
     pub fn find_work_items_by_pr(&self, pr_number: i64) -> Result<Vec<PrWorkItemMatch>> {
         let conn = self.connect()?;
         // Owners: any live row carrying a pr_url. We parse the number in
