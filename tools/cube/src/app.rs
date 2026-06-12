@@ -174,6 +174,13 @@ const JJ_NO_REMOTE_BOOKMARK_SIGNATURE: &str = "no such remote bookmark";
 /// during the on-lease fast-forward without bricking the lease.
 const JJ_REVISION_DOESNT_EXIST_SIGNATURE: &str = "doesn't exist";
 
+/// Stable substring jj prints when `jj bookmark set` is asked to move a
+/// bookmark backwards (target is an ancestor of the current position) or
+/// sideways (neither is an ancestor of the other) without `--allow-backwards`.
+/// Used by the PR-resume path to detect a diverged local `pr/<n>` bookmark
+/// and force-reset it to the GitHub head rather than aborting the lease.
+const JJ_BOOKMARK_BACKWARDS_SIDEWAYS_SIGNATURE: &str = "refusing to move bookmark backwards or sideways";
+
 impl CubeError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
@@ -2807,9 +2814,7 @@ fn resolve_pr_push_target(
             let mut head_branch: Option<String> = None;
             for name in infer_out.lines().map(str::trim).filter(|s| !s.is_empty()) {
                 if pr_bookmark::is_pr_bookmark(name) {
-                    if let Some(n_str) = name.strip_prefix("pr/")
-                        && let Ok(n) = n_str.parse::<u64>()
-                    {
+                    if let Some(n) = name.strip_prefix("pr/").and_then(|s| s.parse::<u64>().ok()) {
                         pr_number = Some(n);
                     }
                 } else {
@@ -3753,11 +3758,54 @@ fn resume_workspace_on_pr(
     // Set pr/<n> to the fetched GitHub head (create-or-move, idempotent).
     // Works for both the warm path (reconciling an existing local bookmark) and
     // the cold path (creating it for the first time in this workspace).
-    run_jj(
-        runner,
-        database_path,
-        &RealCommandRunner::invocation(workspace_path, "jj", &["bookmark", "set", &pr_bm, "-r", &remote_ref]),
-    )?;
+    //
+    // If the local bookmark has diverged from the GitHub head (ahead or sideways
+    // from a prior lease), jj refuses without --allow-backwards. In that case:
+    //   1. Check whether the local bookmark has commits not on the GitHub head
+    //      (true unpushed work — unexpected in a fresh-lease context).
+    //   2. Audit-log if any such commits are found.
+    //   3. Force-reset to the GitHub head; it is the source of truth for an open PR.
+    let first_set = runner.run(&RealCommandRunner::invocation(
+        workspace_path,
+        "jj",
+        &["bookmark", "set", &pr_bm, "-r", &remote_ref],
+    ));
+    if let Err(ref e) = first_set {
+        if !jj_bookmark_backwards_or_sideways(e) {
+            return Err(first_set.unwrap_err());
+        }
+        // Check for locally-unique commits that would be discarded by the reset.
+        // `pr/<n> ~ ancestors(<remote_ref>)` is non-empty when pr/<n> points to a
+        // commit that is NOT an ancestor of the GitHub head — i.e. true unpushed work.
+        let unpushed_revset = format!("{pr_bm} ~ ancestors({remote_ref})");
+        if let Ok(out) = runner.run(&RealCommandRunner::invocation(
+            workspace_path,
+            "jj",
+            &["log", "-r", &unpushed_revset, "--no-graph", "-T", "commit_id"],
+        )) {
+            let trimmed = out.trim();
+            if !trimmed.is_empty() {
+                audit!(
+                    database_path,
+                    "workspace.pr_bookmark_diverged_unpushed",
+                    workspace_path = workspace_path.display().to_string(),
+                    pr_number = pr_number,
+                    pr_bm = pr_bm,
+                    remote_ref = remote_ref,
+                    unpushed_commit = trimmed,
+                );
+            }
+        }
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                workspace_path,
+                "jj",
+                &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
+            ),
+        )?;
+    }
 
     // Re-establish the local head-branch bookmark pointing at the fetched ref
     // so a later `cube pr push` has the branch name available.
@@ -4304,6 +4352,20 @@ fn jj_update_stale_recovery_kind(err: &CubeError) -> Option<&'static str> {
         return Some("workspace.op_diverged_recovered");
     }
     None
+}
+
+/// Returns `true` when the error is jj's "refusing to move bookmark backwards
+/// or sideways" diagnostic — emitted by `jj bookmark set` when the target
+/// commit is an ancestor of (or unrelated to) the current bookmark position
+/// and `--allow-backwards` was not passed.
+fn jj_bookmark_backwards_or_sideways(err: &CubeError) -> bool {
+    let CubeError::CommandFailed { program, stderr, .. } = err else {
+        return false;
+    };
+    if program != "jj" {
+        return false;
+    }
+    stderr.to_lowercase().contains(JJ_BOOKMARK_BACKWARDS_SIDEWAYS_SIGNATURE)
 }
 
 fn current_workspace_commit(
@@ -7529,6 +7591,121 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("CLOSED"), "error should mention CLOSED: {msg}");
+    }
+
+    #[test]
+    fn workspace_lease_resume_pr_diverged_bookmark_reconciles_to_github_head() {
+        // Regression: when the local `pr/<n>` bookmark has diverged from the
+        // GitHub head (stale leftover from a prior lease), the lease must still
+        // succeed by force-resetting the bookmark to the GitHub head rather than
+        // aborting with "refusing to move bookmark backwards or sideways".
+        //
+        // Scenario: the workspace previously held a lease for PR 654, and its
+        // `pr/654` bookmark was left pointing at an old commit. A new lease
+        // for the same PR fetches an updated GitHub head and must reconcile.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-004").join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let ws_path = workspace_root.join("mono-agent-004");
+        let github_remote = "github";
+        let pr_number: u64 = 654;
+        let head_branch = "boss/exec_18b66112a0c4b750_5c8";
+        let remote_ref = format!("{head_branch}@{github_remote}");
+        let pr_bm = format!("pr/{pr_number}");
+        let pr_json = format!(r#"{{"headRefName":"{head_branch}","headRefOid":"abcdef1234567890","state":"OPEN"}}"#);
+        let remote_list = format!("origin\t/local/mirror\n{github_remote}\tgit@github.com:spinyfin/mono.git\n");
+        // The unpushed-check revset: pr/654 ~ ancestors(boss/exec_18b66112a0c4b750_5c8@github)
+        let unpushed_revset = format!("{pr_bm} ~ ancestors({remote_ref})");
+
+        let runner = FakeRunner::new(vec![
+            // Health check
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                "The working copy is clean",
+            ),
+            // Resolve github remote
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "remote", "list"], &remote_list),
+            // Fetch from GitHub remote
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch", "--remote", github_remote], ""),
+            // Resolve PR head from gh
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "gh",
+                &[
+                    "pr",
+                    "view",
+                    &pr_number.to_string(),
+                    "-R",
+                    "spinyfin/mono",
+                    "--json",
+                    "headRefName,headRefOid,state",
+                ],
+                &pr_json,
+            ),
+            // First bookmark set attempt fails — local pr/654 has diverged
+            ExpectedCommand::bookmark_backwards_or_sideways(
+                ws_path.clone(),
+                &["bookmark", "set", &pr_bm, "-r", &remote_ref],
+                &pr_bm,
+            ),
+            // Unpushed-commit check: returns empty (stale leftover, not real unpushed work)
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["log", "-r", &unpushed_revset, "--no-graph", "-T", "commit_id"],
+                "",
+            ),
+            // Force-reset with --allow-backwards
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["bookmark", "set", &pr_bm, "-r", &remote_ref, "--allow-backwards"],
+                "",
+            ),
+            // Re-establish head-branch bookmark
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["bookmark", "set", head_branch, "-r", &remote_ref, "--allow-backwards"],
+                "",
+            ),
+            // Land on PR head
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["new", &pr_bm], ""),
+            // Record head commit
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "d1verged",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from([
+                "cube",
+                "workspace",
+                "lease",
+                "mono",
+                "--task",
+                "resume PR 654 after bookmark diverged",
+                "--resume-pr",
+                "654",
+            ]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("diverged bookmark lease must succeed");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-004");
+        assert_eq!(result.payload["resume_pr"]["pr_number"], 654);
+        assert_eq!(result.payload["resume_pr"]["head_branch"], head_branch);
+        assert_eq!(result.payload["workspace"]["head_commit"], "d1verged");
     }
 
     #[test]
@@ -12232,6 +12409,29 @@ steps:
                     args: args_owned,
                     status: Some(1),
                     stderr: format!("Error: Revision `{target}` doesn't exist"),
+                }),
+                creates_dir: None,
+            }
+        }
+
+        /// Build an expectation that simulates `jj bookmark set` failing
+        /// because the target is an ancestor of (or unrelated to) the current
+        /// bookmark position and `--allow-backwards` was not passed. Matches
+        /// `JJ_BOOKMARK_BACKWARDS_SIDEWAYS_SIGNATURE`.
+        fn bookmark_backwards_or_sideways(cwd: PathBuf, args: &[&str], bookmark_name: &str) -> Self {
+            let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            Self {
+                cwd,
+                program: "jj".to_string(),
+                args: args_owned.clone(),
+                result: Err(CubeError::CommandFailed {
+                    program: "jj".to_string(),
+                    args: args_owned,
+                    status: Some(1),
+                    stderr: format!(
+                        "Error: Refusing to move bookmark backwards or sideways: {bookmark_name}\n\
+                         Hint: Use --allow-backwards to allow it."
+                    ),
                 }),
                 creates_dir: None,
             }
