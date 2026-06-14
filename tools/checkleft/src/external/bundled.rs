@@ -101,6 +101,13 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         limits: None,
     },
     BundledCheckDef {
+        check_names: &["file/size"],
+        kind: BundledCheckDefKind::Component {
+            bytes: checkleft_file_size_wasm_bundle::WASM,
+        },
+        limits: None,
+    },
+    BundledCheckDef {
         check_names: &["rust/giant-structs"],
         kind: BundledCheckDefKind::Component {
             // Bytes come from the checkleft_wasm_bundle micro-library so the

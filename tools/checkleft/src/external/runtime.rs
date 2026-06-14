@@ -205,6 +205,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
         changeset: &ChangeSet,
         source_tree: &dyn SourceTree,
         config: &toml::Value,
+        config_dir: &Path,
     ) -> Result<CheckResult>;
 
     /// Return the declared exclusions for a component check. `config_dir` is the
@@ -249,6 +250,7 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
         _changeset: &ChangeSet,
         _source_tree: &dyn SourceTree,
         _config: &toml::Value,
+        _config_dir: &Path,
     ) -> Result<CheckResult> {
         bail!(
             "external check package `{}` resolved successfully but runtime execution is not implemented yet",
@@ -332,6 +334,7 @@ impl DefaultExternalCheckExecutor {
         changeset: &ChangeSet,
         source_tree: &dyn SourceTree,
         config: &toml::Value,
+        config_dir: &Path,
     ) -> Result<CheckResult> {
         if !self.ticker.is_alive() {
             anyhow::bail!(
@@ -372,6 +375,7 @@ impl DefaultExternalCheckExecutor {
                 changeset,
                 source_tree,
                 config,
+                config_dir,
             },
         )
     }
@@ -437,10 +441,11 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         changeset: &ChangeSet,
         source_tree: &dyn SourceTree,
         config: &toml::Value,
+        config_dir: &Path,
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
-                self.execute_component_check(package, component, changeset, source_tree, config)
+                self.execute_component_check(package, component, changeset, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
                 if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
@@ -620,6 +625,8 @@ struct ComponentRun<'a> {
     changeset: &'a ChangeSet,
     source_tree: &'a dyn SourceTree,
     config: &'a toml::Value,
+    /// Repo-root-relative directory of the CHECKS file that configures this check.
+    config_dir: &'a Path,
 }
 
 fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Result<CheckResult> {
@@ -631,6 +638,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
         changeset,
         source_tree,
         config,
+        config_dir,
     } = run;
     let (timeout_ticks, max_memory_bytes) = resolve_component_limits(limits, changeset.changed_files.len());
     let linker = build_component_v1_linker(engine)?;
@@ -682,7 +690,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
 
-    let input = lower_check_input(changeset, config)?;
+    let input = lower_check_input(changeset, config, config_dir)?;
     let file_list = format_file_list(changeset);
     let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input)).map_err(|err| {
         if is_interrupt_error(&err) {
@@ -822,12 +830,13 @@ fn lower_changeset(changeset: &ChangeSet) -> wit_types::ChangeSet {
     }
 }
 
-fn lower_check_input(changeset: &ChangeSet, config: &toml::Value) -> Result<wit_types::CheckInput> {
+fn lower_check_input(changeset: &ChangeSet, config: &toml::Value, config_dir: &Path) -> Result<wit_types::CheckInput> {
     let config_json =
         serde_json::to_string(config).context("failed to serialize config to JSON for component input")?;
     Ok(wit_types::CheckInput {
         changeset: lower_changeset(changeset),
         config_json,
+        config_dir: config_dir.to_string_lossy().into_owned(),
     })
 }
 

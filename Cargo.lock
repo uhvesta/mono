@@ -633,6 +633,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkleft-file-size"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "globset",
+ "serde",
+ "tempfile",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "checkleft-package"
 version = "0.1.0"
 dependencies = [

@@ -22,6 +22,7 @@ members = [
   "tools/checkleft/sdk",
   "tools/checkleft/sdk-macro",
   "tools/checkleft/sdk/examples/trivial-check",
+  "tools/checkleft/checks/file/size",
   "tools/checkleft/checks/rust/giant-structs",
   "tools/checkleft_package",
   "tools/cube",

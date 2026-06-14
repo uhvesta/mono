@@ -36,6 +36,7 @@ rust_library(
     },
     visibility = ["//:__subpackages__"],
     deps = all_crate_deps(normal = True) + [
+        "//tools/checkleft/checks/file/size:checkleft_wasm_bundle_lib",
         "//tools/checkleft/checks/rust/giant-structs:checkleft_wasm_bundle_lib",
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
     ],

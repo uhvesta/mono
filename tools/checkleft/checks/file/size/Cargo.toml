@@ -1,0 +1,20 @@
+[package]
+name = "checkleft-file-size"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check (file/size): flag files that exceed a configured line-count limit"
+
+# cdylib is required to compile this crate as a wasm component.
+# On the host target this produces a native shared library; on wasm32-wasip2
+# it produces the component .wasm artifact via the rust_wasm_component bazel rule.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+checkleft-check-sdk = { path = "../../../sdk" }
+wit-bindgen = "0.51"
+serde = { workspace = true, features = ["derive"] }
+globset = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -43,6 +43,7 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
         _changeset: &ChangeSet,
         _source_tree: &dyn SourceTree,
         _config: &toml::Value,
+        _config_dir: &std::path::Path,
     ) -> Result<CheckResult> {
         self.seen_packages
             .lock()
@@ -573,10 +574,10 @@ async fn runner_reports_invalid_builtin_config_on_checks_file() {
         temp.path().join("CHECKS.toml"),
         r#"
 [[checks]]
-id = "file-size"
+id = "forbidden-paths"
 
 [checks.config]
-max_lines = "many"
+rules = "not-a-list"
 "#,
     )
     .expect("write config");
@@ -600,7 +601,7 @@ max_lines = "many"
         .expect("run checks");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].check_id, "file-size");
+    assert_eq!(results[0].check_id, "forbidden-paths");
     assert_eq!(
         results[0].findings[0].location.as_ref().map(|location| &location.path),
         Some(&Path::new("CHECKS.toml").to_path_buf())
@@ -608,7 +609,7 @@ max_lines = "many"
     assert!(
         results[0].findings[0]
             .message
-            .contains("invalid file-size check config")
+            .contains("invalid forbidden-paths check config")
     );
     assert!(!results[0].findings[0].message.contains("check execution failed"));
 }

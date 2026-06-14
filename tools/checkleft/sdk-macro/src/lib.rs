@@ -528,6 +528,7 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                 ::checkleft_check_sdk::CheckInput::__from_parts(
                     from_wit_changeset(raw.changeset),
                     raw.config_json,
+                    raw.config_dir,
                 )
             }
 

@@ -15,12 +15,12 @@
 # Root CHECKS.yaml (applies repo-wide unless overridden in child directories).
 # Each checks entry defines one configured check instance.
 checks:
-  - id: file-size
+  - id: file/size
 
     # Optional; defaults to true.
     enabled: true
 
-    # Check-specific config passed to the file-size implementation.
+    # Check-specific config passed to the file/size implementation.
     config:
       max_lines: 500
 
@@ -36,7 +36,7 @@ TOML is also supported:
 ```toml
 # Root CHECKS.toml
 [[checks]]
-id = "file-size"
+id = "file/size"
 enabled = true
 
 [checks.config]
@@ -170,14 +170,14 @@ Root `CHECKS.yaml`:
 
 ```yaml
 checks:
-  - id: file-size
+  - id: file/size
 ```
 
 `backend/generated/CHECKS.yaml`:
 
 ```yaml
 checks:
-  - id: file-size
+  - id: file/size
     enabled: false
 ```
 

@@ -245,7 +245,7 @@ Notes:
 - External URLs (`http`, `https`, `mailto`, `tel`) and same-page anchors are ignored.
 - Severity is `warning`.
 
-## `file-size`
+## `file/size`
 
 Purpose:
 
@@ -260,7 +260,7 @@ Notes:
 
 - Findings default to `warning`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
-- There is only one built-in check for file size. The `check: file-size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
+- There is only one bundled check for file size. The `check: file/size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
 
 ## `forbidden-imports-deps`
 

@@ -22,7 +22,7 @@ checks:
             - "bazel-*"
             - "bazel-*/**"
 
-  - id: file-size
+  - id: file/size
     config:
       max_lines: 3000
       exclude_files:

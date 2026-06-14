@@ -1,0 +1,76 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library", "rust_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/checkleft/wasm:defs.bzl", "rust_wasm_component")
+
+# On the host target this builds a native shared library (.so / .dylib).
+# On wasm32-wasip2 (via the rust_wasm_component rule below) it builds the
+# Component Model component that ships bundled in the checkleft binary.
+rust_shared_library(
+    name = "file_size_check",
+    srcs = ["src/lib.rs"],
+    crate_name = "checkleft_file_size",
+    edition = "2024",
+    proc_macro_deps = [
+        "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
+    ] + all_crate_deps(proc_macro = True),
+    visibility = ["//tools/checkleft:__pkg__"],
+    deps = [
+        "//tools/checkleft/sdk:checkleft_check_sdk",
+        "@@rules_rust++crate+mono_crates__globset-0.4.18//:globset",
+    ] + all_crate_deps(normal = True),
+)
+
+# Build the check as a Component Model component. Produces
+# file_size_check_component.wasm and its .sha256 sidecar. The .wasm is
+# embedded in checkleft_lib via include_bytes! (compile_data entry in
+# tools/checkleft/BUILD.bazel).
+rust_wasm_component(
+    name = "file_size_check_component",
+    crate = ":file_size_check",
+    visibility = ["//tools/checkleft:__pkg__"],
+)
+
+# Micro-library that embeds the wasm bytes via include_bytes!. Kept separate
+# from checkleft_lib so that having the generated wasm artifact in compile_data
+# here does not bleed into checkleft_lib and trigger rules_rust's
+# "symlink-sources-to-bazel-out" mode.
+rust_library(
+    name = "checkleft_wasm_bundle_lib",
+    srcs = ["bundled.rs"],
+    compile_data = [":file_size_check_component"],
+    crate_name = "checkleft_file_size_wasm_bundle",
+    crate_root = "bundled.rs",
+    edition = "2024",
+    visibility = ["//tools/checkleft:__pkg__"],
+    deps = [],
+)
+
+# Smoke test: builds the file/size check through the bazel rule and asserts
+# the sha256 sidecar is produced.
+sh_test(
+    name = "file_size_check_component_smoke_test",
+    size = "small",
+    srcs = ["//tools/checkleft/wasm:verify_component_sha.sh"],
+    args = ["$(rootpaths :file_size_check_component)"],
+    data = [":file_size_check_component"],
+)
+
+# Unit tests for the check logic compiled natively.
+rust_test(
+    name = "file_size_check_test",
+    size = "small",
+    crate = ":file_size_check",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/checkleft/sdk:checkleft_check_sdk",
+        "@@rules_rust++crate+mono_crates__globset-0.4.18//:globset",
+        "@@rules_rust++crate+mono_crates__tempfile-3.27.0//:tempfile",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

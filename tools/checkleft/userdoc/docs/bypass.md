@@ -7,7 +7,7 @@ This page describes bypass support for checks that opt into bypass.
 - Bypass is opt-in per check.
 - By default, checks do not allow bypass.
 - In the current default config, bypass is enabled for:
-  - `file-size`
+  - `file/size`
   - `api-breaking-surface`
   - `no-usfa-typo` (directive name: `BYPASS_NO_USFA_TYPO`)
 
@@ -19,7 +19,7 @@ id = "api-breaking-surface"
 allow_bypass = true
 
 [[checks]]
-id = "file-size"
+id = "file/size"
 
 [checks.policy]
 allow_bypass = true
@@ -45,6 +45,7 @@ The bypass name is derived from the check id by uppercasing and replacing all no
 
 | Check id | Bypass name |
 |---|---|
+| `file/size` | `BYPASS_FILE_SIZE` |
 | `format/rust` | `BYPASS_FORMAT_RUST` |
 | `format/bazel` | `BYPASS_FORMAT_BAZEL` |
 | `lint/rust` | `BYPASS_LINT_RUST` |
@@ -57,7 +58,7 @@ For `api-breaking-surface`:
 BYPASS_API_BREAKING_SURFACE=No public API behavior changed; docs update would be misleading.
 ```
 
-For `file-size`:
+For `file/size`:
 
 ```text
 BYPASS_FILE_SIZE=Generated file mirrors upstream source and cannot be split safely.

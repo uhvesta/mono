@@ -378,7 +378,7 @@ In the consumer repo's checked-in root config:
 ```yaml
 checks:
   - id: oversized-files
-    check: file-size
+    check: file/size
     config:
       max_lines: 600
 ```

@@ -183,6 +183,10 @@ impl Runner {
                     let run_config = run.config;
                     let run_policy = run.policy;
                     let source_path = run.source_path;
+                    let run_config_dir = source_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new(""))
+                        .to_path_buf();
                     let file_count = run_changeset.changed_files.len();
                     info!(
                         check_id = %configured_check_id,
@@ -200,7 +204,13 @@ impl Runner {
                         let source_path_clone = source_path.clone();
                         tokio::task::spawn_blocking(move || {
                             external_executor
-                                .execute(&package, &run_changeset, source_tree.as_ref(), &run_config)
+                                .execute(
+                                    &package,
+                                    &run_changeset,
+                                    source_tree.as_ref(),
+                                    &run_config,
+                                    &run_config_dir,
+                                )
                                 .map(|mut result| {
                                     result.check_id = configured_check_id.clone();
                                     apply_policy_to_result(result, &run_policy, &run_changeset)

@@ -59,6 +59,7 @@ fn component_v1_non_component_bytes_give_compile_error() {
             &ChangeSet::default(),
             &LocalSourceTree::new(temp.path()).expect("tree"),
             &toml::Value::Table(Default::default()),
+            std::path::Path::new(""),
         )
         .expect_err("core wasm bytes must not parse as a component");
     assert!(
@@ -103,6 +104,7 @@ fn component_v1_digest_mismatch_is_rejected() {
             &ChangeSet::default(),
             &LocalSourceTree::new(temp.path()).expect("tree"),
             &toml::Value::Table(Default::default()),
+            std::path::Path::new(""),
         )
         .expect_err("digest mismatch must be rejected");
     assert!(error.to_string().contains("artifact sha256 mismatch"));
@@ -715,7 +717,13 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
     // Run through the full component-v1 host with modified-only sandbox (the default).
     let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
     let result = executor
-        .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
+        .execute(
+            &package,
+            &changeset,
+            &tree,
+            &toml::Value::Table(Default::default()),
+            std::path::Path::new(""),
+        )
         .expect("execute");
 
     assert_eq!(result.check_id, "rust/giant-structs");
@@ -773,7 +781,13 @@ fn bundled_giant_structs_check_skips_files_not_in_changeset() {
 
     let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
     let result = executor
-        .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
+        .execute(
+            &package,
+            &changeset,
+            &tree,
+            &toml::Value::Table(Default::default()),
+            std::path::Path::new(""),
+        )
         .expect("execute");
 
     assert!(
@@ -825,7 +839,13 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
 
     let executor = DefaultExternalCheckExecutor::new(temp.path()).expect("executor");
     let result = executor
-        .execute(&package, &changeset, &tree, &toml::Value::Table(Default::default()))
+        .execute(
+            &package,
+            &changeset,
+            &tree,
+            &toml::Value::Table(Default::default()),
+            std::path::Path::new(""),
+        )
         .expect("check must complete without fuel exhaustion or timeout on a large file");
 
     assert_eq!(result.check_id, "rust/giant-structs");

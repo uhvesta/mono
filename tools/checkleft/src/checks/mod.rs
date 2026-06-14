@@ -2,7 +2,6 @@ mod api_breaking_surface;
 mod bazel;
 mod code_patterns;
 mod docs_link_integrity;
-mod file_size;
 mod forbidden_imports_deps;
 mod forbidden_paths;
 mod frontend_no_legacy_api;
@@ -30,7 +29,6 @@ pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(docs_link_integrity::DocsLinkIntegrityCheck)?;
     registry.register(forbidden_imports_deps::ForbiddenImportsDepsCheck)?;
     registry.register(forbidden_paths::ForbiddenPathsCheck)?;
-    registry.register(file_size::FileSizeCheck)?;
     registry.register(frontend_no_legacy_api::FrontendNoLegacyApiCheck)?;
     registry.register(ifchange_thenchange::IfChangeThenChangeCheck)?;
     registry.register(repo_visibility::RepoVisibilityCheck)?;
