@@ -59,27 +59,37 @@ pub const CACHE_DIR_ENV_VAR: &str = "CHECKLEFT_CWASM_CACHE_DIR";
 /// Maximum age of a cache entry before it is evicted on the next `open()`.
 const CACHE_MAX_AGE_DAYS: u64 = 90;
 
-/// Resolve the default AOT cache directory.
+/// Pure resolution logic for the AOT cache directory.
 ///
 /// Resolution order:
-/// 1. `$CHECKLEFT_CWASM_CACHE_DIR` — explicit override (useful in CI where
-///    disk caches live at a custom mount point).
+/// 1. `env_override` — explicit override value (the content of
+///    `$CHECKLEFT_CWASM_CACHE_DIR`), if non-empty after trimming.
 /// 2. Platform cache directory:
 ///    - macOS: `~/Library/Caches/checkleft/cwasm`
 ///    - Linux: `$XDG_CACHE_HOME/checkleft/cwasm` or `~/.cache/checkleft/cwasm`
 ///    - Windows: `%LOCALAPPDATA%\checkleft\cache\cwasm`
 ///
-/// Returns `None` if neither a valid env override is set nor a platform cache
-/// dir can be resolved (e.g. no home directory is available).  The caller
-/// should then fall back to an in-tree path such as `{repo_root}/.checkleft-cwasm`.
-pub fn default_cache_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(CACHE_DIR_ENV_VAR) {
+/// Returns `None` if neither a valid override is provided nor a platform cache
+/// dir can be resolved (e.g. no home directory is available).
+fn resolve_cache_dir(env_override: Option<&str>) -> Option<PathBuf> {
+    if let Some(dir) = env_override {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
             return Some(PathBuf::from(trimmed));
         }
     }
     directories::ProjectDirs::from("", "", "checkleft").map(|proj| proj.cache_dir().join("cwasm"))
+}
+
+/// Resolve the default AOT cache directory.
+///
+/// Reads `$CHECKLEFT_CWASM_CACHE_DIR` once and delegates to [`resolve_cache_dir`].
+/// Returns `None` if neither a valid env override is set nor a platform cache
+/// dir can be resolved (e.g. no home directory is available).  The caller
+/// should then fall back to an in-tree path such as `{repo_root}/.checkleft-cwasm`.
+pub fn default_cache_dir() -> Option<PathBuf> {
+    let override_val = std::env::var(CACHE_DIR_ENV_VAR).ok();
+    resolve_cache_dir(override_val.as_deref())
 }
 
 /// On-disk `.cwasm` cache directory.
@@ -400,28 +410,22 @@ mod tests {
     }
 
     // --- cache path resolution tests ---
+    //
+    // These tests exercise resolve_cache_dir() directly so no env mutation is
+    // needed — eliminating the race with parallel test threads.
 
     #[test]
     fn default_cache_dir_env_override_is_respected() {
-        // Use a unique env-var value to avoid test cross-contamination.
         let tmp = tempdir().unwrap();
         let expected = tmp.path().join("ci-cache");
-        // SAFETY: single-threaded test; no other thread reads this env var.
-        unsafe { std::env::set_var(CACHE_DIR_ENV_VAR, expected.to_str().unwrap()) };
-        let result = default_cache_dir();
-        // SAFETY: single-threaded test; restoring env var.
-        unsafe { std::env::remove_var(CACHE_DIR_ENV_VAR) };
+        let result = resolve_cache_dir(Some(expected.to_str().unwrap()));
         assert_eq!(result, Some(expected));
     }
 
     #[test]
     fn default_cache_dir_empty_env_falls_back_to_platform() {
         // An empty value must be treated as unset and fall through to the platform dir.
-        // SAFETY: single-threaded test; no other thread reads this env var.
-        unsafe { std::env::set_var(CACHE_DIR_ENV_VAR, "") };
-        let result = default_cache_dir();
-        // SAFETY: single-threaded test; restoring env var.
-        unsafe { std::env::remove_var(CACHE_DIR_ENV_VAR) };
+        let result = resolve_cache_dir(Some(""));
         // We can't assert the exact path (platform-dependent) but it must either
         // be None (no home dir in some CI environments) or contain "checkleft".
         if let Some(p) = result {
@@ -435,13 +439,9 @@ mod tests {
 
     #[test]
     fn default_cache_dir_platform_path_contains_checkleft() {
-        // If CACHE_DIR_ENV_VAR is not set, the resolved path (when available)
+        // When no override is provided the resolved path (when available)
         // should be under the platform cache dir and contain "checkleft".
-        // This test avoids mutating env state for the common case.
-        if std::env::var(CACHE_DIR_ENV_VAR).is_ok() {
-            return; // skip if another test left the var set
-        }
-        if let Some(p) = default_cache_dir() {
+        if let Some(p) = resolve_cache_dir(None) {
             let s = p.to_string_lossy();
             assert!(
                 s.contains("checkleft"),
