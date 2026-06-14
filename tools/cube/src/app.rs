@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use console::{Style, style};
 use git_utils::pr_bookmark;
@@ -119,6 +119,15 @@ pub enum CubeError {
         status: Option<i32>,
         stderr: String,
     },
+    #[error(
+        "command `{program} {}` did not complete within {timeout_secs}s and was killed",
+        args.join(" ")
+    )]
+    CommandTimedOut {
+        program: String,
+        args: Vec<String>,
+        timeout_secs: u64,
+    },
     #[error("failed to serialize output: {0}")]
     Json(#[from] serde_json::Error),
     #[error("workspace `{workspace_path}` is stale and could not be auto-recovered: {cause}")]
@@ -199,6 +208,7 @@ impl CubeError {
             | Self::AuditLogIo { .. }
             | Self::LockIo { .. }
             | Self::CommandFailed { .. }
+            | Self::CommandTimedOut { .. }
             | Self::Json(_)
             | Self::StaleRecoveryFailed { .. } => ExitCode::FAILURE,
             // Surfaced as its own exit code so the engine's heartbeat
@@ -739,16 +749,19 @@ fn materialize_repo_source_if_missing(runner: &dyn CommandRunner, record: &RepoR
 /// authenticate via SSH key here, so corporate SSO does not block detection.
 fn detect_remote_default_branch(runner: &dyn CommandRunner, cwd: &Path, origin: &str) -> Option<String> {
     let output = runner
-        .run(&CommandInvocation {
-            cwd: cwd.to_path_buf(),
-            program: "git".to_string(),
-            args: vec![
-                "ls-remote".to_string(),
-                "--symref".to_string(),
-                origin.to_string(),
-                "HEAD".to_string(),
-            ],
-        })
+        .run_with_timeout(
+            &CommandInvocation {
+                cwd: cwd.to_path_buf(),
+                program: "git".to_string(),
+                args: vec![
+                    "ls-remote".to_string(),
+                    "--symref".to_string(),
+                    origin.to_string(),
+                    "HEAD".to_string(),
+                ],
+            },
+            network_cmd_timeout(),
+        )
         .ok()?;
     parse_symref_default_branch(&output)
 }
@@ -853,16 +866,19 @@ fn add_github_remote_and_track(
         ],
     })?;
 
-    runner.run(&CommandInvocation {
-        cwd: workspace_path.to_path_buf(),
-        program: "jj".to_string(),
-        args: vec![
-            "git".to_string(),
-            "fetch".to_string(),
-            "--remote".to_string(),
-            "github".to_string(),
-        ],
-    })?;
+    runner.run_with_timeout(
+        &CommandInvocation {
+            cwd: workspace_path.to_path_buf(),
+            program: "jj".to_string(),
+            args: vec![
+                "git".to_string(),
+                "fetch".to_string(),
+                "--remote".to_string(),
+                "github".to_string(),
+            ],
+        },
+        network_cmd_timeout(),
+    )?;
 
     // Track the integration branch on the github remote so that local `<main>`
     // follows GitHub rather than the stale local mirror. A missing `<main>@github`
@@ -1103,6 +1119,13 @@ fn run_workspace(
                         lease_expires_at,
                     )?
                     .ok_or_else(|| CubeError::NoAvailableWorkspace(repo.clone()))?;
+
+                // The workspace is now claimed (state=leased) and exclusively
+                // ours, so release the per-repo lock before the local jj probe
+                // and setup below — none of that needs to serialize against
+                // other leases, and holding the lock across it would let one
+                // slow workspace wedge the whole repo pool.
+                drop(_lock);
 
                 // No reset: the working copy is handed over exactly as the
                 // prior holder left it. Record whatever `@` currently is so
@@ -1367,6 +1390,16 @@ fn run_workspace(
                 return Err(CubeError::NoAvailableWorkspace(repo));
             }
 
+            // ── Critical section ends here ──────────────────────────────────
+            // The workspace is claimed (state=leased) and exclusively ours.
+            // Release the per-repo lock before the network-bound reset/resume
+            // and setup below: those operate only on this one workspace, and
+            // the bounded lease TTL (30m) far exceeds the bounded reset, so no
+            // concurrent lease can expire-and-reclaim it mid-reset. Holding
+            // the lock across `jj git fetch` is exactly what let one stalled
+            // workspace wedge every other lease/release for the repo.
+            drop(_lock);
+
             // If the workspace had conflicted bookmarks, repair them before
             // the reset. `jj new main` would succeed with conflicts present,
             // but the conflicts would still appear in `jj status` for the
@@ -1496,8 +1529,11 @@ fn run_workspace(
             let workspace = store
                 .get_workspace_by_lease(&lease)?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
-            let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
+
+            // Missing-dir handling mutates the registry, so it needs the lock;
+            // take it only for that and return.
             if !workspace_path_exists(&workspace) {
+                let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
                 eprintln!(
                     "warning: cube workspace `{}/{}` directory is missing at {}; \
                      removing the dangling registry row instead of running release reset",
@@ -1517,39 +1553,79 @@ fn run_workspace(
                 store.forget_workspace(&workspace.repo, &workspace.workspace_id)?;
                 return Err(CubeError::LeaseNotFound(lease));
             }
+
+            // Reset the workspace OUTSIDE the per-repo lock. This is the
+            // root-cause fix: the workspace is still `leased` (so no concurrent
+            // lease can claim it) and its TTL (30m) far exceeds the now-bounded
+            // reset, so running `jj git fetch && jj new <main>` here cannot be
+            // raced — and a stalled remote can no longer hold the lock and
+            // wedge every other lease/release for the repo. A failed or
+            // timed-out reset degrades to "release the lease anyway, mark the
+            // workspace dirty" instead of blocking the release.
+            let mut reset_error: Option<CubeError> = None;
             if !keep_dirty {
                 let repo_record = store
                     .get_repo(&workspace.repo)?
                     .ok_or_else(|| CubeError::RepoNotFound(workspace.repo.clone()))?;
-                reset_workspace(
+                // Refresh the lease expiry before the unlocked reset so a
+                // concurrent `cube workspace lease` cannot expire-and-reclaim
+                // this still-`leased` workspace while we are mid-reset (the
+                // window that opened up once the reset stopped holding the repo
+                // lock). Best-effort: if the lease is already gone the reset
+                // and release below surface it as LeaseNotFound as before.
+                let _ = store.heartbeat_lease(&lease, Some(current_epoch_s()? + DEFAULT_LEASE_TTL_SECS));
+                match reset_workspace(
                     runner,
                     database_path,
                     &workspace.workspace_path,
                     &repo_record.main_branch,
-                )?;
-                // Opportunistically forget consumed boss/exec_* bookmarks.
-                // The fetch above already updated main, so do_fetch = false.
-                // Best-effort: log a warning but never block the release.
-                match gc_workspace_bookmarks(runner, database_path, &workspace.workspace_path, false, false) {
-                    Ok(forgotten) if !forgotten.is_empty() => {
-                        eprintln!(
-                            "cube: release gc: {} consumed bookmark(s) forgotten in {}",
-                            forgotten.len(),
-                            workspace.workspace_id,
-                        );
+                ) {
+                    Ok(()) => {
+                        // Opportunistically forget consumed boss/exec_* bookmarks.
+                        // The fetch above already updated main, so do_fetch = false.
+                        // Best-effort: log a warning but never block the release.
+                        match gc_workspace_bookmarks(runner, database_path, &workspace.workspace_path, false, false) {
+                            Ok(forgotten) if !forgotten.is_empty() => {
+                                eprintln!(
+                                    "cube: release gc: {} consumed bookmark(s) forgotten in {}",
+                                    forgotten.len(),
+                                    workspace.workspace_id,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!(
+                                    "warning: bookmark gc on release of {} failed: {e}",
+                                    workspace.workspace_id,
+                                );
+                            }
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
                         eprintln!(
-                            "warning: bookmark gc on release of {} failed: {e}",
+                            "warning: workspace reset on release of {} failed: {e}; releasing the \
+                             lease anyway and marking the workspace dirty so the next lease \
+                             re-resets it before handing it out",
                             workspace.workspace_id,
                         );
+                        reset_error = Some(e);
                     }
                 }
             }
+
+            // Take the lock only for the registry state transition.
+            let _lock = RepoLock::acquire(&repo_lock_path(&workspace.repo, database_path)?)?;
             let released = store
                 .release_workspace(&lease, reason.as_deref())?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+            if reset_error.is_some() {
+                // The freed workspace is in an unknown post-reset state. Flag it
+                // dirty (release_workspace cleared health to NULL) so the lease
+                // health-check skips it and pool GC resets it, rather than
+                // handing out an un-reset tree.
+                let _ = store.update_workspace_health(&released.repo, &released.workspace_id, WorkspaceHealth::Dirty);
+            }
+            drop(_lock);
 
             audit!(
                 database_path,
@@ -1559,10 +1635,14 @@ fn run_workspace(
                 lease_id = lease,
                 reason = reason,
                 keep_dirty = keep_dirty,
+                reset_failed = reset_error.is_some(),
+                reset_error = reset_error.as_ref().map(|e| e.to_string()),
             );
 
             let message = if keep_dirty {
                 format!("Released {} (kept dirty).", released.workspace_id)
+            } else if reset_error.is_some() {
+                format!("Released {} (reset failed; marked dirty).", released.workspace_id)
             } else {
                 format!("Released {}.", released.workspace_id)
             };
@@ -1570,6 +1650,7 @@ fn run_workspace(
                 message,
                 json!({
                     "workspace": released,
+                    "reset_failed": reset_error.is_some(),
                 }),
             )
         }
@@ -2080,7 +2161,7 @@ fn workspace_rebase(store: &mut Store, database_path: Option<&Path>, runner: &dy
     let (github_remote, _owner_repo) = resolve_github_remote_for_workspace(runner, database_path, &cwd)?;
 
     // Fetch latest state — needed for both `main` and the boss branch.
-    run_jj(
+    run_jj_network(
         runner,
         database_path,
         &RealCommandRunner::invocation(&cwd, "jj", &["git", "fetch", "--remote", &github_remote]),
@@ -2985,17 +3066,25 @@ fn auto_create_workspace(
         repo_record.origin.clone()
     };
 
-    runner.run(&CommandInvocation {
-        cwd: repo_record.workspace_root.clone(),
-        program: "jj".to_string(),
-        args: vec![
-            "git".to_string(),
-            "clone".to_string(),
-            "--colocate".to_string(),
-            clone_source,
-            staging_path.display().to_string(),
-        ],
-    })?;
+    // Bound the clone so a wedged remote can't hang provisioning forever.
+    // NOTE: this clone still runs under the per-repo lock (the new workspace
+    // id is allocated here and the staging name must not race a concurrent
+    // create). The timeout caps the worst case; moving the clone fully out of
+    // the lock requires reserving the id first — tracked as a follow-up.
+    runner.run_with_timeout(
+        &CommandInvocation {
+            cwd: repo_record.workspace_root.clone(),
+            program: "jj".to_string(),
+            args: vec![
+                "git".to_string(),
+                "clone".to_string(),
+                "--colocate".to_string(),
+                clone_source,
+                staging_path.display().to_string(),
+            ],
+        },
+        network_cmd_timeout(),
+    )?;
 
     if clone_from_source {
         // Cloned from a local mirror: `origin` now points to the stale on-disk
@@ -3177,7 +3266,7 @@ fn gc_workspace_bookmarks(
     dry_run: bool,
 ) -> Result<Vec<String>> {
     if do_fetch {
-        run_jj(
+        run_jj_network(
             runner,
             database_path,
             &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
@@ -3695,7 +3784,7 @@ fn resume_workspace_on_pr(
 
     // Fetch from the GitHub remote — load-bearing for the cold path where the
     // PR branch has never been fetched into this workspace.
-    run_jj(
+    run_jj_network(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch", "--remote", &github_remote]),
@@ -3731,8 +3820,10 @@ fn resume_workspace_on_pr(
 
     // Resolve PR N's current head from GitHub: state, head branch, and OID.
     let pr_n_str = pr_number.to_string();
-    let pr_json = runner
-        .run(&RealCommandRunner::invocation(
+    let pr_json = run_network(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
             workspace_path,
             "gh",
             &[
@@ -3744,8 +3835,9 @@ fn resume_workspace_on_pr(
                 "--json",
                 "headRefName,headRefOid,state",
             ],
-        ))
-        .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {pr_number} in {owner_repo}: {e}")))?;
+        ),
+    )
+    .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {pr_number} in {owner_repo}: {e}")))?;
 
     let pr_info: serde_json::Value = serde_json::from_str(&pr_json)?;
 
@@ -3868,7 +3960,7 @@ fn reset_workspace_guarded(
     prior_expired: Option<&crate::store::ExpiredLease>,
 ) -> Result<()> {
     audit_jj_op(database_path, workspace_path, "git", &["fetch"], prior_expired);
-    run_jj(
+    run_jj_network(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
@@ -4234,6 +4326,135 @@ fn read_head_status(
     })
 }
 
+/// Default per-attempt wall-clock bound for any subprocess cube spawns
+/// through [`run_jj`] / [`run_network`]. Generous enough that a slow but
+/// live `jj git fetch` of a large repo completes, tight enough that a
+/// wedged half-open ssh connection is killed in minutes rather than the
+/// 16+ the unbounded path was observed to hang. Overridable via
+/// `CUBE_NETWORK_TIMEOUT_SECS` for hosts with unusual repos or links.
+const DEFAULT_NETWORK_CMD_TIMEOUT_SECS: u64 = 120;
+
+/// How many extra times a read-only network op (fetch / clone / `gh` /
+/// `ls-remote`) is retried after a timeout or a transient network failure
+/// before the error is surfaced.
+const NETWORK_CMD_RETRIES: u32 = 2;
+
+/// Resolve the per-attempt network command timeout, honouring the
+/// `CUBE_NETWORK_TIMEOUT_SECS` override (clamped to a sane floor so an
+/// operator typo can't reintroduce a near-zero/no timeout).
+fn network_cmd_timeout() -> Duration {
+    let secs = std::env::var("CUBE_NETWORK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s >= 5)
+        .unwrap_or(DEFAULT_NETWORK_CMD_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Stable substrings that mark a network failure as transient (worth a
+/// bounded retry) rather than a hard error like an auth or merge failure.
+/// Matched case-insensitively against a failed command's stderr.
+const TRANSIENT_NETWORK_SIGNATURES: &[&str] = &[
+    "connection reset",
+    "connection timed out",
+    "connection refused",
+    "could not resolve",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "operation timed out",
+    "timed out",
+    "early eof",
+    "broken pipe",
+    "ssh: connect to host",
+];
+
+/// True when `err` represents a transient network condition that a bounded
+/// retry might clear: a cube-side timeout, or a command failure whose
+/// stderr matches a known-transient signature.
+fn is_retryable_network_error(err: &CubeError) -> bool {
+    match err {
+        CubeError::CommandTimedOut { .. } => true,
+        CubeError::CommandFailed { stderr, .. } => {
+            let lowered = stderr.to_ascii_lowercase();
+            TRANSIENT_NETWORK_SIGNATURES.iter().any(|sig| lowered.contains(sig))
+        }
+        _ => false,
+    }
+}
+
+/// [`run_jj`] for a network operation (e.g. `jj git fetch`): the same
+/// recovery behaviour, plus a bounded retry on a timeout or transient
+/// network failure. A non-transient failure (auth, conflict, bad revset)
+/// returns immediately. This is the wrapper the lease/release reset paths
+/// use so a flaky-but-alive remote self-heals while a genuinely wedged one
+/// is bounded by [`network_cmd_timeout`] rather than hanging forever.
+fn run_jj_network(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    invocation: &CommandInvocation,
+) -> Result<String> {
+    let mut attempt: u32 = 0;
+    loop {
+        match run_jj(runner, database_path, invocation) {
+            Ok(out) => return Ok(out),
+            Err(err) if attempt < NETWORK_CMD_RETRIES && is_retryable_network_error(&err) => {
+                attempt += 1;
+                eprintln!(
+                    "cube: network command `{} {}` failed transiently (attempt {attempt}/{NETWORK_CMD_RETRIES}); retrying: {err}",
+                    invocation.program,
+                    invocation.args.join(" "),
+                );
+                audit!(
+                    database_path,
+                    "workspace.network_retry",
+                    workspace_path = invocation.cwd.display().to_string(),
+                    program = invocation.program,
+                    args = invocation.args,
+                    attempt = attempt,
+                    error = err.to_string(),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Run a non-`jj` network subprocess (e.g. `gh`, `git ls-remote`) with the
+/// network timeout and the same bounded retry policy as [`run_jj_network`].
+/// Unlike [`run_jj`] there is no jj-specific recovery to layer on, so this
+/// goes straight through [`CommandRunner::run_with_timeout`].
+fn run_network(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    invocation: &CommandInvocation,
+) -> Result<String> {
+    let timeout = network_cmd_timeout();
+    let mut attempt: u32 = 0;
+    loop {
+        match runner.run_with_timeout(invocation, timeout) {
+            Ok(out) => return Ok(out),
+            Err(err) if attempt < NETWORK_CMD_RETRIES && is_retryable_network_error(&err) => {
+                attempt += 1;
+                eprintln!(
+                    "cube: network command `{} {}` failed transiently (attempt {attempt}/{NETWORK_CMD_RETRIES}); retrying: {err}",
+                    invocation.program,
+                    invocation.args.join(" "),
+                );
+                audit!(
+                    database_path,
+                    "workspace.network_retry",
+                    workspace_path = invocation.cwd.display().to_string(),
+                    program = invocation.program,
+                    args = invocation.args,
+                    attempt = attempt,
+                    error = err.to_string(),
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 /// Run a `jj` command against a workspace, transparently recovering
 /// from a stale working copy, op-log divergence, or a missing jj repo
 /// alongside an existing git repo. If the underlying command fails with
@@ -4245,8 +4466,14 @@ fn read_head_status(
 /// surfaces a clear `NoAvailableWorkspace` error naming the broken
 /// workspace path instead of the raw jj message. Other failures and
 /// non-`jj` invocations pass through untouched.
+///
+/// Every attempt is bounded by [`network_cmd_timeout`] so a wedged
+/// subprocess (most importantly a half-open `jj git fetch`) is killed
+/// rather than hanging cube — and, critically, any lock cube holds is
+/// released instead of starving the whole repo pool.
 fn run_jj(runner: &dyn CommandRunner, database_path: Option<&Path>, invocation: &CommandInvocation) -> Result<String> {
-    match runner.run(invocation) {
+    let timeout = network_cmd_timeout();
+    match runner.run_with_timeout(invocation, timeout) {
         Ok(out) => Ok(out),
         Err(err) => {
             // Sibling heal: workspace has .git but no .jj — colocate-init jj.
@@ -4266,7 +4493,7 @@ fn run_jj(runner: &dyn CommandRunner, database_path: Option<&Path>, invocation: 
                     program = invocation.program,
                     args = invocation.args,
                 );
-                return match runner.run(invocation) {
+                return match runner.run_with_timeout(invocation, timeout) {
                     Ok(out) => Ok(out),
                     Err(_) => Err(err),
                 };
@@ -4308,7 +4535,7 @@ fn run_jj(runner: &dyn CommandRunner, database_path: Option<&Path>, invocation: 
                 program = invocation.program,
                 args = invocation.args,
             );
-            match runner.run(invocation) {
+            match runner.run_with_timeout(invocation, timeout) {
                 Ok(out) => Ok(out),
                 Err(retry_err) => Err(CubeError::StaleRecoveryFailed {
                     workspace_path: invocation.cwd.clone(),
@@ -4954,12 +5181,13 @@ mod tests {
 
     use crate::cli::{Cli, Command};
     use crate::command_runner::{CommandInvocation, CommandRunner};
+    use crate::lock::RepoLock;
 
     use super::{
         BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
-        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_stdin_path,
-        render_boss_infra_exclude_block, resolve_body_file, resolve_checkleft_bin, run_checkleft_gate,
-        run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude,
+        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_retryable_network_error,
+        is_stdin_path, render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin,
+        run_checkleft_gate, run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -10174,6 +10402,235 @@ mod tests {
         )
         .expect("release");
         release_runner.assert_exhausted();
+    }
+
+    /// Shared state for [`BlockingFetchRunner`]: the fetch signals `entered`
+    /// when it starts and then blocks until the test sets `released`. A single
+    /// mutex backs both flags (a Condvar may only ever pair with one mutex).
+    #[derive(Default)]
+    struct GateState {
+        entered: bool,
+        released: bool,
+    }
+
+    struct FetchGate {
+        state: std::sync::Mutex<GateState>,
+        cv: std::sync::Condvar,
+    }
+
+    /// A `CommandRunner` whose `jj git fetch` blocks until the test releases
+    /// it, so we can inspect cube's lock state *while* a network op is in
+    /// flight. All other commands return canned output; `jj git remote list`
+    /// returns a local (non-github) mirror so the reset and gc sweeps complete
+    /// without reaching out to `gh`.
+    struct BlockingFetchRunner {
+        gate: std::sync::Arc<FetchGate>,
+    }
+
+    impl CommandRunner for BlockingFetchRunner {
+        fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+            let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
+            if invocation.program == "jj" && args.first() == Some(&"git") && args.get(1) == Some(&"fetch") {
+                {
+                    let mut state = self.gate.state.lock().unwrap();
+                    state.entered = true;
+                    self.gate.cv.notify_all();
+                }
+                let mut state = self.gate.state.lock().unwrap();
+                while !state.released {
+                    state = self.gate.cv.wait(state).unwrap();
+                }
+                return Ok(String::new());
+            }
+            if invocation.program == "jj" && args == ["git", "remote", "list"] {
+                // Local mirror form: keeps the reset's upstream detection and
+                // the gc pr-sweep from making any github/gh network calls.
+                return Ok("origin /local/path/to/mirror\n".to_string());
+            }
+            Ok(String::new())
+        }
+    }
+
+    /// Root-cause regression test: a `cube workspace release` whose `jj git
+    /// fetch` is wedged must NOT be holding the per-repo lock. If it were, this
+    /// repo would be unable to lease/release any other workspace — the exact
+    /// pool-wide wedge this fix removes.
+    #[test]
+    fn release_does_not_hold_repo_lock_across_stalled_fetch() {
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+        seed_mono_repo(&workspace_root, &database_path);
+
+        // Lease the workspace normally so there is a live lease to release.
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "lock probe"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let gate = Arc::new(FetchGate {
+            state: std::sync::Mutex::new(GateState::default()),
+            cv: std::sync::Condvar::new(),
+        });
+        let runner = BlockingFetchRunner {
+            gate: Arc::clone(&gate),
+        };
+        let lock_path = repo_lock_path("mono", Some(&database_path)).expect("lock path");
+
+        std::thread::scope(|scope| {
+            // Run the release on a worker thread; its fetch will block.
+            let release_handle = scope.spawn(|| {
+                run_with_dependencies(
+                    Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+                    Some(&database_path),
+                    &runner,
+                )
+            });
+
+            // Wait until the release is parked inside `jj git fetch`.
+            {
+                let mut state = gate.state.lock().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !state.entered {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    assert!(remaining > Duration::ZERO, "release never reached the fetch");
+                    let (guard, _timeout) = gate.cv.wait_timeout(state, remaining).unwrap();
+                    state = guard;
+                }
+            }
+
+            // While the fetch is wedged, the per-repo lock must be free. Acquire
+            // it on a helper thread and wait for it with a timeout so a
+            // regression (lock held across the fetch) is detected without
+            // hanging the test.
+            let (tx, rx) = mpsc::channel();
+            let probe_path = lock_path.clone();
+            scope.spawn(move || {
+                // Blocks here under a regression until the release drops the
+                // lock; sends once acquired so the test can measure latency.
+                let acquired = RepoLock::acquire(&probe_path);
+                let _ = tx.send(());
+                drop(acquired);
+            });
+            let lock_was_free = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+            // Always unblock the fetch and join, so the test exits cleanly even
+            // on the regression path, then assert.
+            {
+                let mut state = gate.state.lock().unwrap();
+                state.released = true;
+                gate.cv.notify_all();
+            }
+            let result = release_handle.join().expect("release thread").expect("release ok");
+            assert_eq!(result.payload["workspace"]["state"], "free");
+            assert!(
+                lock_was_free,
+                "per-repo lock was held during release's fetch — the network op is still \
+                 inside the critical section (regression)"
+            );
+        });
+    }
+
+    /// Graceful degradation: if the release reset's fetch fails outright, the
+    /// lease is still released (the worker is never stranded) and the freed
+    /// workspace is marked dirty so the next lease re-resets it.
+    #[test]
+    fn release_degrades_to_dirty_when_reset_fetch_fails() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let workspace_path = workspace_root.join("mono-agent-001");
+        std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        let lease_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "degrade test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+        let lease_id = lease_result.payload["workspace"]["lease_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Release runner: the very first command (the reset fetch) fails with a
+        // non-transient error, so the reset aborts before any further command.
+        let release_runner = FakeRunner::new(vec![ExpectedCommand {
+            cwd: workspace_path.clone(),
+            program: "jj".to_string(),
+            args: vec!["git".to_string(), "fetch".to_string()],
+            result: Err(CubeError::CommandFailed {
+                program: "jj".to_string(),
+                args: vec!["git".to_string(), "fetch".to_string()],
+                status: Some(1),
+                stderr: "fatal: permission denied (publickey)".to_string(),
+            }),
+            creates_dir: None,
+        }]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+            Some(&database_path),
+            &release_runner,
+        )
+        .expect("release should succeed even when reset fails");
+        release_runner.assert_exhausted();
+
+        // Lease succeeded as a release; workspace is free again.
+        assert_eq!(result.payload["workspace"]["state"], "free");
+        assert_eq!(result.payload["reset_failed"], serde_json::Value::Bool(true));
+
+        // And it is flagged dirty so the next lease won't hand out an un-reset tree.
+        let store = crate::store::Store::open_at(&database_path).expect("store");
+        let records = store
+            .list_workspaces_filtered(&crate::store::WorkspaceListFilter {
+                repo: Some("mono"),
+                workspace_id: Some("mono-agent-001"),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].health_status,
+            Some(crate::metadata::WorkspaceHealth::Dirty),
+            "reset failure should mark the freed workspace dirty"
+        );
+    }
+
+    #[test]
+    fn is_retryable_network_error_classifies_transient_failures() {
+        assert!(is_retryable_network_error(&CubeError::CommandTimedOut {
+            program: "jj".to_string(),
+            args: vec!["git".to_string(), "fetch".to_string()],
+            timeout_secs: 120,
+        }));
+        assert!(is_retryable_network_error(&CubeError::CommandFailed {
+            program: "jj".to_string(),
+            args: vec![],
+            status: Some(1),
+            stderr: "ssh: connect to host github.com port 22: Connection timed out".to_string(),
+        }));
+        // A genuine auth/logic failure must NOT be retried.
+        assert!(!is_retryable_network_error(&CubeError::CommandFailed {
+            program: "jj".to_string(),
+            args: vec![],
+            status: Some(1),
+            stderr: "fatal: permission denied (publickey)".to_string(),
+        }));
     }
 
     #[test]
