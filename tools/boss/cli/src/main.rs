@@ -1287,7 +1287,7 @@ struct ProductSetDefaultModelArgs {
     selector: String,
 
     /// Claude model slug to store as the product default (e.g.
-    /// `fable`, `opus`, `sonnet`, `haiku`, `claude-fable-5`, `claude-opus-4-8`). Stored verbatim
+    /// `opus`, `sonnet`, `haiku`, `claude-opus-4-8`). Stored verbatim
     /// — no validation against the engine. Mutually exclusive with
     /// `--unset`; one of the two is required.
     #[arg(long, value_name = "SLUG", conflicts_with = "unset")]
@@ -1673,8 +1673,8 @@ struct TaskCreateArgs {
     #[arg(long, value_enum)]
     effort: Option<EffortLevelArg>,
 
-    /// Claude model slug override (e.g. `fable`, `opus`, `sonnet`, `haiku`,
-    /// or a fully-qualified id like `claude-fable-5`). Stored verbatim —
+    /// Claude model slug override (e.g. `opus`, `sonnet`, `haiku`,
+    /// or a fully-qualified id like `claude-opus-4-8`). Stored verbatim —
     /// claude is the source of truth on slugs.
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,

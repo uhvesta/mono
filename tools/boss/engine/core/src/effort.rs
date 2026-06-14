@@ -46,9 +46,9 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// Default model slug for a given effort level, used when the row
 /// has no explicit `model_override` (design §Q3 step 2).
 ///
-/// Family aliases (`"sonnet"`, `"opus"`, `"fable"`) are used so the
-/// engine auto-tracks the latest snapshot per family without requiring
-/// a code change on each model release.
+/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine
+/// auto-tracks the latest snapshot per family without requiring a code
+/// change on each model release.
 /// Direct-API summarization (see [`crate::live_status::SUMMARY_MODEL`])
 /// still uses a pinned model — that path doesn't go through the
 /// worker CLI.
@@ -63,12 +63,14 @@ pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
 /// lower it back to Haiku.
 ///
 /// Tier ordering, highest to lowest:
-/// Fable (`fable`) > Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
+/// Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
+///
+/// Note: Fable (`claude-fable-5`) has been suspended and is no longer
+/// available for dispatch. `Max` now falls back to `opus`.
 pub fn default_model_for_level(level: EffortLevel) -> &'static str {
     match level {
         EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
-        EffortLevel::Large => "opus",
-        EffortLevel::Max => "fable",
+        EffortLevel::Large | EffortLevel::Max => "opus",
     }
 }
 
@@ -138,9 +140,15 @@ pub fn model_is_opus(model: &str) -> bool {
     model.to_ascii_lowercase().contains("opus")
 }
 
-/// Returns `true` iff the resolved model slug belongs to the Fable family
-/// (the highest-tier model, above Opus). Matching is case-insensitive: any
-/// id that contains the substring `"fable"` counts as Fable.
+/// Returns `true` iff the resolved model slug belongs to the Fable family.
+/// Matching is case-insensitive: any id that contains the substring `"fable"`
+/// counts as Fable.
+///
+/// Note: Fable (`claude-fable-5`) has been suspended. This function is
+/// retained for recognising existing rows that carry a Fable model_override,
+/// so they still receive `--permission-mode auto` instead of
+/// `--dangerously-skip-permissions`. No new dispatch path should resolve
+/// to Fable — see [`default_model_for_level`].
 pub fn model_is_fable(model: &str) -> bool {
     model.to_ascii_lowercase().contains("fable")
 }
@@ -415,7 +423,7 @@ mod tests {
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
         let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
-        assert_eq!(max.model, "fable");
+        assert_eq!(max.model, "opus");
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
@@ -653,15 +661,16 @@ mod tests {
     }
 
     #[test]
-    fn max_effort_dispatches_on_fable() {
+    fn max_effort_dispatches_on_opus() {
+        // Fable has been suspended; Max now falls back to Opus.
         let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
-        assert_eq!(cfg.model, "fable");
+        assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("max"));
         let inv = cfg.claude_invocation(false, None);
-        assert!(inv.contains("--model fable"), "Max effort must use fable, got: {inv:?}",);
+        assert!(inv.contains("--model opus"), "Max effort must use opus, got: {inv:?}",);
         assert!(
             inv.contains("--permission-mode auto"),
-            "Fable (max effort) must use --permission-mode auto, got: {inv:?}",
+            "Opus (max effort) must use --permission-mode auto, got: {inv:?}",
         );
     }
 
