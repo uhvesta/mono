@@ -64,8 +64,7 @@ exclude_structs = [
   "client/src/lib.rs::Discovery",
   "engine/core/src/app.rs::ServerState",
   "engine/core/src/audit.rs::StartContext",
-  "engine/core/src/completion.rs::ApiPr",
-  "engine/core/src/completion.rs::WorkerCompletionHandler",
+
   "engine/core/src/coordinator.rs::CubeRepoSummary",
   "engine/core/src/coordinator.rs::ExecutionCoordinator",
   "engine/core/src/dispatch_events.rs::DispatchEvent",

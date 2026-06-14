@@ -214,6 +214,14 @@ pub struct RegressionCheck {
     /// Always `true`. The reviewer must always perform the deletion check.
     pub performed: bool,
     /// All `category = "regression"` findings extracted from `findings`.
+    ///
+    /// This field is **derived** by [`ReviewResult::from_json`] from
+    /// `findings` entries where `category == Regression` and is never read
+    /// from the JSON supplied by the reviewer (the reviewer always writes
+    /// `suspected_deletions: []`). Skipping deserialization prevents a
+    /// type-mismatch serde error when the reviewer fills the field with
+    /// descriptive strings instead of `ReviewFinding` objects.
+    #[serde(skip_deserializing, default)]
     pub suspected_deletions: Vec<ReviewFinding>,
 }
 
@@ -253,10 +261,19 @@ pub struct ReviewResult {
 impl ReviewResult {
     /// Parse a `ReviewResult` from a JSON string.
     ///
-    /// The completion handler calls this after extracting the ```json fenced
-    /// block from the reviewer's final message.
+    /// After deserialization, `regression_check.suspected_deletions` is
+    /// populated from `findings` entries where `category == Regression` so
+    /// the field is always consistent with `findings` regardless of what the
+    /// reviewer wrote in the JSON (the reviewer always emits `suspected_deletions: []`).
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let mut result: Self = serde_json::from_str(json)?;
+        result.regression_check.suspected_deletions = result
+            .findings
+            .iter()
+            .filter(|f| matches!(f.category, ReviewFindingCategory::Regression))
+            .cloned()
+            .collect();
+        Ok(result)
     }
 }
 
@@ -275,7 +292,25 @@ impl ReviewResult {
 /// Returns `None` when no parseable `ReviewResult` is found (reviewer may
 /// have crashed or emitted malformed output — the caller should fall back to
 /// advancing without revision).
+///
+/// To also receive the serde error from the last failed parse attempt (useful
+/// for surfacing in a re-prompt), use [`extract_review_result_verbose`].
 pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
+    extract_review_result_verbose(text).0
+}
+
+/// Like [`extract_review_result`] but also returns the last serde parse error
+/// when all strategies fail.
+///
+/// The error string names the specific field path and type mismatch so the
+/// caller can include it verbatim in a reviewer re-prompt, giving the reviewer
+/// signal about exactly what is wrong rather than a generic "write valid JSON"
+/// message. Returns `(None, None)` when the text contains no JSON-like content
+/// at all (the error is only `Some` when a JSON block was present but failed to
+/// deserialize as a `ReviewResult`).
+pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Option<String>) {
+    let mut last_error: Option<String> = None;
+
     // Strategy 1: ```json fenced blocks
     let mut rest = text;
     while let Some(fence_start) = rest.find("```json") {
@@ -283,8 +318,9 @@ pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
         let trimmed = after_fence.trim_start_matches('\n');
         if let Some(end) = trimmed.find("```") {
             let json_str = trimmed[..end].trim();
-            if let Ok(result) = ReviewResult::from_json(json_str) {
-                return Some(result);
+            match ReviewResult::from_json(json_str) {
+                Ok(result) => return (Some(result), None),
+                Err(e) => last_error = Some(e.to_string()),
             }
         }
         rest = &rest[fence_start + 7..];
@@ -303,8 +339,9 @@ pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
         let trimmed = after_fence.trim_start_matches('\n');
         if let Some(end) = trimmed.find("```") {
             let json_str = trimmed[..end].trim();
-            if let Ok(result) = ReviewResult::from_json(json_str) {
-                return Some(result);
+            match ReviewResult::from_json(json_str) {
+                Ok(result) => return (Some(result), None),
+                Err(e) => last_error = Some(e.to_string()),
             }
         }
         rest = &rest[fence_start + 3..];
@@ -313,12 +350,6 @@ pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
     // Strategy 3: bare/unfenced JSON — find the last balanced { … } object
     // that validates as a ReviewResult. Scanning from the end handles the
     // common "prose then trailing JSON" shape.
-    extract_review_result_from_bare_json(text)
-}
-
-/// Scan `text` for balanced `{…}` objects and return the last one that parses
-/// as a valid `ReviewResult`. Returns `None` if none found.
-fn extract_review_result_from_bare_json(text: &str) -> Option<ReviewResult> {
     let bytes = text.as_bytes();
     let mut last_result: Option<ReviewResult> = None;
     let mut i = 0;
@@ -326,8 +357,18 @@ fn extract_review_result_from_bare_json(text: &str) -> Option<ReviewResult> {
         if bytes[i] == b'{'
             && let Some(json_str) = extract_balanced_object(&text[i..])
         {
-            if let Ok(result) = ReviewResult::from_json(json_str) {
-                last_result = Some(result);
+            match ReviewResult::from_json(json_str) {
+                Ok(result) => {
+                    last_result = Some(result);
+                }
+                Err(e) => {
+                    // Only surface errors from blocks that look like ReviewResults
+                    // (contain "revision_warranted") to avoid noise from unrelated
+                    // JSON objects in the reviewer's prose.
+                    if json_str.contains("revision_warranted") {
+                        last_error = Some(e.to_string());
+                    }
+                }
             }
             // Advance past this object to find any later one
             i += json_str.len();
@@ -335,7 +376,10 @@ fn extract_review_result_from_bare_json(text: &str) -> Option<ReviewResult> {
         }
         i += 1;
     }
-    last_result
+    if last_result.is_some() {
+        return (last_result, None);
+    }
+    (None, last_error)
 }
 
 /// Given a string starting with `{`, return the slice covering the balanced
@@ -739,8 +783,9 @@ pub fn render_reviewer_initial_prompt(
            for findings that are purely `medium`/`low` correctness/style \
            (the engine applies its own gate on top).\n\
          - `regression_check.performed` MUST be `true` — you cannot skip the \
-           deletion check. If you find no regressions, set \
-           `suspected_deletions: []`.\n\
+           deletion check. Always set `suspected_deletions: []`; regression \
+           findings go in `findings` with `category: \"regression\"` and the \
+           engine derives this list automatically — do NOT populate it.\n\
          - `findings` may be empty if the PR is clean. `revision_warranted` \
            must then be `false`.\n\
          - `location` is optional (omit the key if the finding applies to the \
@@ -1527,6 +1572,115 @@ mod tests {
             extract_review_result(&text).expect("ReviewResult must be found even when preceding prose has bare braces");
         assert!(result.revision_warranted);
         assert_eq!(result.findings.len(), 1);
+    }
+
+    /// Regression fixture for T1687/PR#1497: reviewer correctly identifies a
+    /// regression but fills `suspected_deletions` with descriptive strings
+    /// instead of `ReviewFinding` objects (because the prompt schema never
+    /// showed the element shape). Previously `serde_json::from_str` rejected
+    /// the ENTIRE `ReviewResult` with "invalid type: string, expected struct
+    /// ReviewFinding", silently dropping the finding.
+    ///
+    /// After the fix (`#[serde(skip_deserializing)]` on `suspected_deletions`
+    /// + derivation from `findings` in `from_json`) the JSON must parse and
+    /// `passes_severity_gate` must fire.
+    #[test]
+    fn suspected_deletions_string_array_accepted_and_derived_from_findings() {
+        let json = serde_json::json!({
+            "pr_url": "https://github.com/org/repo/pull/42",
+            "head_sha": "abc123",
+            "summary": "Found a regression — config exclude rule removed.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "regression",
+                    "file": "CHECKS.yaml",
+                    "title": "Config exclude rule dropped without replacement",
+                    "detail": "The config_dir-scoped exclude_files rule was removed.",
+                    "confidence": "high"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                // Reviewer emitted a string array — the T1687 shape that
+                // previously caused a serde type-mismatch rejection.
+                "suspected_deletions": [
+                    "config_dir-scoped exclude_files matching removed without replacement"
+                ]
+            }
+        })
+        .to_string();
+
+        let result = ReviewResult::from_json(&json)
+            .expect("ReviewResult with string-array suspected_deletions must parse (T1687 fix)");
+        assert!(result.revision_warranted, "revision_warranted must be preserved");
+        assert_eq!(result.findings.len(), 1, "finding must be preserved");
+        assert!(
+            passes_severity_gate(&result),
+            "high-severity regression must pass the severity gate",
+        );
+        // Engine derives suspected_deletions from the regression finding.
+        assert_eq!(
+            result.regression_check.suspected_deletions.len(),
+            1,
+            "engine must derive one suspected_deletion from the regression finding",
+        );
+        assert_eq!(
+            result.regression_check.suspected_deletions[0].title,
+            "Config exclude rule dropped without replacement",
+        );
+    }
+
+    /// Deriving `suspected_deletions` from `findings` must work when there are
+    /// no regression-category findings — the field stays empty.
+    #[test]
+    fn suspected_deletions_empty_when_no_regression_findings() {
+        let json = serde_json::json!({
+            "pr_url": "https://github.com/org/repo/pull/1",
+            "head_sha": "abc",
+            "summary": "ok",
+            "revision_warranted": false,
+            "findings": [
+                {
+                    "severity": "medium",
+                    "category": "readability",
+                    "file": "a.rs",
+                    "title": "style nit",
+                    "detail": "consider renaming",
+                    "confidence": "low"
+                }
+            ],
+            "regression_check": {"performed": true, "suspected_deletions": []}
+        })
+        .to_string();
+
+        let result = ReviewResult::from_json(&json).expect("parses");
+        assert!(
+            result.regression_check.suspected_deletions.is_empty(),
+            "no regression findings → suspected_deletions must be empty",
+        );
+    }
+
+    /// `extract_review_result_verbose` must return the serde error text when a
+    /// fenced JSON block is present but fails to deserialize as `ReviewResult`.
+    /// The error text is used in the reviewer re-prompt so the reviewer can
+    /// correct the specific malformation rather than blindly rewriting.
+    #[test]
+    fn extract_review_result_verbose_returns_error_on_malformed_fenced_json() {
+        // findings is a string instead of an array — valid JSON but wrong type.
+        let text = concat!(
+            "Here is my review:\n\n```json\n",
+            "{\"pr_url\":\"https://github.com/org/repo/pull/1\",",
+            "\"head_sha\":\"abc\",\"summary\":\"s\",\"revision_warranted\":true,",
+            "\"findings\":\"not-an-array\",",
+            "\"regression_check\":{\"performed\":true,\"suspected_deletions\":[]}}\n",
+            "```\n"
+        );
+        let (result, err) = extract_review_result_verbose(text);
+        assert!(result.is_none(), "malformed JSON must not produce a result");
+        let err_text = err.expect("error text must be returned for a malformed fenced block");
+        assert!(!err_text.is_empty(), "error text must not be empty; got: {err_text}",);
     }
 
     // --- passes_severity_gate ---

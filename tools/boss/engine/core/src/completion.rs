@@ -2114,29 +2114,52 @@ must not be asked to open one",
         // scraper (`extract_review_result` + the balanced-brace hack) is kept
         // only as this fallback and can be deleted once the artifact path is
         // proven in production.
-        let from_artifact =
-            crate::structured_output::read(&self.structured_output_dir, &execution.id).and_then(|raw| {
-                match crate::pr_review::ReviewResult::from_json(&raw) {
-                    Ok(result) => Some(result),
-                    Err(err) => {
+        //
+        // `last_parse_error` captures the serde error from the last failed
+        // parse attempt across both channels so it can be included verbatim
+        // in the reviewer re-prompt, giving the reviewer the specific field +
+        // type message rather than a generic "write valid JSON" instruction.
+        let mut last_parse_error: Option<String> = None;
+
+        let from_artifact = match crate::structured_output::read(&self.structured_output_dir, &execution.id) {
+            None => None,
+            Some(raw) => match crate::pr_review::ReviewResult::from_json(&raw) {
+                Ok(result) => Some(result),
+                Err(err) => {
+                    let err_str = err.to_string();
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        producing_task_id,
+                        error = %err_str,
+                        "pr_review finalize: structured-output artifact present but did not \
+                         validate as ReviewResult; trying the transcript fallback",
+                    );
+                    last_parse_error = Some(err_str);
+                    None
+                }
+            },
+        };
+        let review_result = match from_artifact {
+            Some(result) => Some(result),
+            None => match self.read_final_triage_message(&execution.id).await.into_message() {
+                None => None,
+                Some(text) => {
+                    let (result, err) = crate::pr_review::extract_review_result_verbose(&text);
+                    if let Some(ref e) = err {
                         tracing::warn!(
                             execution_id = %execution.id,
                             producing_task_id,
-                            ?err,
-                            "pr_review finalize: structured-output artifact present but did not \
-                             validate as ReviewResult; trying the transcript fallback",
+                            error = %e,
+                            "pr_review finalize: transcript JSON block present but did not \
+                             validate as ReviewResult",
                         );
-                        None
+                        if last_parse_error.is_none() {
+                            last_parse_error = err;
+                        }
                     }
+                    result
                 }
-            });
-        let review_result = match from_artifact {
-            Some(result) => Some(result),
-            None => self
-                .read_final_triage_message(&execution.id)
-                .await
-                .into_message()
-                .and_then(|text| crate::pr_review::extract_review_result(&text)),
+            },
         };
 
         // Neither the artifact nor the transcript yielded a valid ReviewResult.
@@ -2152,12 +2175,26 @@ must not be asked to open one",
             {
                 NudgeDecision::Proceed { count } => {
                     let output_path = crate::structured_output::path_in(&self.structured_output_dir, &execution.id);
-                    let probe = format!(
-                        "Your review did not produce a valid ReviewResult. Write the \
-                         ReviewResult JSON (matching the schema in your task prompt) to \
-                         this file with the Write tool, then stop — do NOT change the PR:\n\n{}",
-                        output_path.display(),
-                    );
+                    // Include the specific serde error in the probe when we have one so
+                    // the reviewer can correct the exact malformation rather than blindly
+                    // rewriting the entire JSON.
+                    let probe = if let Some(ref parse_err) = last_parse_error {
+                        format!(
+                            "Your review did not produce a valid ReviewResult. The JSON was \
+                             present but failed to parse:\n\n  {parse_err}\n\n\
+                             Correct the JSON so it matches the schema in your task prompt, \
+                             write it to this file with the Write tool, then stop — do NOT \
+                             change the PR:\n\n{}",
+                            output_path.display(),
+                        )
+                    } else {
+                        format!(
+                            "Your review did not produce a valid ReviewResult. Write the \
+                             ReviewResult JSON (matching the schema in your task prompt) to \
+                             this file with the Write tool, then stop — do NOT change the PR:\n\n{}",
+                            output_path.display(),
+                        )
+                    };
                     tracing::warn!(
                         execution_id = %execution.id,
                         producing_task_id,
@@ -11137,6 +11174,137 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             task.status,
             TaskStatus::InReview,
             "producing task must advance to in_review after bare-JSON review pass",
+        );
+    }
+
+    /// Produce a `ReviewResult` JSON where `suspected_deletions` is a string
+    /// array — the T1687/PR#1497 shape that previously caused the serde
+    /// type-mismatch error "invalid type: string, expected struct ReviewFinding"
+    /// and silently rejected the entire review.
+    fn t1687_regression_string_deletions_json(pr_url: &str) -> String {
+        serde_json::json!({
+            "pr_url": pr_url,
+            "head_sha": "sha_reviewed_abc123",
+            "summary": "Found a regression: config exclude rule removed without replacement.",
+            "revision_warranted": true,
+            "findings": [
+                {
+                    "severity": "high",
+                    "category": "regression",
+                    "file": "CHECKS.yaml",
+                    "title": "Config exclude rule dropped without replacement",
+                    "detail": "The config_dir-scoped exclude_files rule was removed.",
+                    "confidence": "high"
+                }
+            ],
+            "regression_check": {
+                "performed": true,
+                // Reviewer filled this with strings — the T1687 shape.
+                "suspected_deletions": [
+                    "config_dir-scoped exclude_files matching removed without replacement"
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    /// T1687/PR#1497 regression test: a reviewer that correctly identifies a
+    /// regression but fills `suspected_deletions` with descriptive strings
+    /// (instead of `ReviewFinding` objects) must still parse and create a
+    /// revision. Previously the serde type mismatch rejected the entire
+    /// `ReviewResult` and the engine advanced to `in_review` without revision.
+    #[tokio::test]
+    async fn pr_review_pass_regression_with_string_deletions_creates_revision() {
+        let workspace = tempdir().unwrap();
+        let pr_url = "https://github.com/spinyfin/mono/pull/88";
+        let json = t1687_regression_string_deletions_json(pr_url);
+        let (db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+            pr_review_exec_fixture(workspace.path(), Some(&json));
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            Arc::new(RecordingProbeQueuer::default()),
+        )
+        .with_pr_state_checker(open_pr_checker());
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassRevisionCreated { .. }),
+            "regression finding with string suspected_deletions must create a revision \
+             (T1687 fix); got {outcome:?}",
+        );
+
+        let item = db.get_work_item(&chore_id).unwrap();
+        let task = match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => t,
+            other => panic!("expected chore, got {other:?}"),
+        };
+        assert_eq!(
+            task.status,
+            TaskStatus::InReview,
+            "producing task must advance to in_review after revision is created",
+        );
+    }
+
+    /// When the artifact JSON is present but fails to deserialize (e.g. a
+    /// type mismatch in one field), the re-prompt probe must include the
+    /// specific serde error text so the reviewer can correct the exact
+    /// malformation rather than receiving a generic "write valid JSON" message.
+    #[tokio::test]
+    async fn pr_review_pass_malformed_artifact_probe_includes_parse_error() {
+        let workspace = tempdir().unwrap();
+        // Malformed: "findings" is a string instead of an array — valid JSON
+        // but wrong type, so serde fails with a specific error message.
+        let malformed_json = serde_json::json!({
+            "pr_url": "https://github.com/spinyfin/mono/pull/88",
+            "head_sha": "abc",
+            "summary": "Found issues.",
+            "revision_warranted": true,
+            "findings": "this should be an array not a string",
+            "regression_check": {"performed": true, "suspected_deletions": []}
+        })
+        .to_string();
+
+        let (db, _product_id, _chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
+        let out_dir = tempdir().unwrap();
+        std::fs::write(
+            crate::structured_output::path_in(out_dir.path(), &pr_review_exec_id),
+            &malformed_json,
+        )
+        .unwrap();
+
+        let probe_queuer = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            StubPrDetector::ok(None),
+            Arc::new(StubCubeClient::default()),
+            Arc::new(RecordingPublisher::default()),
+            Arc::new(RecordingPaneReleaser::default()),
+            probe_queuer.clone(),
+        )
+        .with_pr_state_checker(open_pr_checker())
+        .with_structured_output_dir(out_dir.path().to_path_buf())
+        .with_max_unproductive_nudges(2);
+
+        let outcome = handler.on_stop(&pr_review_exec_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::ReviewPassAwaitingResult),
+            "malformed artifact must re-prompt, not advance; got {outcome:?}",
+        );
+
+        let probes = probe_queuer.snapshot();
+        assert_eq!(probes.len(), 1, "exactly one probe must be queued");
+        // The probe must mention the specific parse error (serde will say
+        // something like "invalid type: string, expected a sequence").
+        assert!(
+            probes[0].1.contains("invalid type") || probes[0].1.contains("expected"),
+            "probe must contain the serde parse error text so the reviewer can fix the \
+             exact malformation; got: {}",
+            probes[0].1,
         );
     }
 
