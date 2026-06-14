@@ -251,7 +251,8 @@ impl Outcome {
 /// deliberately wide — readers don't need to know about every field
 /// and a writer that doesn't yet have a value emits `null` rather
 /// than dropping the key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct DispatchEvent {
     pub ts_epoch_ms: u128,
     pub stage: String,
@@ -276,6 +277,7 @@ pub struct DispatchEvent {
     pub cube_cwd: Option<String>,
     /// Per-stage open object; readers `jq` into this when they care.
     #[serde(default)]
+    #[builder(default)]
     pub details: serde_json::Value,
 }
 
@@ -524,5 +526,215 @@ mod tests {
         assert_eq!(only_one[0].stage, "request_recorded");
         assert_eq!(only_one[1].stage, "pane_spawned");
         assert_eq!(only_one[1].outcome, "error");
+    }
+
+    /// On an `Ok` event the three skip-serialized optionals must be
+    /// *absent* from the JSON object (not present-as-null) so the `jq`
+    /// expressions downstream tooling uses (`has("error_message")`,
+    /// `.cube_command // empty`) behave. `details` still serializes —
+    /// as JSON `null` — because it carries no `skip_serializing_if`.
+    #[test]
+    fn ok_event_omits_skip_serialized_optional_keys() {
+        let event = DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-omit");
+        let value = serde_json::to_value(&event).unwrap();
+        let obj = value.as_object().unwrap();
+
+        assert!(
+            !obj.contains_key("error_message"),
+            "error_message must be omitted on ok"
+        );
+        assert!(!obj.contains_key("cube_command"), "cube_command must be omitted on ok");
+        assert!(!obj.contains_key("cube_cwd"), "cube_cwd must be omitted on ok");
+
+        // details has no skip_serializing_if, so the key stays and is null.
+        assert!(obj.contains_key("details"), "details key must always be present");
+        assert!(obj["details"].is_null(), "details defaults to JSON null");
+    }
+
+    /// Same omission contract holds for a `Skipped` event — the keys
+    /// are gated on `Option::is_none`, not on the outcome, but a reader
+    /// pinning the skip behaviour on a non-error event must still see
+    /// them absent.
+    #[test]
+    fn skipped_event_omits_skip_serialized_optional_keys() {
+        let event = DispatchEvent::new(Stage::WorkerClaimed, Outcome::Skipped, "exec-skip");
+        let value = serde_json::to_value(&event).unwrap();
+        let obj = value.as_object().unwrap();
+
+        assert!(!obj.contains_key("error_message"));
+        assert!(!obj.contains_key("cube_command"));
+        assert!(!obj.contains_key("cube_cwd"));
+    }
+
+    /// `with_cube_invocation(Some(..))` populates BOTH `cube_command`
+    /// and `cube_cwd`, and both survive serialization.
+    #[test]
+    fn with_cube_invocation_some_sets_both_command_and_cwd() {
+        let event = DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, Outcome::Ok, "exec-inv")
+            .with_cube_invocation(Some((
+                "cube workspace lease ci-infra --task \"fix\"".to_owned(),
+                "/work/dir".to_owned(),
+            )));
+
+        assert_eq!(
+            event.cube_command.as_deref(),
+            Some("cube workspace lease ci-infra --task \"fix\"")
+        );
+        assert_eq!(event.cube_cwd.as_deref(), Some("/work/dir"));
+
+        let obj = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            obj["cube_command"],
+            serde_json::json!("cube workspace lease ci-infra --task \"fix\"")
+        );
+        assert_eq!(obj["cube_cwd"], serde_json::json!("/work/dir"));
+    }
+
+    /// `with_cube_invocation(None)` leaves both fields untouched, so
+    /// they stay `None` and are omitted from the JSON object.
+    #[test]
+    fn with_cube_invocation_none_leaves_both_absent() {
+        let event =
+            DispatchEvent::new(Stage::CubeWorkspaceLeaseAttempted, Outcome::Ok, "exec-inv").with_cube_invocation(None);
+
+        assert!(event.cube_command.is_none());
+        assert!(event.cube_cwd.is_none());
+
+        let obj = serde_json::to_value(&event).unwrap();
+        let map = obj.as_object().unwrap();
+        assert!(!map.contains_key("cube_command"));
+        assert!(!map.contains_key("cube_cwd"));
+    }
+
+    /// `with_error` flattens the full anyhow cause chain via `{err:#}`,
+    /// so the serialized `error_message` contains the outer context
+    /// *and* the root cause, joined by anyhow's `: ` separator.
+    #[test]
+    fn with_error_flattens_full_anyhow_cause_chain() {
+        let err = anyhow::anyhow!("connection refused").context("cube workspace lease failed");
+        let event = DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, Outcome::Error, "exec-err").with_error(&err);
+
+        let obj = serde_json::to_value(&event).unwrap();
+        let message = obj["error_message"].as_str().unwrap();
+
+        assert!(
+            message.contains("cube workspace lease failed"),
+            "outer context missing: {message}"
+        );
+        assert!(message.contains("connection refused"), "root cause missing: {message}");
+        // anyhow's `{:#}` joins each cause with `: `.
+        assert_eq!(message, "cube workspace lease failed: connection refused");
+    }
+
+    /// The full builder chain populates every optional field and the
+    /// values round-trip cleanly through serde back to a `DispatchEvent`
+    /// with the expected getters.
+    #[test]
+    fn full_builder_chain_round_trips_through_serde() {
+        let event = DispatchEvent::new(Stage::CubeWorkspaceLeased, Outcome::Ok, "exec-rt")
+            .with_work_item("task-rt")
+            .with_worker("worker-7")
+            .with_cube_repo("repo-9")
+            .with_cube_lease("lease-3")
+            .with_cube_workspace("ws-2")
+            .with_details(serde_json::json!({ "host_id": "host-1", "did_dispatch": true }));
+
+        let line = serde_json::to_string(&event).unwrap();
+        let restored: DispatchEvent = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(restored.stage, "cube_workspace_leased");
+        assert_eq!(restored.outcome, "ok");
+        assert_eq!(restored.execution_id, "exec-rt");
+        assert_eq!(restored.work_item_id.as_deref(), Some("task-rt"));
+        assert_eq!(restored.worker_id.as_deref(), Some("worker-7"));
+        assert_eq!(restored.cube_repo_id.as_deref(), Some("repo-9"));
+        assert_eq!(restored.cube_lease_id.as_deref(), Some("lease-3"));
+        assert_eq!(restored.cube_workspace_id.as_deref(), Some("ws-2"));
+        assert_eq!(restored.details["host_id"], serde_json::json!("host-1"));
+        assert_eq!(restored.details["did_dispatch"], serde_json::json!(true));
+        assert_eq!(restored.ts_epoch_ms, event.ts_epoch_ms);
+    }
+
+    /// A minimal JSON line that omits every skip-serialized optional key
+    /// (and `details`) still deserializes — this is the forward/backward
+    /// compat guarantee for the wire shape. The absent optionals default
+    /// to `None` and `details` defaults to JSON `null`.
+    #[test]
+    fn deserializes_from_minimal_line_omitting_optional_keys() {
+        let line = r#"{
+            "ts_epoch_ms": 1700000000000,
+            "stage": "request_recorded",
+            "outcome": "ok",
+            "execution_id": "exec-min"
+        }"#;
+
+        let event: DispatchEvent = serde_json::from_str(line).unwrap();
+
+        assert_eq!(event.ts_epoch_ms, 1_700_000_000_000);
+        assert_eq!(event.stage, "request_recorded");
+        assert_eq!(event.outcome, "ok");
+        assert_eq!(event.execution_id, "exec-min");
+        assert!(event.work_item_id.is_none());
+        assert!(event.worker_id.is_none());
+        assert!(event.cube_repo_id.is_none());
+        assert!(event.cube_lease_id.is_none());
+        assert!(event.cube_workspace_id.is_none());
+        assert!(event.error_message.is_none());
+        assert!(event.cube_command.is_none());
+        assert!(event.cube_cwd.is_none());
+        assert!(event.details.is_null());
+    }
+
+    /// `Stage::as_str` is the on-disk stage identifier ledger consumers
+    /// pin against; a silent rename would break them. Pin every variant
+    /// to its exact snake_case string.
+    #[test]
+    fn stage_as_str_pins_exact_snake_case_identifiers() {
+        assert_eq!(Stage::StatusTransition.as_str(), "status_transition");
+        assert_eq!(Stage::RequestRecorded.as_str(), "request_recorded");
+        assert_eq!(Stage::WorkerClaimed.as_str(), "worker_claimed");
+        assert_eq!(Stage::HostSelected.as_str(), "host_selected");
+        assert_eq!(Stage::CubeRepoEnsureAttempted.as_str(), "cube_repo_ensure_attempted");
+        assert_eq!(Stage::CubeRepoEnsured.as_str(), "cube_repo_ensured");
+        assert_eq!(
+            Stage::CubeWorkspaceLeaseAttempted.as_str(),
+            "cube_workspace_lease_attempted"
+        );
+        assert_eq!(Stage::CubeWorkspaceLeased.as_str(), "cube_workspace_leased");
+        assert_eq!(Stage::CubeWorkspaceLeaseFailed.as_str(), "cube_workspace_lease_failed");
+        assert_eq!(Stage::CubeChangeCreated.as_str(), "cube_change_created");
+        assert_eq!(Stage::RunStarted.as_str(), "run_started");
+        assert_eq!(Stage::PaneSpawned.as_str(), "pane_spawned");
+        assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
+        assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");
+        assert_eq!(Stage::DeadPidReconcile.as_str(), "dead_pid_reconcile");
+        assert_eq!(Stage::DispatchDecision.as_str(), "dispatch_decision");
+        assert_eq!(Stage::TransientRecovery.as_str(), "transient_recovery");
+        assert_eq!(
+            Stage::TransientRecoveryExhausted.as_str(),
+            "transient_recovery_exhausted"
+        );
+        assert_eq!(Stage::TransientRecoveryNudge.as_str(), "transient_recovery_nudge");
+        assert_eq!(Stage::StaleWorkerReconcile.as_str(), "stale_worker_reconcile");
+        assert_eq!(Stage::PoolClaimReconcile.as_str(), "pool_claim_reconcile");
+    }
+
+    /// `Outcome::as_str` strings are the on-disk outcome identifiers;
+    /// pin them exactly. The serde `rename_all = "snake_case"`
+    /// serialization must agree with `as_str`.
+    #[test]
+    fn outcome_as_str_pins_exact_identifiers() {
+        assert_eq!(Outcome::Ok.as_str(), "ok");
+        assert_eq!(Outcome::Error.as_str(), "error");
+        assert_eq!(Outcome::Skipped.as_str(), "skipped");
+
+        // serde serialization must agree with as_str so the JSON
+        // `outcome` field and the in-memory identifier never diverge.
+        for outcome in [Outcome::Ok, Outcome::Error, Outcome::Skipped] {
+            assert_eq!(
+                serde_json::to_value(outcome).unwrap(),
+                serde_json::json!(outcome.as_str())
+            );
+        }
     }
 }
