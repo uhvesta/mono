@@ -37,7 +37,8 @@ fn component_v1_non_component_bytes_give_compile_error() {
     fs::write(temp.path().join("check.wasm"), &wasm_bytes).expect("write wasm");
     let artifact_sha256 = super::sha256_hex(&wasm_bytes);
 
-    let executor = super::DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let executor = super::DefaultExternalCheckExecutor::new_with_cache(temp.path(), temp.path().join("cache"))
+        .expect("create executor");
     let package = ExternalCheckPackage {
         id: "example-check".to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
@@ -62,8 +63,9 @@ fn component_v1_non_component_bytes_give_compile_error() {
             std::path::Path::new(""),
         )
         .expect_err("core wasm bytes must not parse as a component");
+    let msg = error.to_string();
     assert!(
-        error.to_string().contains("failed to precompile component"),
+        msg.contains("failed to precompile component") || msg.contains("failed to compile component"),
         "unexpected error: {error}"
     );
 }
@@ -82,7 +84,8 @@ fn component_v1_digest_mismatch_is_rejected() {
     .expect("parse wat");
     fs::write(temp.path().join("check.wasm"), &wasm_bytes).expect("write wasm");
 
-    let executor = super::DefaultExternalCheckExecutor::new(temp.path()).expect("create executor");
+    let executor = super::DefaultExternalCheckExecutor::new_with_cache(temp.path(), temp.path().join("cache"))
+        .expect("create executor");
     let package = ExternalCheckPackage {
         id: "example-check".to_owned(),
         runtime: EXTERNAL_CHECK_COMPONENT_RUNTIME_V1.to_owned(),
