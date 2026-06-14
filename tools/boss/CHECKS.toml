@@ -80,7 +80,6 @@ exclude_structs = [
   "engine/core/src/merge_poller.rs::PrLifecycleProbe",
   "engine/core/src/merge_poller.rs::SweepOutcome",
   "engine/core/src/spawn_flow.rs::StartWorkerInput",
-  "engine/core/src/work/audit_misc.rs::ProjectPropertyAuditEntry",
   "engine/core/src/work/mappers.rs::ConflictResolutionInsertInput",
   "engine/core/src/work/mappers.rs::CiRemediationInsertInput",
   "protocol/src/engine_app.rs::SpawnWorkerPaneInput",

@@ -16,7 +16,8 @@ pub const AUDIT_ACTOR_DESIGN_DETECTOR: &str = "engine_design_detector";
 /// Records that `actor` changed `property` on `project_id` from
 /// `old_value` to `new_value` at `changed_at` (epoch seconds, the
 /// same format as `projects.updated_at`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ProjectPropertyAuditEntry {
     pub id: String,
     pub project_id: String,
@@ -301,5 +302,229 @@ pub(crate) fn task_to_item(task: Task) -> WorkItem {
         WorkItem::Chore(task)
     } else {
         WorkItem::Task(task)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `Product`, optionally carrying its own repo. The
+    /// other fields are irrelevant to the helpers under test — only
+    /// `repo_remote_url` and `slug` are inspected by
+    /// `enforce_task_repo_invariant`.
+    fn product_with_repo(repo: Option<&str>) -> Product {
+        Product::builder()
+            .id("prod_test")
+            .name("Test product")
+            .slug("test-product")
+            .description("")
+            .status("active")
+            .created_at("2026-01-01T00:00:00Z")
+            .updated_at("2026-01-01T00:00:00Z")
+            .maybe_repo_remote_url(repo.map(str::to_owned))
+            .build()
+    }
+
+    // ---- normalize_optional_text -------------------------------------
+
+    #[test]
+    fn normalize_optional_text_none_stays_none() {
+        assert_eq!(normalize_optional_text(None), None);
+    }
+
+    #[test]
+    fn normalize_optional_text_blank_becomes_none() {
+        assert_eq!(normalize_optional_text(Some(String::new())), None);
+        assert_eq!(normalize_optional_text(Some("   ".to_owned())), None);
+        assert_eq!(normalize_optional_text(Some("\t \n".to_owned())), None);
+    }
+
+    #[test]
+    fn normalize_optional_text_trims_non_empty() {
+        assert_eq!(
+            normalize_optional_text(Some("  hello  ".to_owned())),
+            Some("hello".to_owned())
+        );
+        assert_eq!(
+            normalize_optional_text(Some("hello".to_owned())),
+            Some("hello".to_owned())
+        );
+    }
+
+    // ---- canonicalize_worker_branch_prefix ---------------------------
+
+    #[test]
+    fn worker_branch_prefix_adds_trailing_slash() {
+        assert_eq!(
+            canonicalize_worker_branch_prefix(Some("bduff".to_owned())),
+            Some("bduff/".to_owned())
+        );
+    }
+
+    #[test]
+    fn worker_branch_prefix_keeps_existing_trailing_slash() {
+        assert_eq!(
+            canonicalize_worker_branch_prefix(Some("bduff/".to_owned())),
+            Some("bduff/".to_owned())
+        );
+    }
+
+    #[test]
+    fn worker_branch_prefix_trims_then_canonicalises() {
+        assert_eq!(
+            canonicalize_worker_branch_prefix(Some("  bduff/  ".to_owned())),
+            Some("bduff/".to_owned())
+        );
+        assert_eq!(
+            canonicalize_worker_branch_prefix(Some("  bduff  ".to_owned())),
+            Some("bduff/".to_owned())
+        );
+    }
+
+    #[test]
+    fn worker_branch_prefix_blank_and_none_are_none() {
+        assert_eq!(canonicalize_worker_branch_prefix(None), None);
+        assert_eq!(canonicalize_worker_branch_prefix(Some("   ".to_owned())), None);
+        assert_eq!(canonicalize_worker_branch_prefix(Some(String::new())), None);
+    }
+
+    #[test]
+    fn worker_branch_prefix_is_idempotent() {
+        for input in ["bduff", "bduff/", "  bduff  ", "team/sub"] {
+            let once = canonicalize_worker_branch_prefix(Some(input.to_owned()));
+            let twice = canonicalize_worker_branch_prefix(once.clone());
+            assert_eq!(once, twice, "not idempotent for {input:?}");
+        }
+    }
+
+    // ---- validate_design_doc_path ------------------------------------
+
+    #[test]
+    fn validate_design_doc_path_accepts_markdown() {
+        assert_eq!(validate_design_doc_path("docs/design.md").unwrap(), "docs/design.md");
+        assert_eq!(validate_design_doc_path("design.markdown").unwrap(), "design.markdown");
+    }
+
+    #[test]
+    fn validate_design_doc_path_trims_to_canonical() {
+        assert_eq!(
+            validate_design_doc_path("  docs/design.md  ").unwrap(),
+            "docs/design.md"
+        );
+    }
+
+    #[test]
+    fn validate_design_doc_path_rejects_empty() {
+        assert!(validate_design_doc_path("").is_err());
+        assert!(validate_design_doc_path("   ").is_err());
+    }
+
+    #[test]
+    fn validate_design_doc_path_rejects_leading_slash() {
+        assert!(validate_design_doc_path("/etc/design.md").is_err());
+    }
+
+    #[test]
+    fn validate_design_doc_path_rejects_parent_segments() {
+        assert!(validate_design_doc_path("../design.md").is_err());
+        assert!(validate_design_doc_path("docs/../design.md").is_err());
+        // A `..` only counts as a path segment; `..` embedded in a name is fine.
+        assert!(validate_design_doc_path("docs/a..b.md").is_ok());
+    }
+
+    #[test]
+    fn validate_design_doc_path_rejects_cube_workspace_path() {
+        assert!(validate_design_doc_path("cube/workspaces/foo/design.md").is_err());
+    }
+
+    #[test]
+    fn validate_design_doc_path_rejects_non_markdown() {
+        assert!(validate_design_doc_path("docs/design.txt").is_err());
+        assert!(validate_design_doc_path("docs/design").is_err());
+        assert!(validate_design_doc_path("README.mdx").is_err());
+    }
+
+    // ---- enforce_task_repo_invariant ---------------------------------
+
+    #[test]
+    fn task_repo_invariant_product_repo_plus_override_errs() {
+        let product = product_with_repo(Some("git@github.com:org/mono.git"));
+        let result = enforce_task_repo_invariant(&product, Some("git@github.com:org/other.git".to_owned()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_repo_invariant_product_repo_no_override_inherits() {
+        let product = product_with_repo(Some("git@github.com:org/mono.git"));
+        assert_eq!(enforce_task_repo_invariant(&product, None).unwrap(), None);
+        // A blank override is treated as "no override", not a violation.
+        assert_eq!(
+            enforce_task_repo_invariant(&product, Some("   ".to_owned())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn task_repo_invariant_no_product_repo_uses_override_canonicalised() {
+        let product = product_with_repo(None);
+        assert_eq!(
+            enforce_task_repo_invariant(&product, Some("  git@github.com:org/mono.git  ".to_owned())).unwrap(),
+            Some("git@github.com:org/mono.git".to_owned()),
+        );
+    }
+
+    #[test]
+    fn task_repo_invariant_no_product_repo_no_override_errs() {
+        let product = product_with_repo(None);
+        assert!(enforce_task_repo_invariant(&product, None).is_err());
+        // A whitespace-only override canonicalises to None → still an error.
+        assert!(enforce_task_repo_invariant(&product, Some("  ".to_owned())).is_err());
+    }
+
+    // ---- render_design_doc_raw_content_url ---------------------------
+
+    #[test]
+    fn raw_content_url_github_carries_branch_in_ref() {
+        let url = render_design_doc_raw_content_url("git@github.com:org/mono.git", "main", "docs/design.md");
+        assert_eq!(
+            url,
+            Some("https://raw.githubusercontent.com/org/mono/docs/design.md?ref=main".to_owned())
+        );
+    }
+
+    #[test]
+    fn raw_content_url_percent_encodes_slash_in_branch() {
+        let url = render_design_doc_raw_content_url("https://github.com/org/mono", "boss/exec_123", "docs/design.md");
+        assert_eq!(
+            url,
+            Some("https://raw.githubusercontent.com/org/mono/docs/design.md?ref=boss%2Fexec_123".to_owned()),
+        );
+    }
+
+    #[test]
+    fn raw_content_url_non_github_is_none() {
+        assert_eq!(
+            render_design_doc_raw_content_url("git@gitlab.com:org/mono.git", "main", "d.md"),
+            None
+        );
+        assert_eq!(
+            render_design_doc_raw_content_url("not a url at all", "main", "d.md"),
+            None
+        );
+    }
+
+    // ---- render_design_doc_web_url -----------------------------------
+
+    #[test]
+    fn web_url_github_uses_blob_form() {
+        let url = render_design_doc_web_url("git@github.com:org/mono.git", "main", "docs/design.md");
+        assert_eq!(url, "https://github.com/org/mono/blob/main/docs/design.md");
+    }
+
+    #[test]
+    fn web_url_non_github_falls_back_to_remote() {
+        let url = render_design_doc_web_url("https://example.com/org/mono", "main", "docs/design.md");
+        assert_eq!(url, "https://example.com/org/mono/blob/main/docs/design.md");
     }
 }
