@@ -51,6 +51,7 @@ rust_library(
         "src/config.rs",
         "src/conflict_watch.rs",
         "src/coordinator.rs",
+        "src/cube_commands.rs",
         "src/database_backup.rs",
         "src/dead_pid_sweep.rs",
         "src/dep_unblock_sweep.rs",

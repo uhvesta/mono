@@ -18,6 +18,7 @@ pub mod config;
 pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_watch;
 pub mod coordinator;
+pub mod cube_commands;
 pub mod database_backup;
 pub mod dead_pid_sweep;
 pub mod dep_unblock_sweep;

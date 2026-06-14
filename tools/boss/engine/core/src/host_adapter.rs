@@ -25,7 +25,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::config::RuntimeConfig;
@@ -291,8 +290,11 @@ impl SshHostAdapter {
     }
 
     /// Run a cube command on the remote and decode its `--json` output.
-    /// Mirrors `CommandCubeClient::run_json` but routes through SSH.
-    async fn run_cube_json(&self, args: &[&str]) -> Result<serde_json::Value> {
+    /// Mirrors `CommandCubeClient::run_json` but routes through SSH. Exposed
+    /// to the shared `cube_commands` helpers via the
+    /// [`CubeJsonTransport`](crate::cube_commands::CubeJsonTransport) impl
+    /// below.
+    async fn run_cube_json_raw(&self, args: &[&str]) -> Result<serde_json::Value> {
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
         full.push("cube");
         full.extend_from_slice(args);
@@ -436,22 +438,20 @@ impl Drop for StagedFile {
 }
 
 #[async_trait]
+impl crate::cube_commands::CubeJsonTransport for SshHostAdapter {
+    async fn run_cube_json(&self, args: &[&str]) -> Result<serde_json::Value> {
+        self.run_cube_json_raw(args).await
+    }
+}
+
+#[async_trait]
 impl HostAdapter for SshHostAdapter {
     fn host_id(&self) -> &str {
         &self.transport.host_id
     }
 
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
-        #[derive(Deserialize)]
-        struct RepoEnsurePayload {
-            repo_id: String,
-        }
-        let payload: RepoEnsurePayload =
-            serde_json::from_value(self.run_cube_json(&crate::repo_slug::repo_ensure_args(origin)).await?)
-                .context("decoding remote `cube repo ensure` payload")?;
-        Ok(CubeRepoHandle {
-            repo_id: payload.repo_id,
-        })
+        crate::cube_commands::ensure_repo(self, origin).await
     }
 
     async fn lease_workspace(
@@ -462,191 +462,35 @@ impl HostAdapter for SshHostAdapter {
         allow_dirty: bool,
         resume_pr: Option<u64>,
     ) -> Result<CubeWorkspaceLease> {
-        #[derive(Deserialize)]
-        struct LeasePayload {
-            workspace: LeaseWorkspace,
-        }
-        #[derive(Deserialize)]
-        struct LeaseWorkspace {
-            lease_id: Option<String>,
-            workspace_id: String,
-            workspace_path: PathBuf,
-        }
-        let resume_pr_str = resume_pr.map(|n| n.to_string());
-        let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
-        if let Some(prefer) = prefer_workspace_id {
-            args.extend_from_slice(&["--prefer", prefer]);
-        }
-        if allow_dirty {
-            args.push("--allow-dirty");
-        }
-        if let Some(n) = resume_pr_str.as_deref() {
-            args.extend_from_slice(&["--resume-pr", n]);
-        }
-        let payload: LeasePayload = serde_json::from_value(self.run_cube_json(&args).await?)
-            .context("decoding remote `cube workspace lease` payload")?;
-        let lease_id = payload
-            .workspace
-            .lease_id
-            .context("remote cube workspace lease response missing lease_id")?;
-        Ok(CubeWorkspaceLease {
-            lease_id,
-            workspace_id: payload.workspace.workspace_id,
-            workspace_path: payload.workspace.workspace_path,
-        })
+        crate::cube_commands::lease_workspace(self, repo_id, task, prefer_workspace_id, allow_dirty, resume_pr).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
-        let _ = self
-            .run_cube_json(&["--json", "workspace", "release", "--lease", lease_id])
-            .await?;
-        Ok(())
+        crate::cube_commands::release_workspace(self, lease_id).await
     }
 
     async fn heartbeat_lease(&self, lease_id: &str, ttl_seconds: Option<u64>) -> Result<()> {
-        let ttl_string = ttl_seconds.map(|t| t.to_string());
-        let mut args: Vec<&str> = vec!["--json", "workspace", "heartbeat", "--lease", lease_id];
-        if let Some(ttl) = ttl_string.as_deref() {
-            args.extend_from_slice(&["--ttl-seconds", ttl]);
-        }
-        let _ = self.run_cube_json(&args).await?;
-        Ok(())
+        crate::cube_commands::heartbeat_lease(self, lease_id, ttl_seconds).await
     }
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
-        let mut args: Vec<&str> = vec!["--json", "workspace", "force-release", "--lease", lease_id];
-        if let Some(r) = reason {
-            args.extend_from_slice(&["--reason", r]);
-        }
-        let _ = self.run_cube_json(&args).await?;
-        Ok(())
+        crate::cube_commands::force_release_lease(self, lease_id, reason).await
     }
 
     async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
-        #[derive(Deserialize)]
-        struct ChangePayload {
-            change: ChangeRecord,
-        }
-        #[derive(Deserialize)]
-        struct ChangeRecord {
-            change_id: String,
-        }
-        let workspace_arg = workspace_path.display().to_string();
-        let payload: ChangePayload = serde_json::from_value(
-            self.run_cube_json(&[
-                "--json",
-                "change",
-                "create",
-                "--workspace",
-                workspace_arg.as_str(),
-                "--title",
-                title,
-            ])
-            .await?,
-        )
-        .context("decoding remote `cube change create` payload")?;
-        Ok(CubeChangeHandle {
-            change_id: payload.change.change_id,
-        })
+        crate::cube_commands::create_change(self, workspace_path, title).await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
-        #[derive(Deserialize)]
-        struct StatusPayload {
-            workspace: StatusWorkspace,
-        }
-        #[derive(Deserialize)]
-        struct StatusWorkspace {
-            workspace_id: String,
-            workspace_path: PathBuf,
-            state: String,
-            lease_id: Option<String>,
-            holder: Option<String>,
-            task: Option<String>,
-            leased_at_epoch_s: Option<i64>,
-            lease_expires_at_epoch_s: Option<i64>,
-        }
-        let workspace_arg = workspace_path.display().to_string();
-        let payload: StatusPayload = serde_json::from_value(
-            self.run_cube_json(&["--json", "workspace", "status", "--workspace", workspace_arg.as_str()])
-                .await?,
-        )
-        .context("decoding remote `cube workspace status` payload")?;
-        Ok(CubeWorkspaceStatus {
-            workspace_id: payload.workspace.workspace_id,
-            workspace_path: payload.workspace.workspace_path,
-            state: payload.workspace.state,
-            lease_id: payload.workspace.lease_id,
-            holder: payload.workspace.holder,
-            task: payload.workspace.task,
-            leased_at_epoch_s: payload.workspace.leased_at_epoch_s,
-            lease_expires_at_epoch_s: payload.workspace.lease_expires_at_epoch_s,
-        })
+        crate::cube_commands::workspace_status(self, workspace_path).await
     }
 
     async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
-        #[derive(Deserialize)]
-        struct ListPayload {
-            workspaces: Vec<ListWorkspace>,
-        }
-        #[derive(Deserialize)]
-        struct ListWorkspace {
-            workspace_id: String,
-            workspace_path: PathBuf,
-            state: String,
-            lease_id: Option<String>,
-            holder: Option<String>,
-            task: Option<String>,
-            leased_at_epoch_s: Option<i64>,
-            lease_expires_at_epoch_s: Option<i64>,
-        }
-        let payload: ListPayload = serde_json::from_value(self.run_cube_json(&["--json", "workspace", "list"]).await?)
-            .context("decoding remote `cube workspace list` payload")?;
-        Ok(payload
-            .workspaces
-            .into_iter()
-            .map(|w| CubeWorkspaceStatus {
-                workspace_id: w.workspace_id,
-                workspace_path: w.workspace_path,
-                state: w.state,
-                lease_id: w.lease_id,
-                holder: w.holder,
-                task: w.task,
-                leased_at_epoch_s: w.leased_at_epoch_s,
-                lease_expires_at_epoch_s: w.lease_expires_at_epoch_s,
-            })
-            .collect())
+        crate::cube_commands::list_workspaces(self).await
     }
 
     async fn list_repos(&self) -> Result<Vec<CubeRepoSummary>> {
-        #[derive(Deserialize)]
-        struct ListPayload {
-            repos: Vec<ListRepo>,
-        }
-        #[derive(Deserialize)]
-        struct ListRepo {
-            repo: String,
-            origin: String,
-            main_branch: String,
-            workspace_root: PathBuf,
-            workspace_prefix: String,
-            #[serde(default)]
-            source: Option<PathBuf>,
-        }
-        let payload: ListPayload = serde_json::from_value(self.run_cube_json(&["--json", "repo", "list"]).await?)
-            .context("decoding remote `cube repo list` payload")?;
-        Ok(payload
-            .repos
-            .into_iter()
-            .map(|r| CubeRepoSummary {
-                repo_id: r.repo,
-                origin: r.origin,
-                main_branch: r.main_branch,
-                workspace_root: r.workspace_root,
-                workspace_prefix: r.workspace_prefix,
-                source: r.source,
-            })
-            .collect())
+        crate::cube_commands::list_repos(self).await
     }
 
     fn command_repr(&self, args: &[&str]) -> Option<(String, String)> {
