@@ -868,6 +868,7 @@ impl RevisionSource for AtomicU64 {
 }
 
 #[derive(bon::Builder)]
+#[builder(on(String, into))]
 pub struct ExecutionCoordinator {
     work_db: Arc<WorkDb>,
     worker_pool: WorkerPool,
@@ -1105,6 +1106,22 @@ impl ExecutionCoordinator {
     /// pool-claim reconciler to sweep leaked review claims.
     pub fn review_worker_pool(&self) -> WorkerPool {
         self.review_pool.clone()
+    }
+
+    /// Return the union of execution ids currently claimed across ALL
+    /// worker pools (main, automation, and review).
+    ///
+    /// The orphan-active sweep uses this as its liveness oracle so that
+    /// executions claimed in the review or automation pools are correctly
+    /// treated as live — not abandoned and re-dispatched.  Using only
+    /// `worker_pool().claimed_execution_ids()` (the main pool) would miss
+    /// review-pool claims and cause the sweep to abandon live reviewer
+    /// executions ~90 s after they start.
+    pub async fn all_claimed_execution_ids(&self) -> std::collections::HashSet<String> {
+        let mut claimed = self.worker_pool.claimed_execution_ids().await;
+        claimed.extend(self.automation_pool.claimed_execution_ids().await);
+        claimed.extend(self.review_pool.claimed_execution_ids().await);
+        claimed
     }
 
     /// Wire the execution-started hook. Production installs the

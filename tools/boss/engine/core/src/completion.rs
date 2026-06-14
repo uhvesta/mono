@@ -10635,7 +10635,11 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         )
         .unwrap();
 
-        // PrReview execution in waiting_human (reviewer spawned, now stopped).
+        // PrReview execution in running (reviewer pane spawned and alive, about to stop).
+        // After the fix, `PaneSpawnRunner` returns `ReviewerPaneAlive` for `pr_review`
+        // executions so the execution stays in `running` (not `waiting_human`) while the
+        // reviewer agent is working. The Stop hook transitions it to `completed` via
+        // `record_worker_pr_completion`. See runner.rs `RunWaitState::ReviewerPaneAlive`.
         let pr_review_exec = db
             .create_execution(
                 CreateExecutionInput::builder()
@@ -10660,7 +10664,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             .finish_execution_run(
                 &pr_review_exec.id,
                 &run.id,
-                ExecutionStatus::WaitingHuman,
+                ExecutionStatus::Running,
                 "completed",
                 Some("reviewer spawned"),
                 None,

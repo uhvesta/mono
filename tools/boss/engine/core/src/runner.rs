@@ -53,6 +53,19 @@ pub enum RunWaitState {
     /// [`PaneSpawnRunner::run_execution`] and the T981 mid-spawn-cancel
     /// collision this closes.
     CancelledDuringSpawn,
+    /// A `pr_review` reviewer pane was successfully spawned. The pane is
+    /// alive and the reviewer agent is actively working. The execution
+    /// stays in `running` (not `waiting_human`) until the Stop hook fires
+    /// and `finalize_pr_review_pass` transitions it to `completed` via
+    /// `record_worker_pr_completion`. Workspace is retained so the reviewer
+    /// pane can continue.
+    ///
+    /// Using `running` (rather than `waiting_human`) is what keeps the
+    /// "AI reviewing" badge visible on kanban cards for the duration of
+    /// the review — the badge queries `pr_review` executions in `running`
+    /// status. `waiting_human` is semantically wrong here: nobody is waiting
+    /// for a human while the reviewer agent is working.
+    ReviewerPaneAlive,
 }
 
 impl RunWaitState {
@@ -67,6 +80,8 @@ impl RunWaitState {
             // drives a status transition for this variant. Report the
             // terminal status for completeness.
             RunWaitState::CancelledDuringSpawn => ExecutionStatus::Cancelled,
+            // Reviewer pane is alive; execution stays `running`.
+            RunWaitState::ReviewerPaneAlive => ExecutionStatus::Running,
         }
     }
 
@@ -581,8 +596,20 @@ impl ExecutionRunner for PaneSpawnRunner {
             }
         }
 
+        // A `pr_review` reviewer pane stays in `running` after spawn so that
+        // the "AI reviewing" kanban badge remains visible while the reviewer
+        // agent is actively working. `waiting_human` is only correct once the
+        // review is done and a human must act; the execution transitions to
+        // `completed` when the Stop hook fires and `finalize_pr_review_pass`
+        // calls `record_worker_pr_completion`. All other execution kinds use
+        // `WaitingHuman` — the normal post-spawn park state.
+        let wait_state = if execution.kind == ExecutionKind::PrReview {
+            RunWaitState::ReviewerPaneAlive
+        } else {
+            RunWaitState::WaitingHuman
+        };
         Ok(RunOutcome {
-            wait_state: RunWaitState::WaitingHuman,
+            wait_state,
             result_summary: Some(format!(
                 "Spawned worker pane in slot {} (shell pid {}). Hook events from this run will surface on the engine events socket.",
                 started.slot_id, started.shell_pid,
@@ -4572,6 +4599,110 @@ mod pane_spawn_tests {
         // #746: trivial floors to Sonnet, never Haiku.
         assert_eq!(spawn.model, "sonnet");
         assert_eq!(spawn.prompt_addendum, None);
+    }
+
+    /// Regression for T1647: `PaneSpawnRunner::run_execution` must return
+    /// `ReviewerPaneAlive` (not `WaitingHuman`) for `PrReview` executions so
+    /// the execution stays in `running` while the reviewer pane is alive.
+    ///
+    /// This pins the runner.rs change at the `PaneSpawnRunner` level.
+    /// Reverting `run_execution` back to always returning `WaitingHuman`
+    /// would cause this test to fail even if the badge-SQL test in t01.rs
+    /// still passes.
+    #[tokio::test]
+    async fn pr_review_execution_yields_reviewer_pane_alive() {
+        let workspace = TempDir::new().unwrap();
+        let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
+        let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
+            Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
+        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+            crate::config::WorkConfig::builder()
+                .cwd(workspace.path().to_path_buf())
+                .db_path(workspace.path().join("state.db"))
+                .build(),
+            None,
+        ));
+        let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
+
+        let product = work_db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@example.com:foo.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = work_db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Some chore being reviewed".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
+            workspace.path().join("feature-flags.toml"),
+        ));
+        let runner = PaneSpawnRunner::new(cfg.clone(), work_db.clone(), flags.clone());
+        runner.set_server_state(weak.clone());
+
+        // Build a PrReview execution; no pr_url on the chore is fine —
+        // the runner falls back to the generic prompt, which is irrelevant
+        // to the wait_state assertion.
+        let mut pr_review_exec = sample_execution(workspace.path());
+        pr_review_exec.kind = ExecutionKind::PrReview;
+        pr_review_exec.work_item_id = chore.id.clone();
+
+        let outcome = runner
+            .run_execution(
+                "review-1",
+                &pr_review_exec,
+                &WorkItem::Chore(chore.clone()),
+                workspace.path(),
+                Some("change-pr-review"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.wait_state,
+            RunWaitState::ReviewerPaneAlive,
+            "PaneSpawnRunner must return ReviewerPaneAlive for PrReview executions so the \
+             execution stays in running (not waiting_human) while the reviewer pane is alive"
+        );
+
+        // Verify that a non-PrReview kind still yields WaitingHuman.
+        let runner2 = PaneSpawnRunner::new(cfg, work_db, flags);
+        runner2.set_server_state(weak);
+        let mut chore_exec = sample_execution(workspace.path());
+        chore_exec.kind = ExecutionKind::ChoreImplementation;
+        chore_exec.work_item_id = chore.id.clone();
+
+        let outcome2 = runner2
+            .run_execution(
+                "worker-1",
+                &chore_exec,
+                &WorkItem::Chore(chore),
+                workspace.path(),
+                Some("change-chore"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome2.wait_state,
+            RunWaitState::WaitingHuman,
+            "PaneSpawnRunner must return WaitingHuman for non-PrReview executions"
+        );
     }
 
     /// **No env vars related to effort or token caps appear on the

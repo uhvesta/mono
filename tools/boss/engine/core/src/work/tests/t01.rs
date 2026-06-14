@@ -1943,6 +1943,105 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Regression for T1647: the "AI reviewing" badge (`ai_reviewing`) must
+/// remain visible after `finish_execution_run(Running)` — the post-spawn
+/// state `PaneSpawnRunner` now writes for `pr_review` executions via
+/// `RunWaitState::ReviewerPaneAlive`. Before the fix, `PaneSpawnRunner`
+/// returned `WaitingHuman`, immediately flipping the execution to
+/// `waiting_human` after spawn; the badge queries only `running`, so it
+/// disappeared the moment the pane was spawned even though the reviewer
+/// was still actively working.
+#[test]
+fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
+    let path = temp_db_path("ai-reviewing-post-spawn");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Review in progress".to_owned(),
+            description: None,
+            autostart: false,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'active', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![chore.id, "https://github.com/spinyfin/mono/pull/1647"],
+        )
+        .unwrap();
+    }
+
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    // Dispatch: `start_execution_run` → `running`.
+    let (_, run) = db
+        .start_execution_run(
+            &review.id,
+            "review-17",
+            "mono",
+            "lease-review-17",
+            "mono-agent-017",
+            "/tmp/mono-agent-017",
+        )
+        .unwrap();
+
+    // Simulate `PaneSpawnRunner` returning `ReviewerPaneAlive`: the run is
+    // recorded as completed but the execution stays `running`.
+    db.finish_execution_run(
+        &review.id,
+        &run.id,
+        ExecutionStatus::Running,
+        "completed",
+        Some("Spawned reviewer pane in slot 17."),
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+
+    // Badge must be visible: reviewer pane is alive and working.
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let card = tree
+        .chores
+        .iter()
+        .find(|c| c.id == chore.id)
+        .expect("chore present in work tree");
+    assert!(
+        card.ai_reviewing,
+        "badge must show after post-spawn finish_execution_run(Running); \
+         was the execution accidentally moved to waiting_human instead of staying running?"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn cancel_execution_errors_on_unknown_id() {
     let path = temp_db_path("cancel-unknown");

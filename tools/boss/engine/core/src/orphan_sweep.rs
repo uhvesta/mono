@@ -40,7 +40,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use boss_protocol::{ExecutionStatus, RequestExecutionInput};
+use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -62,11 +62,19 @@ pub struct OrphanSweepOutcome {
     /// state. These should already be filtered by the DB query; a non-zero
     /// count here indicates a data-consistency gap worth investigating.
     pub waiting_human_skipped: usize,
+    /// Items skipped because their live execution is a `running` `pr_review`
+    /// (an active reviewer pane). With the union-of-pools liveness fix this
+    /// should never fire; a non-zero count here means the pool snapshot did
+    /// not include the review pool — worth investigating.
+    pub running_reviewer_skipped: usize,
 }
 
 impl OrphanSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.redispatched > 0 || self.churn_skipped > 0 || self.waiting_human_skipped > 0
+        self.redispatched > 0
+            || self.churn_skipped > 0
+            || self.waiting_human_skipped > 0
+            || self.running_reviewer_skipped > 0
     }
 }
 
@@ -88,6 +96,7 @@ pub fn spawn_loop(
                     churn_skipped = outcome.churn_skipped,
                     no_worker_skipped = outcome.no_worker_skipped,
                     waiting_human_skipped = outcome.waiting_human_skipped,
+                    running_reviewer_skipped = outcome.running_reviewer_skipped,
                     "orphan sweep: pass complete",
                 );
             }
@@ -117,9 +126,15 @@ pub async fn run_one_pass(
     }
 
     // Snapshot of which execution ids are currently claimed by a live
-    // worker slot. Built once outside the per-item loop so all items
-    // in this pass see a consistent view.
-    let claimed: HashSet<String> = coordinator.worker_pool().claimed_execution_ids().await;
+    // worker slot across ALL pools (main, automation, review).  Built
+    // once outside the per-item loop so all items in this pass see a
+    // consistent view.
+    //
+    // Using only `worker_pool()` (the main pool) would miss executions
+    // claimed in the review or automation pools — a `pr_review` reviewer
+    // is claimed in `review_pool`, so a main-pool-only snapshot would
+    // incorrectly treat it as dead and abandon it.
+    let claimed: HashSet<String> = coordinator.all_claimed_execution_ids().await;
 
     let candidates = match work_db.list_orphan_active_candidates(ORPHAN_MIN_AGE_SECS) {
         Ok(ids) => ids,
@@ -219,6 +234,30 @@ pub async fn run_one_pass(
                  (should have been excluded by DB query — investigate)",
             );
             outcome.waiting_human_skipped += 1;
+            continue;
+        }
+
+        // Defense-in-depth: a `running` pr_review execution is a live reviewer
+        // pane actively working (RunWaitState::ReviewerPaneAlive). With the
+        // union-of-pools fix the reviewer's review-pool claim is already in
+        // `claimed`, so `request_execution_with_live_check` sees it as live
+        // and returns the existing execution (non-ready → we skip below).
+        // This guard fires ONLY when the reviewer is NOT in `claimed` — i.e.
+        // a future pool-split scenario where the pool union missed the reviewer.
+        // A non-zero `running_reviewer_skipped` count means the union failed;
+        // investigate.
+        if let Some(live) = &live_execution
+            && live.status == ExecutionStatus::Running
+            && live.kind == ExecutionKind::PrReview
+            && !claimed.contains(&live.id)
+        {
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                execution_id = %live.id,
+                "orphan sweep: candidate has a running pr_review execution not in any pool claim \
+                 (pool union failed?); skipping to protect live reviewer — investigate",
+            );
+            outcome.running_reviewer_skipped += 1;
             continue;
         }
 
@@ -420,6 +459,20 @@ mod tests {
         ))
     }
 
+    /// Like `make_coordinator` but also installs a review pool of `review_pool_size`.
+    /// Returns both the coordinator and the review pool so the caller can claim slots.
+    fn make_coordinator_with_review_pool(
+        db: Arc<WorkDb>,
+        pool_size: usize,
+        review_pool_size: usize,
+    ) -> (Arc<ExecutionCoordinator>, WorkerPool) {
+        let review_pool = WorkerPool::new_review(review_pool_size);
+        let mut coordinator =
+            ExecutionCoordinator::new(db, WorkerPool::new(pool_size), Arc::new(NoopCube), Arc::new(NoopRunner));
+        coordinator.set_review_pool(review_pool.clone());
+        (Arc::new(coordinator), review_pool)
+    }
+
     // ─── tests ──────────────────────────────────────────────────────────────
 
     /// Orphan with NO execution → gets redispatched; dispatch event emitted.
@@ -594,6 +647,136 @@ mod tests {
                 .iter()
                 .any(|e| e.id == execution.id && e.status == ExecutionStatus::WaitingHuman),
             "waiting_human execution must not be abandoned by the sweep"
+        );
+    }
+
+    /// Regression for the critical finding in T1647's automated review:
+    ///
+    /// A `running` `pr_review` execution is a live reviewer pane actively
+    /// working (`RunWaitState::ReviewerPaneAlive`). The reviewer is claimed
+    /// in the REVIEW pool — not the MAIN pool. The old sweep only consulted
+    /// `coordinator.worker_pool().claimed_execution_ids()` (the main pool),
+    /// so a review-pool-claimed reviewer read as dead. The sweep would then
+    /// abandon the live pr_review execution and re-dispatch a fresh
+    /// chore_implementation on top of the already-pushed PR.
+    ///
+    /// The fix: `all_claimed_execution_ids()` unions all three pools. This
+    /// test verifies the fix by claiming the pr_review execution in the
+    /// review pool only (never the main pool) and asserting the sweep does
+    /// not abandon it.
+    #[tokio::test]
+    async fn running_pr_review_in_review_pool_is_not_abandoned() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        make_old(&db, &work_item_id);
+
+        // Create a pr_review execution and force it to `running` to simulate
+        // a reviewer pane that was successfully spawned.
+        let execution = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+        // Override kind to PrReview — the execution was created with the
+        // default kind; we force the DB value directly so the sweep reads it.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET kind = 'pr_review', status = 'running' WHERE id = ?1",
+                rusqlite::params![execution.id],
+            )
+            .unwrap();
+        }
+
+        let db = Arc::new(db);
+        // Build a coordinator with a 1-slot main pool AND a 1-slot review pool.
+        // Claim the pr_review execution in the REVIEW pool (not the main pool)
+        // to simulate the production layout: main pool has an idle slot (so
+        // the fast-path check passes), but the reviewer is live in review pool.
+        let (coordinator, review_pool) = make_coordinator_with_review_pool(db.clone(), 1, 1);
+        review_pool.claim_worker(&execution.id, None).await;
+        // Main pool is idle — this is what previously triggered the bug:
+        // has_idle_worker() = true (sweep proceeds), but the main-pool
+        // claimed_execution_ids() didn't include the reviewer exec id.
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "sweep must not re-dispatch when the pr_review execution is claimed in the review pool"
+        );
+        assert_eq!(
+            outcome.running_reviewer_skipped, 0,
+            "defense-in-depth skip must not fire when pool union correctly identifies the reviewer as live"
+        );
+        let events = sink.events().await;
+        assert!(
+            events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+            "no orphan_active_redispatch event must fire for a live review-pool-claimed reviewer"
+        );
+
+        // The running pr_review execution must remain intact — not abandoned.
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|e| e.id == execution.id && e.status == ExecutionStatus::Running),
+            "running pr_review execution must not be abandoned by the sweep"
+        );
+    }
+
+    /// Defense-in-depth regression: even if the pool-union fix were somehow
+    /// absent (e.g. a future refactor splits pools again), the explicit
+    /// `running pr_review` guard in `run_one_pass` must fire and prevent
+    /// abandoning the live reviewer.
+    #[tokio::test]
+    async fn running_pr_review_not_in_any_pool_hits_defense_in_depth_skip() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id);
+        make_old(&db, &work_item_id);
+
+        let execution = db
+            .request_execution(
+                RequestExecutionInput::builder()
+                    .work_item_id(work_item_id.clone())
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET kind = 'pr_review', status = 'running' WHERE id = ?1",
+                rusqlite::params![execution.id],
+            )
+            .unwrap();
+        }
+
+        let db = Arc::new(db);
+        // Claim nothing in any pool — simulates the "pool union absent" scenario.
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "defense-in-depth guard must prevent re-dispatch of a running pr_review execution"
+        );
+        assert_eq!(
+            outcome.running_reviewer_skipped, 1,
+            "defense-in-depth skip counter must be incremented"
+        );
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions
+                .iter()
+                .any(|e| e.id == execution.id && e.status == ExecutionStatus::Running),
+            "running pr_review execution must survive the sweep even when not in any pool"
         );
     }
 }
