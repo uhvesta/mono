@@ -94,19 +94,15 @@ allow_bypass = true
             id: "different-id".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            implementation: ExternalCheckPackageImplementation::Component(
-                ExternalCheckComponentPackage {
-                    artifact_path: "check.wasm".to_owned(),
-                    artifact_sha256:
-                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                            .to_owned(),
-                    artifact_bytes: None,
-                    check_name: "different-id".to_owned(),
-                    limits: None,
-                    checks: None,
-                    provenance: None,
-                },
-            ),
+            implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+                artifact_path: "check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                artifact_bytes: None,
+                check_name: "different-id".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            }),
         }),
     };
 
@@ -155,19 +151,15 @@ allow_bypass = true
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            implementation: ExternalCheckPackageImplementation::Component(
-                ExternalCheckComponentPackage {
-                    artifact_path: "check.wasm".to_owned(),
-                    artifact_sha256:
-                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                            .to_owned(),
-                    artifact_bytes: None,
-                    check_name: "domain-typo-check".to_owned(),
-                    limits: None,
-                    checks: None,
-                    provenance: None,
-                },
-            ),
+            implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+                artifact_path: "check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                artifact_bytes: None,
+                check_name: "domain-typo-check".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            }),
         }),
     };
     let seen_packages = Arc::new(Mutex::new(Vec::new()));
@@ -297,19 +289,15 @@ severity = "error"
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            implementation: ExternalCheckPackageImplementation::Component(
-                ExternalCheckComponentPackage {
-                    artifact_path: "check.wasm".to_owned(),
-                    artifact_sha256:
-                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                            .to_owned(),
-                    artifact_bytes: None,
-                    check_name: "domain-typo-check".to_owned(),
-                    limits: None,
-                    checks: None,
-                    provenance: None,
-                },
-            ),
+            implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+                artifact_path: "check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                artifact_bytes: None,
+                check_name: "domain-typo-check".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            }),
         }),
     };
     let executor = StaticExternalExecutor {
@@ -372,19 +360,15 @@ allow_bypass = true
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            implementation: ExternalCheckPackageImplementation::Component(
-                ExternalCheckComponentPackage {
-                    artifact_path: "check.wasm".to_owned(),
-                    artifact_sha256:
-                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                            .to_owned(),
-                    artifact_bytes: None,
-                    check_name: "domain-typo-check".to_owned(),
-                    limits: None,
-                    checks: None,
-                    provenance: None,
-                },
-            ),
+            implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+                artifact_path: "check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                artifact_bytes: None,
+                check_name: "domain-typo-check".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            }),
         }),
     };
     let executor = StaticExternalExecutor {
@@ -414,9 +398,7 @@ allow_bypass = true
         kind: ChangeKind::Modified,
         old_path: None,
     }])
-    .with_commit_description(Some(
-        "BYPASS_DOMAIN_TYPO=temporary external parity coverage".to_owned(),
-    ));
+    .with_commit_description(Some("BYPASS_DOMAIN_TYPO=temporary external parity coverage".to_owned()));
 
     let results = runner.run_changeset(&changeset).await.expect("run checks");
 
@@ -451,19 +433,15 @@ implementation = "generated:domain-typo-check"
             id: "domain-typo-check".to_owned(),
             runtime: "component-v1".to_owned(),
             api_version: "v1".to_owned(),
-            implementation: ExternalCheckPackageImplementation::Component(
-                ExternalCheckComponentPackage {
-                    artifact_path: "check.wasm".to_owned(),
-                    artifact_sha256:
-                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                            .to_owned(),
-                    artifact_bytes: None,
-                    check_name: "domain-typo-check".to_owned(),
-                    limits: None,
-                    checks: None,
-                    provenance: None,
-                },
-            ),
+            implementation: ExternalCheckPackageImplementation::Component(ExternalCheckComponentPackage {
+                artifact_path: "check.wasm".to_owned(),
+                artifact_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+                artifact_bytes: None,
+                check_name: "domain-typo-check".to_owned(),
+                limits: None,
+                checks: None,
+                provenance: None,
+            }),
         }),
     };
     let executor = StaticExternalExecutor {
@@ -492,11 +470,7 @@ implementation = "generated:domain-typo-check"
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].check_id, "domain-typo");
     assert_eq!(results[0].findings[0].severity, Severity::Error);
-    assert!(
-        results[0].findings[0]
-            .message
-            .contains("sandbox runtime failed")
-    );
+    assert!(results[0].findings[0].message.contains("sandbox runtime failed"));
 }
 
 #[test]
@@ -529,11 +503,7 @@ implementation = "generated:domain-typo-check"
         }]))
         .expect_err("must fail");
 
-    assert!(
-        error
-            .to_string()
-            .contains("failed to resolve external check packages")
-    );
+    assert!(error.to_string().contains("failed to resolve external check packages"));
 }
 
 #[tokio::test]
@@ -602,12 +572,7 @@ checks:
             .message
             .contains("cannot use runtime `declarative-v1`")
     );
-    assert!(
-        seen_packages
-            .lock()
-            .expect("lock seen packages")
-            .is_empty()
-    );
+    assert!(seen_packages.lock().expect("lock seen packages").is_empty());
 }
 
 #[tokio::test]
@@ -676,10 +641,7 @@ checks:
         .expect("run checks");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(
-        results[0].findings[0].message,
-        "external file declarative ran"
-    );
+    assert_eq!(results[0].findings[0].message, "external file declarative ran");
     assert_eq!(
         seen_packages.lock().expect("lock seen packages").as_slice(),
         ["domain-typo-check"]

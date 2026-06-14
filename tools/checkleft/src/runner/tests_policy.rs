@@ -22,11 +22,7 @@ impl Check for StaticFindingCheck {
 
 #[async_trait]
 impl ConfiguredCheck for StaticFindingCheck {
-    async fn run(
-        &self,
-        changeset: &ChangeSet,
-        _tree: &dyn SourceTree,
-    ) -> Result<CheckResult> {
+    async fn run(&self, changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
         let path = changeset
             .changed_files
             .first()
@@ -137,9 +133,7 @@ allow_bypass = true
                 kind: ChangeKind::Modified,
                 old_path: None,
             }])
-            .with_commit_description(Some(
-                "BYPASS_POLICY_CHECK=Legitimate exception.".to_owned(),
-            )),
+            .with_commit_description(Some("BYPASS_POLICY_CHECK=Legitimate exception.".to_owned())),
         )
         .await
         .expect("run checks");
@@ -147,11 +141,7 @@ allow_bypass = true
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].findings.len(), 1);
     assert_eq!(results[0].findings[0].severity, Severity::Warning);
-    assert!(
-        results[0].findings[0]
-            .message
-            .contains("BYPASS_POLICY_CHECK")
-    );
+    assert!(results[0].findings[0].message.contains("BYPASS_POLICY_CHECK"));
 }
 
 #[tokio::test]
@@ -262,17 +252,12 @@ bypass_name = "BYPASS_LEGACY_POLICY_CHECK"
                 kind: ChangeKind::Modified,
                 old_path: None,
             }])
-            .with_commit_description(Some(
-                "BYPASS_LEGACY_POLICY_CHECK=Legacy fallback path.".to_owned(),
-            )),
+            .with_commit_description(Some("BYPASS_LEGACY_POLICY_CHECK=Legacy fallback path.".to_owned())),
         )
         .await
         .expect("run checks");
     assert_eq!(results_with_bypass[0].findings[0].severity, Severity::Error);
-    assert_eq!(
-        results_with_bypass[0].findings[0].message,
-        "synthetic policy finding"
-    );
+    assert_eq!(results_with_bypass[0].findings[0].message, "synthetic policy finding");
 }
 
 #[tokio::test]
@@ -315,9 +300,5 @@ allow_bypass = true
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].findings[0].severity, Severity::Error);
-    assert!(
-        results[0].findings[0]
-            .message
-            .contains("unknown implementation")
-    );
+    assert!(results[0].findings[0].message.contains("unknown implementation"));
 }
