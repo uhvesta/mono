@@ -272,3 +272,84 @@ impl GhRunner for CommandGhRunner {
         Ok(GhResponse { body })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::Output;
+
+    use super::*;
+
+    /// Build a failed `gh` [`Output`] (non-zero exit) carrying `stderr`, so we
+    /// can exercise [`gh_status_error`]'s observable behavior end to end.
+    fn failed_output(stderr: &str) -> Output {
+        Output {
+            // Non-zero exit code: a real `gh` failure.
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn parses_http_404_not_found() {
+        assert_eq!(parse_http_status_from_stderr("gh: Not Found (HTTP 404)"), Some(404));
+    }
+
+    #[test]
+    fn parses_rate_limit_429() {
+        assert_eq!(
+            parse_http_status_from_stderr("gh: API rate limit exceeded (HTTP 429)"),
+            Some(429)
+        );
+    }
+
+    #[test]
+    fn parses_server_error_503() {
+        assert_eq!(
+            parse_http_status_from_stderr("gh: Service Unavailable (HTTP 503)"),
+            Some(503)
+        );
+    }
+
+    #[test]
+    fn parses_status_case_insensitively() {
+        assert_eq!(parse_http_status_from_stderr("internal error: http 500"), Some(500));
+    }
+
+    #[test]
+    fn api_url_is_not_mistaken_for_a_status() {
+        // A bare URL has no "http " token (no space after the scheme), so the
+        // https:// prefix must not produce a false-positive status code.
+        assert_eq!(
+            parse_http_status_from_stderr("error connecting to https://api.github.com/repos/o/r"),
+            None
+        );
+    }
+
+    #[test]
+    fn stderr_without_a_status_yields_none() {
+        assert_eq!(parse_http_status_from_stderr("could not connect to host"), None);
+    }
+
+    #[test]
+    fn malformed_non_numeric_status_yields_none() {
+        assert_eq!(parse_http_status_from_stderr("gh: weird (HTTP abc)"), None);
+    }
+
+    #[test]
+    fn status_error_carries_parsed_status_and_trimmed_message() {
+        let err = gh_status_error(&failed_output("  gh: Not Found (HTTP 404)\n"));
+        assert_eq!(err.http_status, Some(404));
+        assert_eq!(err.message, "gh: Not Found (HTTP 404)");
+    }
+
+    #[test]
+    fn status_error_without_code_yields_status_zero_and_trimmed_message() {
+        // No HTTP status in stderr => status 0 and the trimmed stderr as the
+        // message, so callers treat it as a non-HTTP (transient) failure.
+        let err = gh_status_error(&failed_output("\ncould not connect to host\n"));
+        assert_eq!(err.http_status, Some(0));
+        assert_eq!(err.message, "could not connect to host");
+    }
+}
