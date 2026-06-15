@@ -24,6 +24,7 @@ members = [
   "tools/checkleft/sdk/examples/trivial-check",
   "tools/checkleft/checks/file/size",
   "tools/checkleft/checks/rust/giant-structs",
+  "tools/checkleft/preinstalled-bundle",
   "tools/checkleft_package",
   "tools/cube",
   "tools/repobin",

@@ -37,8 +37,7 @@ rust_library(
     },
     visibility = ["//:__subpackages__"],
     deps = all_crate_deps(normal = True) + [
-        "//tools/checkleft/checks/file/size:checkleft_wasm_bundle_lib",
-        "//tools/checkleft/checks/rust/giant-structs:checkleft_wasm_bundle_lib",
+        "//tools/checkleft/preinstalled-bundle:checkleft_wasm_bundle_lib",
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
     ],
 )
@@ -95,8 +94,7 @@ rust_binary(
 precompiled_cwasm_dir(
     name = "precompiled_cwasm",
     components = [
-        "//tools/checkleft/checks/file/size:file_size_check_component",
-        "//tools/checkleft/checks/rust/giant-structs:rust_giant_structs_use_builder_component",
+        "//tools/checkleft/preinstalled-bundle:preinstalled_bundle_component",
     ],
 )
 

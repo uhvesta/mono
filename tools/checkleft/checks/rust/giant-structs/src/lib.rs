@@ -23,7 +23,7 @@
 //! }
 //! ```
 
-use checkleft_check_sdk::{ChangeKind, CheckInput, DeclaredExclusion, ExclusionStatus, Finding, check, export_checks};
+use checkleft_check_sdk::{ChangeKind, CheckInput, DeclaredExclusion, ExclusionStatus, Finding, check};
 use serde::Deserialize;
 
 const DEFAULT_MAX_FIELDS: usize = 5;
@@ -45,7 +45,7 @@ struct Config {
     description = "flags Rust structs with more than the configured number of named fields that lack a builder derive",
     severity = error
 )]
-fn giant_structs_check(input: CheckInput) -> Vec<Finding> {
+pub fn giant_structs_check(input: CheckInput) -> Vec<Finding> {
     let cfg: Config = input.config().unwrap_or_default();
     let max_fields = cfg.max_fields.unwrap_or(DEFAULT_MAX_FIELDS);
     let use_bon = cfg.builder.as_deref().unwrap_or("bon") != "derive_builder";
@@ -97,7 +97,7 @@ fn giant_structs_check(input: CheckInput) -> Vec<Finding> {
     findings
 }
 
-fn giant_structs_declared_exclusions(config_json: &str) -> Vec<DeclaredExclusion> {
+pub fn giant_structs_declared_exclusions(config_json: &str) -> Vec<DeclaredExclusion> {
     let cfg: Config = serde_json::from_str(config_json).unwrap_or_default();
     let mut result = Vec::new();
     for entry in cfg.exclude_structs.unwrap_or_default() {
@@ -111,7 +111,7 @@ fn giant_structs_declared_exclusions(config_json: &str) -> Vec<DeclaredExclusion
     result
 }
 
-fn giant_structs_evaluate_exclusion(
+pub fn giant_structs_evaluate_exclusion(
     config_json: &str,
     excl: &DeclaredExclusion,
     file_content: Option<&str>,
@@ -145,14 +145,12 @@ fn giant_structs_evaluate_exclusion(
     }
 }
 
-export_checks!(
-    giant_structs_check,
-    exclusion_audit(
-        "rust/giant-structs",
-        giant_structs_declared_exclusions,
-        giant_structs_evaluate_exclusion
-    ),
-);
+// NOTE: this crate is an rlib, NOT a standalone wasm component. The component
+// ABI (`export_checks!` → `list-checks`/`run-check` plus the `exclusion_audit`
+// hooks for `rust/giant-structs`) is wired ONCE in the aggregating
+// `checkleft-preinstalled-bundle` crate, which links this check and `file/size`
+// into a single multiplexed component. That links `syn`, `serde`, and the wasm
+// runtime baseline once across the preinstalled checks instead of per component.
 
 // ── AST analysis ──────────────────────────────────────────────────────────────
 

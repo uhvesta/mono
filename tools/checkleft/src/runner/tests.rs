@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -728,21 +728,40 @@ pub struct ServerState {
 }
 "#;
 
+/// Return a shared executor for the four builder-audit tests.
+///
+/// `OnceLock::get_or_init` is blocking: the first caller initializes the
+/// executor (deserializing the precompiled AOT `.cwasm` under Bazel, or
+/// performing a one-time JIT+cache under plain `cargo test`) while all later
+/// callers wait.  This ensures the compilation/deserialization happens at most
+/// once per test-binary run, preventing the four tests from each independently
+/// running it when they execute in parallel.
+fn shared_builder_audit_executor() -> Arc<dyn ExternalCheckExecutor> {
+    use crate::external::test_support::executor_with_precompiled_cache;
+    // Keep a TempDir alive for the executor's root for the process lifetime.
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    static EXECUTOR: OnceLock<Arc<dyn ExternalCheckExecutor>> = OnceLock::new();
+    let root = ROOT.get_or_init(|| {
+        let t = tempdir().expect("shared builder-audit root");
+        let path = t.path().to_path_buf();
+        std::mem::forget(t); // keep alive for the process lifetime
+        path
+    });
+    Arc::clone(EXECUTOR.get_or_init(|| Arc::new(executor_with_precompiled_cache(root))))
+}
+
 async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
     use crate::external::BundledExternalCheckPackageProvider;
-    use crate::external::test_support::executor_with_precompiled_cache;
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry).expect("register built-ins");
     // Use the full external stack so bundled component checks resolve and execute.
-    // Pointed at the build-time precompiled .cwasm fixture so the giant-structs
-    // component deserializes instead of JIT-compiling at runtime.
-    let executor = executor_with_precompiled_cache(temp.path());
+    // Executor is shared across the four builder-audit tests (see shared_builder_audit_executor).
     let runner = Runner::with_external(
         Arc::new(registry),
         Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
         Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
         Arc::new(BundledExternalCheckPackageProvider),
-        Arc::new(executor),
+        shared_builder_audit_executor(),
     );
     runner
         .run_changeset(&ChangeSet::new(vec![ChangedFile {

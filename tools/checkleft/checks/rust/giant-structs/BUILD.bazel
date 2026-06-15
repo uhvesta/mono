@@ -1,64 +1,27 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_shared_library")
-load("@rules_shell//shell:sh_test.bzl", "sh_test")
-load("//tools/checkleft/wasm:defs.bzl", "rust_wasm_component")
+load("@rules_rust//rust:defs.bzl", "rust_library")
 
-# On the host target this builds a native shared library (.so / .dylib).
-# On wasm32-wasip2 (via the rust_wasm_component rule below) it builds the
-# Component Model component that ships bundled in the checkleft binary.
-rust_shared_library(
+# The rust/giant-structs check logic as an ordinary rlib. It is linked (together
+# with the other preinstalled checks) into the single multiplexed Component Model
+# component built by //tools/checkleft/preinstalled-bundle. This crate no longer
+# builds its own component: a separate component per check duplicated the entire
+# wasm runtime baseline (std/alloc/SDK/wit-bindgen/serde) plus heavy deps like
+# `syn` once per check.
+rust_library(
     name = "rust_giant_structs_use_builder",
     srcs = ["src/lib.rs"],
     crate_name = "checkleft_rust_giant_structs_use_builder",
     edition = "2024",
     proc_macro_deps = [
-        # The #[check] and export_checks! macros are provided by sdk-macro;
-        # they're re-exported from checkleft-check-sdk but Bazel requires the
-        # proc-macro target to be listed explicitly in the user's crate too.
+        # The #[check] macro is provided by sdk-macro; it's re-exported from
+        # checkleft-check-sdk but Bazel requires the proc-macro target to be
+        # listed explicitly in the user's crate too.
         "//tools/checkleft/sdk-macro:checkleft_check_sdk_macro",
     ] + all_crate_deps(proc_macro = True),
-    visibility = ["//tools/checkleft:__pkg__"],
+    visibility = ["//tools/checkleft/preinstalled-bundle:__pkg__"],
     deps = [
         "//tools/checkleft/sdk:checkleft_check_sdk",
         "@@rules_rust++crate+mono_crates__serde_json-1.0.150//:serde_json",
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
     ] + all_crate_deps(normal = True),
-)
-
-# Build the check as a Component Model component via the rust_wasm_component
-# rule (T9). Produces rust_giant_structs_use_builder_component.wasm and its
-# .sha256 sidecar. The .wasm is embedded in checkleft_lib via include_bytes!
-# (compile_data entry in tools/checkleft/BUILD.bazel).
-rust_wasm_component(
-    name = "rust_giant_structs_use_builder_component",
-    crate = ":rust_giant_structs_use_builder",
-    visibility = ["//tools/checkleft:__pkg__"],
-)
-
-# Micro-library that embeds the wasm bytes via include_bytes!.  Kept separate
-# from checkleft_lib so that having the generated wasm artifact in compile_data
-# here does not bleed into checkleft_lib and trigger rules_rust's
-# "symlink-sources-to-bazel-out" mode, which would break wasmtime's bindgen!
-# macro path resolution for check.wit.  checkleft_lib depends on this target;
-# the bytes arrive as checkleft_wasm_bundle::WASM at link time.
-rust_library(
-    name = "checkleft_wasm_bundle_lib",
-    srcs = ["bundled.rs"],
-    compile_data = [":rust_giant_structs_use_builder_component"],
-    crate_name = "checkleft_wasm_bundle",
-    crate_root = "bundled.rs",
-    edition = "2024",
-    visibility = ["//tools/checkleft:__pkg__"],
-    deps = [],
-)
-
-# T10 CI smoke test: builds the giant-structs check through the bazel rule and
-# asserts the sha256 sidecar is produced. Proves the check compiles end-to-end
-# under bazel (the acceptance criterion for T10).
-sh_test(
-    name = "rust_giant_structs_use_builder_component_smoke_test",
-    size = "small",
-    srcs = ["//tools/checkleft/wasm:verify_component_sha.sh"],
-    args = ["$(rootpaths :rust_giant_structs_use_builder_component)"],
-    data = [":rust_giant_structs_use_builder_component"],
 )

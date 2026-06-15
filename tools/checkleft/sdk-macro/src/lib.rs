@@ -194,9 +194,14 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
     Ok(quote! {
         #func
 
+        // `pub` (not private) so an aggregating bundle crate can reference the
+        // entry via `export_checks!` across a crate boundary. The companion
+        // `static` below is also `pub`, and a `pub static` of a private type is
+        // an error (E0446); `#[doc(hidden)]` keeps both out of the public docs
+        // and the `missing_docs` lint.
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
-        struct #entry_struct;
+        pub struct #entry_struct;
 
         impl ::checkleft_check_sdk::__private::CheckEntry for #entry_struct {
             fn name(&self) -> &'static str { #check_name }
@@ -218,10 +223,12 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             }
         }
 
-        // pub(crate) so the generated export module can reference it via super::
+        // `pub` so both the same-crate `export_checks!` (via `super::`) and an
+        // out-of-crate aggregating bundle (via `use <check_crate>::...`) can
+        // reference it. See the `pub struct` note above.
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
-        pub(crate) static #entry_static: #entry_struct = #entry_struct;
+        pub static #entry_static: #entry_struct = #entry_struct;
 
         // Compile-time signature check.
         const _: fn(::checkleft_check_sdk::CheckInput) -> ::std::vec::Vec<::checkleft_check_sdk::Finding> = #fn_ident;

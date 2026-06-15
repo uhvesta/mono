@@ -4,15 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 description = "checkleft check (file/size): flag files that exceed a configured line-count limit"
 
-# cdylib is required to compile this crate as a wasm component.
-# On the host target this produces a native shared library; on wasm32-wasip2
-# it produces the component .wasm artifact via the rust_wasm_component bazel rule.
-[lib]
-crate-type = ["cdylib"]
-
+# An ordinary rlib. The component ABI is wired once in the aggregating
+# `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
+# the single multiplexed preinstalled component. No `wit-bindgen` dependency is
+# needed here because this crate no longer calls `export_checks!`.
 [dependencies]
 checkleft-check-sdk = { path = "../../../sdk" }
-wit-bindgen = "0.51"
 serde = { workspace = true, features = ["derive"] }
 globset = { workspace = true }
 

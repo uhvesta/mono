@@ -24,7 +24,7 @@
 //! CHECKS file are normalized to repo-root-relative by the host before they
 //! reach this check, so matching here is a plain repo-relative glob test.
 
-use checkleft_check_sdk::{ChangeKind, ChangeSet, ChangedFile, CheckInput, Finding, check, export_checks};
+use checkleft_check_sdk::{ChangeKind, ChangeSet, ChangedFile, CheckInput, Finding, check};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
@@ -43,7 +43,7 @@ struct Config {
     description = "flags files exceeding configured line limits",
     severity = warning
 )]
-fn file_size_check(input: CheckInput) -> Vec<Finding> {
+pub fn file_size_check(input: CheckInput) -> Vec<Finding> {
     let cfg: Config = input.config().unwrap_or_default();
     let max_lines = cfg.max_lines.map(|v| v as usize).unwrap_or(DEFAULT_MAX_LINES);
     let exclude_globs = build_globset(cfg.exclude_files.as_deref());
@@ -86,7 +86,12 @@ fn file_size_check(input: CheckInput) -> Vec<Finding> {
     findings
 }
 
-export_checks!(file_size_check);
+// NOTE: this crate is an rlib, NOT a standalone wasm component. The component
+// ABI (`export_checks!` → `list-checks`/`run-check`) is wired ONCE in the
+// aggregating `checkleft-preinstalled-bundle` crate, which links this check and
+// `rust/giant-structs` into a single multiplexed component. That dedups the
+// shared wasm runtime baseline (std/alloc/SDK/wit-bindgen/serde) across the
+// preinstalled checks instead of duplicating it per component.
 
 fn file_grew_in_change(file: &ChangedFile, changeset: &ChangeSet) -> bool {
     if file.kind == ChangeKind::Added {

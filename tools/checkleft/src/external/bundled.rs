@@ -13,13 +13,31 @@
 //! 3. Add the file to `checkleft_lib`'s `compile_data` in `BUILD.bazel` so the
 //!    bazel build can read it at compile time.
 //!
-//! ## Adding a bundled component definition
+//! ## Adding a bundled component (wasm) check
 //!
-//! 1. Build the `.wasm` component artifact via the `rust_wasm_component` bazel
-//!    rule (T9) and record its sha256.
-//! 2. Add a `BundledCheckDef::component` entry to [`BUNDLED_CHECK_DEFS`] below,
-//!    using `include_bytes!` for the artifact.
-//! 3. Add the artifact file to `checkleft_lib`'s `compile_data` in `BUILD.bazel`.
+//! All preinstalled wasm checks are compiled into a SINGLE multiplexed Component
+//! Model component (`//tools/checkleft/preinstalled-bundle`) so the shared wasm
+//! runtime baseline (std/alloc/SDK/wit-bindgen/serde) and heavy shared deps
+//! (e.g. `syn`) are linked once across every check, instead of once per check.
+//! To add a new preinstalled wasm check:
+//!
+//! 1. Author the check crate as an rlib under `tools/checkleft/checks/<ns>/<name>/`
+//!    (`#[check]`, but NO `export_checks!` — the bundle wires that).
+//! 2. Add it as a dependency of `//tools/checkleft/preinstalled-bundle` and list
+//!    its function in that crate's single `export_checks!` call.
+//! 3. Add the check's id to the `check_names` of the single component
+//!    [`BundledCheckDef`] in [`BUNDLED_CHECK_DEFS`] below — the host resolves
+//!    each name to the same component and dispatches by name via `list-checks` /
+//!    `run-check`, so one component can export many checks.
+//!
+//! ## Boundary: preinstalled vs externally-distributed
+//!
+//! This single-component packaging is for the in-binary PREINSTALLED set only.
+//! Externally-distributed checks are still loaded at runtime as their own
+//! separate components (`super::runtime`); that loader path is intentionally
+//! untouched. A `BundledCheckDef::Component` may therefore name MULTIPLE checks
+//! (the preinstalled bundle), whereas an externally-loaded component is resolved
+//! independently per artifact.
 //!
 //! We embed each file explicitly (rather than `include_dir!`) because the bazel
 //! build does not run `build.rs`, and every embedded file must be declared as
@@ -100,21 +118,18 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         },
         limits: None,
     },
+    // All preinstalled wasm checks ship in ONE multiplexed Component Model
+    // component. Resolving any of these names yields a package carrying the same
+    // aggregate bytes; the host dispatches to the right check by name via the
+    // component's `list-checks` / `run-check` exports. Bytes come from the
+    // checkleft_preinstalled_wasm_bundle micro-library so the generated wasm
+    // artifact lives in that target's compile_data, not in checkleft_lib's —
+    // that separation keeps checkleft_lib in "source mode" and preserves
+    // CARGO_MANIFEST_DIR for bindgen!.
     BundledCheckDef {
-        check_names: &["file/size"],
+        check_names: &["file/size", "rust/giant-structs"],
         kind: BundledCheckDefKind::Component {
-            bytes: checkleft_file_size_wasm_bundle::WASM,
-        },
-        limits: None,
-    },
-    BundledCheckDef {
-        check_names: &["rust/giant-structs"],
-        kind: BundledCheckDefKind::Component {
-            // Bytes come from the checkleft_wasm_bundle micro-library so the
-            // generated wasm artifact lives in that target's compile_data, not
-            // in checkleft_lib's.  That separation keeps checkleft_lib in
-            // "source mode" and preserves CARGO_MANIFEST_DIR for bindgen!.
-            bytes: checkleft_wasm_bundle::WASM,
+            bytes: checkleft_preinstalled_wasm_bundle::WASM,
         },
         // No explicit timeout: uses the proportional default
         // (BASE_COMPONENT_TIMEOUT_MS + PER_FILE_COMPONENT_TIMEOUT_MS × n_files),
@@ -230,6 +245,42 @@ mod tests {
             .resolve(&ExternalCheckImplementationRef::Bundled("does-not-exist".to_owned()))
             .expect("resolve");
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn preinstalled_wasm_checks_share_one_consolidated_component() {
+        // Consolidation invariant: every preinstalled wasm check is served by a
+        // SINGLE multiplexed component, so resolving any of their ids must yield
+        // the exact same embedded bytes (and thus the same sha256). If someone
+        // splits them back into per-check components, this fails.
+        let provider = BundledExternalCheckPackageProvider;
+        let resolve_component = |name: &str| {
+            let pkg = provider
+                .resolve(&ExternalCheckImplementationRef::Bundled(name.to_owned()))
+                .expect("resolve")
+                .unwrap_or_else(|| panic!("`{name}` did not resolve"));
+            let ExternalCheckPackageImplementation::Component(comp) = pkg.implementation else {
+                panic!("`{name}` must be a Component def");
+            };
+            comp
+        };
+
+        let file_size = resolve_component("file/size");
+        let giant_structs = resolve_component("rust/giant-structs");
+
+        // Same underlying component bytes (pointer-identical static + equal sha).
+        assert_eq!(
+            file_size.artifact_bytes.map(<[u8]>::as_ptr),
+            giant_structs.artifact_bytes.map(<[u8]>::as_ptr),
+            "preinstalled wasm checks must point at the same consolidated component",
+        );
+        assert_eq!(file_size.artifact_sha256, giant_structs.artifact_sha256);
+        assert!(!file_size.artifact_sha256.is_empty(), "sha256 must be computed");
+
+        // ...but each names its own check so the host dispatches correctly via
+        // the component's list-checks / run-check exports.
+        assert_eq!(file_size.check_name, "file/size");
+        assert_eq!(giant_structs.check_name, "rust/giant-structs");
     }
 
     #[test]

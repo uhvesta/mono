@@ -1,0 +1,19 @@
+[package]
+name = "checkleft-preinstalled-bundle"
+version = "0.1.0"
+edition.workspace = true
+description = "Aggregates every preinstalled checkleft wasm check into a single multiplexed Component Model component."
+
+# cdylib so this crate compiles to a single Component Model component on
+# wasm32-wasip2. It links every preinstalled check (each an rlib) and calls
+# `export_checks!` ONCE, so the shared wasm runtime baseline (std/alloc/SDK/
+# wit-bindgen/serde) and heavy shared deps (e.g. syn) are linked and
+# dead-code-eliminated a single time across all checks instead of per component.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+checkleft-check-sdk = { path = "../sdk" }
+checkleft-file-size = { path = "../checks/file/size" }
+checkleft-rust-giant-structs = { path = "../checks/rust/giant-structs" }
+wit-bindgen = "0.51"

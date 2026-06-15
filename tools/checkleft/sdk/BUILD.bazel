@@ -14,6 +14,7 @@ rust_library(
     visibility = [
         "//tools/checkleft/checks/file/size:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs:__pkg__",
+        "//tools/checkleft/preinstalled-bundle:__pkg__",
         "//tools/checkleft/sdk/examples:__subpackages__",
     ],
     deps = all_crate_deps(normal = True),

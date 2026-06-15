@@ -11,6 +11,7 @@ rust_proc_macro(
     visibility = [
         "//tools/checkleft/checks/file/size:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs:__pkg__",
+        "//tools/checkleft/preinstalled-bundle:__pkg__",
         "//tools/checkleft/sdk:__pkg__",
         "//tools/checkleft/sdk/examples/trivial-check:__pkg__",
     ],

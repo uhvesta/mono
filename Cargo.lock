@@ -640,7 +640,6 @@ dependencies = [
  "globset",
  "serde",
  "tempfile",
- "wit-bindgen 0.51.0",
 ]
 
 [[package]]
@@ -657,6 +656,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkleft-preinstalled-bundle"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "checkleft-file-size",
+ "checkleft-rust-giant-structs",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "checkleft-rust-giant-structs"
 version = "0.1.0"
 dependencies = [
@@ -664,7 +673,6 @@ dependencies = [
  "serde",
  "serde_json",
  "syn",
- "wit-bindgen 0.51.0",
 ]
 
 [[package]]
