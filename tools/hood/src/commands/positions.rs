@@ -92,7 +92,7 @@ async fn build_position_rows(
 ) -> Result<Vec<PositionRow>> {
     let mut rows = Vec::new();
     for account in selected_accounts {
-        let mut positions = client.fetch_positions(&access_token, &account.account_number).await?;
+        let mut positions = client.fetch_positions(access_token, &account.account_number).await?;
         positions.sort_by(|left, right| left.symbol.cmp(&right.symbol));
 
         for position in positions {
@@ -112,7 +112,7 @@ async fn build_position_rows(
     }
 
     let symbols = rows.iter().map(|row| row.symbol.clone()).collect::<Vec<String>>();
-    let quotes = fetch_quote_snapshots(&client, &access_token, &symbols).await?;
+    let quotes = fetch_quote_snapshots(client, access_token, &symbols).await?;
 
     for row in &mut rows {
         let quote = quotes.get(&row.symbol);

@@ -248,7 +248,7 @@ fn globset_is_empty(patterns: &[String]) -> bool {
 
 /// Overlay real PR titles and @logins using `gh api`.
 /// Warns on stderr and leaves the entry unchanged if the call fails.
-fn enrich_entries(entries: &mut Vec<ChangelogEntry>, repo_slug: &str) {
+fn enrich_entries(entries: &mut [ChangelogEntry], repo_slug: &str) {
     for entry in entries.iter_mut() {
         match fetch_pr_metadata(repo_slug, entry.pr_number) {
             Ok((title, login)) => {

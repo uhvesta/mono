@@ -279,7 +279,7 @@ pub async fn run_one_pass(
             .emit(
                 DispatchEvent::new(Stage::TerminalWorkReconcile, Outcome::Ok, &run_id)
                     .with_work_item(&execution.work_item_id)
-                    .with_worker(&crate::coordinator::worker_id_for_slot(state.slot_id))
+                    .with_worker(crate::coordinator::worker_id_for_slot(state.slot_id))
                     .with_details(serde_json::json!({
                         "reason": reason,
                         "slot_id": state.slot_id,

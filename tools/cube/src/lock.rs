@@ -21,6 +21,7 @@ impl RepoLock {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(lock_path)
             .map_err(|e| CubeError::LockIo {
                 path: lock_path.to_path_buf(),

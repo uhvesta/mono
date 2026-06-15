@@ -69,7 +69,7 @@ impl TestEngine {
     }
 
     fn db(&self) -> Result<WorkDb> {
-        WorkDb::open(self.db_path.clone()).map_err(Into::into)
+        WorkDb::open(self.db_path.clone())
     }
 }
 

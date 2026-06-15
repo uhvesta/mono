@@ -855,8 +855,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn enforce_rules() -> CompiledRules {
-        let mut rules = EditorialRules::default();
-        rules.template_policy = TemplatePolicy::Enforce;
+        let rules = EditorialRules {
+            template_policy: TemplatePolicy::Enforce,
+            ..Default::default()
+        };
         CompiledRules::compile(rules).unwrap()
     }
 

@@ -30,12 +30,16 @@ impl WorkspaceState {
             Self::Leased => "leased",
         }
     }
+}
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+impl std::str::FromStr for WorkspaceState {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
-            "free" => Some(Self::Free),
-            "leased" => Some(Self::Leased),
-            _ => None,
+            "free" => Ok(Self::Free),
+            "leased" => Ok(Self::Leased),
+            _ => Err(()),
         }
     }
 }
@@ -62,13 +66,17 @@ impl WorkspaceHealth {
             Self::Conflicted => "conflicted",
         }
     }
+}
 
-    pub fn from_str(raw: &str) -> Option<Self> {
+impl std::str::FromStr for WorkspaceHealth {
+    type Err = ();
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
-            "clean" => Some(Self::Clean),
-            "dirty" => Some(Self::Dirty),
-            "conflicted" => Some(Self::Conflicted),
-            _ => None,
+            "clean" => Ok(Self::Clean),
+            "dirty" => Ok(Self::Dirty),
+            "conflicted" => Ok(Self::Conflicted),
+            _ => Err(()),
         }
     }
 }

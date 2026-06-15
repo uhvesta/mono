@@ -1745,7 +1745,7 @@ fn run_workspace(
         }
         WorkspaceCommand::List { repo, state, holder } => {
             let parsed_effective_state = match state.as_deref() {
-                Some(raw) => Some(EffectiveState::from_str(raw).ok_or_else(|| {
+                Some(raw) => Some(raw.parse::<EffectiveState>().map_err(|()| {
                     CubeError::InvalidArgument(format!(
                         "invalid --state `{raw}`; expected `free`, `free-dirty`, `free-conflicted`, or `leased`"
                     ))
@@ -5277,9 +5277,8 @@ mod tests {
                     Some(v) => std::env::set_var("PATH", v),
                     None => std::env::remove_var("PATH"),
                 }
-                match &self.orig_cube_bin {
-                    Some(v) => std::env::set_var("CUBE_CHECKLEFT_BIN", v),
-                    None => {}
+                if let Some(v) = &self.orig_cube_bin {
+                    std::env::set_var("CUBE_CHECKLEFT_BIN", v);
                 }
             }
         }

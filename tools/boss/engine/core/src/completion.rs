@@ -10639,7 +10639,7 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         workspace_path: &Path,
         review_result_json: Option<&str>,
     ) -> (Arc<WorkDb>, String, String, String, String) {
-        let transcript_jsonl = review_result_json.map(|j| make_review_transcript_jsonl(j));
+        let transcript_jsonl = review_result_json.map(make_review_transcript_jsonl);
         pr_review_exec_fixture_with_jsonl(workspace_path, transcript_jsonl.as_deref())
     }
 

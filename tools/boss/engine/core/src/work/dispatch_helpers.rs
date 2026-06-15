@@ -526,7 +526,7 @@ pub(crate) fn reconcile_revision_execution(
             .optional()?;
         let is_terminal = fresh_status
             .as_deref()
-            .map_or(true, |s| matches!(s, "done" | "archived" | "cancelled" | "in_review"));
+            .is_none_or(|s| matches!(s, "done" | "archived" | "cancelled" | "in_review"));
         let already_closed =
             fresh_status.as_deref() == Some("blocked") && task.blocked_reason.as_deref() == Some("parent_pr_closed");
         if is_terminal || already_closed {
@@ -1350,7 +1350,7 @@ mod tests {
     fn retired_status_none_for_empty_attempt_id() {
         let db = open_db();
         let conn = db.connect().unwrap();
-        let created_via = format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}");
+        let created_via = CREATED_VIA_MERGE_CONFLICT_PREFIX.to_string();
         assert_eq!(
             retired_spawning_attempt_status(&conn, &task_with_created_via(&created_via)).unwrap(),
             None,

@@ -59,6 +59,7 @@ impl RepoCache {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|source| RepobinError::OpenCacheLock {
                 path: lock_path.clone(),
@@ -427,7 +428,7 @@ fn repo_dir_name(url: &str) -> String {
 
 fn url_slug(url: &str) -> String {
     let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    let last = trimmed.rsplit(|c| matches!(c, '/' | ':')).next().unwrap_or("");
+    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
     last.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .take(40)

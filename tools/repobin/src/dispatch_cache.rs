@@ -294,7 +294,7 @@ mod tests {
         touch(&build, "rust_binary(...)");
         touch(&src, "fn main() {}");
 
-        record_in(&cache_root, &repo_root, target, &exe, &[src.clone()]).expect("record");
+        record_in(&cache_root, &repo_root, target, &exe, std::slice::from_ref(&src)).expect("record");
 
         assert!(lookup_in(&cache_root, &repo_root, target).is_some());
         bump_mtime(&src);

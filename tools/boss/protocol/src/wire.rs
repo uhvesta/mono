@@ -3013,7 +3013,7 @@ mod sorted_request_variants_test {
             .take_while(|l| *l != "}")
             .filter_map(|l| {
                 let t = l.trim();
-                if t.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if t.chars().next().is_some_and(|c| c.is_uppercase()) {
                     // Extract just the variant name (up to the first
                     // non-alphanumeric character: space, `{`, or `,`).
                     t.split_once(|c: char| !c.is_alphanumeric())

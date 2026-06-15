@@ -1582,7 +1582,7 @@ mod tests {
     /// ReviewFinding", silently dropping the finding.
     ///
     /// After the fix (`#[serde(skip_deserializing)]` on `suspected_deletions`
-    /// + derivation from `findings` in `from_json`) the JSON must parse and
+    /// plus derivation from `findings` in `from_json`) the JSON must parse and
     /// `passes_severity_gate` must fire.
     #[test]
     fn suspected_deletions_string_array_accepted_and_derived_from_findings() {
