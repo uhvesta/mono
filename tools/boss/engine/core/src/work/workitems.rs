@@ -352,20 +352,25 @@ impl WorkDb {
             tracing::warn!(?err, "get_work_tree: failed to attach ai_reviewing flag; ignoring");
         }
 
-        // Debug: log pr_url delivery for investigation tasks so the delivered
-        // value can be compared against what the macOS card actually receives.
-        // Gated at tracing::debug!; enable with RUST_LOG=boss_engine=debug or
-        // equivalent. This surface is the engine half of the doc-link gap hunt
-        // (T1310): if pr_url is Some here but the card shows no link, the gap
-        // is in the IPC wire format or the app's reception path, not the DB.
-        for task in &tasks {
-            if task.kind == TaskKind::Investigation {
-                tracing::debug!(
+        // Resolve the per-task doc-link state for project-less docs-backed
+        // items (investigations / project-less designs) so their card renders
+        // the Review-lane doc-link icon — parity with design cards, whose
+        // state is resolved from the parent project's `design_doc_*` columns.
+        // Pass `|_| None` for the workspace lookup: cube is not consulted in
+        // get_work_tree, and the app prefers the GitHub raw-content URL for
+        // in-review docs on the PR head branch anyway. Errors per task are
+        // non-fatal — log and leave the field None (affordance hidden).
+        for task in &mut tasks {
+            if !crate::design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none()) {
+                continue;
+            }
+            match resolve_task_doc_pointer(&conn, &task.id, |_| None) {
+                Ok(state) => task.doc_link_state = state,
+                Err(err) => tracing::warn!(
                     task_id = %task.id,
-                    status = %task.status,
-                    pr_url = ?task.pr_url,
-                    "get_work_tree: investigation task delivery"
-                );
+                    ?err,
+                    "get_work_tree: failed to resolve task doc-link state; leaving affordance hidden"
+                ),
             }
         }
 

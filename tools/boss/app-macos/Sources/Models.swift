@@ -837,6 +837,15 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
+    /// Resolved doc-link state for a **project-less** docs-backed item —
+    /// chiefly `kind == "investigation"`. Mirrors `Task.doc_link_state`
+    /// on the wire: the engine resolves the task's own `doc_*` columns
+    /// into the same `ProjectDesignDocState` the kanban already renders
+    /// for design cards (whose state comes from the parent project). The
+    /// card feeds this into the doc-link affordance so investigations get
+    /// the Review-lane icon — parity with design cards. `nil` when the
+    /// item has no per-task pointer (hides the affordance).
+    var docLinkState: ProjectDesignDocState? = nil
 
     var isChore: Bool {
         kind == "chore"

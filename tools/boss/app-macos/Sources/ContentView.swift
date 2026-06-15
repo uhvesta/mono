@@ -1587,8 +1587,14 @@ private struct WorkBoardCardItem: View {
         let designDocProject: WorkProject? = task.kind == "design"
             ? task.projectID.flatMap { model.project(withID: $0) }
             : nil
+        // Design cards resolve their doc-link state from the parent PROJECT;
+        // project-less docs-backed items (investigations) carry an
+        // engine-resolved state on the task itself (`docLinkState`). Prefer the
+        // project state when present, else fall back to the per-task state so
+        // investigation cards render the same Review-lane doc-link icon.
         let designDocState: ProjectDesignDocState? = designDocProject
             .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
+            ?? task.docLinkState
         let externalRefLink = ExternalRefLinkPresentation.forTask(task)
         let inReviewRevisions: [WorkTask] = column == .review
             ? model.inReviewRevisions(forParentTaskID: task.id)
@@ -1623,7 +1629,8 @@ private struct WorkBoardCardItem: View {
                     isRemediatingCI: isRemediatingCI,
                     isFrontierHighlighted: isFrontierHighlighted,
                     designDocState: designDocState,
-                    onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } },
+                    onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } }
+                        ?? (task.docLinkState != nil ? { model.openTaskDoc(task) } : nil),
                     ciRequiredState: column == .review ? (task.ciRequiredState ?? "in_progress") : nil,
                     ciRequiredDetail: column == .review ? task.ciRequiredDetail : nil,
                     reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
@@ -2216,8 +2223,13 @@ struct WorkBoardCardView: View {
                     if let extRef = externalRefLink {
                         ExternalRefLinkView(presentation: extRef)
                     }
-                    if task.kind == "design",
-                       let state = designDocState,
+                    // Doc-link icon. `designDocState` is non-nil for design
+                    // cards (resolved from the parent project) AND for
+                    // project-less docs-backed items like investigations
+                    // (resolved on the task itself), so the kind gate is no
+                    // longer needed — eligibility is already encoded in the
+                    // state. Other kinds carry a nil state and render nothing.
+                    if let state = designDocState,
                        let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
                         Button {
                             onOpenDesignDoc?()

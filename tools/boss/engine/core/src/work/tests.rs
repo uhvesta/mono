@@ -157,6 +157,39 @@ fn seed_project_for_design_doc(db: &WorkDb) -> (Product, Project) {
     (product, project)
 }
 
+/// Stand up a product + a project-less investigation task so the
+/// per-task doc-pointer tests don't open-code the boilerplate. The
+/// product carries the standard `mono` repo so doc resolution has a
+/// repo to fall back to and classifies `SameProduct`.
+fn seed_investigation_for_doc(db: &WorkDb) -> (Product, Task) {
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let investigation = db
+        .create_investigation(boss_protocol::CreateInvestigationInput {
+            product_id: product.id.clone(),
+            autostart: true,
+            force_duplicate: false,
+            name: "Investigate the thing".to_owned(),
+            created_via: None,
+            description: None,
+            effort_level: None,
+            model_override: None,
+            priority: None,
+            project_id: None,
+            repo_remote_url: None,
+        })
+        .unwrap();
+    (product, investigation)
+}
+
 /// Convenience: rebuild a `set_project_design_doc` input with
 /// just the project id and path filled in. Most pointer tests
 /// only care about the path; defaulting the rest keeps signal
@@ -480,6 +513,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         review_cycle: 0,
         last_reviewed_sha: None,
         ai_reviewing: false,
+        doc_link_state: None,
     }
 }
 

@@ -206,6 +206,7 @@ pub(crate) use insert_helpers::*;
 pub(crate) use mappers::*;
 pub(crate) use migrations_a::*;
 pub(crate) use migrations_b::*;
+pub(crate) use products_design::resolve_task_doc_pointer;
 pub(crate) use query_ensure::*;
 pub(crate) use revision_helpers::*;
 

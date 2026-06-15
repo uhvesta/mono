@@ -2536,3 +2536,81 @@ fn cold_path_pr_detection_covers_investigations() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Companion to `investigation_open_pr_exposes_derived_doc_link_in_work_tree`:
+/// once the doc detector has resolved the investigation's deliverable doc
+/// (a single `docs/investigations/*.md` in the PR) into the task's own
+/// `doc_*` columns, `get_work_tree` must surface that as a resolved
+/// `doc_link_state` on the card — parity with how design cards carry the
+/// project's resolved design-doc state. This is the load-bearing wire that
+/// makes the Review-lane doc-link icon render for project-less
+/// investigations (the T1705 bug). The gh PR scan that populates the
+/// columns is covered by `design_detector`'s parse tests; here we write the
+/// pointer directly and assert the delivery + JSON wire shape.
+#[test]
+fn investigation_with_doc_pointer_exposes_resolved_doc_link_in_work_tree() {
+    let db = WorkDb::open(temp_db_path("investigation-doc-link-resolved")).unwrap();
+    let (product, investigation) = seed_investigation_for_doc(&db);
+
+    // Simulate the detector's post-scan write (PR head branch while open).
+    db.sync_task_doc_pointer_from_detector(
+        &investigation.id,
+        None,
+        Some("boss/exec_18b9_6ef"),
+        "docs/investigations/checkleft-lib-test-wasm-compile-timeout.md",
+    )
+    .unwrap();
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let found = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == investigation.id)
+        .expect("investigation must be delivered in the work tree's tasks array");
+    assert_eq!(found.kind, TaskKind::Investigation);
+
+    match found
+        .doc_link_state
+        .as_ref()
+        .expect("card must carry a resolved doc-link state")
+    {
+        ProjectDesignDocState::Resolved {
+            resolved,
+            raw_content_url,
+            ..
+        } => {
+            assert_eq!(
+                resolved.path,
+                "docs/investigations/checkleft-lib-test-wasm-compile-timeout.md"
+            );
+            assert_eq!(resolved.branch, "boss/exec_18b9_6ef");
+            assert!(
+                raw_content_url.is_some(),
+                "github repo -> raw-content fast path available"
+            );
+        }
+        other => panic!("expected Resolved doc-link state, got {other:?}"),
+    }
+
+    // Wire-format assertion: the resolved state must survive serialization to
+    // the IPC payload the macOS app decodes (the app keys the affordance off
+    // `doc_link_state.type == "resolved"`). A serde annotation that dropped it
+    // would fail here.
+    let tasks_json = serde_json::to_value(&tree.tasks).expect("tasks must be JSON-serializable");
+    let inv_json = tasks_json
+        .as_array()
+        .expect("tasks is an array")
+        .iter()
+        .find(|t| t["id"].as_str() == Some(investigation.id.as_str()))
+        .expect("investigation must appear in the serialized tasks array");
+    assert_eq!(
+        inv_json["doc_link_state"]["type"].as_str(),
+        Some("resolved"),
+        "doc_link_state must be present and resolved in the JSON wire payload — \
+         this is what drives the macOS Review-lane doc-link icon for investigations"
+    );
+    assert_eq!(
+        inv_json["doc_link_state"]["resolved"]["path"].as_str(),
+        Some("docs/investigations/checkleft-lib-test-wasm-compile-timeout.md"),
+    );
+}

@@ -2716,10 +2716,57 @@ must not be asked to open one",
         self.publisher
             .publish_work_item_changed(&product_id, &work_item_id, publish_reason)
             .await;
-        // Auto-populate the project's design-doc pointer when the
-        // completed work item is a `kind=design` task with a project.
-        // Errors are logged inside the detector — they must not surface
-        // here because they'd mask the successful PR transition.
+        // Doc-link auto-population. The doc-link card affordance is driven
+        // by a resolved doc pointer, and which pointer depends on the item:
+        //  - design tasks WITH a project -> the PROJECT's `design_doc_*`
+        //    pointer (`design_detector::on_design_pr_*`), surfaced on
+        //    design cards.
+        //  - project-less docs-backed items (investigations, and any
+        //    project-less design task) -> the TASK's own `doc_*` pointer
+        //    (`design_detector::on_task_doc_pr_*`), surfaced on
+        //    investigation cards.
+        // The routing decision is logged ABOVE the per-branch dispatch so a
+        // skip/proceed is ALWAYS visible without entering a gated block.
+        // This closes the historical diagnostic blind spot: investigations
+        // failed BOTH the old `kind == Design` and `project_id.is_some()`
+        // gates, so every diagnostic that lived inside the block stayed
+        // silent for them. Detector errors are logged inside the detector —
+        // they must not surface here because they'd mask the successful PR
+        // transition.
+        if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item {
+            let produces_project_design = task.kind == TaskKind::Design && task.project_id.is_some();
+            let uses_task_doc = design_detector::task_uses_per_task_doc(&task.kind, task.project_id.is_none());
+            let decision = if produces_project_design {
+                "project-design-doc"
+            } else if uses_task_doc {
+                "per-task-doc"
+            } else {
+                "skipped: kind produces no doc"
+            };
+            tracing::info!(
+                execution_id,
+                work_item_id = %task.id,
+                kind = %task.kind,
+                project_id = ?task.project_id,
+                merged,
+                decision,
+                "doc-detection: routing PR completion"
+            );
+
+            if uses_task_doc {
+                if merged {
+                    // Worker merged directly during its session; the detector
+                    // fetches base_ref_name from the PR (unknown here).
+                    design_detector::on_task_doc_pr_merged(&self.work_db, &task.id, &task.product_id, &pr_url, None)
+                        .await;
+                } else {
+                    design_detector::on_task_doc_pr_detected(&self.work_db, &task.id, &task.product_id, &pr_url).await;
+                }
+            }
+        }
+
+        // Per-project design-doc pointer + design-doc questions pipeline,
+        // unchanged: only `kind=design` tasks WITH a project flow here.
         if let WorkItem::Task(ref task) | WorkItem::Chore(ref task) = completion.work_item
             && task.kind == TaskKind::Design
             && let Some(ref project_id) = task.project_id

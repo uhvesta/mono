@@ -609,6 +609,33 @@ pub(crate) fn migrate_drop_tasks_investigation_doc_columns(conn: &Connection) ->
     Ok(())
 }
 
+/// Add per-task doc-pointer columns, mirroring the per-project
+/// `design_doc_*` triple but keyed on the task. These back the doc-link
+/// card affordance for **project-less** docs-backed work items —
+/// chiefly `kind = 'investigation'`, whose deliverable doc cannot live
+/// in any project's `design_doc_*` columns because the item has no
+/// project. The detector populates them from the PR's changed files
+/// (single `docs/investigations/*.md` or `docs/designs/*.md`),
+/// exactly as `design_doc_*` is populated for design tasks.
+///
+/// All three are nullable: `doc_path` is the load-bearing field and a
+/// `NULL` path means no pointer is set. `doc_repo_remote_url` falls
+/// back to the task's product repo and `doc_branch` defaults to
+/// `"main"` when `NULL`. Distinct from the dropped, worker-set
+/// `investigation_doc_*` columns (see
+/// [`migrate_drop_tasks_investigation_doc_columns`]): these are
+/// detector-resolved against the real PR files, never worker-asserted.
+/// Existing rows keep `NULL` on all three across the upgrade.
+pub(crate) fn migrate_tasks_doc_pointer_columns(conn: &Connection) -> Result<()> {
+    for column in ["doc_repo_remote_url", "doc_branch", "doc_path"] {
+        if !table_has_column(conn, "tasks", column)? {
+            let ddl = format!("ALTER TABLE tasks ADD COLUMN {column} TEXT");
+            conn.execute(&ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Mirror existing `tasks.blocked_reason` scalars into the side
 /// table so the multi-signal projection is internally consistent on
 /// first open after the schema lands. The pre-Phase-7 invariant is

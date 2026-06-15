@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 
 use crate::gh_invocation::gh_output;
 use crate::work::WorkDb;
-use boss_protocol::SetProjectDesignDocInput;
+use boss_protocol::{SetProjectDesignDocInput, TaskKind};
 
 /// Metadata extracted from `gh pr view --json files,headRefName,baseRefName`.
 pub(crate) struct PrScanResult {
@@ -280,6 +280,161 @@ pub async fn on_design_pr_merged(
     }
 }
 
+/// Whether a docs-backed work item routes through the **per-task** doc
+/// pointer (this module's `on_task_doc_pr_*` + `tasks.doc_*` columns)
+/// rather than the per-project design-doc pointer.
+///
+/// `true` for every `kind = investigation` (its deliverable doc is never
+/// a project's design doc) and for project-less `kind = design` tasks
+/// (which have no project pointer to populate). `false` for design tasks
+/// that have a project — those keep using the per-project pointer — and
+/// for every kind that produces no doc.
+pub(crate) fn task_uses_per_task_doc(kind: &TaskKind, has_project: bool) -> bool {
+    matches!(kind, TaskKind::Investigation) || (matches!(kind, TaskKind::Design) && !has_project)
+}
+
+/// Per-task analogue of [`on_design_pr_detected`] for project-less
+/// docs-backed items (investigations). Fired on the `in_review`
+/// transition. Scans the PR's changed files for a single
+/// `docs/designs/*.md` or `docs/investigations/*.md` and populates the
+/// task's own `doc_*` columns (or, when already set, updates `doc_branch`
+/// to the PR **head** branch so the in-app viewer can fetch the doc while
+/// the PR is open).
+pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id: &str, pr_url: &str) {
+    let scan = match scan_pr_for_task_doc(task_id, pr_url).await {
+        Some(s) => s,
+        None => return,
+    };
+    let Some(path) = scan.doc_path else {
+        return;
+    };
+    let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
+    let head_ref_name = scan.head_ref_name;
+    let branch = head_ref_name.as_deref();
+    match work_db.sync_task_doc_pointer_from_detector(task_id, repo_remote_url.as_deref(), branch, &path) {
+        Ok(true) => {
+            tracing::info!(
+                task_id,
+                product_id,
+                pr_url,
+                path,
+                branch,
+                "doc detector: populated task doc pointer (in_review)"
+            );
+        }
+        Ok(false) => {
+            // Path already set — update the branch to the PR head branch so
+            // the in-app viewer fetches from the live PR branch while open.
+            if let Some(head_branch) = head_ref_name {
+                match work_db.set_task_doc_pointer(task_id, None, Some(&head_branch), None) {
+                    Ok(_) => tracing::info!(
+                        task_id,
+                        product_id,
+                        pr_url,
+                        branch = head_branch,
+                        "doc detector: updated task doc branch to PR head branch (in_review)"
+                    ),
+                    Err(err) => tracing::warn!(
+                        task_id,
+                        product_id,
+                        pr_url,
+                        ?err,
+                        "doc detector: failed to update task doc branch to PR head branch"
+                    ),
+                }
+            } else {
+                tracing::debug!(
+                    task_id,
+                    product_id,
+                    pr_url,
+                    "doc detector: task already has a doc pointer, head branch unknown; skipping (in_review)"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                product_id,
+                pr_url,
+                ?err,
+                "doc detector: failed to write task doc pointer (in_review)"
+            );
+        }
+    }
+}
+
+/// Per-task analogue of [`on_design_pr_merged`]. Fired when a project-less
+/// docs-backed item's PR merges. If the task already has a `doc_path`,
+/// only `doc_branch` is updated to the PR's base branch (typically
+/// `"main"`); otherwise the PR is scanned and the full pointer written.
+pub async fn on_task_doc_pr_merged(
+    work_db: &WorkDb,
+    task_id: &str,
+    product_id: &str,
+    pr_url: &str,
+    base_ref_name: Option<&str>,
+) {
+    let existing_path = match work_db.task_doc_path(task_id) {
+        Ok(path) => path,
+        Err(err) => {
+            tracing::warn!(
+                task_id,
+                product_id,
+                ?err,
+                "doc detector: failed to read task doc pointer for merge update"
+            );
+            return;
+        }
+    };
+
+    if existing_path.is_some() {
+        match work_db.set_task_doc_pointer(task_id, None, base_ref_name, None) {
+            Ok(_) => tracing::info!(
+                task_id,
+                product_id,
+                pr_url,
+                branch = base_ref_name,
+                "doc detector: updated task doc branch to main after merge"
+            ),
+            Err(err) => tracing::warn!(
+                task_id,
+                product_id,
+                pr_url,
+                ?err,
+                "doc detector: failed to update task doc branch after merge"
+            ),
+        }
+        return;
+    }
+
+    let scan = match scan_pr_for_task_doc(task_id, pr_url).await {
+        Some(s) => s,
+        None => return,
+    };
+    let Some(path) = scan.doc_path else {
+        return;
+    };
+    let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
+    let effective_branch = base_ref_name.or(scan.base_ref_name.as_deref());
+    match work_db.set_task_doc_pointer(task_id, repo_remote_url.as_deref(), effective_branch, Some(&path)) {
+        Ok(_) => tracing::info!(
+            task_id,
+            product_id,
+            pr_url,
+            path,
+            branch = effective_branch,
+            "doc detector: populated task doc pointer after merge"
+        ),
+        Err(err) => tracing::warn!(
+            task_id,
+            product_id,
+            pr_url,
+            ?err,
+            "doc detector: failed to write task doc pointer after merge"
+        ),
+    }
+}
+
 /// Resolve the repo_remote_url for a product, returning `None` if the
 /// product is not found or has no repo (causes the design-doc pointer
 /// to fall back to the product default on resolution).
@@ -320,7 +475,34 @@ pub(crate) async fn scan_pr(task_id: &str, pr_url: &str) -> Option<PrScanResult>
     }
 }
 
+/// Like [`scan_pr`] but selects the doc among the PR's changed files with
+/// the project-less matcher (`docs/designs/*.md` OR
+/// `docs/investigations/*.md`). Used by the per-task detector that serves
+/// investigations and project-less design tasks.
+pub(crate) async fn scan_pr_for_task_doc(task_id: &str, pr_url: &str) -> Option<PrScanResult> {
+    match fetch_pr_view_json(pr_url).await {
+        Ok(root) => Some(parse_pr_scan_matching(
+            &root,
+            is_project_less_doc_path,
+            "docs/designs/*.md or docs/investigations/*.md",
+        )),
+        Err(err) => {
+            tracing::warn!(task_id, pr_url, ?err, "doc detector: failed to scan PR files");
+            None
+        }
+    }
+}
+
 async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
+    Ok(parse_pr_scan(&fetch_pr_view_json(pr_url).await?))
+}
+
+/// Run `gh pr view <pr_url> --json files,headRefName,baseRefName` and
+/// parse stdout into a JSON value. Shared by the design and per-task doc
+/// scans so the gh shell-out lives in exactly one place; the doc-selection
+/// logic differs only in which [`parse_pr_scan_matching`] matcher each
+/// caller applies.
+async fn fetch_pr_view_json(pr_url: &str) -> Result<serde_json::Value> {
     let output = gh_output(&["pr", "view", pr_url, "--json", "files,headRefName,baseRefName"])
         .await
         .with_context(|| format!("failed to spawn `gh pr view {pr_url}`"))?;
@@ -334,10 +516,7 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let root: serde_json::Value =
-        serde_json::from_str(&stdout).with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))?;
-
-    Ok(parse_pr_scan(&root))
+    serde_json::from_str(&stdout).with_context(|| format!("failed to parse `gh pr view {pr_url}` JSON"))
 }
 
 /// Pure parse of the `gh pr view --json files,headRefName,baseRefName`
@@ -351,6 +530,20 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
 ///   [`is_design_doc_path`]). Zero or multiple matches yield `None`. A
 ///   missing or non-array `files` key is treated as zero matches.
 pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
+    parse_pr_scan_matching(root, is_design_doc_path, "docs/designs/*.md")
+}
+
+/// Generic core of [`parse_pr_scan`]: extract the head/base ref names and
+/// select the single doc among `files[].path` that satisfies `matcher`.
+/// `doc_label` names the matched shape in the zero/multiple-match
+/// warnings so the design path and the project-less (investigation) path
+/// log an accurate hint. Zero or multiple matches yield `doc_path =
+/// None`; a missing/non-array `files` key is treated as zero matches.
+pub(crate) fn parse_pr_scan_matching(
+    root: &serde_json::Value,
+    matcher: impl Fn(&str) -> bool,
+    doc_label: &str,
+) -> PrScanResult {
     let head_ref_name = root
         .get("headRefName")
         .and_then(|v| v.as_str())
@@ -369,7 +562,7 @@ pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
         .map(|arr| {
             arr.iter()
                 .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(str::to_owned))
-                .filter(|p| is_design_doc_path(p))
+                .filter(|p| matcher(p))
                 .collect()
         })
         .unwrap_or_default();
@@ -378,17 +571,17 @@ pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
         1 => Some(matches.into_iter().next().unwrap()),
         0 => {
             tracing::warn!(
-                "design detector: no `docs/designs/*.md` file in PR changed files; \
-                 design-doc pointer not updated — add the file and re-push, or set \
-                 manually with `boss project set-design-doc`"
+                doc_label,
+                "doc detector: no matching doc file in PR changed files; \
+                 doc pointer not updated — add the file and re-push"
             );
             None
         }
         n => {
             tracing::warn!(
                 count = n,
-                "design detector: multiple `docs/designs/*.md` files in PR; \
-                 skipping auto-populate — use `boss project set-design-doc` to resolve"
+                doc_label,
+                "doc detector: multiple matching doc files in PR; skipping auto-populate"
             );
             None
         }
@@ -401,24 +594,47 @@ pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
     }
 }
 
-/// Return `true` when `path` is a direct child of any `docs/designs/`
-/// directory, regardless of the leading product prefix.  For example:
+/// Return `true` when `path` is a direct-child markdown file of any
+/// `docs/<segment>/` directory, regardless of the leading product
+/// prefix. For `segment = "designs"`:
 /// - `tools/boss/docs/designs/foo.md`        → true
 /// - `tools/checkleft/docs/designs/foo.md`   → true
 /// - `docs/designs/foo.md`                   → true
 /// - `tools/boss/docs/designs/sub/foo.md`    → false (sub-directory)
 /// - `tools/boss/docs/other/foo.md`          → false (wrong segment)
-fn is_design_doc_path(path: &str) -> bool {
-    // Locate `docs/designs/` preceded by `/` or at the very start.
-    let rest = if let Some(rest) = path.strip_prefix("docs/designs/") {
+fn is_doc_path_under(path: &str, segment: &str) -> bool {
+    let prefix = format!("docs/{segment}/");
+    let mid = format!("/docs/{segment}/");
+    // Locate `docs/<segment>/` preceded by `/` or at the very start.
+    let rest = if let Some(rest) = path.strip_prefix(prefix.as_str()) {
         rest
-    } else if let Some((_, rest)) = path.split_once("/docs/designs/") {
+    } else if let Some((_, rest)) = path.split_once(mid.as_str()) {
         rest
     } else {
         return false;
     };
     // Only direct children — no sub-directories.
     !rest.contains('/') && (rest.ends_with(".md") || rest.ends_with(".markdown"))
+}
+
+/// Direct-child markdown under any `docs/designs/` directory.
+fn is_design_doc_path(path: &str) -> bool {
+    is_doc_path_under(path, "designs")
+}
+
+/// Direct-child markdown under any `docs/investigations/` directory —
+/// where an investigation's deliverable doc lives (e.g.
+/// `docs/investigations/foo.md`, `tools/boss/docs/investigations/foo.md`).
+fn is_investigation_doc_path(path: &str) -> bool {
+    is_doc_path_under(path, "investigations")
+}
+
+/// Matches a **project-less** docs-backed item's deliverable: a single
+/// `docs/designs/*.md` OR `docs/investigations/*.md`. Used by the
+/// per-task detector, which serves both project-less design tasks and
+/// investigations.
+fn is_project_less_doc_path(path: &str) -> bool {
+    is_design_doc_path(path) || is_investigation_doc_path(path)
 }
 
 #[cfg(test)]
@@ -594,5 +810,91 @@ mod tests {
         });
         let scan = parse_pr_scan(&root);
         assert_eq!(scan.doc_path, None);
+    }
+
+    // ---- investigation / project-less doc matchers -------------------
+
+    #[test]
+    fn investigation_doc_path_matches_direct_child() {
+        assert!(is_investigation_doc_path(
+            "docs/investigations/checkleft-lib-test-wasm-compile-timeout.md"
+        ));
+        assert!(is_investigation_doc_path(
+            "tools/boss/docs/investigations/markdown-render-slowness-2026-05-18.md"
+        ));
+        assert!(is_investigation_doc_path("docs/investigations/x.markdown"));
+        // Not a design doc, and not a sub-directory / wrong segment / non-md.
+        assert!(!is_design_doc_path("docs/investigations/foo.md"));
+        assert!(!is_investigation_doc_path("docs/investigations/sub/foo.md"));
+        assert!(!is_investigation_doc_path("tools/boss/docs/designs/foo.md"));
+        assert!(!is_investigation_doc_path("docs/investigations/foo.txt"));
+    }
+
+    #[test]
+    fn project_less_matcher_accepts_designs_and_investigations() {
+        assert!(is_project_less_doc_path("tools/boss/docs/designs/foo.md"));
+        assert!(is_project_less_doc_path("docs/investigations/foo.md"));
+        assert!(!is_project_less_doc_path("README.md"));
+        assert!(!is_project_less_doc_path("docs/other/foo.md"));
+    }
+
+    #[test]
+    fn parse_pr_scan_matching_selects_single_investigation_doc() {
+        // The T1705 repro shape: one investigation doc among code files.
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/checkleft/runtime/tests.rs",
+                "docs/investigations/checkleft-lib-test-wasm-compile-timeout.md",
+            ]),
+            "headRefName": "boss/exec_abc_1",
+            "baseRefName": "main",
+        });
+        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        assert_eq!(
+            scan.doc_path.as_deref(),
+            Some("docs/investigations/checkleft-lib-test-wasm-compile-timeout.md")
+        );
+        assert_eq!(scan.head_ref_name.as_deref(), Some("boss/exec_abc_1"));
+    }
+
+    #[test]
+    fn parse_pr_scan_matching_ambiguous_design_plus_investigation_is_none() {
+        // A design doc AND an investigation doc -> two matches -> ambiguous.
+        let root = serde_json::json!({
+            "files": files_json(&[
+                "tools/boss/docs/designs/feature.md",
+                "docs/investigations/probe.md",
+            ]),
+        });
+        let scan = parse_pr_scan_matching(&root, is_project_less_doc_path, "label");
+        assert_eq!(scan.doc_path, None);
+    }
+
+    #[test]
+    fn parse_pr_scan_design_path_ignores_investigation_doc() {
+        // The design path must NOT adopt an investigation doc.
+        let root = serde_json::json!({
+            "files": files_json(&["docs/investigations/probe.md"]),
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None);
+    }
+
+    // ---- task_uses_per_task_doc routing ------------------------------
+
+    #[test]
+    fn task_doc_routing_matches_investigations_and_project_less_designs() {
+        // Investigations always route to the per-task pointer.
+        assert!(task_uses_per_task_doc(&TaskKind::Investigation, true));
+        assert!(task_uses_per_task_doc(&TaskKind::Investigation, false));
+        // Design with a project uses the per-project pointer; project-less
+        // design falls back to the per-task pointer.
+        assert!(!task_uses_per_task_doc(&TaskKind::Design, true));
+        assert!(task_uses_per_task_doc(&TaskKind::Design, false));
+        // Kinds that produce no doc never route to the per-task pointer.
+        assert!(!task_uses_per_task_doc(&TaskKind::Task, false));
+        assert!(!task_uses_per_task_doc(&TaskKind::Chore, false));
+        assert!(!task_uses_per_task_doc(&TaskKind::ProjectTask, false));
+        assert!(!task_uses_per_task_doc(&TaskKind::Revision, false));
     }
 }

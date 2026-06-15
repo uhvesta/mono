@@ -1644,7 +1644,7 @@ final class ChatViewModel: ObservableObject {
     /// [[markdownViewerOpener]] window. Falls back to `urlOpener(webURL)`
     /// if the fetch fails or [[markdownViewerOpener]] is not wired.
     @MainActor
-    private func fetchAndOpenDesignDoc(
+    func fetchAndOpenDesignDoc(
         projectName: String,
         rawURL: URL,
         webURL: String,
@@ -1676,7 +1676,7 @@ final class ChatViewModel: ObservableObject {
     /// state. Transitions to `.loaded` on success or `.failed` on error so
     /// the window always resolves to a terminal state.
     @MainActor
-    private func fetchAndUpdateAsyncMarkdownViewerVM(
+    func fetchAndUpdateAsyncMarkdownViewerVM(
         projectName: String,
         rawURL: URL,
         projectShortID: String

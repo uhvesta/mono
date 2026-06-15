@@ -2046,8 +2046,21 @@ final class EngineClient: @unchecked Sendable {
             effortLevel: (payload["effort_level"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
             sourceAutomationId: payload["source_automation_id"] as? String,
-            aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false
+            aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
+            docLinkState: parseDocLinkState(payload["doc_link_state"])
         )
+    }
+
+    /// Decode the per-task `doc_link_state` wire object (engine-resolved
+    /// `ProjectDesignDocState`) for project-less docs-backed items. Absent
+    /// / null on every task that has no per-task pointer. Reuses the
+    /// `ProjectDesignDocState` Codable decoder so the resolved/broken/
+    /// not_set shapes stay in lockstep with the project RPC path.
+    private func parseDocLinkState(_ value: Any?) -> ProjectDesignDocState? {
+        guard let value, !(value is NSNull),
+              let data = try? JSONSerialization.data(withJSONObject: value)
+        else { return nil }
+        return try? JSONDecoder().decode(ProjectDesignDocState.self, from: data)
     }
 
     private func parseExternalRef(_ value: Any?) -> WorkItemExternalRef? {

@@ -436,4 +436,199 @@ impl WorkDb {
         })?;
         Ok(Some(item))
     }
+
+    /// Sync a `(repo, branch, path)` triple discovered by the doc
+    /// detector into a **task's** own `doc_*` pointer columns, **iff**
+    /// the task's `doc_path` is currently `NULL`. The task-level analogue
+    /// of [`Self::sync_project_design_doc_from_detector`] for project-less
+    /// docs-backed items (investigations), which have no project pointer
+    /// to populate.
+    ///
+    /// One-way auto-populate: a task that already carries a pointer wins;
+    /// a task with no pointer benefits from the detector's discovery. The
+    /// repo URL is canonicalised and the path validated with the same Q8
+    /// rules the project path enforces.
+    ///
+    /// Returns `true` if the columns were written, `false` if the task
+    /// already had a pointer set (no-op).
+    pub fn sync_task_doc_pointer_from_detector(
+        &self,
+        task_id: &str,
+        repo_remote_url: Option<&str>,
+        branch: Option<&str>,
+        path: &str,
+    ) -> Result<bool> {
+        let validated_path = validate_design_doc_path(path)?;
+        let repo = canonicalize_design_doc_repo_remote_url(repo_remote_url.map(str::to_owned));
+        let branch = normalize_optional_text(branch.map(str::to_owned));
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let existing_path: Option<String> = tx
+            .query_row("SELECT doc_path FROM tasks WHERE id = ?1", [task_id], |row| row.get(0))
+            .optional()?
+            .flatten();
+        if existing_path.is_some() {
+            return Ok(false);
+        }
+        let now = now_string();
+        tx.execute(
+            "UPDATE tasks
+             SET doc_repo_remote_url = ?2,
+                 doc_branch = ?3,
+                 doc_path = ?4,
+                 updated_at = ?5
+             WHERE id = ?1",
+            params![task_id, repo, branch, validated_path, now],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Write a task's `doc_*` pointer columns last-writer-wins. The
+    /// task-level analogue of [`Self::set_project_design_doc`]'s write
+    /// path, used by the doc detector to (a) update only `doc_branch`
+    /// while leaving the path intact — `path = None` keeps the existing
+    /// path — or (b) write the full pointer when `path = Some(_)`. As
+    /// with the project path, `repo = None` clears `doc_repo_remote_url`
+    /// so resolution re-inherits the task's product repo, and a `None`
+    /// branch clears `doc_branch` so it re-defaults to `"main"`.
+    pub fn set_task_doc_pointer(
+        &self,
+        task_id: &str,
+        repo_remote_url: Option<&str>,
+        branch: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<()> {
+        let repo = canonicalize_design_doc_repo_remote_url(repo_remote_url.map(str::to_owned));
+        let branch = normalize_optional_text(branch.map(str::to_owned));
+        let now = now_string();
+
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        match path {
+            Some(raw_path) => {
+                let validated = validate_design_doc_path(raw_path)?;
+                tx.execute(
+                    "UPDATE tasks
+                     SET doc_repo_remote_url = ?2,
+                         doc_branch = ?3,
+                         doc_path = ?4,
+                         updated_at = ?5
+                     WHERE id = ?1",
+                    params![task_id, repo, branch, validated, now],
+                )?;
+            }
+            None => {
+                tx.execute(
+                    "UPDATE tasks
+                     SET doc_repo_remote_url = ?2,
+                         doc_branch = ?3,
+                         updated_at = ?4
+                     WHERE id = ?1",
+                    params![task_id, repo, branch, now],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read a task's stored `doc_path` (the load-bearing pointer field).
+    /// `None` when the task has no row or no pointer set. Used by the doc
+    /// detector to decide between the populate-if-empty and branch-update
+    /// paths on a PR-merged transition.
+    pub fn task_doc_path(&self, task_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let path: Option<String> = conn
+            .query_row("SELECT doc_path FROM tasks WHERE id = ?1", [task_id], |row| row.get(0))
+            .optional()?
+            .flatten();
+        Ok(path)
+    }
+}
+
+/// Resolve a task's per-task doc pointer (`doc_*` columns) into a
+/// [`ProjectDesignDocState`], the same wire shape the kanban already
+/// renders for project design docs. Returns `Ok(None)` when the task
+/// carries no pointer (`doc_path` is `NULL`), so the caller can leave
+/// the card's affordance hidden.
+///
+/// Mirrors [`WorkDb::resolve_project_design_doc`] but keyed on the
+/// task's own columns with the task's product as the repo/classification
+/// fallback:
+/// - `doc_repo_remote_url` falls back to the product's `repo_remote_url`.
+/// - `doc_branch` defaults to `"main"`.
+/// - the resolved repo is classified `SameProduct` / `OtherProduct` /
+///   `External` against the task's product, exactly like the project path.
+///
+/// `lookup_repo_workspace_path` mirrors the project resolver: pass
+/// `|_| None` in `get_work_tree` (no cube lookup there — the app prefers
+/// the GitHub `raw_content_url` for in-review docs on the PR head branch
+/// anyway).
+pub(crate) fn resolve_task_doc_pointer(
+    conn: &Connection,
+    task_id: &str,
+    lookup_repo_workspace_path: impl FnOnce(&str) -> Option<String>,
+) -> Result<Option<ProjectDesignDocState>> {
+    let row = conn
+        .query_row(
+            "SELECT product_id, doc_repo_remote_url, doc_branch, doc_path FROM tasks WHERE id = ?1",
+            [task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((product_id, doc_repo, doc_branch, doc_path)) = row else {
+        return Ok(None);
+    };
+    let Some(path) = doc_path else {
+        return Ok(None);
+    };
+    let product = query_product(conn, &product_id).require("product", &product_id)?;
+
+    let resolved_repo = doc_repo.or_else(|| product.repo_remote_url.clone());
+    let Some(repo) = resolved_repo else {
+        return Ok(Some(ProjectDesignDocState::Broken {
+            reason: "doc_path is set but neither the task's doc_repo_remote_url nor the product's repo_remote_url is populated".to_owned(),
+        }));
+    };
+
+    let branch = doc_branch.unwrap_or_else(|| "main".to_owned());
+
+    let kind = if let Some(product_repo) = product.repo_remote_url.as_deref()
+        && product_repo == repo.as_str()
+    {
+        ResolvedDesignDocKind::SameProduct {
+            product_id: product_id.clone(),
+        }
+    } else if let Some(other_product) = find_product_by_repo_remote_url(conn, &repo)? {
+        ResolvedDesignDocKind::OtherProduct {
+            product_id: other_product,
+        }
+    } else {
+        ResolvedDesignDocKind::External
+    };
+
+    let web_url = render_design_doc_web_url(&repo, &branch, &path);
+    let raw_content_url = render_design_doc_raw_content_url(&repo, &branch, &path);
+    let workspace_path = lookup_repo_workspace_path(&repo);
+
+    Ok(Some(ProjectDesignDocState::Resolved {
+        resolved: ResolvedDesignDoc {
+            repo_remote_url: repo,
+            branch,
+            path,
+            kind,
+        },
+        workspace_path,
+        web_url,
+        raw_content_url,
+    }))
 }

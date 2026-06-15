@@ -216,6 +216,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // in single-item query paths (get_work_item etc.) where the derived
         // projection is not computed.
         ai_reviewing: false,
+        // Resolved per-task doc-link state for project-less docs-backed
+        // items (investigations). Computed by attach_task_doc_links in
+        // get_work_tree from the task's `doc_*` columns; None everywhere
+        // else (the standard SELECT omits those columns).
+        doc_link_state: None,
     })
 }
 
@@ -430,7 +435,8 @@ pub(crate) fn query_conflict_resolution(conn: &Connection, id: &str) -> Result<O
 /// engine knows at detection time is required, everything the engine
 /// stamps post-spawn (`head_sha_after`, `cube_lease_id`, …) is
 /// omitted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ConflictResolutionInsertInput {
     pub product_id: String,
     pub work_item_id: String,
@@ -446,7 +452,8 @@ pub struct ConflictResolutionInsertInput {
 /// the `ci_remediations` schema for the engine-known fields at
 /// detection time. `consumes_budget` is `1` for `attempt_kind='fix'`
 /// and `0` for `'retrigger'` per design §Q3.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct CiRemediationInsertInput {
     pub product_id: String,
     pub work_item_id: String,

@@ -229,6 +229,12 @@ impl WorkDb {
         // affordance now derives from `pr_url`, mirroring the design-doc model.
         // This drop is idempotent (fresh DBs never had the columns).
         migrate_drop_tasks_investigation_doc_columns(&conn)?;
+        // Per-task doc-pointer columns (doc_repo_remote_url / doc_branch /
+        // doc_path) for the project-less doc-link card affordance —
+        // investigations have no project, so they cannot reuse the
+        // per-project `design_doc_*` columns. Detector-populated from the
+        // PR's changed files, mirroring the design-doc model.
+        migrate_tasks_doc_pointer_columns(&conn)?;
         migrate_backfill_task_blocked_signals(&conn)?;
         migrate_effort_escalations_table(&conn)?;
         migrate_null_redundant_task_repo_remote_urls(&conn)?;
