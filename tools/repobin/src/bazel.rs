@@ -52,6 +52,9 @@ impl BazelAdapter for RealBazel {
             .arg("--show_result=0")
             .arg("--noshow_progress")
             .arg("--ui_event_filters=-info")
+            // Build repo tools optimized so local runs match release perf.
+            // REPOBIN_BAZEL_FLAGS can override with --compilation_mode=fastbuild.
+            .arg("--compilation_mode=opt")
             .args(extra_bazel_flags())
             .arg(target)
             .current_dir(repo_root)
@@ -171,6 +174,7 @@ impl BazelAdapter for RealBazel {
             .arg("cquery")
             .arg("--color=no")
             .arg("--curses=no")
+            .arg("--compilation_mode=opt")
             .args(extra_bazel_flags())
             .arg(target)
             .arg("--output=starlark")
