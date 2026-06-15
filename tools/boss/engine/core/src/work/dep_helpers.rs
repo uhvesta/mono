@@ -318,10 +318,25 @@ pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &s
     // unless an external event (frontend request, reconciler kick)
     // happened to trigger `reconcile_product_executions`. Only applies
     // to task_ ids; projects don't have `work_executions` rows.
+    //
+    // Guard: if a live execution (running/waiting_human) is already
+    // attached to this work item — possible when a worker was dispatched
+    // during the gated window via a timing race — skip the reconcile.
+    // Creating or promoting a `ready` execution on top of a live one
+    // would let the dispatcher spawn a second worker for the same row.
     if dependent_id.starts_with("task_") {
-        let kind = execution_kind_for_work_item(conn, dependent_id)?;
-        let mut reconcile_result = ExecutionReconcileResult::default();
-        reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, ExecutionStatus::Ready)?;
+        let live = query_live_execution_for_work_item(conn, dependent_id)?;
+        if live.is_none() {
+            let kind = execution_kind_for_work_item(conn, dependent_id)?;
+            let mut reconcile_result = ExecutionReconcileResult::default();
+            reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, ExecutionStatus::Ready)?;
+        } else {
+            tracing::info!(
+                dependent_id,
+                live_execution_id = %live.as_ref().map(|e| e.id.as_str()).unwrap_or(""),
+                "gate-clear: skipping ready-promotion — live execution already attached",
+            );
+        }
     }
     Ok(true)
 }

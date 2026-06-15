@@ -2400,3 +2400,82 @@ fn stale_lease_reclaim_skips_unknown_workspace() {
         .unwrap();
     assert_eq!(reclaim, None);
 }
+
+/// Fix (c) regression: `cancel_running_execution_and_demote_task` must NOT
+/// reset the work item status to `todo` when another live execution is still
+/// attached. This covers the double-dispatch scenario where exec_A was
+/// dispatched on a gated row, the gate later cleared and spawned exec_B, and
+/// then a human stops exec_A — the kanban card must stay in `active` (owned
+/// by exec_B) rather than regressing to `todo`.
+#[test]
+fn cancel_exec_with_other_live_exec_does_not_demote_task() {
+    let db = WorkDb::open(temp_db_path("cancel-no-demote-with-live")).unwrap();
+    let product = db
+        .create_product(CreateProductInput {
+            name: "Boss".to_owned(),
+            description: None,
+            repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+            design_repo: None,
+            docs_repo: None,
+            worker_branch_prefix: None,
+        })
+        .unwrap();
+    let chore = db
+        .create_chore(CreateChoreInput {
+            product_id: product.id.clone(),
+            name: "Double-dispatched chore".to_owned(),
+            description: None,
+            autostart: true,
+            priority: None,
+            created_via: None,
+            repo_remote_url: None,
+            effort_level: None,
+            model_override: None,
+            force_duplicate: false,
+        })
+        .unwrap();
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // exec_a: the earlier (gated-race) execution being stopped.
+    let exec_a = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    // exec_b: the gate-clear execution that is still live.
+    let _exec_b = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+
+    let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&exec_a.id).unwrap();
+    assert!(cancelled, "exec_a must be cancelled");
+    assert!(!demoted, "task must NOT be demoted — exec_b is still live");
+
+    let task = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        _ => panic!("expected chore"),
+    };
+    assert_eq!(
+        task.status,
+        TaskStatus::Active,
+        "work item must stay active while exec_b is live"
+    );
+}

@@ -518,6 +518,63 @@ mod tests {
         );
     }
 
+    /// Fix (b) regression: when the gate clears, `try_unblock_dependency_if_resolved`
+    /// must NOT create a new `ready` execution when a live (running) execution is
+    /// already attached to the work item. This covers the scenario where a worker
+    /// was dispatched on a gated row via a timing race; the gate-clear must not
+    /// double-dispatch.
+    #[tokio::test]
+    async fn gate_clear_with_live_execution_does_not_create_new_ready() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let prereq_id = create_chore(&db, &product_id, "prereq");
+        let dep_id = create_chore(&db, &product_id, "dependent");
+
+        db.add_dependency(AddDependencyInput {
+            dependent: dep_id.clone(),
+            prerequisite: prereq_id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Simulate a worker being dispatched on the gated row via a timing race:
+        // directly insert a `running` execution as the engine would after dispatch.
+        db.create_execution(
+            crate::work::CreateExecutionInput::builder()
+                .work_item_id(dep_id.clone())
+                .kind(crate::work::ExecutionKind::ChoreImplementation)
+                .status(crate::work::ExecutionStatus::Running)
+                .repo_remote_url("https://github.com/test/repo")
+                .build(),
+        )
+        .unwrap();
+
+        // Clear the gate (prereq done without cascade to isolate this path).
+        db.mark_task_done_for_test_no_cascade(&prereq_id).unwrap();
+
+        // The sweep's per-item unblock: gate is clear, so the item transitions
+        // to `todo` and attempts execution reconcile.
+        let db = Arc::new(db);
+        let outcome = run_one_pass(db.as_ref()).await;
+
+        // The item is unblocked (status → todo).
+        assert_eq!(outcome.rows_unblocked, 1);
+
+        // Crucially: no NEW execution must have been created — the running one
+        // is already doing the work.
+        let executions = db.list_executions(Some(&dep_id)).unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "must not create a second execution when a live one is already attached"
+        );
+        assert_eq!(
+            executions[0].status,
+            crate::work::ExecutionStatus::Running,
+            "the existing running execution must be preserved"
+        );
+    }
+
     /// Part B: sweep must NOT promote a `todo` task that still has gating prereqs.
     #[tokio::test]
     async fn sweep_does_not_promote_still_gated_todo_task() {

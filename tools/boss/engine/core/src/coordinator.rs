@@ -902,6 +902,12 @@ pub(crate) fn occupying_live_worker(
         .map(|s| s.run_id.clone())
 }
 
+fn default_coordinator_metrics() -> Arc<Registry> {
+    let metrics = Arc::new(Registry::new());
+    register_metrics(&metrics);
+    metrics
+}
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct ExecutionCoordinator {
@@ -910,11 +916,13 @@ pub struct ExecutionCoordinator {
     /// Dedicated pool for automation triage and automation-produced task
     /// executions. Sized independently from the main pool (default 3) so
     /// maintenance work never contends with interactive dispatch.
+    #[builder(default = WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE))]
     automation_pool: WorkerPool,
     /// Dedicated pool for `pr_review` reviewer executions. Sized
     /// independently (default small — see [`DEFAULT_REVIEW_POOL_SIZE`]) so
     /// review latency and always-Opus review spend stay isolated from both
     /// the main and automation pools.
+    #[builder(default = WorkerPool::new_review(DEFAULT_REVIEW_POOL_SIZE))]
     review_pool: WorkerPool,
     /// The local-host adapter. Retained as the `local` special case and
     /// the backing adapter for the default provider; the dispatch loop
@@ -934,10 +942,12 @@ pub struct ExecutionCoordinator {
     /// [`crate::dispatch_events::JsonlFileSink`] via
     /// [`ExecutionCoordinator::set_dispatch_events`] before
     /// scheduling starts.
+    #[builder(default = Arc::new(NoopDispatchEventSink))]
     dispatch_events: Arc<dyn DispatchEventSink>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
+    #[builder(default = AtomicBool::new(false))]
     scheduling_active: AtomicBool,
     /// Wakeup flag set by every `kick()` (whether or not it spawned a
     /// fresh scheduler). The running scheduler reads + resets this on
@@ -947,6 +957,7 @@ pub struct ExecutionCoordinator {
     /// the drain loop instead of being silently dropped. Closes the
     /// TOCTOU between "queue saw empty" and "active=false" that left
     /// fresh `ready` executions stranded with no scheduler running.
+    #[builder(default = AtomicBool::new(false))]
     scheduling_pending: AtomicBool,
     /// Repo origin URLs the cold-pool probe has already inspected in
     /// this engine's lifetime. The probe runs once per URL on the
@@ -955,29 +966,35 @@ pub struct ExecutionCoordinator {
     /// round-trip and the attention-item write. Engine restart resets
     /// this; per `multi-repo-work-modeling.md` R4 the deduplication
     /// scope is engine-lifetime, not durable.
+    #[builder(default = Mutex::new(HashSet::new()))]
     repo_cold_probe_seen: Mutex<HashSet<String>>,
     /// Backoff delays between successive pre-start retry attempts.
     /// Defaults to [`PRE_START_RETRY_DELAYS`]. Tests may override via
     /// [`Self::with_pre_start_retry_delays`] to avoid real sleeps.
+    #[builder(default = PRE_START_RETRY_DELAYS.to_vec())]
     pre_start_retry_delays: Vec<Duration>,
     /// Engine-wide counter registry. Defaults to a fresh local registry
     /// with the lease counters pre-registered so tests that do not call
     /// `set_metrics` still get valid increments. Production wires in the
     /// shared engine registry via `set_metrics` after construction.
+    #[builder(default = default_coordinator_metrics())]
     metrics: Arc<Registry>,
     /// Hook called when an execution transitions to `running`.
     /// Defaults to [`NoopExecutionStartedHook`]; production installs
     /// the `WorkerCompletionHandler` via
     /// [`Self::set_execution_started_hook`] so the SHA-delta gate
     /// can snapshot the bound chore PR's head SHA at run start.
+    #[builder(default = Arc::new(NoopExecutionStartedHook))]
     execution_started_hook: Arc<dyn ExecutionStartedHook>,
     /// Global dispatch-pause flag. When `true`, `drain_ready_queue` exits
     /// immediately without claiming any slots. Seeded from the `dispatch_paused`
     /// metadata key at engine startup; persisted there on every toggle so the
     /// pause survives an engine restart.
+    #[builder(default = AtomicBool::new(false))]
     dispatch_paused: AtomicBool,
     /// Epoch seconds when dispatch was last paused. Zero means "not paused".
     /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
+    #[builder(default = AtomicU64::new(0))]
     dispatch_paused_since_epoch_s: AtomicU64,
     /// Live per-slot worker registry, used by the lease-time occupancy
     /// guard to refuse leasing a workspace that is still the cwd of a
@@ -1891,6 +1908,51 @@ impl ExecutionCoordinator {
                     work_item_id = %execution.work_item_id,
                     ?err,
                     "spawn_attempt: live-execution check failed — proceeding without dedup guard",
+                );
+            }
+        }
+
+        // At-dispatch gate check: if the work item is still gated by an
+        // unmet prerequisite, the execution must not be dispatched. This
+        // closes the timing window where a `ready` row was created before
+        // a `blocks` dep edge committed (or before the gate check in
+        // `reconcile_work_item_execution` ran). Downgrade to
+        // `waiting_dependency` so the execution leaves the ready queue
+        // and gets re-promoted when the gate clears.
+        match self.work_db.gating_prereqs_for(&execution.work_item_id) {
+            Ok(prereqs) if !prereqs.is_empty() => {
+                let names = prereqs.join(", ");
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    gating_prereqs = %names,
+                    "spawn_attempt: execution for gated work item — downgrading to waiting_dependency and skipping dispatch",
+                );
+                if let Err(err) = self.work_db.downgrade_ready_to_waiting_dependency(&execution.id) {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        ?err,
+                        "spawn_attempt: failed to downgrade gated execution",
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "gated: execution {} for {} blocked by [{}]",
+                    execution.id,
+                    execution.work_item_id,
+                    names,
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // Non-fatal: proceed rather than blocking all dispatches.
+                // The work item's gating state is re-evaluated on the next
+                // kick, so a transient DB error here at most allows one
+                // erroneous dispatch.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: gate check failed — proceeding without gating guard",
                 );
             }
         }
@@ -4010,8 +4072,8 @@ mod tests {
     }
     use crate::runner::{ExecutionRunner, RunAttention, RunOutcome, RunWaitState};
     use crate::work::{
-        CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput, CreateTaskInput,
-        RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
+        AddDependencyInput, CreateChoreInput, CreateExecutionInput, CreateProductInput, CreateProjectInput,
+        CreateTaskInput, RequestExecutionInput, TaskStatus, WorkDb, WorkExecution, WorkItem,
     };
 
     /// Recorded args for each `lease_workspace` call:
@@ -9547,6 +9609,118 @@ mod tests {
         assert!(
             cube.create_calls.lock().await.is_empty(),
             "create_change must not be called when --resume-pr positioning succeeds in the fallback"
+        );
+    }
+
+    /// Fix (a) regression: `schedule_execution` must refuse to dispatch a
+    /// `ready` execution when the work item is still gated by an unmet
+    /// prerequisite. Concretely: a `ready` row created via a timing race
+    /// (autostart flipped before the dep edge committed) must be downgraded
+    /// back to `waiting_dependency` and must NOT result in a cube workspace
+    /// lease or worker spawn.
+    #[tokio::test]
+    async fn schedule_execution_rejects_gated_ready_execution() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+
+        // prereq: a separate chore that has not yet completed.
+        let prereq = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Prereq (still active)".to_owned(),
+                description: None,
+                autostart: true,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // dependent: the gated chore. Created with autostart=false so no
+        // execution is created automatically.
+        let dep = db
+            .create_chore(CreateChoreInput {
+                product_id: product.id.clone(),
+                name: "Gated chore (should not dispatch)".to_owned(),
+                description: None,
+                autostart: false,
+                priority: None,
+                created_via: None,
+                repo_remote_url: None,
+                effort_level: None,
+                model_override: None,
+                force_duplicate: false,
+            })
+            .unwrap();
+
+        // Wire the blocks edge: dep requires prereq to be done.
+        db.add_dependency(AddDependencyInput {
+            dependent: dep.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+
+        // Simulate the race: directly insert a `ready` execution as if the
+        // autostart flip and reconcile ran before the dep edge committed.
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(dep.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
+        assert!(result.is_err(), "gated execution must be refused by schedule_execution");
+
+        // The execution must have been downgraded to waiting_dependency, not
+        // abandoned — it can be re-promoted when the gate clears.
+        let updated = db.get_execution(&execution.id).unwrap();
+        assert_eq!(
+            updated.status,
+            ExecutionStatus::WaitingDependency,
+            "gated execution must be downgraded to waiting_dependency, got {:?}",
+            updated.status,
+        );
+
+        // No cube calls must have been made — no workspace was leased.
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube lease must occur for a gated execution"
+        );
+        assert!(
+            cube.ensure_calls.lock().await.is_empty(),
+            "no cube ensure must occur for a gated execution"
         );
     }
 }

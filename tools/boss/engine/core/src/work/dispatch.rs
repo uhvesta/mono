@@ -627,6 +627,23 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Atomically move a `ready` execution back to `waiting_dependency` when
+    /// the dispatcher discovers at dispatch time that the work item is still
+    /// gated by an unmet prereq. A no-op (returns `false`) when the execution
+    /// is not in `ready` status — it may have been promoted or claimed by
+    /// a concurrent path. Returns `true` when the row was actually updated.
+    pub fn downgrade_ready_to_waiting_dependency(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions
+             SET status = 'waiting_dependency'
+             WHERE id = ?1
+               AND status = 'ready'",
+            rusqlite::params![execution_id],
+        )?;
+        Ok(affected > 0)
+    }
+
     /// Find a *stale* cube lease that the engine recorded against
     /// `workspace_id` and that is safe to force-release before a
     /// resume re-leases the same workspace.
