@@ -1631,6 +1631,8 @@ pub enum FrontendEvent {
         worker_slots: u8,
         automation_slots: u8,
         review_slots: u8,
+        /// `--model` slug for the Boss coordinator session (from `effort=max`).
+        coordinator_model: String,
     },
     /// Engine confirms the Boss session pid was registered.
     BossSessionRegistered,
@@ -2668,25 +2670,23 @@ mod editorial_controls_tests {
             worker_slots: 8,
             automation_slots: 3,
             review_slots: 8,
+            coordinator_model: "opus".to_owned(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"engine_pool_config\""), "serialized: {json}");
-        assert!(json.contains("\"worker_slots\":8"), "serialized: {json}");
-        assert!(json.contains("\"automation_slots\":3"), "serialized: {json}");
-        assert!(json.contains("\"review_slots\":8"), "serialized: {json}");
-        let parsed: FrontendEvent = serde_json::from_str(&json).unwrap();
-        match parsed {
-            FrontendEvent::EnginePoolConfig {
-                worker_slots,
-                automation_slots,
-                review_slots,
-            } => {
-                assert_eq!(worker_slots, 8);
-                assert_eq!(automation_slots, 3);
-                assert_eq!(review_slots, 8);
-            }
-            other => panic!("unexpected variant: {other:?}"),
-        }
+        let FrontendEvent::EnginePoolConfig {
+            worker_slots,
+            automation_slots,
+            review_slots,
+            coordinator_model,
+        } = serde_json::from_str::<FrontendEvent>(&json).unwrap()
+        else {
+            panic!("unexpected variant")
+        };
+        assert_eq!(worker_slots, 8);
+        assert_eq!(automation_slots, 3);
+        assert_eq!(review_slots, 8);
+        assert_eq!(coordinator_model, "opus");
     }
 
     #[test]

@@ -64,7 +64,10 @@ struct GhosttyTerminalView: NSViewRepresentable {
 final class GhosttyTerminalHostView: NSView {
     let runtime: GhosttyRuntime
     let session: TerminalPaneSession
-    let launchSpec: TerminalLaunchSpec
+    /// The launch spec used for the next `restartSurface()` call.
+    /// Mutable so the Boss pane can update the coordinator model before
+    /// a restart without tearing down the whole view hierarchy.
+    var launchSpec: TerminalLaunchSpec
     private(set) var surface: ghostty_surface_t?
 
     private var trackingAreaRef: NSTrackingArea?

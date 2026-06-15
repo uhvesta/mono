@@ -202,7 +202,9 @@ enum EngineEvent {
     /// its slot ranges before any `SpawnWorkerPane` request arrives.
     /// This is the single source of truth: the engine's runtime config
     /// drives the app's capacity check so they can never drift out of sync.
-    case enginePoolConfig(workerSlots: Int, automationSlots: Int, reviewSlots: Int)
+    /// `coordinatorModel` is the `--model` slug the Boss pane must use —
+    /// derived from `effort=max` so it follows the effort table automatically.
+    case enginePoolConfig(workerSlots: Int, automationSlots: Int, reviewSlots: Int, coordinatorModel: String)
     /// Response to `get_settings` — snapshot of every per-installation
     /// setting and its current value. Drives the Settings window.
     case settingsList(settings: [EngineSetting])
@@ -1364,7 +1366,8 @@ final class EngineClient: @unchecked Sendable {
                 let workerSlots = (payload["worker_slots"] as? NSNumber)?.intValue ?? 8
                 let automationSlots = (payload["automation_slots"] as? NSNumber)?.intValue ?? 3
                 let reviewSlots = (payload["review_slots"] as? NSNumber)?.intValue ?? 8
-                emit(.enginePoolConfig(workerSlots: workerSlots, automationSlots: automationSlots, reviewSlots: reviewSlots))
+                let coordinatorModel = payload["coordinator_model"] as? String ?? "opus"
+                emit(.enginePoolConfig(workerSlots: workerSlots, automationSlots: automationSlots, reviewSlots: reviewSlots, coordinatorModel: coordinatorModel))
             case "boss_session_registered":
                 emit(.bossSessionRegistered)
             case "engine_request":

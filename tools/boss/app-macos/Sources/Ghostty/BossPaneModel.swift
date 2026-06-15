@@ -3,10 +3,11 @@ import os
 
 private let logger = Logger(subsystem: "com.boss.app", category: "BossPaneModel")
 
-/// The exact claude invocation typed into the Boss-session shell on startup.
-/// Stored here (not computed on the fly) so callers can surface it for
-/// diagnostics without parsing the TerminalLaunchSpec.
-let bossPaneClaudeInvocation = "claude --model fable --permission-mode auto"
+/// Build the claude invocation for the Boss coordinator session given a model slug.
+/// Always passes `--permission-mode auto` — the coordinator runs unattended.
+private func coordinatorInvocation(model: String) -> String {
+    "claude --model \(model) --permission-mode auto"
+}
 
 /// Owns the single libghostty pane that hosts the Boss session — a
 /// Claude Code session with a coordinator-flavoured system prompt
@@ -19,14 +20,24 @@ let bossPaneClaudeInvocation = "claude --model fable --permission-mode auto"
 final class BossPaneModel: ObservableObject {
     let runtime: GhosttyRuntime
     @Published var session: TerminalPaneSession
+    /// The model slug the coordinator session was launched with (or will
+    /// use on the next restart). Updated when the engine pushes
+    /// `engine_pool_config` so it always tracks `effort=max` without a
+    /// separately-maintained constant.
+    private(set) var coordinatorModel: String
     /// The resolved claude command line sent to the Boss-session shell.
     /// Exposed so the UI and debug surfaces can display it without
     /// inspecting pane scrollback.
-    let claudeInvocation: String = bossPaneClaudeInvocation
+    var claudeInvocation: String { coordinatorInvocation(model: coordinatorModel) }
 
     init() {
+        // Seed with the current effort=max model (opus).  The engine will
+        // push the authoritative value via engine_pool_config shortly after
+        // connect; updateCoordinatorModel(_:) picks it up then.
+        self.coordinatorModel = "opus"
         self.runtime = GhosttyRuntime.shared
         let workingDirectory = Self.ensureBossWorkingDirectory()
+        let invocation = coordinatorInvocation(model: "opus")
         // Unset ANTHROPIC_API_KEY before invoking claude so the Boss
         // session authenticates via OAuth (~/.claude/.credentials.json)
         // rather than the engine's API key. The macOS app process still
@@ -36,7 +47,7 @@ final class BossPaneModel: ObservableObject {
         // instead of Anthropic Console key."
         // --permission-mode auto is required so the coordinator session
         // runs unattended (same policy as worker spawns from T465).
-        logger.info("Boss-session claude invocation: \(bossPaneClaudeInvocation, privacy: .public)")
+        logger.info("Boss-session claude invocation: \(invocation, privacy: .public)")
         let env = Self.bossSessionEnv()
         let launchSpec = TerminalLaunchSpec(
             fontSize: 11.0,
@@ -53,7 +64,7 @@ final class BossPaneModel: ObservableObject {
             // process to fall back into when claude exits. A single Ctrl-C
             // is handled by Claude Code itself (interrupt-current-turn) rather
             // than by the shell (which would leave the user at a bare prompt).
-            initialInput: "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; exec \(bossPaneClaudeInvocation)\n",
+            initialInput: Self.buildInitialInput(invocation: invocation),
             env: env
         )
         self.session = TerminalPaneSession(
@@ -64,14 +75,37 @@ final class BossPaneModel: ObservableObject {
         // Restart the surface when claude exits so the coordinator is always
         // running. The 1.5 s delay lets the "Picard restarting…" message be
         // readable before the new surface blanks the screen.
+        // Before restarting, update hostView.launchSpec so the new surface
+        // picks up any coordinator model change pushed by the engine since
+        // the last start.
         self.session.onChildExited = { [weak self] in
             guard let self else { return }
             self.session.statusMessage = "Picard restarting…"
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self else { return }
+                let latest = coordinatorInvocation(model: self.coordinatorModel)
+                self.session.hostView?.launchSpec = TerminalLaunchSpec(
+                    fontSize: 11.0,
+                    workingDirectory: Self.ensureBossWorkingDirectory(),
+                    initialInput: Self.buildInitialInput(invocation: latest),
+                    env: Self.bossSessionEnv()
+                )
                 self.session.hostView?.restartSurface()
             }
         }
+    }
+
+    /// Called by `ContentView` when the engine pushes `engine_pool_config`
+    /// with an updated coordinator model.  Stores the new model; the next
+    /// coordinator restart (after Claude exits) will pick it up automatically.
+    func updateCoordinatorModel(_ model: String) {
+        guard !model.isEmpty, model != coordinatorModel else { return }
+        coordinatorModel = model
+        logger.info("Coordinator model updated to: \(model, privacy: .public)")
+    }
+
+    private static func buildInitialInput(invocation: String) -> String {
+        "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; exec \(invocation)\n"
     }
 
     /// Env layered onto the Boss-session shell so `boss` / `bossctl`

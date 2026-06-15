@@ -98,6 +98,7 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
                 worker_slots: server_state.worker_pool_size,
                 automation_slots: server_state.automation_pool_size,
                 review_slots: server_state.review_pool_size,
+                coordinator_model: crate::effort::default_model_for_level(boss_protocol::EffortLevel::Max).to_owned(),
             },
         );
     }

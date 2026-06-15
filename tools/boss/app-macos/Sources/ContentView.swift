@@ -151,8 +151,11 @@ struct ContentView: View {
             // Forward pool-config pushes from the engine so WorkersWorkspaceModel
             // always uses the engine's live pool sizes rather than independently-
             // maintained constants that drift when pool sizes change.
-            model.panePoolConfigHandler = { [workspace = workersWorkspace] workerSlots, automationSlots, reviewSlots in
+            // Also forward coordinatorModel to BossPaneModel so the Boss pane
+            // tracks whatever effort=max resolves to in the engine.
+            model.panePoolConfigHandler = { [workspace = workersWorkspace, boss = bossPane] workerSlots, automationSlots, reviewSlots, coordinatorModel in
                 workspace.configureSlots(workerCount: workerSlots, automationCount: automationSlots, reviewCount: reviewSlots)
+                boss.updateCoordinatorModel(coordinatorModel)
             }
             // Install the Boss-pane shell-pid provider so the engine can
             // authenticate Boss-tier RPCs (e.g. `bossctl agents reap`).
