@@ -10,7 +10,7 @@ rust_proc_macro(
     edition = "2024",
     visibility = [
         "//tools/checkleft/checks/file/forbidden-path:__pkg__",
-        "//tools/checkleft/checks/file/ifchange:__pkg__",
+        "//tools/checkleft/checks/file/require-companion-change:__pkg__",
         "//tools/checkleft/checks/file/size:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs-create:__pkg__",

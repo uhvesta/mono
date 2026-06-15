@@ -2,23 +2,12 @@
 
 This page documents the built-in check implementations currently registered in the checks binary.
 
-## `api-breaking-surface`
+## `api-breaking-surface` (deprecated alias)
 
-Purpose:
-
-- Flags configured backend API-surface changes unless companion docs/spec files are also updated.
-
-Config keys:
-
-- `trigger_globs` (required, array of glob strings)
-- `required_globs` (required, array of glob strings)
-- `message` (optional string)
-- `remediation` (optional string)
-
-Notes:
-
-- Findings default to `error`. Override per instance with `[checks.policy].severity`.
-- Enable bypass per instance with `[checks.policy].allow_bypass` (see [Bypass mechanism](bypass.md)).
+Deprecated alias of [`file/require-companion-change`](#filerequire-companion-change). It
+dispatches to the same implementation with the same `trigger_globs` / `required_globs` /
+`message` / `remediation` config. New configuration should reference
+`file/require-companion-change`; this alias is kept for one migration window.
 
 ## `bazel-policies`
 
@@ -311,18 +300,6 @@ Notes:
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 
-## `frontend-no-legacy-api`
-
-Purpose:
-
-- Prevents frontend imports from deprecated module suffixes.
-
-Config keys:
-
-- `legacy_modules` (required array of module suffixes)
-- `severity` (optional `error|warning|info`, default `error`)
-- `remediation` (optional string)
-
 ## `file/ifchange`
 
 Purpose:
@@ -332,9 +309,7 @@ Purpose:
 
 Config keys:
 
-- None.
-
-Syntax:
+## `frontend-no-legacy-api`
 
 ```text
 LINT.IfChange
@@ -343,14 +318,46 @@ LINT.ThenChange(path)
 LINT.ThenChange(path:label)
 ```
 
+- Directives should live on their own lines inside normal source comments
+  (`//`, `#`, `--`, `;`, `/* */`, `* `, `<!-- -->`).
+- `ThenChange(path)` requires any change to the linked file.
+- `ThenChange(path:label)` requires a touched `LINT.IfChange(label)` block in the
+  linked file.
+- Enforced even when a marked region is deleted or its markers are removed (via
+  base-revision content).
+
+**2. Config globs** (policy-declared):
+
+```yaml
+- id: api-surface-docs           # local policy label (drives findings/bypass/severity)
+  check: file/require-companion-change
+  config:
+    trigger_globs: ["backend/blob/src/v3/**"]
+    required_globs: ["docs/backend.md", "docs/product-specs/**"]
+    message: "Potential backend API surface change without docs update."
+    remediation: "Update docs/backend.md or a relevant product spec in this PR."
+```
+
+If any changed (non-deleted) file matches `trigger_globs` but no changed file matches
+`required_globs`, every trigger file is flagged. For multiple couplings in one instance,
+use a `couplings` array, each entry carrying its own
+`trigger_globs` / `required_globs` / `message` / `remediation`.
+
+Config keys:
+
+- `trigger_globs` (optional, array of glob strings) — flat single-coupling trigger set.
+- `required_globs` (optional, array of glob strings) — required when `trigger_globs` is set.
+- `message` (optional string)
+- `remediation` (optional string)
+- `couplings` (optional array of `{ trigger_globs, required_globs, message?, remediation? }`)
+
 Notes:
 
-- Directives should live on their own lines inside normal source comments.
-- `ThenChange(path)` requires any change to the linked file.
-- `ThenChange(path:label)` requires a touched `LINT.IfChange(label)` block in
-  the linked file.
-- Severity defaults to `error`.
-- Use normal per-instance bypass policy if you need an exception.
+- Severity defaults to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass` (see
+  [Bypass mechanism](bypass.md)).
+- Deprecated aliases `file/ifchange` and `api-breaking-surface` dispatch to this same
+  check during the migration window.
 
 ## `rust-test-rule-coverage`
 

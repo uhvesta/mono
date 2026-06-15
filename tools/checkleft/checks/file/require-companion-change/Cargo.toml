@@ -1,8 +1,8 @@
 [package]
-name = "checkleft-file-ifchange"
+name = "checkleft-file-require-companion-change"
 version = "0.1.0"
 edition.workspace = true
-description = "checkleft check (file/ifchange): require linked files or blocks to change together (LINT.IfChange / LINT.ThenChange markers)"
+description = "checkleft check (file/require-companion-change): require a companion change when a coupled surface changes (LINT.IfChange / LINT.ThenChange markers or trigger_globs / required_globs)"
 
 # An ordinary rlib. The component ABI is wired once in the aggregating
 # `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
@@ -10,6 +10,8 @@ description = "checkleft check (file/ifchange): require linked files or blocks t
 # needed here because this crate does not call `export_checks!`.
 [dependencies]
 checkleft-check-sdk = { path = "../../../sdk" }
+serde = { workspace = true, features = ["derive"] }
+globset = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -23,7 +23,7 @@ members = [
   "tools/checkleft/sdk-macro",
   "tools/checkleft/sdk/examples/trivial-check",
   "tools/checkleft/checks/file/forbidden-path",
-  "tools/checkleft/checks/file/ifchange",
+  "tools/checkleft/checks/file/require-companion-change",
   "tools/checkleft/checks/file/size",
   "tools/checkleft/checks/rust/giant-structs",
   "tools/checkleft/checks/rust/giant-structs-common",

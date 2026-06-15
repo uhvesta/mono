@@ -3,6 +3,19 @@
 Status: decided.
 Date: 2026-06-14.
 
+> **Implementation note (forbidden-patterns).** The mono-side change landed the generic check as a **wasm bundle** check under the `file/` namespace — `file/forbidden-patterns` — rather than a native rename. It ships in the single multiplexed preinstalled component alongside `file/size` and `file/ifchange`, following the same authorship pattern (an rlib check crate wired into `checkleft-preinstalled-bundle`). The native `forbidden-imports-deps` implementation was removed outright rather than kept as a deprecated alias (one implementation, not two); the flunge-side `CHECKS.yaml` migration to `check: file/forbidden-patterns` is a separate flunge change. The `rules`-array config surface in §1.1 is preserved exactly, so the flunge config below applies as written (only the `check:` id becomes `file/forbidden-patterns`). The `require-companion-change` half of this doc is unaffected and tracked separately.
+
+> **Update (2026-06-15, implementation):** the `require-companion-change` half was
+> implemented as a single generic WASM check `file/require-companion-change` that
+> *subsumes* both the marker-based `ifchange-thenchange` / `file/ifchange` check and
+> the glob-based `api-breaking-surface` check, rather than keeping them as two
+> separate complementary primitives (§1.2's table below). The unified check supports
+> both coupling-declaration mechanisms — in-source `LINT.IfChange`/`LINT.ThenChange`
+> markers *and* config `trigger_globs`/`required_globs` — and exports `file/ifchange`
+> and `api-breaking-surface` as deprecated aliases for the migration window. This
+> consolidation (one implementation, not two) follows the T1775 rewrite of this
+> decision. The "complementary, not substitutes" framing in §1.2 is superseded.
+
 ## Summary
 
 Two checkleft built-in checks — `frontend-no-legacy-api` and `api-breaking-surface` — live in mono but are used only by flunge. Both are config-driven and generic in implementation; the flunge-specific parts are already entirely in flunge's `CHECKS.yaml`, not in the Rust code.

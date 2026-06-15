@@ -8,12 +8,12 @@ This page describes bypass support for checks that opt into bypass.
 - By default, checks do not allow bypass.
 - In the current default config, bypass is enabled for:
   - `file/size`
-  - `api-breaking-surface`
+  - `file/require-companion-change` (and its deprecated alias `api-breaking-surface`)
   - `no-usfa-typo` (directive name: `BYPASS_NO_USFA_TYPO`)
 
 ```toml
 [[checks]]
-id = "api-breaking-surface"
+id = "file/require-companion-change"
 
 [checks.policy]
 allow_bypass = true
@@ -51,11 +51,14 @@ The bypass name is derived from the check id by uppercasing and replacing all no
 | `lint/rust` | `BYPASS_LINT_RUST` |
 | `lint/bazel` | `BYPASS_LINT_BAZEL` |
 | `rust/giant-structs` | `BYPASS_RUST_GIANT_STRUCTS` |
+| `file/require-companion-change` | `BYPASS_FILE_REQUIRE_COMPANION_CHANGE` |
 
-For `api-breaking-surface`:
+For `file/require-companion-change` (the bypass name follows the policy `id:`, so an
+instance kept under the deprecated `id: api-breaking-surface` still uses
+`BYPASS_API_BREAKING_SURFACE`):
 
 ```text
-BYPASS_API_BREAKING_SURFACE=No public API behavior changed; docs update would be misleading.
+BYPASS_FILE_REQUIRE_COMPANION_CHANGE=No public API behavior changed; docs update would be misleading.
 ```
 
 For `file/size`:

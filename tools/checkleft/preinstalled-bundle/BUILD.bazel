@@ -22,7 +22,7 @@ rust_shared_library(
     visibility = ["//tools/checkleft:__pkg__"],
     deps = [
         "//tools/checkleft/checks/file/forbidden-path:file_forbidden_path_check",
-        "//tools/checkleft/checks/file/ifchange:file_ifchange_check",
+        "//tools/checkleft/checks/file/require-companion-change:require_companion_change_check",
         "//tools/checkleft/checks/file/size:file_size_check",
         "//tools/checkleft/checks/rust/giant-structs:rust_giant_structs_use_builder",
         "//tools/checkleft/checks/rust/giant-structs-create:rust_giant_structs_create",

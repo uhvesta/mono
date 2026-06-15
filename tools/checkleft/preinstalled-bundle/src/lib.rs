@@ -42,7 +42,10 @@ use checkleft_check_sdk::export_checks;
 // that name from the function ident it is given and references it via `super::`.
 // The `rust/giant-structs` stale-exclusion audit hooks are plain functions.
 use checkleft_file_forbidden_path::__CHECKLEFT_ENTRY_forbidden_path_check;
-use checkleft_file_ifchange::__CHECKLEFT_ENTRY_file_ifchange_check;
+use checkleft_file_require_companion_change::{
+    __CHECKLEFT_ENTRY_api_breaking_surface_check, __CHECKLEFT_ENTRY_file_ifchange_check,
+    __CHECKLEFT_ENTRY_file_require_companion_change_check,
+};
 use checkleft_file_size::__CHECKLEFT_ENTRY_file_size_check;
 use checkleft_rust_giant_structs_create::{
     __CHECKLEFT_ENTRY_giant_structs_create_check, giant_structs_create_declared_exclusions,
@@ -55,7 +58,12 @@ use checkleft_rust_giant_structs_use_builder::{
 export_checks!(
     forbidden_path_check,
     file_size_check,
+    file_require_companion_change_check,
+    // Deprecated aliases of file/require-companion-change, kept for the migration
+    // window so existing `file/ifchange` and `api-breaking-surface` configs keep
+    // resolving. All three dispatch to the same implementation.
     file_ifchange_check,
+    api_breaking_surface_check,
     giant_structs_check,
     exclusion_audit(
         "rust/giant-structs",
