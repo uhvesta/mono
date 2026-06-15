@@ -5564,7 +5564,8 @@ mod tests {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let path = bin.join("checkleft");
-        let script = format!("#!/bin/sh\ncat <<'CHECKLEFT_EOF'\n{stdout}\nCHECKLEFT_EOF\nexit {exit_code}\n");
+        let stdout_escaped = stdout.replace('\'', "'\\''");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{stdout_escaped}'\nexit {exit_code}\n");
         std::fs::write(&path, script).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
@@ -5593,7 +5594,8 @@ mod tests {
     fn write_fake_checkleft_to_dir(dir: &std::path::Path, exit_code: i32, stdout: &str) {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("checkleft");
-        let script = format!("#!/bin/sh\ncat <<'CHECKLEFT_EOF'\n{stdout}\nCHECKLEFT_EOF\nexit {exit_code}\n");
+        let stdout_escaped = stdout.replace('\'', "'\\''");
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{stdout_escaped}'\nexit {exit_code}\n");
         std::fs::write(&path, script).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
