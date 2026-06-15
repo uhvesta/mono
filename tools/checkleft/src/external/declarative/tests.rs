@@ -275,6 +275,7 @@ fn passthrough_runs_binary_end_to_end() {
         &declarative,
         &changeset,
         &toml::Value::Table(Default::default()),
+        None,
     )
     .expect("declarative passthrough runs");
 
@@ -526,7 +527,7 @@ fn e2e_declarative_runs_buildifier_end_to_end() {
         },
     ]);
 
-    let result = super::run_declarative_check(temp.path(), "buildifier", &package, &changeset, &config)
+    let result = super::run_declarative_check(temp.path(), "buildifier", &package, &changeset, &config, None)
         .expect("declarative run");
 
     // The fixture is format-clean but has 3 lint warnings.
@@ -789,6 +790,7 @@ fn rustfmt_missing_binary_degrades_to_check_error() {
         &declarative,
         &changeset,
         &toml::Value::Table(Default::default()),
+        None,
     )
     .expect_err("missing binary must produce an error, not a successful result");
 
@@ -860,6 +862,7 @@ fn linelist_absolute_paths_are_normalised_to_repo_relative() {
             &declarative,
             &changeset,
             &toml::Value::Table(Default::default()),
+            None,
         )
         .expect("run succeeds");
 
@@ -931,6 +934,7 @@ fn duplicate_findings_across_module_tree_are_deduplicated() {
             &declarative,
             &changeset,
             &toml::Value::Table(Default::default()),
+            None,
         )
         .expect("run succeeds");
 
@@ -996,6 +1000,7 @@ fn rustfmt_repo_root_arg_expands_to_absolute_path() {
             &declarative,
             &changeset,
             &toml::Value::Table(Default::default()),
+            None,
         )
         .expect("run succeeds");
 

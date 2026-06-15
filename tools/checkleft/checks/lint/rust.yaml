@@ -35,6 +35,7 @@ invocations:
     build_flags:
       - "--@rules_rust//rust/settings:capture_clippy_output=true"
       - "--@rules_rust//rust/settings:clippy_error_format=json"
+      - "--@rules_rust//rust/settings:clippy_flags={{severity_deny_flag}}"
     artifact_format: jsonl
     # Exit semantics classify the `bazel build` step. With capture_clippy_output
     # the build succeeds even when clippy reports violations, so 0 → findings

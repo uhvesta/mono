@@ -567,7 +567,7 @@ mod tests {
             "non-colocated jj workspace must not error: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), true, "non-colocated jj workspace must return Ok(true)");
+        assert!(result.unwrap(), "non-colocated jj workspace must return Ok(true)");
     }
 
     // ── resolve_git_root ──────────────────────────────────────────────────────

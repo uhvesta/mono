@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSetBuilder};
 
 use crate::input::{ChangeKind, ChangeSet};
-use crate::output::{CheckResult, Finding};
+use crate::output::{CheckResult, Finding, Severity};
 
 use super::{
     ArtifactFormat, BazelAspectInvocation, ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationKind,
@@ -26,12 +26,18 @@ use super::{
 
 /// Run a declarative check end-to-end. `repo_root` is the working directory
 /// invocations run from (and the Bazel workspace, when the `bazel` resolver is used).
+///
+/// `effective_severity` is the policy severity configured for this check instance
+/// (from CHECKS.yaml). Declarative invocations may use it — e.g. `bazel_aspect`
+/// supports `{{severity_deny_flag}}` in `build_flags`, which expands to `-Dwarnings`
+/// when the severity is `error` and is dropped otherwise.
 pub fn run_declarative_check(
     repo_root: &Path,
     package_id: &str,
     package: &ExternalCheckDeclarativePackage,
     changeset: &ChangeSet,
     config: &toml::Value,
+    effective_severity: Option<Severity>,
 ) -> Result<CheckResult> {
     let files = select_files(changeset, &package.applies_to)?;
     if files.is_empty() {
@@ -55,7 +61,13 @@ pub fn run_declarative_check(
 
     let mut findings = Vec::new();
     for invocation in &package.invocations {
-        findings.extend(run_invocation(repo_root, &binaries, invocation, &files)?);
+        findings.extend(run_invocation(
+            repo_root,
+            &binaries,
+            invocation,
+            &files,
+            effective_severity,
+        )?);
     }
 
     // Deduplicate: some tools (e.g. rustfmt with per-file + module-tree recursion)
@@ -136,10 +148,13 @@ fn run_invocation(
     binaries: &BTreeMap<String, PathBuf>,
     invocation: &Invocation,
     files: &[String],
+    effective_severity: Option<Severity>,
 ) -> Result<Vec<Finding>> {
     let mut findings = match &invocation.kind {
         InvocationKind::Tool(tool) => run_tool_invocation(repo_root, binaries, invocation, tool, files)?,
-        InvocationKind::BazelAspect(aspect) => run_bazel_aspect_invocation(repo_root, invocation, aspect, files)?,
+        InvocationKind::BazelAspect(aspect) => {
+            run_bazel_aspect_invocation(repo_root, invocation, aspect, files, effective_severity)?
+        }
     };
 
     // Normalize absolute paths to repo-relative. Tools invoked via the hermetic
@@ -178,6 +193,25 @@ fn run_tool_invocation(
     }
 }
 
+/// Expand `{{severity_deny_flag}}` in a single `build_flags` entry.
+///
+/// Returns `Some(expanded)` to keep the entry (with the template replaced), or
+/// `None` to drop the entry entirely. Currently the only recognised template is
+/// `{{severity_deny_flag}}`, which resolves to `-Dwarnings` when the effective
+/// severity is `Error` (so clippy violations fail the build action) and causes
+/// the containing flag to be dropped when severity is anything else.
+fn expand_build_flag(flag: &str, effective_severity: Option<Severity>) -> Option<String> {
+    const SEVERITY_DENY_FLAG: &str = "{{severity_deny_flag}}";
+    if flag.contains(SEVERITY_DENY_FLAG) {
+        match effective_severity {
+            Some(Severity::Error) => Some(flag.replace(SEVERITY_DENY_FLAG, "-Dwarnings")),
+            _ => None,
+        }
+    } else {
+        Some(flag.to_owned())
+    }
+}
+
 /// Run a bazel_aspect invocation: map the matched files to their owning targets,
 /// build those targets with the declared aspect, then read the output-group
 /// artifacts and project each through the transform.
@@ -191,6 +225,7 @@ fn run_bazel_aspect_invocation(
     invocation: &Invocation,
     aspect: &BazelAspectInvocation,
     files: &[String],
+    effective_severity: Option<Severity>,
 ) -> Result<Vec<Finding>> {
     let bazel = PathBuf::from("bazel");
 
@@ -237,9 +272,14 @@ fn run_bazel_aspect_invocation(
         format!("--aspects={}", aspect.aspect),
         format!("--output_groups={}", aspect.output_groups.join(",")),
     ];
+    let expanded_build_flags: Vec<String> = aspect
+        .build_flags
+        .iter()
+        .filter_map(|f| expand_build_flag(f, effective_severity))
+        .collect();
     let mut build_args: Vec<String> = vec!["build".to_owned()];
     build_args.extend(aspect_flags.iter().cloned());
-    build_args.extend(aspect.build_flags.iter().cloned());
+    build_args.extend(expanded_build_flags.iter().cloned());
     build_args.extend(targets.iter().cloned());
     let build_output = spawn(repo_root, &bazel, &build_args, &invocation.id)?;
     match invocation.exit.classify(build_output.exit_code) {
@@ -259,7 +299,7 @@ fn run_bazel_aspect_invocation(
     //    targets are a parse error — so the targets are wrapped in `set(...)`.
     let mut cquery_args: Vec<String> = vec!["cquery".to_owned()];
     cquery_args.extend(aspect_flags.iter().cloned());
-    cquery_args.extend(aspect.build_flags.iter().cloned());
+    cquery_args.extend(expanded_build_flags.iter().cloned());
     cquery_args.push("--output=files".to_owned());
     cquery_args.push(format!("set({})", targets.join(" ")));
     let cquery_output = spawn(repo_root, &bazel, &cquery_args, &invocation.id)?;

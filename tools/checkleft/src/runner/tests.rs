@@ -45,6 +45,7 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
         _source_tree: &dyn SourceTree,
         _config: &toml::Value,
         _config_dir: &std::path::Path,
+        _effective_severity: Option<crate::output::Severity>,
     ) -> Result<CheckResult> {
         self.seen_packages
             .lock()
@@ -86,6 +87,7 @@ impl ExternalCheckExecutor for MockExclusionExecutor {
         _source_tree: &dyn SourceTree,
         _config: &toml::Value,
         _config_dir: &std::path::Path,
+        _effective_severity: Option<crate::output::Severity>,
     ) -> Result<CheckResult> {
         Ok(CheckResult {
             check_id: package.id.clone(),

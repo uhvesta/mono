@@ -64,3 +64,5 @@ checks:
       severity: error
 
   - id: lint/rust
+    policy:
+      severity: error

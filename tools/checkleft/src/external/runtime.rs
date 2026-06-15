@@ -207,6 +207,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
         source_tree: &dyn SourceTree,
         config: &toml::Value,
         config_dir: &Path,
+        effective_severity: Option<Severity>,
     ) -> Result<CheckResult>;
 
     /// Return the declared exclusions for a component check. `config_dir` is the
@@ -252,6 +253,7 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
         _source_tree: &dyn SourceTree,
         _config: &toml::Value,
         _config_dir: &Path,
+        _effective_severity: Option<Severity>,
     ) -> Result<CheckResult> {
         bail!(
             "external check package `{}` resolved successfully but runtime execution is not implemented yet",
@@ -470,6 +472,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         source_tree: &dyn SourceTree,
         config: &toml::Value,
         config_dir: &Path,
+        effective_severity: Option<Severity>,
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
@@ -485,7 +488,14 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 }
                 // Framework-owned invocation: resolve declared binaries and run
                 // them at the repo root. Sandboxing is deferred by design.
-                run_declarative_check(&self.root, &package.id, declarative, changeset, config)
+                run_declarative_check(
+                    &self.root,
+                    &package.id,
+                    declarative,
+                    changeset,
+                    config,
+                    effective_severity,
+                )
             }
         }
     }

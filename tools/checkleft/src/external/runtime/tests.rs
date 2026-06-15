@@ -85,6 +85,7 @@ fn component_v1_non_component_bytes_give_compile_error() {
             &LocalSourceTree::new(temp.path()).expect("tree"),
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
+            None,
         )
         .expect_err("core wasm bytes must not parse as a component");
     let msg = error.to_string();
@@ -132,6 +133,7 @@ fn component_v1_digest_mismatch_is_rejected() {
             &LocalSourceTree::new(temp.path()).expect("tree"),
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
+            None,
         )
         .expect_err("digest mismatch must be rejected");
     assert!(error.to_string().contains("artifact sha256 mismatch"));
@@ -794,6 +796,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
             &tree,
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
+            None,
         )
         .expect("execute");
 
@@ -871,6 +874,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
             &tree,
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
+            None,
         )
         .expect("check must complete without fuel exhaustion or timeout on a large file");
 
@@ -1035,6 +1039,7 @@ fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
             &tree,
             &config,
             std::path::Path::new("tools/boss"),
+            None,
         )
         .expect("execute");
 
@@ -1203,6 +1208,7 @@ fn giant_structs_create_exclude_structs_suppresses_finding() {
             &tree,
             &config,
             std::path::Path::new(""),
+            None,
         )
         .expect("execute");
 

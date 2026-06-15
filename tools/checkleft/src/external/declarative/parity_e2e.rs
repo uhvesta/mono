@@ -98,6 +98,7 @@ fn run_declarative(
         package,
         changeset,
         &toml::Value::Table(config),
+        None,
     )
     .expect("declarative buildifier check runs")
     .findings

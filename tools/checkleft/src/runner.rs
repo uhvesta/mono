@@ -210,6 +210,7 @@ impl Runner {
                                     source_tree.as_ref(),
                                     &run_config,
                                     &run_config_dir,
+                                    run_policy.severity_override,
                                 )
                                 .map(|mut result| {
                                     result.check_id = configured_check_id.clone();
