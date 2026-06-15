@@ -62,6 +62,12 @@ impl RealCommandRunner {
                 "ssh -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3",
             );
         }
+
+        // Suppress git credential prompts unconditionally. cube runs headless
+        // and has no terminal to type into; a credential prompt would hang the
+        // subprocess until run_with_timeout kills it. Setting this to "0"
+        // makes git fail immediately with an auth error instead of hanging.
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
     }
 }
 

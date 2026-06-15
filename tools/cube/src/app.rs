@@ -36,7 +36,14 @@ const DEFAULT_LEASE_TTL_SECS: i64 = 1800;
 
 /// Pool-wide gc runs at most once per 24 hours, triggered from `cube workspace lease`.
 const AUTO_GC_INTERVAL_SECS: i64 = 24 * 60 * 60;
+/// Stamped on COMPLETION of a background GC pass; gates the 24-hour throttle.
 const POOL_GC_LAST_AT_KEY: &str = "last_pool_gc_at";
+/// Stamped before spawning the background GC thread to prevent concurrent passes.
+/// A started-but-not-completed pass is treated as in-progress for up to
+/// POOL_GC_IN_PROGRESS_TIMEOUT_SECS; after that it is assumed hung/crashed and
+/// a new pass is allowed.
+const POOL_GC_STARTED_AT_KEY: &str = "last_pool_gc_started_at";
+const POOL_GC_IN_PROGRESS_TIMEOUT_SECS: i64 = 3 * 60 * 60; // 3 hours
 
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -1834,6 +1841,21 @@ fn run_workspace(
                 }
             }
 
+            // Run the aged-unhealthy recycler so that `cube workspace gc` also
+            // clears long-lived dirty/conflicted workspaces — the operator's
+            // mental model is that gc cleans up dirty workspaces, not just
+            // consumed bookmarks. Skipped in dry-run mode.
+            let unhealthy_recycled: usize = if !dry_run {
+                let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
+                let max_age_secs = gc_config.max_age_secs();
+                match current_epoch_s() {
+                    Ok(now) => gc_aged_unhealthy_workspaces(runner, &store, database_path, now, max_age_secs),
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            };
+
             let total_forgotten: usize = results.iter().map(|r| r.bookmarks_forgotten.len()).sum();
             let message = if dry_run {
                 format!(
@@ -1843,12 +1865,16 @@ fn run_workspace(
                 )
             } else {
                 format!(
-                    "{} workspace(s): {} bookmark(s) forgotten.",
+                    "{} workspace(s): {} bookmark(s) forgotten, {} unhealthy workspace(s) recycled.",
                     results.len(),
-                    total_forgotten
+                    total_forgotten,
+                    unhealthy_recycled
                 )
             };
-            RunResult::new(message, json!({ "results": results }))
+            RunResult::new(
+                message,
+                json!({ "results": results, "unhealthy_recycled": unhealthy_recycled }),
+            )
         }
         WorkspaceCommand::Rebase => workspace_rebase(&mut store, database_path, runner),
     }
@@ -3359,20 +3385,28 @@ fn gc_collect_closed_pr_bookmarks(
         .collect()
 }
 
-/// Update `last_pool_gc_at` and spawn a background thread to gc consumed
-/// bookmarks across all free workspaces, at most once per 24 hours.
-/// The timestamp is written BEFORE the thread is spawned so concurrent lease
-/// calls within the same window skip redundant gc triggers.
+/// Trigger a background pool GC pass at most once per 24 hours.
+///
+/// Two metadata keys guard the trigger:
+/// - `last_pool_gc_at` (POOL_GC_LAST_AT_KEY): stamped by the background thread
+///   on successful completion; gates the 24-hour throttle.
+/// - `last_pool_gc_started_at` (POOL_GC_STARTED_AT_KEY): stamped here before
+///   the thread is spawned to prevent concurrent passes within the same window.
+///   A pass that started but never completed (crash or hang) is retried after
+///   POOL_GC_IN_PROGRESS_TIMEOUT_SECS so a single hung fetch cannot suppress
+///   GC for 24h.
 fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Path>, now_epoch_s: i64) -> Result<()> {
-    let last_gc = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)?;
-    let should_trigger = match last_gc {
-        None => true,
-        Some(last) => (now_epoch_s - last) >= AUTO_GC_INTERVAL_SECS,
-    };
-    if !should_trigger {
+    // Skip if a pass completed recently (the main 24h throttle).
+    let last_completed = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)?;
+    if last_completed.map_or(false, |t| (now_epoch_s - t) < AUTO_GC_INTERVAL_SECS) {
         return Ok(());
     }
-    store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now_epoch_s)?;
+    // Skip if a pass is already in progress (started within the stuck timeout).
+    let last_started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)?;
+    if last_started.map_or(false, |t| (now_epoch_s - t) < POOL_GC_IN_PROGRESS_TIMEOUT_SECS) {
+        return Ok(());
+    }
+    store.set_pool_metadata_i(POOL_GC_STARTED_AT_KEY, now_epoch_s)?;
     let db_path_owned = database_path.map(Path::to_path_buf);
     std::thread::spawn(move || {
         run_pool_gc_background(db_path_owned);
@@ -3389,6 +3423,22 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
         eprintln!("cube: auto gc: failed to open store");
         return;
     };
+    let runner = RealCommandRunner;
+
+    // Run the aged-unhealthy recycler FIRST so it is never blocked by a slow
+    // or hanging per-workspace fetch in the bookmark loop below.
+    let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
+    let max_age_secs = gc_config.max_age_secs();
+    if let Ok(now) = current_epoch_s() {
+        gc_aged_unhealthy_workspaces(&runner, &store, database_path.as_deref(), now, max_age_secs);
+    }
+
+    gc_stale_workspace_logs(&store);
+
+    // Sweep consumed bookmarks from every non-leased workspace. Each workspace
+    // runs jj git fetch; a broken/unreachable remote times out after
+    // network_cmd_timeout() and is skipped so one slow workspace cannot block
+    // the rest of the pass.
     let records = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
         Ok(r) => r,
         Err(e) => {
@@ -3396,7 +3446,6 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
             return;
         }
     };
-    let runner = RealCommandRunner;
     for record in &records {
         if record.state == WorkspaceState::Leased {
             continue;
@@ -3409,35 +3458,38 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
         }
     }
 
-    let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
-    let max_age_secs = gc_config.max_age_secs();
+    // Stamp completion so the 24h throttle and in-progress guard advance.
+    // Only reached when the pass finishes (not on crash or hang), so a hung
+    // pass does not silently suppress GC for 24h.
     if let Ok(now) = current_epoch_s() {
-        gc_aged_unhealthy_workspaces(&runner, &store, database_path.as_deref(), now, max_age_secs);
+        let _ = store
+            .set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now)
+            .map_err(|e| eprintln!("cube: auto gc: failed to stamp completion: {e}"));
     }
-
-    gc_stale_workspace_logs(&store);
 }
 
 /// During pool GC, reset any non-leased free workspace that has been
 /// continuously `dirty` or `conflicted` for longer than `max_age_secs`.
 /// Emits a `workspace.unhealthy_gc_reset` audit event for each workspace
 /// that is reclaimed so the discarded work is traceable.
+/// Returns the number of workspaces successfully recycled.
 fn gc_aged_unhealthy_workspaces(
     runner: &dyn CommandRunner,
     store: &Store,
     database_path: Option<&Path>,
     now_epoch_s: i64,
     max_age_secs: i64,
-) {
+) -> usize {
     let records = match store.list_workspaces_filtered(&WorkspaceListFilter::default()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("cube: unhealthy gc: failed to list workspaces: {e}");
-            return;
+            return 0;
         }
     };
 
     let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
+    let mut recycled: usize = 0;
 
     for record in records {
         if record.state == WorkspaceState::Leased {
@@ -3532,7 +3584,9 @@ fn gc_aged_unhealthy_workspaces(
             "cube: unhealthy gc: reset {} (was {} for {}s)",
             record.workspace_id, prior_health, age_secs,
         );
+        recycled += 1;
     }
+    recycled
 }
 
 fn gc_stale_workspace_logs(store: &Store) {
@@ -5191,10 +5245,11 @@ mod tests {
     use crate::lock::RepoLock;
 
     use super::{
-        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, RepoEnsureDefaults, Result,
-        current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces, is_retryable_network_error,
-        is_stdin_path, render_boss_infra_exclude_block, repo_lock_path, resolve_body_file, resolve_checkleft_bin,
-        run_checkleft_gate, run_checkleft_gate_impl, run_with_context, run_with_dependencies, upsert_managed_exclude,
+        BOSS_INFRA_EXCLUDE_BEGIN, BOSS_INFRA_EXCLUDE_END, CubeError, POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY,
+        RepoEnsureDefaults, Result, current_epoch_s, ensure_boss_infra_excluded, gc_aged_unhealthy_workspaces,
+        is_retryable_network_error, is_stdin_path, render_boss_infra_exclude_block, repo_lock_path, resolve_body_file,
+        resolve_checkleft_bin, run_checkleft_gate, run_checkleft_gate_impl, run_with_context, run_with_dependencies,
+        upsert_managed_exclude,
     };
 
     /// Write an executable fake `checkleft` at `<root>/bin/checkleft` that
@@ -11013,7 +11068,9 @@ mod tests {
 
     #[test]
     fn auto_gc_updates_timestamp_when_stale() {
-        // When last_pool_gc_at is older than 24h, lease updates it.
+        // When last_pool_gc_at is older than 24h, lease stamps last_pool_gc_started_at
+        // and spawns the background pass. The start key is visible synchronously; the
+        // completion key (last_pool_gc_at) is written by the background thread.
         let (tempdir, database_path) = with_database_path();
         let workspace_root = tempdir.path().join("workspaces");
         std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
@@ -11038,16 +11095,21 @@ mod tests {
         .expect("lease");
         lease_runner.assert_exhausted();
 
-        // last_pool_gc_at must have advanced past old_ts.
+        // last_pool_gc_started_at must have been set ≈ now (GC was triggered).
+        // The completion key (last_pool_gc_at) is written by the background thread
+        // and may not be visible yet; we do not assert on it here.
         use crate::store::Store;
         let store = Store::open_at(&database_path).unwrap();
-        let ts = store
-            .get_pool_metadata_i(POOL_GC_LAST_AT_KEY)
+        let started_ts = store
+            .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
             .unwrap()
-            .expect("last_pool_gc_at should be set");
-        assert!(ts > old_ts, "last_pool_gc_at should have been updated");
+            .expect("last_pool_gc_started_at should be set after triggering GC");
         let now = current_epoch_s().unwrap();
-        assert!(now - ts < 10, "last_pool_gc_at should be near now");
+        assert!(now - started_ts < 10, "last_pool_gc_started_at should be near now");
+        assert!(
+            started_ts > old_ts,
+            "last_pool_gc_started_at should have advanced past old completion timestamp"
+        );
     }
 
     #[test]
@@ -11085,6 +11147,185 @@ mod tests {
             .unwrap()
             .expect("last_pool_gc_at should be set");
         assert_eq!(ts, recent_ts, "last_pool_gc_at should NOT change within 24h");
+        // And last_pool_gc_started_at should not be set either.
+        let started = store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap();
+        assert!(
+            started.is_none(),
+            "last_pool_gc_started_at should not be set when gc was skipped"
+        );
+    }
+
+    #[test]
+    fn auto_gc_skips_when_in_progress() {
+        // When last_pool_gc_started_at is recent (< 3h) and last_pool_gc_at is old,
+        // a lease does NOT retrigger — the pass is assumed in progress.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let old_completed = current_epoch_s().unwrap() - (25 * 60 * 60); // 25h ago
+        let recent_started = current_epoch_s().unwrap() - 1800; // 30 min ago
+        {
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).unwrap();
+            store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, old_completed).unwrap();
+            store
+                .set_pool_metadata_i(POOL_GC_STARTED_AT_KEY, recent_started)
+                .unwrap();
+        }
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "in-progress gc test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        // GC must NOT have been retriggered (started_at unchanged).
+        let ts = store
+            .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
+            .unwrap()
+            .expect("last_pool_gc_started_at should still be set");
+        assert_eq!(
+            ts, recent_started,
+            "last_pool_gc_started_at should NOT change while pass is in progress"
+        );
+    }
+
+    #[test]
+    fn auto_gc_allows_retry_after_stuck_timeout() {
+        // When last_pool_gc_started_at is old (> 3h, stuck timeout) and last_pool_gc_at
+        // was never updated (pass never completed), a new pass is triggered.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).expect("dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        let old_completed = current_epoch_s().unwrap() - (25 * 60 * 60); // 25h ago
+        let stuck_started = current_epoch_s().unwrap() - (4 * 60 * 60); // 4h ago (> 3h stuck timeout)
+        {
+            use crate::store::Store;
+            let store = Store::open_at(&database_path).unwrap();
+            store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, old_completed).unwrap();
+            store
+                .set_pool_metadata_i(POOL_GC_STARTED_AT_KEY, stuck_started)
+                .unwrap();
+        }
+
+        let workspace_path = workspace_root.join("mono-agent-001");
+        let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "stuck gc retry test"]),
+            Some(&database_path),
+            &lease_runner,
+        )
+        .expect("lease");
+        lease_runner.assert_exhausted();
+
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ts = store
+            .get_pool_metadata_i(POOL_GC_STARTED_AT_KEY)
+            .unwrap()
+            .expect("last_pool_gc_started_at should be set");
+        let now = current_epoch_s().unwrap();
+        assert!(
+            ts > stuck_started,
+            "last_pool_gc_started_at should have advanced past stuck value"
+        );
+        assert!(now - ts < 10, "last_pool_gc_started_at should be near now");
+    }
+
+    #[test]
+    fn workspace_gc_verb_runs_unhealthy_recycler() {
+        // `cube workspace gc` should run the aged-unhealthy recycler, not just
+        // forget consumed bookmarks. A dirty workspace past the threshold is reset.
+        let (tempdir, database_path) = with_database_path();
+        let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+        store
+            .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+            .expect("mark dirty");
+
+        // Backdate unhealthy_since to 6 days ago so the real clock is past the 5-day threshold.
+        let six_days_ago = current_epoch_s().unwrap() - (6 * 86_400);
+        store
+            .set_workspace_unhealthy_since("mono", "mono-agent-001", six_days_ago)
+            .expect("set unhealthy_since");
+        drop(store);
+
+        // FakeRunner sequence:
+        // 1. gc_workspace_bookmarks: fetch, log (no consumed bookmarks), gc_collect pr remote
+        // 2. gc_aged_unhealthy_workspaces → reset_workspace: fetch, remote list, bookmark set, jj new
+        let gc_runner = FakeRunner::new(vec![
+            // gc_workspace_bookmarks
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    "bookmarks(glob:\"boss/exec_*\") & ::main",
+                    "--no-graph",
+                    "-T",
+                    "bookmarks ++ \"\\n\"",
+                ],
+                "",
+            ),
+            gc_pr_remote_noop_command(&ws_path),
+            // gc_aged_unhealthy_workspaces → reset_workspace
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main"], ""),
+        ]);
+
+        let gc_result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "gc"]),
+            Some(&database_path),
+            &gc_runner,
+        )
+        .expect("gc");
+        gc_runner.assert_exhausted();
+
+        assert_eq!(
+            gc_result.payload["unhealthy_recycled"].as_u64().unwrap(),
+            1,
+            "one dirty workspace should have been recycled"
+        );
+        assert!(
+            gc_result.message.contains("1 unhealthy workspace(s) recycled"),
+            "message should report recycled count: {}",
+            gc_result.message
+        );
+
+        // The workspace should now be clean in the store.
+        use crate::store::Store;
+        let store2 = Store::open_at(&database_path).unwrap();
+        let ws_after = store2.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(
+            ws_after.health_status, None,
+            "workspace health should be cleared after gc recycling"
+        );
     }
 
     #[test]

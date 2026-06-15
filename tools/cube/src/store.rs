@@ -520,6 +520,19 @@ impl Store {
         Ok(())
     }
 
+    /// Directly override a workspace's `unhealthy_since_epoch_s` timestamp.
+    /// Only used in tests to simulate an aged-unhealthy workspace without waiting.
+    #[cfg(test)]
+    pub fn set_workspace_unhealthy_since(&self, repo: &str, workspace_id: &str, epoch_s: i64) -> Result<(), CubeError> {
+        self.connection
+            .execute(
+                "UPDATE workspaces SET unhealthy_since_epoch_s = ?3 WHERE repo = ?1 AND workspace_id = ?2",
+                params![repo, workspace_id, epoch_s],
+            )
+            .map_err(CubeError::Storage)?;
+        Ok(())
+    }
+
     /// Mark a workspace's health as clean after pool GC has reset it.
     /// Clears both `health_status` and `unhealthy_since_epoch_s`, but only
     /// if the workspace is still free — if it was claimed mid-pass, this
