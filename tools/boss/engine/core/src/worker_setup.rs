@@ -1174,13 +1174,13 @@ def main():
 
     findings = (proc.stdout or "").strip()
     extra = (proc.stderr or "").strip()
-    # Empty stdout with non-empty stderr means checkleft crashed before
-    # producing any findings -- this is an internal/parser error, not a
-    # policy violation. Use a clearly distinct message so users don't try
-    # to fix policy or reach for BYPASS unnecessarily.
+    # Empty stdout with non-empty stderr means checkleft exited nonzero before
+    # producing any findings -- this is an internal/operational error (e.g. a
+    # VCS detection failure), not a policy violation. Use a clearly distinct
+    # message so users don't try to fix policy or reach for BYPASS unnecessarily.
     if not findings:
         reason = (
-            "Push blocked: checkleft internal error — parser crashed; this is "
+            "Push blocked: checkleft internal error — this is "
             "a bug, not a policy violation. Please report it.\n\n"
             + extra
         )

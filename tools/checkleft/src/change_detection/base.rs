@@ -85,6 +85,79 @@ impl HeadProber for GitHeadProber<'_> {
     }
 }
 
+/// Production [`HeadProber`] for **jj** workspaces. Resolves revisions and the
+/// merge-base via `jj` revsets against the shared store, so it works in
+/// non-colocated cube secondary workspaces (no `.git` at the workspace root) as
+/// well as colocated ones. Returned ids are git commit hashes (jj's `commit_id`
+/// over the git backend), interchangeable with git-resolved bases.
+///
+/// Only history is consulted (no shallow deepening): jj workspaces always carry
+/// full history via the shared store. Deepening remains a git/CI-only concern.
+pub(crate) struct JjHeadProber<'a> {
+    root: &'a Path,
+}
+
+impl<'a> JjHeadProber<'a> {
+    pub fn new(root: &'a Path) -> Self {
+        Self { root }
+    }
+
+    /// Translate the git-style revs `select_base` uses into jj revsets.
+    /// `select_base` only ever passes `origin/<branch>`, a bare `<branch>`, or
+    /// `HEAD^1`.
+    fn to_revset(rev: &str) -> String {
+        match rev {
+            "HEAD" => "@".to_owned(),
+            "HEAD^1" | "HEAD~1" => "@-".to_owned(),
+            r => match r.strip_prefix("origin/") {
+                Some(branch) => format!("{branch}@origin"),
+                None => r.to_owned(), // bare local bookmark or a raw commit id
+            },
+        }
+    }
+
+    /// `jj log -r <revset> -T commit_id`, first id only. `None` if the revset is
+    /// empty/unresolvable, resolves to jj's virtual root, or jj fails.
+    fn commit_id(&self, revset: &str) -> Option<String> {
+        let output = Command::new("jj")
+            .args([
+                "log",
+                "-r",
+                revset,
+                "--no-graph",
+                "--ignore-working-copy",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ])
+            .current_dir(self.root)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let out = String::from_utf8(output.stdout).ok()?;
+        let id = out.lines().next()?.trim();
+        // jj's virtual root commit is all-zeros; treat it as "no parent".
+        if id.is_empty() || id.bytes().all(|b| b == b'0') {
+            None
+        } else {
+            Some(id.to_owned())
+        }
+    }
+}
+
+impl HeadProber for JjHeadProber<'_> {
+    fn resolve(&self, rev: &str) -> Option<String> {
+        self.commit_id(&Self::to_revset(rev))
+    }
+
+    fn merge_base(&self, base_ref: &str) -> Option<String> {
+        // git merge-base(base_ref, HEAD) == jj `heads(::base & ::@)`.
+        let base = Self::to_revset(base_ref);
+        self.commit_id(&format!("heads((::{base}) & (::@))"))
+    }
+}
+
 /// Select the base revision for a given scenario.
 ///
 /// This is the **single centralised place** where the scenario→base matrix

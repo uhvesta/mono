@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::vcs::{Vcs, VcsKind};
 
-use self::base::{BaseSelection, EmptyReason, GitHeadProber, HeadProber, select_base};
+use self::base::{BaseSelection, EmptyReason, GitHeadProber, HeadProber, JjHeadProber, select_base};
 use self::default_branch::{RefProber, resolve_default_branch};
 use self::environment::CiEnvironment;
 use self::scenario::{Scenario, classify};
@@ -94,7 +94,7 @@ pub fn resolve_change_plan(env: &CiEnvironment, vcs: &Vcs, overrides: &ChangeOve
     // ── 2. --base-ref: bypass classification; keep merge-base semantics. ─────
     if let Some(base_ref) = overrides.base_ref.as_deref().filter(|s| !s.trim().is_empty()) {
         info!(base_ref, "--base-ref override: computing merge-base(ref, HEAD)");
-        let prober = GitHeadProber::new(vcs.root());
+        let prober = head_prober_for(vcs.kind(), vcs.root());
         let base_sha = prober
             .merge_base(base_ref)
             .ok_or_else(|| anyhow::anyhow!("git merge-base: no common ancestor between `{base_ref}` and HEAD"))?;
@@ -161,8 +161,8 @@ pub fn resolve_change_plan(env: &CiEnvironment, vcs: &Vcs, overrides: &ChangeOve
         }
     }
 
-    let head_prober = GitHeadProber::new(root);
-    let base_selection = select_base(&scenario, env, &head_prober, &default_branch);
+    let head_prober = head_prober_for(kind, root);
+    let base_selection = select_base(&scenario, env, head_prober.as_ref(), &default_branch);
     info!(?base_selection, "selected base revision");
 
     Ok(match base_selection {
@@ -175,6 +175,16 @@ pub fn resolve_change_plan(env: &CiEnvironment, vcs: &Vcs, overrides: &ChangeOve
             ChangePlan::Empty { reason }
         }
     })
+}
+
+/// Construct the right [`HeadProber`] for the VCS: jj revsets for jj workspaces
+/// (resolves a base in non-colocated shared-store workspaces, which have no
+/// `.git` at the root), raw `git` otherwise.
+fn head_prober_for(kind: VcsKind, root: &Path) -> Box<dyn HeadProber + '_> {
+    match kind {
+        VcsKind::Jujutsu => Box::new(JjHeadProber::new(root)),
+        VcsKind::Git => Box::new(GitHeadProber::new(root)),
+    }
 }
 
 /// Derive the base revision for source-tree reads from a resolved change plan.

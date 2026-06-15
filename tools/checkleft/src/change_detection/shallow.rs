@@ -32,11 +32,16 @@ pub const DEEPEN_LADDER: &[u32] = &[50, 250, 1000];
 ///   reachability check after each step, then `--unshallow` as last resort.
 ///   Returns `Ok(false)` if the ref is still unreachable after all attempts.
 ///
-/// # jj colocated repos
+/// # jj workspaces
 ///
-/// jj's colocated git repo is what is shallow. We operate on the underlying
-/// git repo via the `.git` directory at the workspace root and then run
-/// `jj git import` to sync jj's op log after deepening.
+/// - **Non-colocated (shared-store) jj workspace**: no `.git` at the workspace
+///   root. These share the canonical jj store, which always has full history —
+///   there is nothing to shallow-deepen. This function returns `Ok(true)`
+///   immediately without touching git. This is the correct model for cube
+///   secondary workspaces (`jj workspace add --no-colocate`).
+/// - **Colocated jj workspace**: has a `.git` at the workspace root. The
+///   underlying git repo may be a shallow CI clone. We operate on that git repo
+///   and run `jj git import` to sync jj's op log after deepening.
 pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &Scenario) -> Result<bool> {
     // Secondary jj workspaces have no colocated .git at their root. These are
     // local development environments, not CI shallow clones, so there is no
@@ -537,6 +542,32 @@ mod tests {
         assert!(!reached, "permanently unreachable ref must yield reached=false");
 
         drop(remote_dir);
+    }
+
+    // ── ensure_history: non-colocated jj workspace → immediate Ok(true) ──────
+
+    #[test]
+    fn ensure_history_returns_true_immediately_for_non_colocated_jj_workspace() {
+        // A directory with no .git — the shared-store jj workspace model.
+        // ensure_history must return Ok(true) immediately without attempting any
+        // git operations (which would fail since there is no git repo here).
+        let dir = tempdir().expect("tempdir");
+        // No .git created — this simulates a non-colocated jj workspace.
+
+        let result = ensure_history(
+            dir.path(),
+            VcsKind::Jujutsu,
+            "origin/main",
+            &Scenario::PushToBranch {
+                branch: "boss/exec_test".to_owned(),
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "non-colocated jj workspace must not error: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), true, "non-colocated jj workspace must return Ok(true)");
     }
 
     // ── resolve_git_root ──────────────────────────────────────────────────────

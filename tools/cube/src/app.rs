@@ -2411,13 +2411,13 @@ fn run_checkleft_gate_impl(cwd: &Path, checkleft: Option<PathBuf>) -> Result<()>
     let findings = findings.trim();
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
-    // Empty stdout with non-empty stderr means checkleft crashed before it
-    // could produce any findings — this is an internal/parser error, not a
-    // policy violation. Use a clearly distinct message so users don't try to
-    // fix policy or reach for BYPASS unnecessarily.
+    // Empty stdout with non-empty stderr means checkleft exited nonzero before
+    // producing any findings — this is an internal/operational error (e.g. a
+    // VCS detection failure), not a policy violation. Use a clearly distinct
+    // message so users don't try to fix policy or reach for BYPASS unnecessarily.
     if findings.is_empty() {
         return Err(CubeError::InvalidArgument(format!(
-            "checkleft internal error — parser crashed; this is a bug, not a policy \
+            "Push blocked: checkleft internal error — this is a bug, not a policy \
              violation. Please report it.\n\n{stderr}"
         )));
     }
