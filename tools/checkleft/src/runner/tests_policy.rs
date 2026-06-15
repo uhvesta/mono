@@ -47,6 +47,50 @@ impl ConfiguredCheck for StaticFindingCheck {
 }
 
 #[tokio::test]
+async fn runner_defaults_to_error_severity_when_no_policy_specified() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create dirs");
+    fs::write(temp.path().join("docs/file.md"), "hello\n").expect("write file");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "policy-check"
+check = "static-finding"
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(StaticFindingCheck {
+            id: "static-finding".to_owned(),
+            severity: Severity::Warning,
+            remediation: None,
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: Path::new("docs/file.md").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].findings.len(), 1);
+    assert_eq!(results[0].findings[0].severity, Severity::Error);
+}
+
+#[tokio::test]
 async fn runner_applies_policy_severity_override() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("docs")).expect("create dirs");

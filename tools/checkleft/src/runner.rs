@@ -835,10 +835,11 @@ fn apply_policy_to_result(
         }
     }
 
-    if let Some(severity_override) = policy.severity_override {
-        for finding in &mut result.findings {
-            finding.severity = severity_override;
-        }
+    // Default to Error when no policy severity is specified. A check author who
+    // wants a non-blocking check must explicitly set `policy: severity: warning`.
+    let effective_severity = policy.severity_override.unwrap_or(Severity::Error);
+    for finding in &mut result.findings {
+        finding.severity = effective_severity;
     }
 
     result

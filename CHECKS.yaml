@@ -5,9 +5,13 @@ check_definitions:
 
 checks:
   - id: docs-link-integrity
+    policy:
+      severity: warning
 
   - id: no-generated-artifacts
     check: file/forbidden-path
+    policy:
+      severity: warning
     config:
       rules:
         - remediation: "Generated build output must not be committed. Remove the artifact from the change."
@@ -52,12 +56,20 @@ checks:
       severity: error
 
   - id: lint/bazel
+    policy:
+      severity: error
 
   - id: rust-test-rule-coverage
+    policy:
+      severity: warning
 
   - id: todo-expiry
+    policy:
+      severity: warning
 
   - id: repo-visibility
+    policy:
+      severity: warning
 
   - id: format/rust
     policy:

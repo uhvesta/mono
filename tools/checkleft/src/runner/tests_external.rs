@@ -198,7 +198,8 @@ allow_bypass = true
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].check_id, "domain-typo");
     assert_eq!(results[0].findings.len(), 1);
-    assert_eq!(results[0].findings[0].severity, Severity::Warning);
+    // No policy severity specified → default is Error (strict-by-default).
+    assert_eq!(results[0].findings[0].severity, Severity::Error);
     assert_eq!(results[0].findings[0].message, "external ran");
 
     let seen_packages = seen_packages.lock().expect("lock seen packages").clone();
