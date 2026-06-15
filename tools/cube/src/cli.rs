@@ -115,6 +115,13 @@ pub enum WorkspaceCommand {
         /// Mutually exclusive with `--allow-dirty`.
         #[arg(long, conflicts_with = "allow_dirty")]
         resume_pr: Option<u64>,
+        /// Workspace ids to skip even if they are otherwise free and healthy.
+        /// May be repeated: `--exclude mono-agent-037 --exclude mono-agent-012`.
+        /// Used by the engine to avoid re-offering a workspace that was just
+        /// refused (e.g. occupancy-guard rejection) so a single stuck workspace
+        /// cannot livelock a dispatch loop.
+        #[arg(long = "exclude", action = clap::ArgAction::Append)]
+        exclude: Vec<String>,
     },
     /// Release a workspace lease.
     ///
@@ -502,6 +509,7 @@ mod tests {
                         prefer,
                         allow_dirty,
                         resume_pr,
+                        ..
                     },
             } => {
                 assert_eq!(repo, "mono");
@@ -536,6 +544,7 @@ mod tests {
                         prefer,
                         allow_dirty,
                         resume_pr,
+                        ..
                     },
             } => {
                 assert_eq!(repo, "mono");
@@ -611,6 +620,7 @@ mod tests {
                         prefer,
                         allow_dirty,
                         resume_pr,
+                        ..
                     },
             } => {
                 assert_eq!(repo, "mono");

@@ -930,6 +930,7 @@ fn run_workspace(
             prefer,
             allow_dirty,
             resume_pr,
+            exclude,
         } => {
             let repo_record = store
                 .get_repo(&repo)?
@@ -1148,20 +1149,24 @@ fn run_workspace(
             // Ordering: try the --prefer workspace first; effective-free before
             // stale-dirty so we skip the stale-dirty jj-status cost when a clean
             // candidate is already available.
+            // Workspaces listed in --exclude are skipped entirely so the engine
+            // can avoid re-offering a workspace it just refused (e.g. occupancy
+            // guard) without looping forever on the same candidate.
             let ordered_ids: Vec<String> = {
                 let mut v = Vec::new();
                 if let Some(pref) = prefer.as_deref()
                     && all_free.iter().any(|w| w.workspace_id == pref)
+                    && !exclude.contains(&pref.to_string())
                 {
                     v.push(pref.to_string());
                 }
                 for w in &effective_free {
-                    if !v.contains(&w.workspace_id) {
+                    if !v.contains(&w.workspace_id) && !exclude.contains(&w.workspace_id) {
                         v.push(w.workspace_id.clone());
                     }
                 }
                 for w in &stale_unhealthy {
-                    if !v.contains(&w.workspace_id) {
+                    if !v.contains(&w.workspace_id) && !exclude.contains(&w.workspace_id) {
                         v.push(w.workspace_id.clone());
                     }
                 }

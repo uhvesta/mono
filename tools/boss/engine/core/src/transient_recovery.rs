@@ -600,6 +600,7 @@ mod tests {
             _: Option<&str>,
             _: bool,
             _: Option<u64>,
+            _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
         }

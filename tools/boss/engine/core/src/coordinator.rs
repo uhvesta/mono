@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -310,6 +310,7 @@ pub trait CubeClient: Send + Sync {
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
         resume_pr: Option<u64>,
+        exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease>;
     async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle>;
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
@@ -408,8 +409,18 @@ impl CubeClient for CommandCubeClient {
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
         resume_pr: Option<u64>,
+        exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
-        crate::cube_commands::lease_workspace(self, repo_id, task, prefer_workspace_id, allow_dirty, resume_pr).await
+        crate::cube_commands::lease_workspace(
+            self,
+            repo_id,
+            task,
+            prefer_workspace_id,
+            allow_dirty,
+            resume_pr,
+            exclude_workspace_ids,
+        )
+        .await
     }
 
     async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
@@ -1020,6 +1031,16 @@ pub struct ExecutionCoordinator {
     /// [`Self::set_live_worker_states`]. When absent the guard fails open
     /// (the historical no-check behaviour).
     live_worker_states: Option<Arc<crate::live_worker_state::LiveWorkerStateRegistry>>,
+    /// Workspace IDs refused by the occupancy guard, keyed by execution id.
+    /// When cube hands us a workspace that the engine's live-worker registry
+    /// knows is still occupied, we release the lease and record the workspace
+    /// here so the *next* `cube workspace lease` call passes `--exclude` and
+    /// skips it — breaking the livelock where the same occupied-but-"free"
+    /// workspace is re-offered on every retry. Lives in memory only (no DB
+    /// schema change needed); clears on engine restart, which is acceptable
+    /// because at worst we refuse once more and re-populate the set.
+    #[builder(default = Mutex::new(HashMap::new()))]
+    refused_workspaces: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// Check out a leased cube workspace to the head commit of a PR, so a reviewer
@@ -1100,6 +1121,7 @@ impl ExecutionCoordinator {
             dispatch_paused: AtomicBool::new(false),
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
             live_worker_states: None,
+            refused_workspaces: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2282,6 +2304,17 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
+                // Record this workspace as refused so the next lease call
+                // passes --exclude and skips it, breaking the livelock where
+                // cube's deterministic ordering re-offers the same occupied
+                // workspace on every retry attempt.
+                self.refused_workspaces
+                    .lock()
+                    .await
+                    .entry(execution.id.clone())
+                    .or_default()
+                    .push(lease.workspace_id.clone());
+
                 // Hand the workspace straight back so it isn't stranded.
                 if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
                     tracing::error!(
@@ -2794,6 +2827,19 @@ impl ExecutionCoordinator {
             "none"
         };
 
+        // Look up any workspaces that were refused for this execution by the
+        // occupancy guard on a previous dispatch attempt. Passing them as
+        // `--exclude` to cube breaks the livelock where cube's deterministic
+        // candidate ordering keeps re-offering the same occupied workspace.
+        let refused: Vec<String> = self
+            .refused_workspaces
+            .lock()
+            .await
+            .get(&execution.id)
+            .cloned()
+            .unwrap_or_default();
+        let refused_refs: Vec<&str> = refused.iter().map(|s| s.as_str()).collect();
+
         // Stale-lease reclaim (issue #962 — UI-crash resume).
         //
         // A hard-prefer resume targets the exact workspace the dead
@@ -2827,6 +2873,9 @@ impl ExecutionCoordinator {
         if let Some(n) = resume_pr_str.as_deref() {
             attempt1_args.extend_from_slice(&["--resume-pr", n]);
         }
+        for excluded in &refused_refs {
+            attempt1_args.extend_from_slice(&["--exclude", excluded]);
+        }
         let attempt1_repr = adapter.command_repr(&attempt1_args);
 
         // First attempt: use the preferred workspace if the caller
@@ -2846,13 +2895,23 @@ impl ExecutionCoordinator {
                         "fallback_policy": fallback_policy,
                         "allow_dirty": allow_dirty,
                         "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
+                        "excluded_workspace_ids": refused,
                     })),
             )
             .await;
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         let first_err = match self
-            .invoke_lease(repo, task, prefer, allow_dirty, resume_pr, CUBE_LEASE_TIMEOUT, adapter)
+            .invoke_lease(
+                repo,
+                task,
+                prefer,
+                allow_dirty,
+                resume_pr,
+                CUBE_LEASE_TIMEOUT,
+                adapter,
+                &refused_refs,
+            )
             .await
         {
             Ok(lease) => {
@@ -2885,6 +2944,7 @@ impl ExecutionCoordinator {
                                 "reason": reason,
                                 "fallback_policy": fallback_policy,
                                 "allow_dirty": allow_dirty,
+                                "excluded_workspace_ids": refused,
                             })),
                     )
                     .await;
@@ -2912,6 +2972,9 @@ impl ExecutionCoordinator {
         if let Some(n) = resume_pr_str.as_deref() {
             attempt2_args.extend_from_slice(&["--resume-pr", n]);
         }
+        for excluded in &refused_refs {
+            attempt2_args.extend_from_slice(&["--exclude", excluded]);
+        }
         let attempt2_repr = adapter.command_repr(&attempt2_args);
 
         self.dispatch_events
@@ -2927,13 +2990,23 @@ impl ExecutionCoordinator {
                         "fallback_policy": "none",
                         "timeout_ms": CUBE_LEASE_TIMEOUT.as_millis() as u64,
                         "fallback_from_prefer": prefer,
+                        "excluded_workspace_ids": refused,
                     })),
             )
             .await;
 
         CUBE_WORKSPACE_LEASE_ATTEMPTS.inc(&self.metrics);
         match self
-            .invoke_lease(repo, task, None, false, resume_pr, CUBE_LEASE_TIMEOUT, adapter)
+            .invoke_lease(
+                repo,
+                task,
+                None,
+                false,
+                resume_pr,
+                CUBE_LEASE_TIMEOUT,
+                adapter,
+                &refused_refs,
+            )
             .await
         {
             Ok(lease) => {
@@ -2964,6 +3037,7 @@ impl ExecutionCoordinator {
                                 "reason": reason,
                                 "fallback_policy": "none",
                                 "fallback_from_prefer": prefer,
+                                "excluded_workspace_ids": refused,
                             })),
                     )
                     .await;
@@ -2986,10 +3060,18 @@ impl ExecutionCoordinator {
         resume_pr: Option<u64>,
         timeout: Duration,
         adapter: &Arc<dyn HostAdapter>,
+        exclude_workspace_ids: &[&str],
     ) -> std::result::Result<CubeWorkspaceLease, (&'static str, anyhow::Error)> {
         match tokio::time::timeout(
             timeout,
-            adapter.lease_workspace(&repo.repo_id, task, prefer_workspace_id, allow_dirty, resume_pr),
+            adapter.lease_workspace(
+                &repo.repo_id,
+                task,
+                prefer_workspace_id,
+                allow_dirty,
+                resume_pr,
+                exclude_workspace_ids,
+            ),
         )
         .await
         {
@@ -4088,7 +4170,7 @@ mod tests {
 
     /// Recorded args for each `lease_workspace` call:
     /// `(repo_id, task, prefer_workspace_id, allow_dirty, resume_pr)`.
-    type LeaseCall = (String, String, Option<String>, bool, Option<u64>);
+    type LeaseCall = (String, String, Option<String>, bool, Option<u64>, Vec<String>);
 
     #[derive(Default)]
     struct FakeCubeClient {
@@ -4123,6 +4205,13 @@ mod tests {
         fail_first_n_leases: usize,
         fail_create: bool,
         next_workspace_id: Mutex<Option<String>>,
+        /// Ordered queue of workspace IDs to return from successive
+        /// `lease_workspace` calls. When non-empty, dequeues from the
+        /// front; when empty, falls through to `next_workspace_id` or the
+        /// default "mono-agent-001". Used by livelock tests that need the
+        /// first lease call to return an occupied workspace and subsequent
+        /// calls to return a free one.
+        workspace_id_queue: Mutex<std::collections::VecDeque<String>>,
         /// Canned response for `list_workspaces` — lets a test model cube
         /// reporting a workspace still leased to a dead worker so the
         /// stale-lease reclaim path (issue #962) can be exercised.
@@ -4132,6 +4221,11 @@ mod tests {
     impl FakeCubeClient {
         fn with_next_workspace_id(self, id: impl Into<String>) -> Self {
             *self.next_workspace_id.try_lock().expect("uncontended") = Some(id.into());
+            self
+        }
+
+        fn with_workspace_id_queue(self, ids: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            *self.workspace_id_queue.try_lock().expect("uncontended") = ids.into_iter().map(|s| s.into()).collect();
             self
         }
 
@@ -4165,6 +4259,7 @@ mod tests {
             prefer_workspace_id: Option<&str>,
             allow_dirty: bool,
             resume_pr: Option<u64>,
+            exclude_workspace_ids: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             let mut calls = self.lease_calls.lock().await;
             let call_index = calls.len();
@@ -4174,6 +4269,7 @@ mod tests {
                 prefer_workspace_id.map(str::to_owned),
                 allow_dirty,
                 resume_pr,
+                exclude_workspace_ids.iter().map(|s| s.to_string()).collect(),
             ));
             drop(calls);
             if self.fail_lease {
@@ -4187,11 +4283,15 @@ mod tests {
             if call_index < self.fail_first_n_leases {
                 return Err(anyhow!("cube workspace lease failed: workspace has uncommitted work"));
             }
+            // Queue takes priority; falls through to next_workspace_id, then prefer,
+            // then the default. The queue lets tests model a sequence of
+            // workspace responses (e.g. occupied-then-free for livelock tests).
             let workspace_id = self
-                .next_workspace_id
+                .workspace_id_queue
                 .lock()
                 .await
-                .clone()
+                .pop_front()
+                .or_else(|| self.next_workspace_id.try_lock().ok().and_then(|g| g.clone()))
                 .or_else(|| prefer_workspace_id.map(str::to_owned))
                 .unwrap_or_else(|| "mono-agent-001".to_owned());
             Ok(CubeWorkspaceLease {
@@ -9415,6 +9515,142 @@ mod tests {
         assert!(
             cube.ensure_calls.lock().await.is_empty(),
             "no cube ensure must occur for a gated execution"
+        );
+    }
+
+    /// Occupancy-guard livelock regression (T1769). When cube keeps handing
+    /// back the same occupied workspace, the engine must exclude it on the
+    /// next lease call and land on a different free workspace.
+    ///
+    /// Setup:
+    ///   - mono-agent-037 is returned first by cube, and the live-worker
+    ///     registry says exec-live occupies it (live pid = current test
+    ///     process, so probe_pid sees it as alive).
+    ///   - mono-agent-014 is returned on subsequent calls (simulating cube
+    ///     respecting --exclude mono-agent-037).
+    ///
+    /// Expected: the execution lands on mono-agent-014, not loops forever
+    /// on mono-agent-037; and the second lease call carries --exclude
+    /// mono-agent-037.
+    #[tokio::test]
+    async fn occupancy_refusal_excludes_workspace_on_retry() {
+        use crate::live_worker_state::LiveWorkerStateRegistry;
+        use boss_protocol::WorkerEvent;
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Anti-livelock task")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        // Create a second product and chore to serve as the "occupied" execution.
+        // We need a separate DB row for exec-live so get_execution(exec_live.id)
+        // returns cube_workspace_id = "mono-agent-037".
+        let other_product = db
+            .create_product(CreateProductInput {
+                name: "OtherProduct".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let other_chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(other_product.id.clone())
+                    .name("Live worker chore")
+                    .build(),
+            )
+            .unwrap();
+        db.reconcile_product_executions(&other_product.id).unwrap();
+        let exec_live = db.list_executions(Some(&other_chore.id)).unwrap().pop().unwrap();
+        // Transition it to running so start_execution_run can set cube_workspace_id.
+        db.start_execution_run(
+            &exec_live.id,
+            "worker-0",
+            "mono",
+            "lease-live",
+            "mono-agent-037",
+            "/workspaces/mono-agent-037",
+        )
+        .unwrap();
+
+        // First lease returns the occupied workspace; subsequent calls
+        // return the free one (simulating cube respecting --exclude).
+        let cube = Arc::new(FakeCubeClient::default().with_workspace_id_queue(["mono-agent-037", "mono-agent-014"]));
+
+        // Wire the live-worker registry: exec-live is Working and alive
+        // (pid = current test process → probe_pid sees it as alive).
+        let live_pid = std::process::id() as i32;
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        live_states.register_spawn(0, &exec_live.id, "sonnet", live_pid, None);
+        // Advance the slot to Working so the occupancy guard doesn't see Spawning.
+        live_states.apply_event(
+            0,
+            &WorkerEvent::UserPromptSubmit {
+                session_id: "s".to_owned(),
+                prompt: "do the thing".to_owned(),
+            },
+        );
+
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+
+        let mut coordinator_inner =
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone());
+        coordinator_inner.set_live_worker_states(live_states);
+        // Zero-delay retry so the test doesn't sleep.
+        let coordinator = Arc::new(coordinator_inner.with_pre_start_retry_delays(vec![Duration::ZERO]));
+
+        coordinator.kick();
+
+        // Wait for the anti-livelock task execution to reach Running.
+        let our_execution_id = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap().id;
+
+        wait_for_execution_status(db.as_ref(), &our_execution_id, ExecutionStatus::Running).await;
+
+        let calls = cube.lease_calls.lock().await;
+        // At minimum two cube lease calls: first returning mono-agent-037
+        // (refused by occupancy guard), then returning mono-agent-014 (accepted).
+        assert!(
+            calls.len() >= 2,
+            "expected at least 2 lease calls (refused + accepted); got {}",
+            calls.len()
+        );
+        // The second call must exclude mono-agent-037.
+        assert!(
+            calls[1].5.iter().any(|id| id == "mono-agent-037"),
+            "second lease call must pass --exclude mono-agent-037; got {:?}",
+            calls[1].5
+        );
+        drop(calls);
+
+        // The execution must have landed on mono-agent-014, not 037.
+        let execution = db.get_execution(&our_execution_id).unwrap();
+        assert_eq!(
+            execution.cube_workspace_id.as_deref(),
+            Some("mono-agent-014"),
+            "execution must land on the free workspace, not the occupied one"
         );
     }
 }

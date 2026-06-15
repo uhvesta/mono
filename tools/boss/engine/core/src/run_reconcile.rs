@@ -276,6 +276,7 @@ mod tests {
             _prefer: Option<&str>,
             _allow_dirty: bool,
             _resume_pr: Option<u64>,
+            _exclude: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!("not used by probe")
         }

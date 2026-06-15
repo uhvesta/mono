@@ -104,6 +104,7 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     prefer_workspace_id: Option<&str>,
     allow_dirty: bool,
     resume_pr: Option<u64>,
+    exclude_workspace_ids: &[&str],
 ) -> Result<CubeWorkspaceLease> {
     let resume_pr_str = resume_pr.map(|n| n.to_string());
     let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
@@ -115,6 +116,9 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     }
     if let Some(n) = resume_pr_str.as_deref() {
         args.extend_from_slice(&["--resume-pr", n]);
+    }
+    for excluded in exclude_workspace_ids {
+        args.extend_from_slice(&["--exclude", excluded]);
     }
     let payload: LeasePayload = serde_json::from_value(transport.run_cube_json(&args).await?)
         .context("decoding `cube workspace lease` payload")?;

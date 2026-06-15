@@ -5006,6 +5006,7 @@ mod tests {
             _: Option<&str>,
             _: bool,
             _: Option<u64>,
+            _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unreachable!("not used in completion tests")
         }

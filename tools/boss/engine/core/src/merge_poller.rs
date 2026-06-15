@@ -3252,6 +3252,7 @@ mod tests {
             _: Option<&str>,
             _: bool,
             _: Option<u64>,
+            _: &[&str],
         ) -> Result<crate::coordinator::CubeWorkspaceLease> {
             unreachable!("not used in merge_poller tests")
         }
@@ -6109,6 +6110,7 @@ mod tests {
             _: Option<&str>,
             _: bool,
             _: Option<u64>,
+            _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }

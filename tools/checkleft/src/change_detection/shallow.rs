@@ -603,6 +603,25 @@ mod tests {
     // ── resolve_git_root ──────────────────────────────────────────────────────
 
     #[test]
+    fn ensure_history_is_noop_for_non_colocated_jj_workspace() {
+        // Non-colocated jj workspaces (cube secondary workspaces) have no
+        // .git dir. ensure_history must return Ok(true) without trying to
+        // resolve a git root, so cube pr ensure can push from them.
+        let dir = tempdir().expect("tempdir");
+        // No .git directory — non-colocated secondary workspace.
+        let result = ensure_history(
+            dir.path(),
+            VcsKind::Jujutsu,
+            "origin/main",
+            &Scenario::PushToBranch {
+                branch: "my-feature".to_owned(),
+            },
+        );
+        assert!(result.is_ok(), "must not error: {:?}", result);
+        assert!(result.unwrap(), "must return true (nothing to deepen)");
+    }
+
+    #[test]
     fn resolve_git_root_errors_for_jj_without_colocated_git() {
         let dir = tempdir().expect("tempdir");
         // No .git directory → should fail.

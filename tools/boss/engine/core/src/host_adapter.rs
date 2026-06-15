@@ -79,6 +79,7 @@ pub trait HostAdapter: Send + Sync {
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
         resume_pr: Option<u64>,
+        exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease>;
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()>;
@@ -183,9 +184,17 @@ impl HostAdapter for LocalHostAdapter {
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
         resume_pr: Option<u64>,
+        exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
         self.cube_client
-            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, resume_pr)
+            .lease_workspace(
+                repo_id,
+                task,
+                prefer_workspace_id,
+                allow_dirty,
+                resume_pr,
+                exclude_workspace_ids,
+            )
             .await
     }
 
@@ -461,8 +470,18 @@ impl HostAdapter for SshHostAdapter {
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
         resume_pr: Option<u64>,
+        exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
-        crate::cube_commands::lease_workspace(self, repo_id, task, prefer_workspace_id, allow_dirty, resume_pr).await
+        crate::cube_commands::lease_workspace(
+            self,
+            repo_id,
+            task,
+            prefer_workspace_id,
+            allow_dirty,
+            resume_pr,
+            exclude_workspace_ids,
+        )
+        .await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
