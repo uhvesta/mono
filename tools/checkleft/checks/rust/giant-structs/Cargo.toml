@@ -20,3 +20,6 @@ checkleft-check-sdk = { path = "../../../sdk" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 syn = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

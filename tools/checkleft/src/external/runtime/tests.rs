@@ -791,57 +791,14 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
     assert_eq!(loc.path, Path::new("src.rs"));
 }
 
-/// Verifies the modified-only scope: a file that was NOT in the changeset must
-/// not be read even when it contains violations — the sandbox excludes it.
-#[test]
-fn bundled_giant_structs_check_skips_files_not_in_changeset() {
-    use crate::external::{
-        BundledExternalCheckPackageProvider, ExternalCheckImplementationRef, ExternalCheckPackageProvider as _,
-    };
-
-    const VIOLATION_SOURCE: &str = r#"pub struct GiantStruct {
-    a: String, b: String, c: String, d: String, e: String, f: String,
-}
-"#;
-
-    let temp = tempdir().expect("temp dir");
-    // Write the file but do NOT include it in the changeset.
-    fs::write(temp.path().join("out_of_scope.rs"), VIOLATION_SOURCE).expect("write source");
-    // The changeset only contains a harmless file.
-    fs::write(temp.path().join("empty.rs"), "").expect("write empty");
-
-    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
-    let changeset = ChangeSet::new(vec![ChangedFile {
-        path: PathBuf::from("empty.rs"),
-        kind: ChangeKind::Modified,
-        old_path: None,
-    }]);
-
-    let provider = BundledExternalCheckPackageProvider;
-    let package = provider
-        .resolve(&ExternalCheckImplementationRef::Bundled(
-            "rust/giant-structs".to_owned(),
-        ))
-        .expect("resolve")
-        .expect("bundled package must exist");
-
-    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
-    let result = executor
-        .execute(
-            &package,
-            &changeset,
-            &tree,
-            &toml::Value::Table(Default::default()),
-            std::path::Path::new(""),
-        )
-        .expect("execute");
-
-    assert!(
-        result.findings.is_empty(),
-        "out-of-scope file must not be read; got {} finding(s)",
-        result.findings.len()
-    );
-}
+// NOTE: the modified-only scope behavior (a file NOT in the changeset is never
+// read even when it contains a violation) is no longer round-tripped through the
+// real component here. Its mechanism is proven structurally — the sandbox simply
+// excludes out-of-scope files — by
+// `sandbox_is_populated_only_with_changeset_files_for_modified_only_scope` above,
+// and the check's own detection logic is covered by the native unit tests in the
+// giant-structs check crate. Keeping a full wasm execution just to re-observe
+// "no finding" was redundant matrix coverage on the slow layer.
 
 /// Regression test: the check must complete without crashing when given a large
 /// Rust file (~3100 lines). Previously, an instruction-counting fuel limit was

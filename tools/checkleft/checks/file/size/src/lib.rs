@@ -338,6 +338,71 @@ mod tests {
     }
 
     #[test]
+    fn deleted_files_are_never_flagged() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        // No file on disk: a deleted oversized file must be skipped before any read.
+        let findings = run_with_config(
+            make_changeset("gone.rs", ChangeKind::Deleted, 0, 10),
+            r#"{"max_lines": 2}"#,
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn default_max_lines_applies_when_unset() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        // 501 lines: just over the built-in default of 500, with no max_lines in config.
+        let body = "x\n".repeat(501);
+        fs::write(dir.path().join("big.rs"), &body).unwrap();
+
+        let findings = run_with_config(make_changeset("big.rs", ChangeKind::Added, 501, 0), "{}");
+
+        std::env::set_current_dir(old_cwd).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].message.contains("max_lines=500"),
+            "message was: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn multiple_exclude_patterns_are_all_honored() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        fs::write(dir.path().join("a.lock"), "a\nb\nc\n").unwrap();
+        fs::write(dir.path().join("b.gen"), "a\nb\nc\n").unwrap();
+        fs::write(dir.path().join("c.rs"), "a\nb\nc\n").unwrap();
+
+        let config = r#"{"max_lines": 2, "exclude_files": ["**/*.lock", "**/*.gen"]}"#;
+        let excluded_a = run_with_config(make_changeset("a.lock", ChangeKind::Modified, 2, 0), config);
+        let excluded_b = run_with_config(make_changeset("b.gen", ChangeKind::Modified, 2, 0), config);
+        let flagged_c = run_with_config(make_changeset("c.rs", ChangeKind::Modified, 2, 0), config);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+
+        assert!(excluded_a.is_empty(), "*.lock must be excluded");
+        assert!(excluded_b.is_empty(), "*.gen must be excluded");
+        assert_eq!(
+            flagged_c.len(),
+            1,
+            "a non-excluded oversized file must still be flagged"
+        );
+    }
+
+    #[test]
     fn repo_relative_glob_matches_within_its_subtree() {
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();

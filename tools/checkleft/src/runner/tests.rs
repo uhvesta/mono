@@ -10,6 +10,7 @@ use tempfile::tempdir;
 use crate::check::{Check, CheckRegistry, ConfiguredCheck};
 use crate::checks::register_builtin_checks;
 use crate::config::ConfigResolver;
+use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::external::{
     ExternalCheckComponentPackage, ExternalCheckExecutor, ExternalCheckImplementationRef, ExternalCheckPackage,
     ExternalCheckPackageImplementation, ExternalCheckPackageProvider, parse_external_check_package_manifest,
@@ -58,6 +59,60 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
             check_id: package.id.clone(),
             findings: Vec::new(),
         }))
+    }
+}
+
+/// A mock component executor for the stale-exclusion *host orchestration* tests.
+///
+/// It returns a caller-supplied set of declared exclusions and a fixed
+/// `ExclusionStatus`, so the runner's audit plumbing (diff-gating, CHECKS-line
+/// resolution, severity application, off-mode short-circuit) can be asserted
+/// without compiling or running the real wasm component. The
+/// stale-vs-load-bearing *determination* itself is proven natively in the
+/// giant-structs check crate; here we only verify what the host does with it.
+struct MockExclusionExecutor {
+    declared: Vec<DeclaredExclusion>,
+    status: ExclusionStatus,
+    /// Number of times `evaluate_exclusion_for_component` was invoked. Zero proves
+    /// the audit was short-circuited (e.g. severity = off) before consulting the check.
+    evaluate_calls: Arc<Mutex<usize>>,
+}
+
+impl ExternalCheckExecutor for MockExclusionExecutor {
+    fn execute(
+        &self,
+        package: &ExternalCheckPackage,
+        _changeset: &ChangeSet,
+        _source_tree: &dyn SourceTree,
+        _config: &toml::Value,
+        _config_dir: &std::path::Path,
+    ) -> Result<CheckResult> {
+        Ok(CheckResult {
+            check_id: package.id.clone(),
+            findings: Vec::new(),
+        })
+    }
+
+    fn declared_exclusions_for_component(
+        &self,
+        _package: &ExternalCheckPackage,
+        _check_name: &str,
+        _config_json: &str,
+        _config_dir: &std::path::Path,
+    ) -> Result<Vec<DeclaredExclusion>> {
+        Ok(self.declared.clone())
+    }
+
+    fn evaluate_exclusion_for_component(
+        &self,
+        _package: &ExternalCheckPackage,
+        _check_name: &str,
+        _config_json: &str,
+        _exclusion: &DeclaredExclusion,
+        _file_content: Option<&str>,
+    ) -> Result<ExclusionStatus> {
+        *self.evaluate_calls.lock().expect("lock evaluate calls") += 1;
+        Ok(self.status.clone())
     }
 }
 
@@ -750,18 +805,23 @@ fn shared_builder_audit_executor() -> Arc<dyn ExternalCheckExecutor> {
     Arc::clone(EXECUTOR.get_or_init(|| Arc::new(executor_with_precompiled_cache(root))))
 }
 
-async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
+/// Run the audit for the standard `tools/boss/engine/src/app.rs` changeset with an
+/// arbitrary external executor (real wasm component or mock).
+async fn run_builder_audit_with_executor(
+    temp: &tempfile::TempDir,
+    executor: Arc<dyn ExternalCheckExecutor>,
+) -> Vec<CheckResult> {
     use crate::external::BundledExternalCheckPackageProvider;
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry).expect("register built-ins");
-    // Use the full external stack so bundled component checks resolve and execute.
-    // Executor is shared across the four builder-audit tests (see shared_builder_audit_executor).
+    // The bundled provider only resolves package metadata (cheap sha256 over the
+    // embedded bytes); whether any wasm is compiled/run is up to the executor.
     let runner = Runner::with_external(
         Arc::new(registry),
         Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
         Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
         Arc::new(BundledExternalCheckPackageProvider),
-        shared_builder_audit_executor(),
+        executor,
     );
     runner
         .run_changeset(&ChangeSet::new(vec![ChangedFile {
@@ -773,6 +833,31 @@ async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
         .expect("run checks")
 }
 
+/// The real-component parity variant: runs the audit through the actual bundled
+/// wasm component (shared across the round-trip tests, see
+/// [`shared_builder_audit_executor`]).
+async fn run_builder_audit(temp: &tempfile::TempDir) -> Vec<CheckResult> {
+    run_builder_audit_with_executor(temp, shared_builder_audit_executor()).await
+}
+
+/// Run the audit with a MOCK component executor that declares one
+/// `engine/src/app.rs::ServerState` exclusion (depending on the changed file) and
+/// reports `status`. Returns the results plus the mock's evaluate-call count.
+async fn run_mock_exclusion_audit(temp: &tempfile::TempDir, status: ExclusionStatus) -> (Vec<CheckResult>, usize) {
+    let evaluate_calls = Arc::new(Mutex::new(0usize));
+    let executor = Arc::new(MockExclusionExecutor {
+        declared: vec![DeclaredExclusion {
+            entry: "engine/src/app.rs::ServerState".to_owned(),
+            depends_on: vec![Path::new("tools/boss/engine/src/app.rs").to_path_buf()],
+        }],
+        status,
+        evaluate_calls: Arc::clone(&evaluate_calls),
+    });
+    let results = run_builder_audit_with_executor(temp, executor).await;
+    let calls = *evaluate_calls.lock().expect("lock evaluate calls");
+    (results, calls)
+}
+
 fn stale_findings(results: &[CheckResult]) -> Vec<&Finding> {
     results
         .iter()
@@ -781,6 +866,12 @@ fn stale_findings(results: &[CheckResult]) -> Vec<&Finding> {
         .collect()
 }
 
+/// Layer-3 parity round-trip: the REAL bundled wasm component, run end-to-end
+/// through the audit, must produce a stale finding anchored on the CHECKS.toml
+/// entry line. This is the one real-component exclusion-audit test kept to prove
+/// the component's `declared-exclusions` / `evaluate-exclusion` hooks behave
+/// identically to the native determination; the orchestration variants below use
+/// a mock executor so they don't pay the wasm cost.
 #[tokio::test]
 async fn stale_exclusion_surfaced_on_checks_toml_when_struct_gains_builder() {
     let temp = boss_repo_with_app("", SERVER_STATE_WITH_BUILDER);
@@ -798,10 +889,18 @@ async fn stale_exclusion_surfaced_on_checks_toml_when_struct_gains_builder() {
     assert!(finding.message.contains("engine/src/app.rs::ServerState"));
 }
 
+// Layer-2 host orchestration: the verdict is supplied by a mock executor (the
+// determination itself is proven natively in the giant-structs crate); these
+// assert only what the *host* does with that verdict.
+
 #[tokio::test]
 async fn load_bearing_exclusion_is_not_flagged() {
     let temp = boss_repo_with_app("", SERVER_STATE_WITHOUT_BUILDER);
-    let results = run_builder_audit(&temp).await;
+    let (results, calls) = run_mock_exclusion_audit(&temp, ExclusionStatus::LoadBearing).await;
+    assert_eq!(
+        calls, 1,
+        "the audit must consult the check exactly once for the dependent exclusion"
+    );
     assert!(
         stale_findings(&results).is_empty(),
         "load-bearing exclusion must stay quiet, got {results:?}"
@@ -814,7 +913,13 @@ async fn stale_exclusion_severity_setting_upgrades_to_error() {
         "[settings]\nstale_exclusion_severity = \"error\"\n",
         SERVER_STATE_WITH_BUILDER,
     );
-    let results = run_builder_audit(&temp).await;
+    let (results, _calls) = run_mock_exclusion_audit(
+        &temp,
+        ExclusionStatus::Stale {
+            reason: "ServerState now satisfies the builder rule".to_owned(),
+        },
+    )
+    .await;
     let stale = stale_findings(&results);
     assert_eq!(stale.len(), 1, "expected one stale finding, got {results:?}");
     assert_eq!(stale[0].severity, Severity::Error);
@@ -826,7 +931,14 @@ async fn stale_exclusion_severity_off_disables_audit() {
         "[settings]\nstale_exclusion_severity = \"off\"\n",
         SERVER_STATE_WITH_BUILDER,
     );
-    let results = run_builder_audit(&temp).await;
+    let (results, calls) = run_mock_exclusion_audit(
+        &temp,
+        ExclusionStatus::Stale {
+            reason: "irrelevant — the audit is disabled".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(calls, 0, "off mode must short-circuit before the check is consulted");
     assert!(
         stale_findings(&results).is_empty(),
         "audit must be disabled when set to off, got {results:?}"

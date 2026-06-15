@@ -1,5 +1,5 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 # The rust/giant-structs check logic as an ordinary rlib. It is linked (together
 # with the other preinstalled checks) into the single multiplexed Component Model
@@ -24,4 +24,27 @@ rust_library(
         "@@rules_rust++crate+mono_crates__serde_json-1.0.150//:serde_json",
         "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
     ] + all_crate_deps(normal = True),
+)
+
+# Native unit tests for the check logic (no wasm host). These carry the bulk of
+# the giant-structs behavioral matrix so it no longer has to be exercised through
+# the slow host→wasm executor path; the wasm layer keeps only a thin round-trip
+# set proving parity (see //tools/checkleft:checkleft_lib_test).
+rust_test(
+    name = "rust_giant_structs_use_builder_test",
+    size = "small",
+    crate = ":rust_giant_structs_use_builder",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/checkleft/sdk:checkleft_check_sdk",
+        "@@rules_rust++crate+mono_crates__serde_json-1.0.150//:serde_json",
+        "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
+        "@@rules_rust++crate+mono_crates__tempfile-3.27.0//:tempfile",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
 )
