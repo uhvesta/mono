@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -267,6 +268,11 @@ pub struct DefaultExternalCheckExecutor {
     /// directory could not be created (disk full, read-only FS, etc.); in that
     /// case every component-v1 invocation falls back to JIT compilation.
     component_cache: Option<ComponentAotCache>,
+    /// Per-run cache of loaded audit components, keyed by `artifact_sha256`.
+    /// Avoids re-reading the WASM bytes and re-computing the SHA-256 digest
+    /// for every `declared_exclusions_for_component` / `evaluate_exclusion_for_component`
+    /// call when many exclusion entries share the same component.
+    audit_component_cache: Mutex<HashMap<String, Component>>,
 }
 
 impl DefaultExternalCheckExecutor {
@@ -300,6 +306,7 @@ impl DefaultExternalCheckExecutor {
             engine,
             ticker,
             component_cache,
+            audit_component_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -324,6 +331,7 @@ impl DefaultExternalCheckExecutor {
             engine,
             ticker,
             component_cache,
+            audit_component_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -409,11 +417,25 @@ impl DefaultExternalCheckExecutor {
 
     /// Load and compile the component for a lightweight exclusion-audit call.
     /// Uses the AOT cache when available, same as normal execution.
+    ///
+    /// Results are memoized in `audit_component_cache` for the duration of the
+    /// run so that the stale-exclusion audit hashes each distinct component at
+    /// most once, regardless of how many exclusion entries reference it.
     fn load_component_for_audit(
         &self,
         package: &ExternalCheckPackage,
         component: &ExternalCheckComponentPackage,
     ) -> Result<Component> {
+        // Fast path: component already loaded for this run.
+        if let Some(cached) = self
+            .audit_component_cache
+            .lock()
+            .unwrap()
+            .get(&component.artifact_sha256)
+        {
+            return Ok(cached.clone());
+        }
+
         let component_bytes = if let Some(bytes) = component.artifact_bytes {
             bytes.to_vec()
         } else {
@@ -430,7 +452,13 @@ impl DefaultExternalCheckExecutor {
                 actual_sha256
             );
         }
-        self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)
+        let wasm_component =
+            self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)?;
+        self.audit_component_cache
+            .lock()
+            .unwrap()
+            .insert(component.artifact_sha256.clone(), wasm_component.clone());
+        Ok(wasm_component)
     }
 }
 
