@@ -1894,6 +1894,21 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          Do NOT hand-roll `jj rebase` manually — the correct flags differ from the bare \
          form and agents reliably get them wrong.\n\n",
     );
+    out.push_str(
+        "### How to resolve jj conflicts (structural edit — NOT line-range surgery)\n\n\
+         jj materializes each conflict as annotated regions directly in the file. \
+         Resolve by **editing those regions in place**:\n\n\
+         - Open the conflicted file and find the `<<<<<<<` / `>>>>>>>` marker blocks.\n\
+         - Each block contains the conflict base and the two sides (`Contents of side #1`, \
+         `Contents of side #2`). Decide which content to keep (or merge both), then replace \
+         the entire marker block with the resolved content.\n\
+         - Alternatively, run `jj resolve <file>` to open a 3-way merge tool (e.g. vimdiff) \
+         that handles the structured regions for you.\n\n\
+         **Anti-pattern — do NOT do this:** grep for conflict markers, extract specific line \
+         ranges, and concatenate them to rebuild the file. That approach silently drops hunks \
+         (off-by-one, missed sections) and makes the resolution look like a from-scratch \
+         rewrite. Edit the marker regions directly instead.\n\n",
+    );
     out.push_str("### Conflict diagnosis (from the engine's pre-spawn pass)\n\n");
     match attempt
         .conflict_diagnosis
