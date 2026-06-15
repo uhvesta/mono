@@ -1120,6 +1120,10 @@ pub struct CreateChoreInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// See [`CreateTaskInput::driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     /// One of `low` / `medium` / `high`. Omitted → engine default
     /// (`medium`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1198,9 +1202,11 @@ pub struct CreateInvestigationInput {
     pub product_id: String,
     /// See [`CreateChoreInput::autostart`].
     #[serde(default = "default_true")]
+    #[builder(default = true)]
     pub autostart: bool,
 
     #[serde(default)]
+    #[builder(default)]
     pub force_duplicate: bool,
 
     pub name: String,
@@ -1215,6 +1221,10 @@ pub struct CreateInvestigationInput {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// See [`CreateTaskInput::driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
@@ -1346,6 +1356,10 @@ pub struct CreateRevisionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// See [`CreateTaskInput::driver`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     /// Short summary title for the revision card (1–10 words). When the
     /// coordinator supplies this, it is used verbatim as `tasks.name`;
     /// when absent the engine falls back to deriving a name from the first
@@ -1423,6 +1437,11 @@ pub struct CreateTaskInput {
     /// resolves per design §Q3 precedence. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// Explicit driver override. `None` → resolve via
+    /// `product.default_driver` → `"claude"`. Stored verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 
     /// One of `low` / `medium` / `high`. Omitted → engine default
     /// (`medium`), which is the right answer for the vast majority
@@ -2092,6 +2111,13 @@ pub struct Product {
     /// migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+
+    /// Per-product default agent driver. `None` → fall through to the
+    /// engine default (`"claude"`). Stored verbatim — the engine does
+    /// not validate the slug. Precedence: `task.driver` →
+    /// `product.default_driver` → `"claude"` (design §Mix-and-match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_driver: Option<String>,
 
     /// Optional override repo for `kind = 'design'` tasks on this
     /// product. When set, design tasks resolve to this repo (the docs
@@ -2765,6 +2791,12 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// Explicit agent driver override. `None` → resolve via
+    /// `product.default_driver` → engine default (`"claude"`).
+    /// Stored verbatim (design §Mix-and-match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+
     pub ordinal: Option<i64>,
     /// Soft FK to the `tasks.id` whose PR this revision targets. `None`
     /// for every non-`revision` row. Required (app-enforced) when
@@ -3267,6 +3299,11 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
 
+    /// Product-level default driver. Only honoured on product-targeted
+    /// updates. `None` → leave unchanged. `Some("")` → clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_driver: Option<String>,
+
     pub description: Option<String>,
     /// Product-level design-task repo override. Only honoured on
     /// product-targeted updates; ignored when patching a task /
@@ -3303,6 +3340,11 @@ pub struct WorkItemPatch {
     /// validation — `claude` is the source of truth on slugs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// Driver override. `None` → leave unchanged. `Some("")` → clear.
+    /// Any other string is stored verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
 
     pub name: Option<String>,
     pub ordinal: Option<i64>,

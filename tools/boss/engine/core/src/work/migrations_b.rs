@@ -1421,3 +1421,29 @@ pub(crate) fn migrate_planner_runs_table(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// Add `tasks.driver` for the agent-driver abstraction (P1422 task B).
+/// Nullable TEXT carrying the selected driver slug verbatim; `NULL`
+/// resolves to the engine default (`"claude"`). Existing rows keep
+/// `NULL` so behaviour is unchanged after the migration (design
+/// §Mix-and-match: "NULL resolves to `claude`; existing dispatches
+/// are a no-op").
+pub(crate) fn migrate_tasks_driver_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "driver")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN driver TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `products.default_driver` for the agent-driver abstraction
+/// (P1422 task B). Nullable TEXT carrying a driver slug verbatim;
+/// `NULL` falls through to the engine default (`"claude"`). Mirrors
+/// `products.default_model` in semantics — per the design's
+/// §Mix-and-match precedence: `task.driver` → `product.default_driver`
+/// → `"claude"`.
+pub(crate) fn migrate_products_default_driver(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "default_driver")? {
+        conn.execute("ALTER TABLE products ADD COLUMN default_driver TEXT", [])?;
+    }
+    Ok(())
+}

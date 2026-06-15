@@ -118,6 +118,46 @@ pub(super) async fn handle_set_product_default_model(ctx: Dispatch, req: Fronten
     }
 }
 
+pub(super) async fn handle_set_product_default_driver(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetProductDefaultDriver { product_id, driver } = req else {
+        unreachable!()
+    };
+    {
+        match work_db.set_product_default_driver(&product_id, driver.as_deref()) {
+            Ok(product) => {
+                let item = WorkItem::Product(product);
+                let pid = work_item_product_id(&item);
+                let revision = publish_work_invalidation(
+                    &server_state,
+                    &session_id,
+                    &request_id,
+                    vec![work_product_topic(&pid)],
+                    "product_default_driver_set",
+                    Some(pid),
+                    vec![work_item_id(&item)],
+                )
+                .await;
+                send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+            }
+            Err(err) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::WorkError {
+                    message: err.to_string(),
+                },
+            ),
+        }
+    }
+}
+
 pub(super) async fn handle_set_product_editorial_rules(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

@@ -5069,18 +5069,12 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Detect worker stop".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Detect worker stop")
+                    .build(),
+            )
             .unwrap();
         let execution = db
             .create_execution(
@@ -5136,18 +5130,12 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Fix CI".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Fix CI")
+                    .build(),
+            )
             .unwrap();
         let pr_url = "https://github.com/spinyfin/mono/pull/88";
         db.update_work_item(
@@ -6374,18 +6362,13 @@ mod tests {
         workspace_path: &str,
     ) -> (String, String) {
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product_id.to_owned(),
-                name: name.to_owned(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: true,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name(name)
+                    .force_duplicate(true)
+                    .build(),
+            )
             .unwrap();
         let exec = db
             .create_execution(
@@ -6525,18 +6508,12 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Running execution".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Running execution")
+                    .build(),
+            )
             .unwrap();
         let execution = db
             .create_execution(
@@ -6754,18 +6731,13 @@ not be reintroduced as-is. Out-of-scope section of prior PR #379 \
 applies. Discussion in PR #379 still relevant. PR #379. PR #379. \
 PR #379. PR #379.";
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Engine PR-auto-bind regression returned".into(),
-                description: Some(description_with_pr_refs.into()),
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Engine PR-auto-bind regression returned")
+                    .description(description_with_pr_refs)
+                    .build(),
+            )
             .unwrap();
         let execution = db
             .create_execution(
@@ -6886,18 +6858,13 @@ PR #379. PR #379.";
 Follow-up to PR #379. See PR #379. Reverted in #381. PR #379. PR #379. \
 PR #379. PR #379. PR #379. PR #379. PR #379.";
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Engine PR-auto-bind regression returned".into(),
-                description: Some(description_with_pr_refs.into()),
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Engine PR-auto-bind regression returned")
+                    .description(description_with_pr_refs)
+                    .build(),
+            )
             .unwrap();
         let execution = db
             .create_execution(
@@ -7214,21 +7181,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // Reuse the same DB for the next two so a single merge-poller
         // pass sees all three executions.
         let chore2 = db
-            .create_chore(crate::work::CreateChoreInput {
-                product_id: {
-                    let item = db.get_work_item(&c1).unwrap();
-                    work_item_product_id(&item)
-                },
-                name: "Crusher".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                crate::work::CreateChoreInput::builder()
+                    .product_id({
+                        let item = db.get_work_item(&c1).unwrap();
+                        work_item_product_id(&item)
+                    })
+                    .name("Crusher")
+                    .build(),
+            )
             .unwrap();
         let exec2 = db
             .create_execution(
@@ -7262,21 +7223,15 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             )
             .unwrap();
         let chore3 = db
-            .create_chore(crate::work::CreateChoreInput {
-                product_id: {
-                    let item = db.get_work_item(&c1).unwrap();
-                    work_item_product_id(&item)
-                },
-                name: "Troi".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                crate::work::CreateChoreInput::builder()
+                    .product_id({
+                        let item = db.get_work_item(&c1).unwrap();
+                        work_item_product_id(&item)
+                    })
+                    .name("Troi")
+                    .build(),
+            )
             .unwrap();
         let exec3 = db
             .create_execution(
@@ -8574,18 +8529,12 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Late PR chore".into(),
-                description: None,
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Late PR chore")
+                    .build(),
+            )
             .unwrap();
         let execution = db
             .create_execution(
@@ -10923,18 +10872,13 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
         // can find the PR (mirrors what finalize_pr_transition writes on
         // PendingReview).
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "Implement feature X".into(),
-                description: Some("Feature X adds Y functionality to the pipeline.".into()),
-                autostart: true,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Implement feature X")
+                    .description("Feature X adds Y functionality to the pipeline.")
+                    .build(),
+            )
             .unwrap();
         db.update_work_item(
             &chore.id,

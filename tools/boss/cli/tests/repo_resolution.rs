@@ -158,18 +158,12 @@ async fn chore_create_with_prompt_naming_known_repo_auto_resolves() -> Result<()
     .await?;
     create_chore(
         &mut client,
-        CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "seed nimbus".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some("git@github.com:foo/nimbus.git".to_owned()),
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        },
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("seed nimbus")
+            .autostart(false)
+            .repo_remote_url("git@github.com:foo/nimbus.git")
+            .build(),
     )
     .await?;
 

@@ -211,19 +211,12 @@ async fn task_list_infers_product_from_project_typed_id() -> Result<()> {
     .await?;
     let task = create_task(
         &mut client,
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "wire it up".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("wire it up")
+            .autostart(false)
+            .build(),
     )
     .await?;
 

@@ -454,6 +454,7 @@ pub(crate) fn insert_revision_in_tx(
         .map(|l| l.as_str().to_owned())
         .or_else(|| Some("small".to_owned())); // revision-tasks.md §Q7: default small
     let model_override = normalize_model_override(input.model_override);
+    let driver = normalize_model_override(input.driver);
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");
     // Inherit product, project, and repo from the chain root. A revision
     // by definition lands a follow-up commit on the chain root's PR, which
@@ -490,9 +491,9 @@ pub(crate) fn insert_revision_in_tx(
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
-         effort_level, model_override, short_id, parent_task_id, repo_remote_url) \
+         effort_level, model_override, driver, short_id, parent_task_id, repo_remote_url) \
          VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14)",
+         ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             id,
             product_id,
@@ -505,6 +506,7 @@ pub(crate) fn insert_revision_in_tx(
             created_via,
             effort_level,
             model_override,
+            driver,
             short_id,
             parent_id,
             repo_remote_url,

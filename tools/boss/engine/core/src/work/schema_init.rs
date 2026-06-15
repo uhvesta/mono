@@ -22,6 +22,7 @@ impl WorkDb {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 default_model TEXT,
+                default_driver TEXT,
                 ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
                 dispatch_preamble TEXT,
                 external_tracker_kind TEXT,
@@ -68,6 +69,7 @@ impl WorkDb {
                 created_via TEXT NOT NULL DEFAULT 'unknown',
                 effort_level TEXT,
                 model_override TEXT,
+                driver TEXT,
                 ci_attempt_budget INTEGER,
                 ci_attempts_used INTEGER NOT NULL DEFAULT 0,
                 external_ref_kind TEXT,
@@ -347,6 +349,11 @@ impl WorkDb {
         // `CREATE INDEX IF NOT EXISTS` make this fully idempotent.
         // Design: tools/boss/docs/designs/auto-populate-project-tasks-on-design-pr-merge.md
         migrate_planner_runs_table(&conn)?;
+        // P1422 task B: driver data model (mix-and-match agent-driver
+        // abstraction). Adds `tasks.driver` and `products.default_driver`
+        // TEXT columns. NULL resolves to the engine default (`"claude"`).
+        migrate_tasks_driver_column(&conn)?;
+        migrate_products_default_driver(&conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '20')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

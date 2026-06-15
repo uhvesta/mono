@@ -150,12 +150,13 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
+    let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, short_id)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, short_id],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing task after insert: {id}"))
@@ -181,12 +182,13 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
+    let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, short_id)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, short_id],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id)
+         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))
@@ -221,14 +223,15 @@ pub(crate) fn insert_investigation_in_tx(
     let repo_remote_url = input.repo_remote_url.filter(|s| !s.is_empty());
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
+    let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, short_id)
-         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id)
+         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id, input.product_id, input.project_id, input.name, description, now,
             autostart_value, priority, created_via, repo_remote_url,
-            effort_level, model_override, short_id
+            effort_level, model_override, driver, short_id
         ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing investigation after insert: {id}"))

@@ -360,7 +360,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, driver,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
                     external_ref_synced_at, external_ref_unbound_at
              FROM tasks
@@ -391,7 +391,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, driver,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
                     external_ref_synced_at, external_ref_unbound_at
              FROM tasks

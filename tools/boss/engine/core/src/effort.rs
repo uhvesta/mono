@@ -28,6 +28,10 @@ use crate::driver::AgentDriver;
 /// Opus snapshot without requiring a code change on each model release.
 pub const ENGINE_DEFAULT_MODEL: &str = "opus";
 
+/// Engine default driver used when neither `tasks.driver` nor
+/// `products.default_driver` is set (agent-driver design §Mix-and-match).
+pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
+
 /// What the row's effort level maps to for `claude --effort`. Note
 /// these are **claude**'s vocabulary, not Boss's — `Trivial` becomes
 /// `"low"` on the wire, etc. The numbers in this table follow
@@ -114,6 +118,10 @@ pub struct SpawnConfig {
     /// `--model <slug>` even for the engine-default fall-through so
     /// the choice is visible on the dispatch stream.
     pub model: String,
+    /// Resolved driver slug (agent-driver design §Mix-and-match).
+    /// Precedence: `tasks.driver` → `products.default_driver` → `ENGINE_DEFAULT_DRIVER`.
+    /// Always present so the spawn path always knows which agent CLI to invoke.
+    pub driver: String,
     /// Per-level prompt addendum to prepend to `.claude/initial-prompt.txt`.
     /// `None` when the level has no addendum (or no level is set).
     pub prompt_addendum: Option<&'static str>,
@@ -159,6 +167,19 @@ pub fn model_requires_auto_permissions(model: &str) -> bool {
     model_is_opus(model) || model_is_fable(model)
 }
 
+/// Resolve the agent driver (agent-driver design §Mix-and-match precedence):
+/// 1. `tasks.driver` (when non-empty after trim).
+/// 2. `products.default_driver` (when non-empty after trim).
+/// 3. [`ENGINE_DEFAULT_DRIVER`] (`"claude"`).
+pub fn resolve_driver(task_driver: Option<&str>, product_default_driver: Option<&str>) -> String {
+    if let Some(d) = task_driver.map(str::trim).filter(|s| !s.is_empty()) {
+        return d.to_owned();
+    }
+    if let Some(d) = product_default_driver.map(str::trim).filter(|s| !s.is_empty()) {
+        return d.to_owned();
+    }
+    ENGINE_DEFAULT_DRIVER.to_owned()
+}
 /// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
 /// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5):
 /// 1. `tasks.model_override` (when non-empty after trim).
@@ -180,6 +201,8 @@ pub fn resolve_spawn_config(
     model_override: Option<&str>,
     pool_model_override: Option<&str>,
     product_default_model: Option<&str>,
+    task_driver: Option<&str>,
+    product_default_driver: Option<&str>,
 ) -> SpawnConfig {
     let model = if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
@@ -193,10 +216,13 @@ pub fn resolve_spawn_config(
         ENGINE_DEFAULT_MODEL.to_owned()
     };
 
+    let driver = resolve_driver(task_driver, product_default_driver);
+
     SpawnConfig {
         effort_level,
         claude_effort: effort_level.map(claude_effort_for_level),
         model,
+        driver,
         prompt_addendum: effort_level.and_then(prompt_addendum_for_level),
     }
 }
@@ -375,7 +401,7 @@ mod tests {
 
     #[test]
     fn null_row_falls_through_to_engine_default() {
-        let cfg = resolve_spawn_config(None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None);
         assert_eq!(cfg.effort_level, None);
         assert_eq!(cfg.claude_effort, None);
         assert_eq!(cfg.model, ENGINE_DEFAULT_MODEL);
@@ -384,14 +410,14 @@ mod tests {
 
     #[test]
     fn null_row_with_product_default_uses_product_default() {
-        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"));
+        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"), None, None);
         assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.claude_effort, None);
     }
 
     #[test]
     fn empty_product_default_does_not_satisfy_precedence_step_3() {
-        let cfg = resolve_spawn_config(None, None, None, Some("   "));
+        let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None);
         assert_eq!(cfg.model, ENGINE_DEFAULT_MODEL);
     }
 
@@ -399,17 +425,17 @@ mod tests {
     fn effort_level_alone_picks_level_default_model() {
         // #746: Trivial maps to Sonnet, not Haiku — only the effort
         // value stays `low`.
-        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None);
+        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None);
         assert_eq!(trivial.model, "sonnet");
         assert_eq!(trivial.claude_effort, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
-        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None);
+        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None, None, None);
         assert_eq!(small.model, "sonnet");
         assert_eq!(small.claude_effort, Some("medium"));
         assert_eq!(small.prompt_addendum, None);
 
-        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None);
+        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None);
         assert_eq!(medium.model, "sonnet");
         assert_eq!(medium.claude_effort, Some("high"));
         assert!(
@@ -417,12 +443,12 @@ mod tests {
             "medium addendum should be the 'sketch a plan' nudge",
         );
 
-        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None);
+        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None, None, None);
         assert_eq!(large.model, "opus");
         assert_eq!(large.claude_effort, Some("xhigh"));
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
-        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
+        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
         assert_eq!(max.model, "opus");
         assert_eq!(max.claude_effort, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
@@ -455,7 +481,14 @@ mod tests {
         // Row: effort = medium, model_override = opus. Design §Q3 says
         // the override changes the model only; effort + addendum still
         // follow `effort_level`.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, Some("claude-sonnet-4-6"));
+        let cfg = resolve_spawn_config(
+            Some(EffortLevel::Medium),
+            Some("opus"),
+            None,
+            Some("claude-sonnet-4-6"),
+            None,
+            None,
+        );
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
@@ -463,7 +496,14 @@ mod tests {
 
     #[test]
     fn model_override_beats_product_default_when_effort_is_unset() {
-        let cfg = resolve_spawn_config(None, Some("claude-haiku-4-5-20251001"), None, Some("claude-opus-4-7"));
+        let cfg = resolve_spawn_config(
+            None,
+            Some("claude-haiku-4-5-20251001"),
+            None,
+            Some("claude-opus-4-7"),
+            None,
+            None,
+        );
         assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
         assert_eq!(cfg.claude_effort, None);
         assert_eq!(cfg.prompt_addendum, None);
@@ -476,7 +516,7 @@ mod tests {
         // canonicalises empty → NULL on insert, but the dispatcher
         // tolerates the looser shape so a hand-edited DB row doesn't
         // produce `claude --model ""`.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None, None, None);
         assert_eq!(cfg.model, "opus");
     }
 
@@ -484,7 +524,7 @@ mod tests {
     fn null_row_invocation_matches_today_plus_explicit_model() {
         // Untagged rows fall through to ENGINE_DEFAULT_MODEL (Opus). Must
         // carry --permission-mode auto (Opus) and no --effort.
-        let cfg = resolve_spawn_config(None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -497,7 +537,7 @@ mod tests {
         // `--settings '<path>'`, positioned before the trailing prompt
         // arg so claude parses it as a flag, and single-quoted so a
         // path with spaces survives the pane shell.
-        let cfg = resolve_spawn_config(None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None);
         let path = Path::new("/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json");
         let inv = cfg.claude_invocation(false, Some(path));
         assert!(
@@ -516,7 +556,7 @@ mod tests {
     fn trivial_invocation_includes_both_flags() {
         // #746: Trivial spawns Sonnet (never Haiku) at --effort low.
         // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model sonnet --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -526,7 +566,7 @@ mod tests {
     #[test]
     fn medium_with_override_uses_override_model_and_medium_effort() {
         // model_override = "opus" → Opus family → --permission-mode auto.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -544,6 +584,7 @@ mod tests {
                     effort_level: None,
                     claude_effort: None,
                     model: model.to_owned(),
+                    driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                     prompt_addendum: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
@@ -567,6 +608,7 @@ mod tests {
                 effort_level: None,
                 claude_effort: None,
                 model: model.to_owned(),
+                driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
             };
             let inv = cfg.claude_invocation(false, None);
@@ -589,6 +631,7 @@ mod tests {
                 effort_level: None,
                 claude_effort: None,
                 model: model.to_owned(),
+                driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
             };
             let inv = cfg.claude_invocation(true, None);
@@ -645,6 +688,7 @@ mod tests {
                     effort_level: None,
                     claude_effort: None,
                     model: model.to_owned(),
+                    driver: "claude".to_owned(),
                     prompt_addendum: None,
                 };
                 let inv = cfg.claude_invocation(non_opus_auto_mode, None);
@@ -663,7 +707,7 @@ mod tests {
     #[test]
     fn max_effort_dispatches_on_opus() {
         // Fable has been suspended; Max now falls back to Opus.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("max"));
         let inv = cfg.claude_invocation(false, None);
@@ -719,12 +763,12 @@ mod tests {
         // the pool override, but a task-level model_override still wins.
 
         // Pool override beats effort default (Small → Sonnet normally, Opus via pool).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("medium"));
 
         // Task model_override beats pool override.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), Some("sonnet"), Some("opus"), None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), Some("sonnet"), Some("opus"), None, None, None);
         assert_eq!(cfg.model, "sonnet");
         assert_eq!(cfg.claude_effort, Some("medium"));
     }
@@ -732,11 +776,11 @@ mod tests {
     #[test]
     fn pool_override_beats_product_default_and_engine_default() {
         // Pool override beats product default_model.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"));
+        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"), None, None);
         assert_eq!(cfg.model, "opus");
 
         // Pool override beats engine default.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), None);
+        let cfg = resolve_spawn_config(None, None, Some("opus"), None, None, None);
         assert_eq!(cfg.model, "opus");
     }
 
@@ -744,7 +788,7 @@ mod tests {
     fn empty_pool_override_falls_through_to_effort_default() {
         // An empty/whitespace pool override is the same as no override — the
         // effort default still applies.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None, None, None);
         assert_eq!(cfg.model, "sonnet");
     }
 
@@ -752,7 +796,7 @@ mod tests {
     fn pool_override_does_not_change_effort_or_addendum() {
         // Pool override changes the model only; effort + addendum still follow
         // effort_level (mirrors the task-level model_override rule in §Q3).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None, None, None);
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.claude_effort, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));

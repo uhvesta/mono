@@ -2446,6 +2446,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SetProductDefaultModel { .. } => {
                 products::handle_set_product_default_model(ctx, r).await
             }
+            r @ FrontendRequest::SetProductDefaultDriver { .. } => {
+                products::handle_set_product_default_driver(ctx, r).await
+            }
             r @ FrontendRequest::SetProductEditorialRules { .. } => {
                 products::handle_set_product_editorial_rules(ctx, r).await
             }

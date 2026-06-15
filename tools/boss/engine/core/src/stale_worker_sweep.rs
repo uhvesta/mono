@@ -575,18 +575,12 @@ mod tests {
 
     fn create_active_chore(db: &WorkDb, product_id: &str) -> String {
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product_id.to_owned(),
-                name: "test chore".to_owned(),
-                description: None,
-                repo_remote_url: None,
-                priority: None,
-                effort_level: None,
-                model_override: None,
-                created_via: None,
-                autostart: true,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("test chore")
+                    .build(),
+            )
             .unwrap();
         db.update_work_item(
             &chore.id,

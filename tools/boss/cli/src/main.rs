@@ -221,6 +221,12 @@ enum ProductCommand {
     /// source of truth on which slugs resolve.
     #[command(name = "set-default-model")]
     SetDefaultModel(ProductSetDefaultModelArgs),
+    /// Set (or clear) the product's default agent driver. When set, all
+    /// tasks on this product that do not have a per-task `--driver`
+    /// override will use this driver instead of the engine default
+    /// (`claude`). Mutually exclusive with `--unset`.
+    #[command(name = "set-default-driver")]
+    SetDefaultDriver(ProductSetDefaultDriverArgs),
     /// Heuristic feedback-loop audit (design §Q4 follow-up, PR
     /// #370). Aggregates recorded effort-escalation events against
     /// the §Q4 marker corpus and prints a per-marker
@@ -1301,6 +1307,23 @@ struct ProductSetDefaultModelArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct ProductSetDefaultDriverArgs {
+    selector: String,
+
+    /// Agent driver slug to store as the product default (e.g. `claude`,
+    /// `copilot`, `codex`). Stored verbatim. Mutually exclusive with
+    /// `--unset`; one of the two is required.
+    #[arg(long, value_name = "DRIVER", conflicts_with = "unset")]
+    driver: Option<String>,
+
+    /// Clear the product's `default_driver` so the dispatcher falls
+    /// through to the engine default (`claude`).
+    /// Mutually exclusive with `--driver`.
+    #[arg(long)]
+    unset: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 struct ProductAuditEffortArgs {
     /// Product id or slug to audit.
     selector: String,
@@ -1673,11 +1696,18 @@ struct TaskCreateArgs {
     #[arg(long, value_enum)]
     effort: Option<EffortLevelArg>,
 
-    /// Claude model slug override (e.g. `opus`, `sonnet`, `haiku`,
-    /// or a fully-qualified id like `claude-opus-4-8`). Stored verbatim —
-    /// claude is the source of truth on slugs.
+    /// Model slug for the resolved driver (e.g. `opus`, `sonnet`, `haiku`,
+    /// or a fully-qualified id like `claude-opus-4-8`). Stored verbatim — the driver
+    /// is the source of truth on valid slugs.
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
+
+    /// Agent driver override (e.g. `claude`, `copilot`, `codex`).
+    /// Stored verbatim. When set, the slug passed to `--model` must be
+    /// valid for this driver; `--driver copilot --model claude-opus-4-7`
+    /// is rejected at parse time.
+    #[arg(long, value_name = "DRIVER")]
+    driver: Option<String>,
 
     /// Bypass the duplicate guard. When a task with the same name
     /// already exists in this product and was created within the last
@@ -1795,10 +1825,13 @@ struct ChoreCreateArgs {
     #[arg(long, value_enum)]
     effort: Option<EffortLevelArg>,
 
-    /// Claude model slug override. Stored verbatim — claude is the
-    /// source of truth on slugs.
+    /// Model slug for the resolved driver. Stored verbatim.
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
+
+    /// Agent driver override (e.g. `claude`, `copilot`, `codex`).
+    #[arg(long, value_name = "DRIVER")]
+    driver: Option<String>,
 
     /// Bypass the duplicate guard. See `boss task create --help` for
     /// the full description.
@@ -1837,6 +1870,9 @@ struct InvestigationCreateArgs {
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
 
+    #[arg(long, value_name = "DRIVER")]
+    driver: Option<String>,
+
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
 }
@@ -1873,6 +1909,9 @@ struct RevisionCreateArgs {
 
     #[arg(long, value_name = "SLUG")]
     model: Option<String>,
+
+    #[arg(long, value_name = "DRIVER")]
+    driver: Option<String>,
 
     #[arg(long = "force-duplicate", default_value_t = false)]
     force_duplicate: bool,
@@ -2081,7 +2120,7 @@ struct TaskUpdateArgs {
     #[arg(long = "unset-effort")]
     unset_effort: bool,
 
-    /// Claude model slug override. Stored verbatim. Mutually
+    /// Model slug for the resolved driver. Stored verbatim. Mutually
     /// exclusive with `--unset-model`.
     #[arg(long, value_name = "SLUG", conflicts_with = "unset_model")]
     model: Option<String>,
@@ -2090,6 +2129,16 @@ struct TaskUpdateArgs {
     /// through per design §Q3 precedence.
     #[arg(long = "unset-model")]
     unset_model: bool,
+
+    /// Agent driver override (e.g. `claude`, `copilot`, `codex`).
+    /// Mutually exclusive with `--unset-driver`.
+    #[arg(long, value_name = "DRIVER", conflicts_with = "unset_driver")]
+    driver: Option<String>,
+
+    /// Clear the per-row driver override so the dispatcher falls
+    /// through to the product / engine default.
+    #[arg(long = "unset-driver")]
+    unset_driver: bool,
 
     /// Enable or disable auto-dispatch for this item. `--autostart true`
     /// lets the engine auto-dispatch the item when a worker slot is free;
@@ -2821,6 +2870,17 @@ async fn run_product_command(command: ProductCommand, ctx: &RunContext) -> Resul
                 print_product_details("Updated product", &updated);
             })
         }
+        ProductCommand::SetDefaultDriver(args) => {
+            if !args.unset && args.driver.is_none() {
+                return Err(CliError::usage("provide either --driver <slug> or --unset"));
+            }
+            let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
+            let driver = if args.unset { None } else { args.driver };
+            let updated = set_product_default_driver(&mut client, &product.id, driver).await?;
+            print_entity(ctx, &serde_json::json!({ "product": updated }), || {
+                print_product_details("Updated product", &updated);
+            })
+        }
         ProductCommand::AuditEffort(args) => {
             let product = resolve_product(&mut client, Some(args.selector), ctx).await?;
             let response = client
@@ -3271,21 +3331,25 @@ async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> Result<(), 
             if product.repo_remote_url.is_none() && resolved_repo.is_none() && !ctx.allow_input {
                 return Err(repo_resolution::unresolved_repo_error(&product.slug));
             }
+            let model_override = normalize_non_empty(args.model);
+            let driver = normalize_non_empty(args.driver);
+            validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
             let task = create_task(
                 &mut client,
-                CreateTaskInput {
-                    product_id: product.id,
-                    project_id: project.id,
-                    name,
-                    description,
-                    autostart: !ctx.no_autostart,
-                    priority: args.priority.map(|priority| priority.as_str().to_owned()),
-                    created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: resolved_repo,
-                    effort_level: args.effort.map(EffortLevel::from),
-                    model_override: normalize_non_empty(args.model),
-                    force_duplicate: args.force_duplicate,
-                },
+                CreateTaskInput::builder()
+                    .product_id(product.id)
+                    .project_id(project.id)
+                    .name(name)
+                    .maybe_description(description)
+                    .autostart(!ctx.no_autostart)
+                    .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
+                    .created_via(CREATED_VIA_CLI)
+                    .maybe_repo_remote_url(resolved_repo)
+                    .maybe_effort_level(args.effort.map(EffortLevel::from))
+                    .maybe_model_override(model_override)
+                    .maybe_driver(driver)
+                    .force_duplicate(args.force_duplicate)
+                    .build(),
             )
             .await?;
             let task = with_display_status(task);
@@ -3380,20 +3444,24 @@ async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -> Result<()
             if product.repo_remote_url.is_none() && resolved_repo.is_none() && !ctx.allow_input {
                 return Err(repo_resolution::unresolved_repo_error(&product.slug));
             }
+            let model_override = normalize_non_empty(args.model);
+            let driver = normalize_non_empty(args.driver);
+            validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
             let chore = create_chore(
                 &mut client,
-                CreateChoreInput {
-                    product_id: product.id,
-                    name,
-                    description,
-                    autostart: !ctx.no_autostart,
-                    priority: args.priority.map(|priority| priority.as_str().to_owned()),
-                    created_via: Some(CREATED_VIA_CLI.to_owned()),
-                    repo_remote_url: resolved_repo,
-                    effort_level: args.effort.map(EffortLevel::from),
-                    model_override: normalize_non_empty(args.model),
-                    force_duplicate: args.force_duplicate,
-                },
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name(name)
+                    .maybe_description(description)
+                    .autostart(!ctx.no_autostart)
+                    .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
+                    .created_via(CREATED_VIA_CLI)
+                    .maybe_repo_remote_url(resolved_repo)
+                    .maybe_effort_level(args.effort.map(EffortLevel::from))
+                    .maybe_model_override(model_override)
+                    .maybe_driver(driver)
+                    .force_duplicate(args.force_duplicate)
+                    .build(),
             )
             .await?;
             let chore = with_display_status(chore);
@@ -3577,6 +3645,15 @@ async fn run_update_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskUp
     } else {
         args.model
     };
+    let driver = if args.unset_driver {
+        Some(String::new())
+    } else {
+        args.driver.clone()
+    };
+    validate_driver_model_pair(
+        args.driver.as_deref().filter(|_| !args.unset_driver),
+        model_override.as_deref().filter(|s| !s.is_empty()),
+    )?;
     let patch = WorkItemPatch {
         name: args.name,
         description: args.description,
@@ -3590,6 +3667,7 @@ async fn run_update_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskUp
         repo_remote_url: args.repo_remote_url,
         effort_level,
         model_override,
+        driver,
         autostart: args.autostart,
         // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
         // maps to NULL in the engine (clears the field).
@@ -3598,7 +3676,7 @@ async fn run_update_leaf(client: &mut BossClient, ctx: &RunContext, args: TaskUp
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --autostart, or --blocked-reason",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, or --blocked-reason",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {
@@ -5942,6 +6020,27 @@ async fn set_product_default_model(
     }
 }
 
+async fn set_product_default_driver(
+    client: &mut BossClient,
+    product_id: &str,
+    driver: Option<String>,
+) -> Result<Product, CliError> {
+    match client
+        .send_request(&FrontendRequest::SetProductDefaultDriver {
+            product_id: product_id.to_owned(),
+            driver,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::WorkItemUpdated { item } => expect_product(item),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("set-default-driver", &other)),
+    }
+}
+
 /// Build the kind-specific JSON config for `set-external-tracker` from CLI args.
 fn build_external_tracker_config(
     kind: &str,
@@ -6132,21 +6231,25 @@ async fn run_create_investigation(
     };
     let name = required_text(args.name, "Investigation name", ctx)?;
     let description = optional_text(args.description, "Description", ctx)?;
+    let model_override = normalize_non_empty(args.model);
+    let driver = normalize_non_empty(args.driver);
+    validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
     let task = create_investigation(
         client,
-        CreateInvestigationInput {
-            product_id: product.id,
-            project_id,
-            name: name.clone(),
-            description,
-            autostart: !ctx.no_autostart,
-            priority: args.priority.map(|p| p.as_str().to_owned()),
-            created_via: Some("cli".to_owned()),
-            repo_remote_url: args.repo_remote_url,
-            effort_level: args.effort.map(boss_protocol::EffortLevel::from),
-            model_override: args.model,
-            force_duplicate: args.force_duplicate,
-        },
+        CreateInvestigationInput::builder()
+            .product_id(product.id)
+            .maybe_project_id(project_id)
+            .name(name.clone())
+            .maybe_description(description)
+            .autostart(!ctx.no_autostart)
+            .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
+            .created_via("cli")
+            .maybe_repo_remote_url(args.repo_remote_url)
+            .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
+            .maybe_model_override(model_override)
+            .maybe_driver(driver)
+            .force_duplicate(args.force_duplicate)
+            .build(),
     )
     .await?;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
@@ -6220,19 +6323,23 @@ async fn run_create_revision(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
+    let model_override = normalize_non_empty(args.model);
+    let driver = normalize_non_empty(args.driver);
+    validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
     let task = create_revision_rpc(
         client,
-        CreateRevisionInput {
-            parent_task_id: parent_id,
-            description: description.clone(),
-            name,
-            priority: args.priority.map(|p| p.as_str().to_owned()),
-            effort_level: args.effort.map(boss_protocol::EffortLevel::from),
-            model_override: args.model,
-            force_duplicate: args.force_duplicate,
-            created_via: Some(boss_protocol::CREATED_VIA_CLI.to_owned()),
-            autostart: !ctx.no_autostart,
-        },
+        CreateRevisionInput::builder()
+            .parent_task_id(parent_id)
+            .description(description.clone())
+            .maybe_name(name)
+            .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
+            .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
+            .maybe_model_override(model_override)
+            .maybe_driver(driver)
+            .force_duplicate(args.force_duplicate)
+            .created_via(boss_protocol::CREATED_VIA_CLI)
+            .autostart(!ctx.no_autostart)
+            .build(),
     )
     .await?;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
@@ -6621,19 +6728,17 @@ async fn run_task_create_many(
                 }
             },
         };
-        inputs.push(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id,
-            name: item.name,
-            description: normalize_non_empty(Some(item.description)),
-            autostart: item.autostart.unwrap_or(default_autostart),
-            priority: item.priority,
-            created_via: Some(CREATED_VIA_CLI.to_owned()),
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        });
+        inputs.push(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project_id)
+                .name(item.name)
+                .maybe_description(normalize_non_empty(Some(item.description)))
+                .autostart(item.autostart.unwrap_or(default_autostart))
+                .maybe_priority(item.priority)
+                .created_via(CREATED_VIA_CLI)
+                .build(),
+        );
     }
 
     let count = inputs.len();
@@ -6669,18 +6774,16 @@ async fn run_chore_create_many(
                 "item {index}: chores do not have a project — remove `project_id`"
             )));
         }
-        inputs.push(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: item.name,
-            description: normalize_non_empty(Some(item.description)),
-            autostart: item.autostart.unwrap_or(default_autostart),
-            priority: item.priority,
-            created_via: Some(CREATED_VIA_CLI.to_owned()),
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        });
+        inputs.push(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(item.name)
+                .maybe_description(normalize_non_empty(Some(item.description)))
+                .autostart(item.autostart.unwrap_or(default_autostart))
+                .maybe_priority(item.priority)
+                .created_via(CREATED_VIA_CLI)
+                .build(),
+        );
     }
 
     let created = create_many_chores(client, CreateManyChoresInput { items: inputs }).await?;
@@ -7550,6 +7653,30 @@ fn compose_prompt_text(name: &str, description: Option<&str>) -> String {
     }
 }
 
+/// Reject `--driver <non-claude> --model <claude-slug>` combinations at CLI
+/// parse time (agent-driver design §Mix-and-match). A Claude-specific slug is
+/// one that starts with `"claude-"` or is one of the family aliases
+/// `"opus"`, `"sonnet"`, `"haiku"`. When the driver is `"claude"` (or absent,
+/// which resolves to `"claude"`), any model slug is accepted.
+fn validate_driver_model_pair(driver: Option<&str>, model: Option<&str>) -> Result<(), CliError> {
+    let Some(d) = driver else { return Ok(()) };
+    let d_lower = d.trim().to_ascii_lowercase();
+    if d_lower == "claude" || d_lower.is_empty() {
+        return Ok(());
+    }
+    let Some(m) = model else { return Ok(()) };
+    let m_lower = m.trim().to_ascii_lowercase();
+    let is_claude_slug =
+        m_lower.starts_with("claude-") || m_lower == "opus" || m_lower == "sonnet" || m_lower == "haiku";
+    if is_claude_slug {
+        return Err(CliError::usage(format!(
+            "model slug `{m}` is for the Claude driver but `--driver {d}` was specified; \
+             pass a model slug valid for `{d}` or omit `--model`"
+        )));
+    }
+    Ok(())
+}
+
 fn normalize_non_empty(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -7572,6 +7699,7 @@ fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Result<(), CliE
         || patch.ordinal.is_some()
         || patch.effort_level.is_some()
         || patch.model_override.is_some()
+        || patch.driver.is_some()
         || patch.default_model.is_some()
         || patch.dispatch_preamble.is_some()
         || patch.worker_branch_prefix.is_some()

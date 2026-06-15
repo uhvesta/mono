@@ -150,18 +150,13 @@ mod tests {
             })
             .unwrap();
         let chore = db
-            .create_chore(CreateChoreInput {
-                product_id: product.id.clone(),
-                name: "c".to_owned(),
-                description: None,
-                autostart: false,
-                priority: None,
-                created_via: None,
-                repo_remote_url: None,
-                effort_level: None,
-                model_override: None,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("c")
+                    .autostart(false)
+                    .build(),
+            )
             .unwrap();
         db.update_work_item(
             &chore.id,

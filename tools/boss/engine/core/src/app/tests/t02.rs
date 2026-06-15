@@ -29,18 +29,13 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -128,18 +123,13 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "remote chore".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("remote chore")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -229,18 +219,13 @@ async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "remote chore".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("remote chore")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -324,18 +309,13 @@ async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -445,18 +425,13 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -538,18 +513,13 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -706,18 +676,13 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -841,18 +806,13 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -961,18 +921,13 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -1071,18 +1026,13 @@ async fn tail_transcript_resolver_reports_buffering_for_live_run_without_path() 
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -1153,18 +1103,13 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = server_state
         .work_db
@@ -1443,18 +1388,12 @@ fn make_work_db_with_chore() -> (Arc<WorkDb>, String, String) {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "In-review reap test".into(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("In-review reap test")
+                .build(),
+        )
         .unwrap();
     (db, product.id, chore.id)
 }
@@ -1979,18 +1918,13 @@ fn make_execution_for_test(server_state: &Arc<ServerState>) -> boss_protocol::Wo
         .unwrap();
     let chore = server_state
         .work_db
-        .create_chore(boss_protocol::CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            boss_protocol::CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     server_state
         .work_db
@@ -2195,18 +2129,13 @@ fn executions_list_returns_empty_for_task_with_no_executions() {
         .unwrap();
     let task = server_state
         .work_db
-        .create_chore(boss_protocol::CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            boss_protocol::CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let executions = server_state.work_db.list_executions(Some(&task.id)).unwrap();
     assert!(

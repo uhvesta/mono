@@ -13,6 +13,7 @@ impl WorkDb {
         apply_repo_remote_url_patch(&mut product.docs_repo, patch.docs_repo);
         apply_text_patch(&mut product.status, patch.status);
         apply_optional_string_patch(&mut product.default_model, patch.default_model);
+        apply_optional_string_patch(&mut product.default_driver, patch.default_driver);
         apply_optional_string_patch(&mut product.dispatch_preamble, patch.dispatch_preamble);
         apply_optional_string_patch(&mut product.worker_branch_prefix, patch.worker_branch_prefix);
         // Re-canonicalise so a patched (or pre-existing) prefix always
@@ -24,7 +25,7 @@ impl WorkDb {
 
         tx.execute(
             "UPDATE products
-             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12
+             SET name = ?2, slug = ?3, description = ?4, repo_remote_url = ?5, status = ?6, updated_at = ?7, default_model = ?8, dispatch_preamble = ?9, design_repo = ?10, worker_branch_prefix = ?11, docs_repo = ?12, default_driver = ?13
              WHERE id = ?1",
             params![
                 product.id,
@@ -39,6 +40,7 @@ impl WorkDb {
                 product.design_repo,
                 product.worker_branch_prefix,
                 product.docs_repo,
+                product.default_driver,
             ],
         )?;
 
@@ -149,6 +151,7 @@ impl WorkDb {
             };
         }
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
+        apply_optional_string_patch(&mut task.driver, patch.driver);
         apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
         if let Some(autostart) = patch.autostart {
             task.autostart = autostart;
@@ -182,7 +185,7 @@ impl WorkDb {
              SET name = ?2, description = ?3, status = ?4, ordinal = ?5, pr_url = ?6, updated_at = ?7,
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
-                 blocked_reason = ?14, blocked_attempt_id = ?15,
+                 blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
              WHERE id = ?1",
             params![
@@ -201,6 +204,7 @@ impl WorkDb {
                 task.autostart as i64,
                 task.blocked_reason,
                 task.blocked_attempt_id,
+                task.driver,
             ],
         )?;
 

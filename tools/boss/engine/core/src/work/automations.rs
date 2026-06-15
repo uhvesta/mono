@@ -289,7 +289,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, driver,
                     source_automation_id
                FROM tasks
               WHERE source_automation_id = ?1
@@ -766,18 +766,14 @@ impl WorkDb {
         // 60-second recent-duplicate guard.
         let mut task = insert_chore_in_tx(
             &tx,
-            CreateChoreInput {
-                product_id: automation.product_id.clone(),
-                name: name.to_owned(),
-                description: description.map(str::to_owned),
-                autostart: true,
-                priority: None,
-                created_via: Some(boss_protocol::CREATED_VIA_ENGINE_AUTO.to_owned()),
-                repo_remote_url: automation.repo_remote_url.clone(),
-                effort_level: None,
-                model_override: None,
-                force_duplicate: true,
-            },
+            CreateChoreInput::builder()
+                .product_id(automation.product_id.clone())
+                .name(name)
+                .maybe_description(description.map(str::to_owned))
+                .created_via(boss_protocol::CREATED_VIA_ENGINE_AUTO)
+                .maybe_repo_remote_url(automation.repo_remote_url.clone())
+                .force_duplicate(true)
+                .build(),
         )?;
         tx.execute(
             "UPDATE tasks SET source_automation_id = ?2 WHERE id = ?1",

@@ -20,18 +20,13 @@ fn retry_ci_remediation_resets_counter_and_unblocks_exhausted_parent() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "chore-retry".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-retry")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let pr_url = "https://github.com/foo/bar/pull/200".to_owned();
     db.update_work_item(
@@ -117,18 +112,13 @@ fn list_engine_attempts_unions_three_subsystems_with_kind_filter() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "chore-attempts".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("chore-attempts")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let pr_url = "https://github.com/foo/bar/pull/300".to_owned();
     db.update_work_item(
@@ -224,18 +214,13 @@ fn unblock_via_update_clears_blocked_reason_and_attempt_id() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "C".into(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("C")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     // Simulate the engine having set blocked fields directly.
@@ -856,18 +841,14 @@ fn create_revision_inherits_repo_remote_url_from_root() {
     let root_repo = "git@github.com:linkedin-multiproduct/dev-infra.git";
     // Root chore carries its own repo override (allowed: product has none).
     let root_chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product_id.clone(),
-            name: "Root chore in multi-repo product".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some(root_repo.to_owned()),
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name("Root chore in multi-repo product")
+                .autostart(false)
+                .repo_remote_url(root_repo)
+                .build(),
+        )
         .unwrap();
     assert_eq!(
         root_chore.repo_remote_url.as_deref(),
@@ -924,18 +905,14 @@ fn create_revision_of_revision_inherits_repo_from_chain_root() {
         .id;
     let root_repo = "git@github.com:linkedin-multiproduct/dev-infra.git";
     let root_chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product_id.clone(),
-            name: "Root chore".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some(root_repo.to_owned()),
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id.clone())
+                .name("Root chore")
+                .autostart(false)
+                .repo_remote_url(root_repo)
+                .build(),
+        )
         .unwrap();
     {
         let conn = db.connect().unwrap();
@@ -2289,19 +2266,14 @@ fn make_in_review_project_task(db: &WorkDb, product_id: &str, pr_url: &str) -> S
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product_id.to_owned(),
-            project_id: project.id.clone(),
-            name: "Project task for revision tests".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.to_owned())
+                .project_id(project.id.clone())
+                .name("Project task for revision tests")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     db.connect()
         .unwrap()

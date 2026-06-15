@@ -516,18 +516,14 @@ pub(super) async fn handle_comments_dispatch_magic_wand(ctx: Dispatch, req: Fron
                 // `repo_remote_url` is inherited from the product
                 // (which was resolved by `find_product_id_by_repo_remote_url`),
                 // so we don't need to set it again here.
-                let chore = match work_db.create_chore(CreateChoreInput {
-                    product_id: product_id.clone(),
-                    name: chore_name,
-                    description: Some(chore_description),
-                    autostart: true,
-                    priority: None,
-                    created_via: Some(format!("comment_dispatch:{comment_id}")),
-                    repo_remote_url: None,
-                    effort_level: None,
-                    model_override: None,
-                    force_duplicate: false,
-                }) {
+                let chore = match work_db.create_chore(
+                    CreateChoreInput::builder()
+                        .product_id(product_id.clone())
+                        .name(chore_name)
+                        .description(chore_description)
+                        .created_via(format!("comment_dispatch:{comment_id}"))
+                        .build(),
+                ) {
                     Ok(c) => c,
                     Err(err) => {
                         send_response(

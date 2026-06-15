@@ -53,33 +53,21 @@ fn creates_tree_and_soft_deletes_chores() {
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Backend schema".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Backend schema")
+                .build(),
+        )
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Cleanup".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
 
     let tree = db.get_work_tree(&product.id).unwrap();
@@ -116,18 +104,12 @@ fn restore_work_item_clears_tombstone() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Recover me".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Recover me")
+                .build(),
+        )
         .unwrap();
     let short_id = chore.short_id.expect("chore has a short id");
 
@@ -251,18 +233,14 @@ fn create_many_tasks_inserts_all_in_one_transaction() {
         .unwrap();
 
     let inputs = (0..5)
-        .map(|i| CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: format!("Task {i}"),
-            description: Some(format!("d{i}")),
-            autostart: i % 2 == 0,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
+        .map(|i| {
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name(format!("Task {i}"))
+                .description(format!("d{i}"))
+                .autostart(i % 2 == 0)
+                .build()
         })
         .collect::<Vec<_>>();
     let created = db.create_many_tasks(CreateManyTasksInput { items: inputs }).unwrap();
@@ -316,32 +294,16 @@ fn create_many_tasks_rolls_back_on_invalid_item() {
     // Item 1 references a non-existent project. The whole batch
     // must roll back — no rows visible after the failure.
     let inputs = vec![
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Good".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        },
-        CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: "proj_does_not_exist".to_owned(),
-            name: "Bad".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        },
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id(project.id.clone())
+            .name("Good")
+            .build(),
+        CreateTaskInput::builder()
+            .product_id(product.id.clone())
+            .project_id("proj_does_not_exist")
+            .name("Bad")
+            .build(),
     ];
     let err = db
         .create_many_tasks(CreateManyTasksInput { items: inputs })
@@ -378,17 +340,12 @@ fn create_many_chores_inserts_all_atomically() {
         .unwrap();
 
     let inputs = (0..3)
-        .map(|i| CreateChoreInput {
-            product_id: product.id.clone(),
-            name: format!("Chore {i}"),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
+        .map(|i| {
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(format!("Chore {i}"))
+                .autostart(false)
+                .build()
         })
         .collect::<Vec<_>>();
     let created = db.create_many_chores(CreateManyChoresInput { items: inputs }).unwrap();
@@ -422,32 +379,20 @@ fn work_tree_includes_runtime_status_per_task() {
         })
         .unwrap();
     let chore_idle = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Idle".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Idle")
+                .build(),
+        )
         .unwrap();
     let chore_running = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Running".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Running")
+                .build(),
+        )
         .unwrap();
     db.reconcile_product_executions(&product.id).unwrap();
 
@@ -515,18 +460,12 @@ fn get_task_runtime_tracks_execution_then_run_id() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Investigate".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Investigate")
+                .build(),
+        )
         .unwrap();
 
     // Pre-dispatch: nothing in flight, every field is `None`.
@@ -591,32 +530,22 @@ fn work_tree_includes_product_scoped_dependency_edges() {
         })
         .unwrap();
     let prereq = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Prereq".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Prereq")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let dependent = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Dependent".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Dependent")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: dependent.id.clone(),
@@ -638,32 +567,22 @@ fn work_tree_includes_product_scoped_dependency_edges() {
         })
         .unwrap();
     let other_prereq = db
-        .create_chore(CreateChoreInput {
-            product_id: other_product.id.clone(),
-            name: "Other Prereq".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(other_product.id.clone())
+                .name("Other Prereq")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let other_dependent = db
-        .create_chore(CreateChoreInput {
-            product_id: other_product.id.clone(),
-            name: "Other Dependent".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(other_product.id.clone())
+                .name("Other Dependent")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     db.add_dependency(AddDependencyInput {
         dependent: other_dependent.id.clone(),
@@ -773,34 +692,22 @@ fn reorders_project_tasks() {
         })
         .unwrap();
     let first = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "One".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("One")
+                .build(),
+        )
         .unwrap();
     let second = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Two".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Two")
+                .build(),
+        )
         .unwrap();
 
     db.reorder_project_tasks(&project.id, &[second.id.clone(), first.id.clone()])
@@ -844,19 +751,13 @@ fn creates_and_lists_execution_entities() {
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Schema".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Schema")
+                .build(),
+        )
         .unwrap();
 
     let execution = db
@@ -1043,48 +944,30 @@ fn reconciles_missing_executions_for_product_tree() {
         })
         .unwrap();
     let first_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "First".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("First")
+                .build(),
+        )
         .unwrap();
     let second_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Second".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Second")
+                .build(),
+        )
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Cleanup".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
 
     // Mark the project's auto-created design task done so the
@@ -1149,34 +1032,22 @@ fn reconcile_promotes_next_project_task_when_previous_done() {
         })
         .unwrap();
     let first_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "First".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("First")
+                .build(),
+        )
         .unwrap();
     let second_task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Second".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Second")
+                .build(),
+        )
         .unwrap();
 
     // Mark the auto-created design task done so first_task takes
@@ -1264,6 +1135,7 @@ fn reconcile_waits_for_product_repo_remote_url() {
             repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             ..WorkItemPatch::default()
         },
     )
@@ -1303,18 +1175,13 @@ fn reconcile_dispatches_chore_against_repo_override() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Nimbus migration".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Nimbus migration")
+                .repo_remote_url("git@github.com:myorg/nimbus.git")
+                .build(),
+        )
         .unwrap();
 
     let result = db.reconcile_product_executions(&product.id).unwrap();
@@ -1511,6 +1378,7 @@ fn reconcile_dispatches_after_override_repairs_unresolvable_chore() {
             repo_remote_url: Some("git@github.com:myorg/nimbus.git".to_owned()),
             effort_level: None,
             model_override: None,
+            driver: None,
             ..WorkItemPatch::default()
         },
     )
@@ -1540,18 +1408,12 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Cleanup".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -1711,18 +1573,12 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Cleanup".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cleanup")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -1778,18 +1634,12 @@ fn cancel_execution_preserves_in_review_and_done_status() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Has PR".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Has PR")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -1844,18 +1694,13 @@ fn ai_reviewing_badge_only_shows_while_reviewer_running() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Has PR under review".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Has PR under review")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     // Simulate the P992 `PendingReview` hold: the implementation finished and
@@ -1967,18 +1812,13 @@ fn ai_reviewing_badge_shows_after_reviewer_pane_spawn() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Review in progress".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Review in progress")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
 
     {
@@ -2073,18 +1913,12 @@ fn start_execution_does_not_downgrade_done_chores() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Already done".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Already done")
+                .build(),
+        )
         .unwrap();
     // Manually mark the chore as done before starting execution.
     db.update_work_item(
@@ -2146,18 +1980,12 @@ fn reconcile_dispatches_active_chore_with_no_execution() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Stranded chore".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Stranded chore")
+                .build(),
+        )
         .unwrap();
     // Manually flip to active, mimicking a kanban drag that
     // wrote tasks.status without ever dispatching.
@@ -2199,18 +2027,12 @@ fn reconcile_redispatches_when_latest_execution_is_terminal() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Bounced chore".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Bounced chore")
+                .build(),
+        )
         .unwrap();
     db.update_work_item(
         &chore.id,
@@ -2258,18 +2080,12 @@ fn reconcile_skips_active_chore_with_live_execution() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Live chore".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Live chore")
+                .build(),
+        )
         .unwrap();
     db.update_work_item(
         &chore.id,
@@ -2320,18 +2136,12 @@ fn reconcile_redispatches_when_non_terminal_but_no_live_worker() {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Stale chore".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Stale chore")
+                .build(),
+        )
         .unwrap();
     db.update_work_item(
         &chore.id,
@@ -2382,18 +2192,13 @@ fn start_run_on_host_for_test(db: &WorkDb, host_id: &str) -> String {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "c".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("c")
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let execution = db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())

@@ -43,6 +43,25 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Set (or clear) a product's `default_driver`. `driver = None` or
+    /// `Some("")` clears the column (resolves to `"claude"` at dispatch).
+    /// Any non-empty value is stored verbatim after a trim. Returns the
+    /// updated product.
+    pub fn set_product_default_driver(&self, product_id: &str, driver: Option<&str>) -> Result<Product> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let _ = query_product(&tx, product_id).require("product", product_id)?;
+        let now = now_string();
+        let stored = driver.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        tx.execute(
+            "UPDATE products SET default_driver = ?2, updated_at = ?3 WHERE id = ?1",
+            params![product_id, stored, now],
+        )?;
+        let updated = query_product(&tx, product_id).require("product", product_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Bind (or unbind) a product's external tracker columns.
     ///
     /// When `unset = true`: clears both `external_tracker_kind` and

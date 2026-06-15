@@ -558,18 +558,18 @@ pub(crate) fn reconcile_revision_execution(
             let is_wip = task.status == TaskStatus::Active;
             let new_chore = insert_chore_in_tx(
                 conn,
-                CreateChoreInput {
-                    product_id: task.product_id.clone(),
-                    autostart: is_wip,
-                    force_duplicate: true,
-                    name: task.name.clone(),
-                    created_via: Some(CREATED_VIA_ENGINE_AUTO.to_owned()),
-                    description: Some(task.description.clone()),
-                    effort_level: task.effort_level,
-                    model_override: task.model_override.clone(),
-                    priority: Some(task.priority.clone()),
-                    repo_remote_url: task.repo_remote_url.clone(),
-                },
+                CreateChoreInput::builder()
+                    .product_id(task.product_id.clone())
+                    .autostart(is_wip)
+                    .force_duplicate(true)
+                    .name(task.name.clone())
+                    .maybe_created_via(Some(CREATED_VIA_ENGINE_AUTO.to_owned()))
+                    .maybe_description(Some(task.description.clone()))
+                    .maybe_effort_level(task.effort_level)
+                    .maybe_model_override(task.model_override.clone())
+                    .maybe_priority(Some(task.priority.clone()))
+                    .maybe_repo_remote_url(task.repo_remote_url.clone())
+                    .build(),
             )?;
             conn.execute(
                 "UPDATE tasks

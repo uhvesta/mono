@@ -532,18 +532,13 @@ mod tests {
     /// An open task counted against the automation's cap.
     fn create_open_task_for_automation(db: &WorkDb, product_id: &str, automation_id: &str) {
         let task_id = db
-            .create_chore(CreateChoreInput {
-                product_id: product_id.to_owned(),
-                name: "produced".to_owned(),
-                description: None,
-                repo_remote_url: None,
-                priority: None,
-                effort_level: None,
-                model_override: None,
-                created_via: None,
-                autostart: false,
-                force_duplicate: false,
-            })
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product_id)
+                    .name("produced")
+                    .autostart(false)
+                    .build(),
+            )
             .unwrap()
             .id;
         db.stamp_task_source_automation_for_test(&task_id, automation_id, "todo")

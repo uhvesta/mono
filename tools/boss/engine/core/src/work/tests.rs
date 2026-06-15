@@ -70,19 +70,13 @@ fn product_task_execution_with_prefix(db: &WorkDb, worker_branch_prefix: Option<
         })
         .unwrap();
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "T".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("T")
+                .build(),
+        )
         .unwrap();
     let execution = db
         .create_execution(
@@ -113,18 +107,12 @@ fn setup_product_and_chore() -> (WorkDb, String, String) {
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: "Fix thing".into(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Fix thing")
+                .build(),
+        )
         .unwrap();
     (db, product.id, chore.id)
 }
@@ -173,19 +161,12 @@ fn seed_investigation_for_doc(db: &WorkDb) -> (Product, Task) {
         })
         .unwrap();
     let investigation = db
-        .create_investigation(boss_protocol::CreateInvestigationInput {
-            product_id: product.id.clone(),
-            autostart: true,
-            force_duplicate: false,
-            name: "Investigate the thing".to_owned(),
-            created_via: None,
-            description: None,
-            effort_level: None,
-            model_override: None,
-            priority: None,
-            project_id: None,
-            repo_remote_url: None,
-        })
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Investigate the thing")
+                .build(),
+        )
         .unwrap();
     (product, investigation)
 }
@@ -209,19 +190,13 @@ fn set_design_doc_input(project_id: &str, path: &str) -> SetProjectDesignDocInpu
 /// the attention item to.
 fn seed_execution_for(db: &WorkDb, product_id: &str, project_id: &str) -> WorkExecution {
     let task = db
-        .create_task(CreateTaskInput {
-            product_id: product_id.to_owned(),
-            project_id: project_id.to_owned(),
-            name: "Schema".to_owned(),
-            description: None,
-            autostart: true,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id)
+                .project_id(project_id)
+                .name("Schema")
+                .build(),
+        )
         .unwrap();
     db.create_execution(
         CreateExecutionInput::builder()
@@ -279,19 +254,14 @@ fn make_resolve_scaffold(label: &str, product_repo: Option<&str>) -> (PathBuf, W
             ).unwrap();
         id
     } else {
-        db.create_task(CreateTaskInput {
-            product_id: product.id.clone(),
-            project_id: project.id.clone(),
-            name: "Task".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        db.create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Task")
+                .autostart(false)
+                .build(),
+        )
         .unwrap()
         .id
     };
@@ -325,18 +295,13 @@ fn make_waiting_human_chore(db: &WorkDb, label: &str) -> (String, String, String
         })
         .unwrap();
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product.id.clone(),
-            name: format!("Chore-{label}"),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None,
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name(format!("Chore-{label}"))
+                .autostart(false)
+                .build(),
+        )
         .unwrap();
     let exec = db
         .create_execution(
@@ -392,18 +357,13 @@ fn make_revision_product(db: &WorkDb, label: &str) -> String {
 
 /// Helper: create a chore (non-revision root) and return its id.
 fn make_chore_root(db: &WorkDb, product_id: &str, label: &str) -> String {
-    db.create_chore(CreateChoreInput {
-        product_id: product_id.to_owned(),
-        name: format!("Root chore {label}"),
-        description: None,
-        autostart: false,
-        priority: None,
-        created_via: None,
-        repo_remote_url: None,
-        effort_level: None,
-        model_override: None,
-        force_duplicate: false,
-    })
+    db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product_id)
+            .name(format!("Root chore {label}"))
+            .autostart(false)
+            .build(),
+    )
     .unwrap()
     .id
 }
@@ -429,18 +389,14 @@ fn insert_revision_row(db: &WorkDb, product_id: &str, parent_task_id: &str) -> S
 /// Helper: create a chore and set its pr_url (to simulate "in review").
 fn make_in_review_chore(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
     let chore = db
-        .create_chore(CreateChoreInput {
-            product_id: product_id.to_owned(),
-            name: "Chore for revision tests".to_owned(),
-            description: None,
-            autostart: false,
-            priority: None,
-            created_via: None,
-            repo_remote_url: None, // inherits from product
-            effort_level: None,
-            model_override: None,
-            force_duplicate: false,
-        })
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product_id)
+                .name("Chore for revision tests")
+                .autostart(false)
+                // inherits from product
+                .build(),
+        )
         .unwrap();
     let conn = db.connect().unwrap();
     conn.execute(
@@ -496,6 +452,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         blocked_signals: vec![],
         effort_level: None,
         model_override: None,
+        driver: None,
         ci_attempt_budget: None,
         ci_attempts_used: 0,
         ci_required_state: None,

@@ -189,18 +189,18 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
             let is_wip = rev.status == TaskStatus::Active;
             let new_chore = insert_chore_in_tx(
                 conn,
-                CreateChoreInput {
-                    product_id: rev.product_id.clone(),
-                    autostart: is_wip,
-                    force_duplicate: true,
-                    name: rev.name.clone(),
-                    created_via: Some(CREATED_VIA_ENGINE_AUTO.to_owned()),
-                    description: Some(rev.description.clone()),
-                    effort_level: rev.effort_level,
-                    model_override: rev.model_override.clone(),
-                    priority: Some(rev.priority.clone()),
-                    repo_remote_url: rev.repo_remote_url.clone(),
-                },
+                CreateChoreInput::builder()
+                    .product_id(rev.product_id.clone())
+                    .autostart(is_wip)
+                    .force_duplicate(true)
+                    .name(rev.name.clone())
+                    .maybe_created_via(Some(CREATED_VIA_ENGINE_AUTO.to_owned()))
+                    .maybe_description(Some(rev.description.clone()))
+                    .maybe_effort_level(rev.effort_level)
+                    .maybe_model_override(rev.model_override.clone())
+                    .maybe_priority(Some(rev.priority.clone()))
+                    .maybe_repo_remote_url(rev.repo_remote_url.clone())
+                    .build(),
             )?;
             conn.execute(
                 "UPDATE tasks
