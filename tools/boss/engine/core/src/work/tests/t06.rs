@@ -2503,3 +2503,206 @@ fn abandoned_conflict_resolution_revision_execution_has_no_run_row() {
         "no transcript path must be recorded for an execution that was never dispatched",
     );
 }
+
+// ── Per-PR single-writer guard: live_execution_elsewhere_in_chain ──────────
+
+/// A revision must see the chain root's live execution: the root (the task
+/// that owns the PR) is a chain member, so a `running` execution on it blocks
+/// any sibling revision's dispatch onto the shared jj backing store.
+#[test]
+fn live_execution_elsewhere_in_chain_finds_live_root_from_revision() {
+    let db = WorkDb::open(temp_db_path("chain-live-root-from-rev")).unwrap();
+    let product_id = make_revision_product(&db, "live-root");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1577";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+
+    // A live (running) resume on the chain root.
+    let root_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(root_id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+
+    let found = db.live_execution_elsewhere_in_chain(&revision.id).unwrap();
+    assert_eq!(
+        found.map(|e| e.id),
+        Some(root_exec.id),
+        "a revision must observe the chain root's live implementation execution",
+    );
+}
+
+/// Symmetrically, the chain root must see a revision's live execution — a
+/// conflict-resolution worker rebasing the stack must block the root resume.
+#[test]
+fn live_execution_elsewhere_in_chain_finds_live_revision_from_root() {
+    let db = WorkDb::open(temp_db_path("chain-live-rev-from-root")).unwrap();
+    let product_id = make_revision_product(&db, "live-rev");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1815";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+
+    let rev_exec = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::WaitingHuman)
+                .build(),
+        )
+        .unwrap();
+
+    let found = db.live_execution_elsewhere_in_chain(&root_id).unwrap();
+    assert_eq!(
+        found.map(|e| e.id),
+        Some(rev_exec.id),
+        "the chain root must observe a revision's live execution",
+    );
+}
+
+/// The work item's OWN execution and TERMINAL executions are ignored — only
+/// a live execution on a DIFFERENT chain member counts.
+#[test]
+fn live_execution_elsewhere_in_chain_ignores_self_and_terminal() {
+    let db = WorkDb::open(temp_db_path("chain-live-ignores")).unwrap();
+    let product_id = make_revision_product(&db, "ignores");
+    let pr_url = "https://github.com/spinyfin/mono/pull/300";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&root_id), &checker).unwrap();
+
+    // Live execution on the ROOT itself — must be excluded when scanning
+    // from the root (it's the work item we're asking about).
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(root_id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+
+    // A TERMINAL execution on the revision — must not count as live.
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(revision.id.clone())
+            .kind(ExecutionKind::RevisionImplementation)
+            .status(ExecutionStatus::Completed)
+            .build(),
+    )
+    .unwrap();
+
+    assert!(
+        db.live_execution_elsewhere_in_chain(&root_id).unwrap().is_none(),
+        "scanning from the root must exclude the root's own live exec and the revision's terminal exec",
+    );
+}
+
+/// A chore with no revisions is a single-member chain, so a live execution on
+/// it never registers as an "elsewhere" sibling — the guard is a no-op and
+/// preserves the historical per-work-item behaviour for chain-less work.
+#[test]
+fn live_execution_elsewhere_in_chain_noop_for_choreless_chain() {
+    let db = WorkDb::open(temp_db_path("chain-live-choreless")).unwrap();
+    let product_id = make_revision_product(&db, "choreless");
+    let chore_id = make_chore_root(&db, &product_id, "solo");
+
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+
+    assert!(
+        db.live_execution_elsewhere_in_chain(&chore_id).unwrap().is_none(),
+        "a chore with no revisions must report no chain sibling",
+    );
+}
+
+// ── Reviewer-fallback single-live-worker guard ─────────────────────────────
+
+/// Helper: a chore held in `active` (Doing) with a bound PR url.
+fn make_active_chore_with_pr(db: &WorkDb, product_id: &str, pr_url: &str) -> String {
+    let id = make_in_review_chore(db, product_id, pr_url);
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET status = 'active' WHERE id = ?1",
+        rusqlite::params![id],
+    )
+    .unwrap();
+    id
+}
+
+/// The reviewer-fallback must NOT advance active→in_review while a live
+/// IMPLEMENTATION execution is working the task (T1577 incident): doing so
+/// strands the implementation worker in the Review lane with no Doing card.
+#[test]
+fn reviewer_fallback_refuses_while_impl_exec_live() {
+    let db = WorkDb::open(temp_db_path("reviewer-refuse-impl-live")).unwrap();
+    let product_id = make_revision_product(&db, "refuse-impl");
+    let pr_url = "https://github.com/spinyfin/mono/pull/1577";
+    let chore_id = make_active_chore_with_pr(&db, &product_id, pr_url);
+
+    // A stale/timed-out pr_review execution is what surfaces this task as a
+    // fallback candidate — but a live implementation resume is also present.
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Abandoned)
+            .build(),
+    )
+    .unwrap();
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+
+    let advanced = db.advance_pending_review_task_to_in_review(&chore_id).unwrap();
+    assert!(
+        !advanced,
+        "must refuse to advance while a live implementation execution is working the task",
+    );
+    let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Active, "task must stay in Doing");
+}
+
+/// With only a live `pr_review` execution (the actual reviewer), the
+/// reviewer-fallback advances the lane as before.
+#[test]
+fn reviewer_fallback_advances_with_only_live_reviewer() {
+    let db = WorkDb::open(temp_db_path("reviewer-advance-reviewer")).unwrap();
+    let product_id = make_revision_product(&db, "advance-rev");
+    let pr_url = "https://github.com/spinyfin/mono/pull/42";
+    let chore_id = make_active_chore_with_pr(&db, &product_id, pr_url);
+
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore_id.clone())
+            .kind(ExecutionKind::PrReview)
+            .status(ExecutionStatus::Running)
+            .build(),
+    )
+    .unwrap();
+
+    let advanced = db.advance_pending_review_task_to_in_review(&chore_id).unwrap();
+    assert!(
+        advanced,
+        "a live pr_review execution must not block the reviewer-fallback"
+    );
+    let task = query_task(&db.connect().unwrap(), &chore_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::InReview);
+}

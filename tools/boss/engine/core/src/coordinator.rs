@@ -1461,11 +1461,24 @@ impl ExecutionCoordinator {
             .filter_map(|exec| {
                 let created_at_secs: u64 = exec.created_at.parse().ok()?;
                 let age_ms = now_secs.saturating_sub(created_at_secs).saturating_mul(1000);
-                if age_ms >= cutoff_ms {
-                    Some((exec.id, age_ms))
-                } else {
-                    None
+                if age_ms < cutoff_ms {
+                    return None;
                 }
+                // A `ready` row that the per-PR single-writer guard is
+                // deliberately holding behind a live chain sibling is NOT
+                // stranded — it is correctly queued and will dispatch when
+                // the sibling reaps. Excluding it keeps the heartbeat's
+                // "kick/drain handoff may have dropped a wakeup" warning
+                // honest (it would otherwise fire every interval for the
+                // entire lifetime of the live sibling). Fail open: if the
+                // chain query errors, treat the row as stranded as before.
+                if matches!(
+                    self.work_db.live_execution_elsewhere_in_chain(&exec.work_item_id),
+                    Ok(Some(_))
+                ) {
+                    return None;
+                }
+                Some((exec.id, age_ms))
             })
             .collect()
     }
@@ -1659,6 +1672,53 @@ impl ExecutionCoordinator {
                 pool = pool_label,
                 "spawn_attempt status=ready -> picked_up"
             );
+
+            // Per-PR single-writer guard (T1577 / T1815 incident): defer this
+            // execution if ANOTHER work item on the same PR/revision chain is
+            // already live. Checked BEFORE claiming a worker so a serialized
+            // row never burns a slot or pollutes its dispatch timeline. The
+            // row stays `ready` and re-attempts on the next kick (which fires
+            // when the live sibling reaps), so it runs strictly after it.
+            // `schedule_execution` re-checks this as the chokepoint backstop
+            // for the `force_dispatch` path. See
+            // `WorkDb::live_execution_elsewhere_in_chain`.
+            match self.work_db.live_execution_elsewhere_in_chain(&execution.work_item_id) {
+                Ok(Some(sibling)) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        live_sibling_execution_id = %sibling.id,
+                        live_sibling_work_item_id = %sibling.work_item_id,
+                        pool = pool_label,
+                        "spawn_attempt status=ready -> deferred reason=chain_serialized"
+                    );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "reason": "chain_serialized",
+                                    "live_sibling_execution_id": sibling.id,
+                                    "live_sibling_work_item_id": sibling.work_item_id,
+                                })),
+                        )
+                        .await;
+                    // Leave the row `ready`; do NOT mark any pool exhausted —
+                    // other executions in this pass may still dispatch.
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    // Fail open: a DB error must not wedge the queue. The
+                    // `schedule_execution` backstop still guards the spawn.
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        ?err,
+                        "drain: chain single-writer check failed — proceeding without pre-claim defer",
+                    );
+                }
+            }
 
             let pool = self.pool_for_execution(&execution);
             let Some(worker_id) = pool
@@ -1946,6 +2006,63 @@ impl ExecutionCoordinator {
                     work_item_id = %execution.work_item_id,
                     ?err,
                     "spawn_attempt: live-execution check failed — proceeding without dedup guard",
+                );
+            }
+        }
+
+        // Per-PR single-writer guard (T1577 / T1815 incident). The
+        // double-spawn guard above only sees executions on this exact
+        // work_item; it cannot see a *sibling* execution that targets the
+        // SAME PR. A revision (conflict-resolution, ci-fix, review-findings,
+        // operator) is a distinct work item whose chain root owns the PR,
+        // and cube co-locates every same-PR worker on ONE shared jj backing
+        // store — so a second live execution anywhere in the chain rebases
+        // and rewrites the first's commits. Every dispatch entry point
+        // funnels through here, so this one check serializes ALL of them:
+        // the conflict-resolution and ci-fix auto-spawn paths included.
+        //
+        // The auto-dispatcher (`drain_ready_queue`) applies this same guard
+        // BEFORE claiming a worker (so it never wastes a slot or emits a
+        // misleading `worker_claimed` timeline for a deferred row); this
+        // copy is the backstop for `force_dispatch` (`bossctl agents
+        // launch`) and any future direct caller, closing the chokepoint.
+        //
+        // Unlike the redundant-duplicate guard above, a chain sibling is NOT
+        // redundant — it has its own real work — so we DEFER rather than
+        // abandon: the execution stays `ready` and is re-attempted on the
+        // next scheduler kick (which fires when the live sibling reaps), so
+        // it runs strictly after the live one finishes.
+        match self.work_db.live_execution_elsewhere_in_chain(&execution.work_item_id) {
+            Ok(Some(sibling)) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    live_sibling_execution_id = %sibling.id,
+                    live_sibling_work_item_id = %sibling.work_item_id,
+                    "spawn_attempt: deferred — another execution on the same PR/chain is live; \
+                     serializing behind it rather than co-dispatching onto the shared jj store",
+                );
+                // Leave the execution `ready` (do NOT abandon). The caller
+                // releases the claimed worker on this `Err`, and the next
+                // kick re-evaluates the still-`ready` row.
+                return Err(anyhow::anyhow!(
+                    "serialized: execution {} for work_item {} deferred behind live chain sibling {} (work_item {})",
+                    execution.id,
+                    execution.work_item_id,
+                    sibling.id,
+                    sibling.work_item_id,
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // Non-fatal: proceed rather than blocking all dispatches.
+                // The post-lease assertion below is the defense-in-depth
+                // backstop for the single-writer invariant.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: chain single-writer check failed — proceeding without serialization guard",
                 );
             }
         }
@@ -2338,6 +2455,76 @@ impl ExecutionCoordinator {
                     &err,
                 )?;
                 return Err(err);
+            }
+        }
+
+        // Per-PR single-writer assertion (defense in depth). The pre-claim
+        // chain guard at the top of `schedule_execution` already deferred
+        // any execution whose PR/chain has a live sibling, but there is a
+        // TOCTOU window between that check and committing this run to the
+        // leased workspace: a sibling could have gone live in between. We
+        // re-assert the invariant HERE, immediately before spawning onto the
+        // shared jj backing store — the irreversible step. The occupancy
+        // guard above only catches a sibling in the SAME workspace; two
+        // same-PR workers in DIFFERENT cube workspaces still share one
+        // backing store and corrupt each other, which this catches. On a
+        // violation we release the lease and refuse rather than interleave.
+        match self.work_db.live_execution_elsewhere_in_chain(&execution.work_item_id) {
+            Ok(Some(sibling)) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    worker_id,
+                    cube_workspace_id = %lease.workspace_id,
+                    live_sibling_execution_id = %sibling.id,
+                    live_sibling_work_item_id = %sibling.work_item_id,
+                    "REFUSING spawn: another execution on the same PR/chain went live after the \
+                     pre-claim guard — refusing rather than handing two same-PR workers the shared \
+                     jj backing store (single-writer invariant)",
+                );
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::CubeWorkspaceLeaseFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_cube_repo(&repo.repo_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_details(serde_json::json!({
+                                "reason": "chain_sibling_went_live",
+                                "live_sibling_execution_id": sibling.id,
+                                "live_sibling_work_item_id": sibling.work_item_id,
+                            })),
+                    )
+                    .await;
+                // Hand the workspace back so it isn't stranded, then leave
+                // the execution `ready` (the deferral path) so it re-attempts
+                // once the sibling reaps.
+                if let Err(release_err) = adapter.release_workspace(&lease.lease_id).await {
+                    tracing::error!(
+                        ?release_err,
+                        lease_id = %lease.lease_id,
+                        "failed to release workspace after refusing a chain-sibling-racing spawn",
+                    );
+                }
+                return Err(anyhow!(
+                    "serialized: execution {} for work_item {} refused after lease — chain sibling {} (work_item {}) went live",
+                    execution.id,
+                    execution.work_item_id,
+                    sibling.id,
+                    sibling.work_item_id,
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // Fail open: a DB error here must not wedge dispatch. The
+                // pre-claim guard already covered the common case.
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    ?err,
+                    "spawn_attempt: post-lease chain single-writer assertion failed to query — proceeding",
+                );
             }
         }
         {
@@ -9515,6 +9702,124 @@ mod tests {
         assert!(
             cube.ensure_calls.lock().await.is_empty(),
             "no cube ensure must occur for a gated execution"
+        );
+    }
+
+    /// Per-PR single-writer guard (T1577 / T1815 incident). When an
+    /// implementation execution on the chain root is live, dispatching a
+    /// conflict-resolution revision (a DIFFERENT work item that targets the
+    /// SAME PR via the chain) must be DEFERRED — not co-dispatched onto the
+    /// shared jj backing store, and not abandoned. The revision execution
+    /// must stay `ready` and must dispatch only once the live sibling reaps.
+    #[tokio::test]
+    async fn schedule_execution_defers_revision_behind_live_chain_sibling() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/1467";
+        // Chain root: a chore in_review with a bound PR (the implementation task).
+        let (_, root_id) = make_pr_review_fixture(&db, Some(pr_url));
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review' WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+            // A conflict-resolution revision hanging off the chain root.
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_serialize', product_id, 'revision', 'Resolve conflicts', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Live implementation resume on the chain root.
+        let root_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(root_id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+
+        // Ready conflict-resolution revision execution targeting the same PR.
+        let revision_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_serialize")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_pre_start_retry_delays(Vec::new()),
+        );
+
+        let worker_id = coordinator
+            .worker_pool()
+            .claim_worker(&revision_exec.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&revision_exec, &worker_id).await;
+        assert!(
+            result.is_err(),
+            "revision must be deferred while a chain sibling is live: {result:?}",
+        );
+
+        // Deferred, NOT abandoned: the execution stays `ready` so it can be
+        // re-attempted when the live sibling reaps.
+        let after_defer = db.get_execution(&revision_exec.id).unwrap();
+        assert_eq!(
+            after_defer.status,
+            ExecutionStatus::Ready,
+            "deferred revision must remain ready, not abandoned/waiting_dependency, got {:?}",
+            after_defer.status,
+        );
+        assert!(
+            cube.lease_calls.lock().await.is_empty(),
+            "no cube workspace may be leased while serialized behind a live chain sibling",
+        );
+
+        // The live sibling reaps. Mirror the drain loop releasing the worker,
+        // then re-attempt: the revision must now dispatch.
+        coordinator.worker_pool().release_worker(&worker_id, None).await;
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE work_executions SET status = 'completed', finished_at = '1' WHERE id = ?1",
+                rusqlite::params![root_exec.id],
+            )
+            .unwrap();
+        }
+
+        let worker_id2 = coordinator
+            .worker_pool()
+            .claim_worker(&revision_exec.id, None)
+            .await
+            .expect("worker pool slot available after release");
+        let result_after = coordinator.schedule_execution(&revision_exec, &worker_id2).await;
+        assert!(
+            result_after.is_ok(),
+            "revision must dispatch once the live chain sibling has reaped: {result_after:?}",
+        );
+        assert!(
+            !cube.lease_calls.lock().await.is_empty(),
+            "a cube workspace must be leased once the chain is clear",
         );
     }
 

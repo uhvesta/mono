@@ -610,6 +610,61 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// Return a live (`running` / `waiting_human`) execution belonging to
+    /// ANY *other* work item in the same revision chain as `work_item_id` —
+    /// the chain root (the task that owns the PR) plus every revision
+    /// descendant of that root. Returns `None` when no other chain member
+    /// is live.
+    ///
+    /// This is the per-PR single-writer guard. Every task in a revision
+    /// chain shares the chain root's PR branch, and cube co-locates same-PR
+    /// workers on ONE shared jj backing store; two live executions anywhere
+    /// in the chain therefore rebase/rewrite each other's commits (the
+    /// T1577 / T1815 incident: a conflict-resolution revision rebased the
+    /// stack out from under a still-live implementation resume). Unlike
+    /// [`Self::get_live_execution_for_work_item`], which keys on a single
+    /// `work_item_id` and so cannot see a sibling revision's (or the chain
+    /// root's) live worker, this walks the whole chain.
+    ///
+    /// The work item itself is excluded from the scan — the same-work-item
+    /// "is this exact task already being worked?" question is answered by
+    /// [`Self::get_live_execution_for_work_item`]; this answers the broader
+    /// "is anything ELSE on this PR live?". For a work item with no revision
+    /// chain (a chore with no revisions, an automation, a product/project)
+    /// the chain collapses to the work item itself, so this returns `None`
+    /// and the behaviour is identical to the historical per-work-item guard.
+    pub fn live_execution_elsewhere_in_chain(&self, work_item_id: &str) -> Result<Option<WorkExecution>> {
+        let conn = self.connect()?;
+        let root_id = chain_root(&conn, work_item_id)?;
+        let mut member_ids = Vec::with_capacity(4);
+        member_ids.push(root_id.clone());
+        member_ids.extend(collect_chain_revision_ids(&conn, &root_id)?);
+        for member_id in &member_ids {
+            if member_id == work_item_id {
+                continue;
+            }
+            let live: Option<WorkExecution> = conn
+                .query_row(
+                    "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                            cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                            created_at, started_at, finished_at,
+                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming
+                     FROM work_executions
+                     WHERE work_item_id = ?1
+                       AND status IN ('running', 'waiting_human')
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT 1",
+                    rusqlite::params![member_id],
+                    map_execution,
+                )
+                .optional()?;
+            if live.is_some() {
+                return Ok(live);
+            }
+        }
+        Ok(None)
+    }
+
     /// Mark an execution `abandoned` without touching any other
     /// execution or task state. Used by the double-spawn guard to
     /// discard a redundant `ready` execution before it ever reaches

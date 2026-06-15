@@ -2632,8 +2632,13 @@ async fn sweep_stalled_reviewer(
             outcome.reviewer_fallback_advanced += 1;
         }
         Ok(false) => {
-            // Task was already past `active` — no-op; a concurrent sweep or the
-            // reviewer's own Stop hook already advanced it.
+            // No-op. Either the task was already past `active` (a concurrent
+            // sweep or the reviewer's own Stop hook advanced it), or the
+            // single-live-worker guard inside
+            // `advance_pending_review_task_to_in_review` refused to advance
+            // because a live non-reviewer execution (an implementation/CI
+            // resume) is still working the task — advancing then would strand
+            // that worker in the Review lane (T1577 incident).
         }
         Err(err) => {
             tracing::warn!(

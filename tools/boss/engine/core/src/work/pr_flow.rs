@@ -308,6 +308,17 @@ impl WorkDb {
     /// (the reviewer finished or timed out without advancing it). Idempotent:
     /// no-ops if the task is already past `active`. Returns `true` if the task
     /// was updated.
+    ///
+    /// Single-live-worker guard (T1577 incident): the reviewer-fallback is
+    /// only correct when the worker holding the task in `active` is actually
+    /// the AI reviewer. A `pr_review` execution can be terminal/timed-out
+    /// (which surfaces the task as a fallback candidate) while a DIFFERENT
+    /// live execution — a `chore_implementation`/`task_implementation`/
+    /// `ci_remediation` resume — is actively working the task. Advancing the
+    /// lane then would strand the implementation worker in the Review column
+    /// with no Doing card. So we refuse to advance while ANY live
+    /// (`running`/`waiting_human`) non-`pr_review` execution exists on the
+    /// task: the `NOT EXISTS` clause makes the update a no-op in that case.
     pub fn advance_pending_review_task_to_in_review(&self, work_item_id: &str) -> Result<bool> {
         let conn = self.connect()?;
         let now = now_string();
@@ -320,7 +331,13 @@ impl WorkDb {
                AND status = 'active'
                AND pr_url IS NOT NULL
                AND pr_url != ''
-               AND deleted_at IS NULL",
+               AND deleted_at IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions we
+                 WHERE we.work_item_id = ?1
+                   AND we.status IN ('running', 'waiting_human')
+                   AND we.kind != 'pr_review'
+               )",
             params![work_item_id, now],
         )?;
         Ok(rows_changed > 0)

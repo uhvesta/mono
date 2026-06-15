@@ -5881,8 +5881,9 @@ mod tests {
     fn checkleft_gate_proceeds_when_checkleft_clean() {
         let dir = TempDir::new().unwrap();
         write_fake_checkleft(dir.path(), 0, "checks: no findings");
+        let checkleft = Some(dir.path().join("bin").join("checkleft"));
         assert!(
-            run_checkleft_gate(dir.path()).is_ok(),
+            run_checkleft_gate_impl(dir.path(), checkleft).is_ok(),
             "gate must proceed when checkleft exits 0",
         );
     }
@@ -5891,7 +5892,9 @@ mod tests {
     fn checkleft_gate_refuses_with_findings_when_checkleft_fails() {
         let dir = TempDir::new().unwrap();
         write_fake_checkleft(dir.path(), 1, "error[rustfmt]: file needs formatting");
-        let err = run_checkleft_gate(dir.path()).expect_err("gate must refuse when checkleft exits non-zero");
+        let checkleft = Some(dir.path().join("bin").join("checkleft"));
+        let err =
+            run_checkleft_gate_impl(dir.path(), checkleft).expect_err("gate must refuse when checkleft exits non-zero");
         let CubeError::InvalidArgument(msg) = err else {
             panic!("expected InvalidArgument, got {err:?}");
         };
@@ -5955,7 +5958,9 @@ mod tests {
         // prevents users from thinking they have policy violations to fix.
         let dir = TempDir::new().unwrap();
         write_fake_checkleft_stderr_only(dir.path(), 1, "error: unsupported jj diff summary line: X some/file.rs");
-        let err = run_checkleft_gate(dir.path()).expect_err("gate must block when checkleft exits non-zero");
+        let checkleft = Some(dir.path().join("bin").join("checkleft"));
+        let err =
+            run_checkleft_gate_impl(dir.path(), checkleft).expect_err("gate must block when checkleft exits non-zero");
         let CubeError::InvalidArgument(msg) = err else {
             panic!("expected InvalidArgument, got {err:?}");
         };
