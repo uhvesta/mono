@@ -2304,7 +2304,9 @@ final class ChatViewModel: ObservableObject {
         // device-flow transition out on it. We stay subscribed for the
         // whole session so the "GitHub account" settings subsection
         // re-renders live (OAuth device-flow design §4, TOPIC_GITHUB_AUTH).
-        var topics: Set<String> = ["work.products", "worker.live_states", "github.auth"]
+        // `engine.health` carries health-state changes (dispatch pause/resume,
+        // etc.) so the banner updates live without polling or restarting.
+        var topics: Set<String> = ["work.products", "worker.live_states", "github.auth", "engine.health"]
         if let productID = currentSelectedProductID {
             topics.insert(workTopic(forProductID: productID))
         }

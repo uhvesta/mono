@@ -30,8 +30,9 @@ use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, InterruptWorkerPaneInput,
     OrgAuthState, ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput,
-    TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
-    editorial_actions_topic, execution_topic, magic_wand_dispatch_topic, probe_topic, work_product_topic,
+    TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload,
+    comment_topic, editorial_actions_topic, execution_topic, magic_wand_dispatch_topic, probe_topic,
+    work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -1474,6 +1475,16 @@ impl ServerState {
     pub async fn broadcast_github_auth_state(&self, state: GitHubAuthStateDto) {
         let envelope = FrontendEventEnvelope::push(FrontendEvent::GitHubAuthState { state });
         self.topic_broker.publish(TOPIC_GITHUB_AUTH, envelope).await;
+    }
+
+    /// Push the current engine-health snapshot on the `engine.health` topic.
+    /// Called whenever health-affecting state changes (dispatch pause/resume,
+    /// etc.) so subscribed frontends update the health banner without polling
+    /// or restarting.
+    pub async fn broadcast_engine_health(self: &Arc<Self>) {
+        let report = build_engine_health_report(self);
+        let envelope = FrontendEventEnvelope::push(FrontendEvent::EngineHealthResult { report });
+        self.topic_broker.publish(TOPIC_ENGINE_HEALTH, envelope).await;
     }
 
     /// Set the Boss session's shell pid (the second trust root). Any

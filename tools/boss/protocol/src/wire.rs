@@ -28,6 +28,12 @@ pub const TOPIC_WORK_PRODUCTS: &str = "work.products";
 /// advances. See the OAuth device-flow design (§3 state machine, §4 RPC).
 pub const TOPIC_GITHUB_AUTH: &str = "github.auth";
 
+/// Global topic carrying engine-health pushes
+/// ([`FrontendEvent::EngineHealthResult`]). The engine fans every
+/// health-state change (dispatch pause/resume, API key changes, etc.)
+/// out on this topic so subscribed frontends update without polling.
+pub const TOPIC_ENGINE_HEALTH: &str = "engine.health";
+
 pub fn work_product_topic(product_id: &str) -> String {
     format!("work.product.{product_id}")
 }

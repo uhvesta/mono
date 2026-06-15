@@ -373,6 +373,9 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 paused_since_epoch_s,
             },
         );
+        // Broadcast the new health report to all connected app clients so
+        // the pause banner updates live without requiring an app restart.
+        server_state.broadcast_engine_health().await;
     }
 }
 
