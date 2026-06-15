@@ -204,6 +204,14 @@ pub struct PrLifecycleProbe {
     /// not queued. Used to render the merging indicator on Review-lane cards
     /// (replaces the CI icon while the PR is merging).
     pub in_merge_queue: bool,
+    /// Raw `mergeable` string from GitHub (e.g. `"MERGEABLE"`, `"CONFLICTING"`,
+    /// `"UNKNOWN"`). Carried through so callers can log the exact GitHub signal
+    /// that drove each transition decision without a second round trip.
+    pub raw_mergeable: String,
+    /// Raw `mergeStateStatus` string from GitHub (e.g. `"CLEAN"`, `"DIRTY"`,
+    /// `"BLOCKED"`, `"BEHIND"`, `"UNKNOWN"`). Paired with `raw_mergeable`
+    /// for diagnosability on transition log lines.
+    pub raw_merge_state_status: String,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -489,6 +497,8 @@ impl MergeProbe for CommandMergeProbe {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 });
             }
             return Err(anyhow!(
@@ -758,6 +768,8 @@ fn parse_probe_json(url: &str, body: &str, combined_state: Option<&str>) -> Resu
         labels,
         review,
         in_merge_queue,
+        raw_mergeable: mergeable.to_owned(),
+        raw_merge_state_status: merge_state_status.to_owned(),
     })
 }
 
@@ -1912,37 +1924,12 @@ async fn sweep_one(
                         &probe_result.labels,
                         ci,
                         false, // mergeability_clean=false: skip merge_conflict retire on UNKNOWN
+                        &probe_result.raw_mergeable,
+                        &probe_result.raw_merge_state_status,
                         outcome,
                     )
                     .await;
-                    if let OpenPrCiStatus::Failing { failures } = ci {
-                        if ci_watch::on_ci_failure_detected(
-                            work_db,
-                            publisher,
-                            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
-                            candidate,
-                            &probe_result,
-                            failures,
-                        )
-                        .await
-                        {
-                            outcome.ci_flagged += 1;
-                        }
-                    }
-                    if matches!(ci, OpenPrCiStatus::InFlight) {
-                        if ci_watch::on_ci_in_flight_supersedes_failure(
-                            work_db,
-                            publisher,
-                            candidate,
-                            &probe_result.labels,
-                            probe_result.head_ref_oid.as_deref(),
-                        )
-                        .await
-                        {
-                            outcome.ci_cleared += 1;
-                        }
-                        ci_watch::on_ci_in_flight(work_db, publisher, candidate, &probe_result).await;
-                    }
+                    dispatch_ci_axis(work_db, publisher, candidate, &probe_result, ci, outcome).await;
                 }
                 OpenPrMergeability::Clean => {
                     // Polymorphic clear dispatch (design §Q5 Phase 10 #31):
@@ -1966,6 +1953,8 @@ async fn sweep_one(
                         &probe_result.labels,
                         ci,
                         true, // mergeability_clean=true: merge_conflict retire is safe
+                        &probe_result.raw_mergeable,
+                        &probe_result.raw_merge_state_status,
                         outcome,
                     )
                     .await;
@@ -1973,55 +1962,9 @@ async fn sweep_one(
                     // its own fan-out regardless of what the side-table
                     // says, because the chore is currently `in_review`
                     // (no signal in the table yet) on the first failure.
-                    if let OpenPrCiStatus::Failing { failures } = ci {
-                        // Phase 4 cutover: the `fix`-kind CI producer creates
-                        // an engine-triggered revision via the shared
-                        // `create_revision` gate (R4 reuse). We are inside the
-                        // `Open` arm with `mergeability = Clean`, so the PR is
-                        // known-open; feed that observation to the gate via a
-                        // static checker rather than a redundant `gh pr view`.
-                        if ci_watch::on_ci_failure_detected(
-                            work_db,
-                            publisher,
-                            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
-                            candidate,
-                            &probe_result,
-                            failures,
-                        )
-                        .await
-                        {
-                            outcome.ci_flagged += 1;
-                        }
-                    }
-                    // `InFlight` is the explicit "don't act yet" leaf
-                    // for CI; the clear dispatch above already declined
-                    // because `should_clear_ci` requires Clean. The
-                    // never-starts soft alert (Phase 12 #39) tracks
-                    // how long the same head sha has been sitting in
-                    // InFlight and emits a warn at 30m / alert at 2h.
-                    if matches!(ci, OpenPrCiStatus::InFlight) {
-                        // Issue #901: a newer in-progress run supersedes
-                        // an older failing result. The polymorphic clear
-                        // dispatch above only retires on `Clean`, so a
-                        // chore still parked in `blocked: ci_failure` from
-                        // the previous run keeps its stale "ci failing"
-                        // badge even though CI is now re-running. Clear it
-                        // here so the card shows a single coherent
-                        // "in progress" state rather than asserting a
-                        // failure that is actively being re-evaluated.
-                        if ci_watch::on_ci_in_flight_supersedes_failure(
-                            work_db,
-                            publisher,
-                            candidate,
-                            &probe_result.labels,
-                            probe_result.head_ref_oid.as_deref(),
-                        )
-                        .await
-                        {
-                            outcome.ci_cleared += 1;
-                        }
-                        ci_watch::on_ci_in_flight(work_db, publisher, candidate, &probe_result).await;
-                    }
+                    // `InFlight` supersedes-failure and in-flight tracking
+                    // are also independent of mergeability.
+                    dispatch_ci_axis(work_db, publisher, candidate, &probe_result, ci, outcome).await;
                 }
             }
         }
@@ -2228,6 +2171,48 @@ async fn reconcile_stranded(
     }
 }
 
+/// Dispatch CI signals (failure detection and in-flight tracking) independent
+/// of mergeability. Called from both the `Unknown` and `Clean` mergeability
+/// arms in `sweep_one` — CI is an orthogonal axis and is handled identically
+/// regardless of whether mergeability is known.
+async fn dispatch_ci_axis(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    candidate: &PendingMergeCheck,
+    probe_result: &PrLifecycleProbe,
+    ci: &OpenPrCiStatus,
+    outcome: &mut SweepOutcome,
+) {
+    if let OpenPrCiStatus::Failing { failures } = ci {
+        if ci_watch::on_ci_failure_detected(
+            work_db,
+            publisher,
+            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+            candidate,
+            probe_result,
+            failures,
+        )
+        .await
+        {
+            outcome.ci_flagged += 1;
+        }
+    }
+    if matches!(ci, OpenPrCiStatus::InFlight) {
+        if ci_watch::on_ci_in_flight_supersedes_failure(
+            work_db,
+            publisher,
+            candidate,
+            &probe_result.labels,
+            probe_result.head_ref_oid.as_deref(),
+        )
+        .await
+        {
+            outcome.ci_cleared += 1;
+        }
+        ci_watch::on_ci_in_flight(work_db, publisher, candidate, probe_result).await;
+    }
+}
+
 /// Polymorphic retire dispatch (design §Q5 / Phase 10 #31).
 ///
 /// The merge poller's `Clean`-mergeability branch used to call every
@@ -2270,6 +2255,8 @@ async fn maybe_clear_blocked(
     labels: &[String],
     ci: &OpenPrCiStatus,
     mergeability_clean: bool,
+    raw_mergeable: &str,
+    raw_merge_state_status: &str,
     outcome: &mut SweepOutcome,
 ) {
     let signals = match work_db.active_blocked_signals(&candidate.work_item_id) {
@@ -2348,7 +2335,17 @@ async fn maybe_clear_blocked(
                     "merge poller: dispatching conflict_watch::on_resolved \
                      (mergeable=MERGEABLE/definitive Clean)",
                 );
-                if conflict_watch::on_resolved(work_db, publisher, cube_client, candidate, labels).await {
+                if conflict_watch::on_resolved(
+                    work_db,
+                    publisher,
+                    cube_client,
+                    candidate,
+                    labels,
+                    raw_mergeable,
+                    raw_merge_state_status,
+                )
+                .await
+                {
                     outcome.conflict_cleared += 1;
                 }
             }
@@ -2791,6 +2788,8 @@ mod tests {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 }),
             );
         }
@@ -2815,6 +2814,8 @@ mod tests {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 }),
             );
         }
@@ -2832,6 +2833,8 @@ mod tests {
                     labels: labels.iter().map(|s| (*s).to_owned()).collect(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 }),
             );
         }
@@ -2858,6 +2861,8 @@ mod tests {
                     labels: Vec::new(),
                     review: PrReviewState::Unknown,
                     in_merge_queue: false,
+                    raw_mergeable: String::new(),
+                    raw_merge_state_status: String::new(),
                 }),
             }
         }
@@ -3369,6 +3374,8 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         }
     }
 
@@ -3383,6 +3390,8 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         }
     }
 
@@ -3404,6 +3413,8 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         }
     }
 
@@ -5867,6 +5878,8 @@ mod tests {
             labels: Vec::new(),
             review: PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         };
         probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
         let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
@@ -6707,6 +6720,8 @@ mod tests {
                 labels: vec![],
                 review: PrReviewState::Unknown,
                 in_merge_queue: false,
+                raw_mergeable: String::new(),
+                raw_merge_state_status: String::new(),
             }),
         );
         let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;

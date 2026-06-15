@@ -482,6 +482,8 @@ pub async fn on_conflict_detected(
         attempt_status = ?attempt.as_ref().map(|a| a.status.as_str()),
         task_flipped_to_blocked,
         task_unblocked_for_revision,
+        raw_mergeable = %probe.raw_mergeable,
+        raw_merge_state_status = %probe.raw_merge_state_status,
         "conflict_watch: PR conflicts with base; conflict detection ran",
     );
     task_flipped_to_blocked || task_unblocked_for_revision
@@ -618,6 +620,8 @@ pub async fn on_resolved(
     cube_client: Option<&dyn CubeClient>,
     candidate: &PendingMergeCheck,
     labels: &[String],
+    raw_mergeable: &str,
+    raw_merge_state_status: &str,
 ) -> bool {
     // Phase 6 #18 / Q7: opt-out is symmetric — an opted-out product's
     // retire path is also a no-op so the engine doesn't undo a manual
@@ -762,6 +766,8 @@ pub async fn on_resolved(
         attempt_id = ?attempt.as_ref().map(|a| a.id.as_str()),
         task_transitioned,
         attempt_transitioned,
+        raw_mergeable,
+        raw_merge_state_status,
         "conflict_watch: PR mergeable again; retire path ran",
     );
     true
@@ -858,6 +864,8 @@ mod tests {
             labels: Vec::new(),
             review: crate::merge_poller::PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         }
     }
 
@@ -880,6 +888,8 @@ mod tests {
             labels: labels.iter().map(|s| (*s).to_owned()).collect(),
             review: crate::merge_poller::PrReviewState::Unknown,
             in_merge_queue: false,
+            raw_mergeable: String::new(),
+            raw_merge_state_status: String::new(),
         }
     }
 
@@ -1048,7 +1058,7 @@ mod tests {
         let (status_before, _) = chore_status(&db, &chore);
         assert_eq!(status_before, TaskStatus::InReview);
 
-        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
         assert!(resolved, "on_resolved must return true (attempt was retired)");
 
         // Parent still in_review — didn't change status.
@@ -1100,7 +1110,7 @@ mod tests {
 
         // Now manually install a running attempt (simulates legacy worker) and resolve.
         let attempt_id = install_running_attempt(&db, &product, &chore, pr, "lease-x");
-        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let resolved = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
         assert!(resolved);
 
         let (status, reason) = chore_status(&db, &chore);
@@ -1127,7 +1137,7 @@ mod tests {
 
         // First call: row is in_review (not blocked), so resolution is
         // a no-op — the WHERE guard misses, no event published.
-        let r1 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let r1 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
         assert!(!r1);
         assert!(pub_.events.lock().await.is_empty());
 
@@ -1141,8 +1151,8 @@ mod tests {
             &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
         )
         .await;
-        let r2 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
-        let r3 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let r2 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
+        let r3 = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
         assert!(r2);
         assert!(!r3);
     }
@@ -1173,7 +1183,7 @@ mod tests {
         assert_eq!(s, TaskStatus::InReview);
 
         // Resolve: PR goes clean, attempt retired, signal cleared.
-        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await);
+        assert!(on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await);
         let (s, _) = chore_status(&db, &chore);
         assert_eq!(s, TaskStatus::InReview);
 
@@ -1278,7 +1288,7 @@ mod tests {
         let before_count = pub_.events.lock().await.len();
         // on_resolved: abandoned crz → no active_conflict_resolution → clear_chore
         // WHERE guard misses (status='active') → no-op.
-        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
         assert!(!r);
         assert_eq!(pub_.events.lock().await.len(), before_count);
     }
@@ -1403,6 +1413,8 @@ mod tests {
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
             &[],
+            "",
+            "",
         )
         .await;
         assert!(resolved, "retire path must return true");
@@ -1486,6 +1498,8 @@ mod tests {
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
             &[],
+            "",
+            "",
         )
         .await;
         assert!(resolved);
@@ -1540,6 +1554,8 @@ mod tests {
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
             &[],
+            "",
+            "",
         )
         .await;
 
@@ -1668,6 +1684,8 @@ mod tests {
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
             &[],
+            "",
+            "",
         )
         .await;
         let second = on_resolved(
@@ -1676,6 +1694,8 @@ mod tests {
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
             &[],
+            "",
+            "",
         )
         .await;
         assert!(first, "first retire transitions");
@@ -1730,6 +1750,8 @@ mod tests {
             Some(cube.as_ref() as &dyn crate::coordinator::CubeClient),
             &candidate(&product, &chore, pr),
             &[],
+            "",
+            "",
         )
         .await;
         assert!(resolved, "retire transitions must still report success");
@@ -2009,7 +2031,7 @@ mod tests {
         let before = pub_.events.lock().await.len();
         set_product_auto_pr_maintenance(&db_path, &product, false);
 
-        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[]).await;
+        let r = on_resolved(&db, pub_.as_ref(), None, &candidate(&product, &chore, pr), &[], "", "").await;
         assert!(!r, "opted-out product must not retire automatically");
         let (status, reason) = chore_status(&db, &chore);
         assert_eq!(status, TaskStatus::InReview);
