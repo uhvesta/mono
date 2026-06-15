@@ -980,7 +980,7 @@ fn claude_dir_for_appends_dot_claude() {
 }
 
 #[test]
-fn claude_md_has_cube_pr_ensure_section() {
+fn claude_md_has_cube_pr_create_section() {
     let input = sample_input();
     let rendered = render_claude_md(&input);
     assert!(
@@ -988,8 +988,16 @@ fn claude_md_has_cube_pr_ensure_section() {
         "expected a 'Creating a PR from a jj workspace' section",
     );
     assert!(
-        rendered.contains("cube pr ensure"),
-        "expected cube pr ensure to be the canonical PR creation command",
+        rendered.contains("cube pr create"),
+        "expected cube pr create to be the canonical PR creation command",
+    );
+    assert!(
+        rendered.contains("cube pr update"),
+        "expected cube pr update to be the canonical PR-advancing command",
+    );
+    assert!(
+        !rendered.contains("cube pr ensure"),
+        "new CLAUDE.md guidance must not mention the deprecated cube pr ensure",
     );
     assert!(rendered.contains("--branch"), "expected --branch flag guidance",);
     assert!(
@@ -1019,8 +1027,8 @@ fn claude_md_draft_directive_present_when_enabled() {
         "CLAUDE.md must include --draft directive when draft_pr_mode is true",
     );
     assert!(
-        rendered.contains("cube pr ensure"),
-        "draft directive must reference cube pr ensure",
+        rendered.contains("cube pr create"),
+        "draft directive must reference cube pr create",
     );
 }
 
@@ -1086,113 +1094,8 @@ fn standard_claude_md_is_unchanged_by_reviewer_branch() {
     let input = sample_input(); // WorkerKind::Standard
     let rendered = render_claude_md(&input);
     assert!(rendered.contains("Pull requests are the deliverable"));
-    assert!(rendered.contains("cube pr ensure"));
+    assert!(rendered.contains("cube pr create"));
     assert!(rendered.contains("real GitHub upstream"));
-}
-
-#[test]
-fn claude_md_forbids_raw_git_against_store() {
-    // Workers must be explicitly told not to use GIT_DIR=.jj/repo/store/git
-    // or gh pr checkout against the colocated store — this is how recoverable
-    // jj states turned into corruption in the incident that prompted this guidance.
-    let input = sample_input();
-    let rendered = render_claude_md(&input);
-    assert!(
-        rendered.contains("GIT_DIR=.jj/repo/store/git"),
-        "CLAUDE.md must call out the forbidden GIT_DIR form explicitly",
-    );
-    assert!(
-        rendered.contains("op-log"),
-        "CLAUDE.md must explain that bypassing jj bypasses the op-log",
-    );
-    assert!(
-        rendered.contains("jj git fetch"),
-        "CLAUDE.md must name the correct jj alternative",
-    );
-}
-
-#[test]
-fn claude_md_explains_conflicts_are_first_class() {
-    // Agents treated conflicted commits as an emergency halt (git mental model).
-    // The prompt must correct this: conflicts are first-class in jj and do not
-    // require a panic-reset.
-    let input = sample_input();
-    let rendered = render_claude_md(&input);
-    assert!(
-        rendered.contains("Conflicts are first-class"),
-        "CLAUDE.md must state that conflicts are first-class in jj",
-    );
-    assert!(
-        rendered.contains("NOT an emergency"),
-        "CLAUDE.md must clarify that a conflicted commit is not an emergency",
-    );
-}
-
-#[test]
-fn claude_md_explains_divergent_change_ids() {
-    // Agents panic-reset on divergent change-ids (the `??` indicator).
-    // The prompt must explain what it means and give the correct resolution.
-    let input = sample_input();
-    let rendered = render_claude_md(&input);
-    assert!(
-        rendered.contains("??"),
-        "CLAUDE.md must show the divergent change-id indicator",
-    );
-    assert!(
-        rendered.contains("jj abandon"),
-        "CLAUDE.md must mention jj abandon as the way to resolve divergence",
-    );
-    assert!(
-        rendered.contains("not corruption"),
-        "CLAUDE.md must state that divergent change-ids are not corruption",
-    );
-}
-
-#[test]
-fn claude_md_explains_op_log_recovery() {
-    // Agents used git reset+replay instead of the op-log when things went wrong.
-    // The prompt must teach op-log recovery.
-    let input = sample_input();
-    let rendered = render_claude_md(&input);
-    assert!(
-        rendered.contains("jj op log"),
-        "CLAUDE.md must show jj op log as the first recovery step",
-    );
-    assert!(rendered.contains("jj op undo"), "CLAUDE.md must show jj op undo",);
-    assert!(rendered.contains("jj op restore"), "CLAUDE.md must show jj op restore",);
-    assert!(
-        rendered.contains("reset-to-remote-and-replay-a-patch"),
-        "CLAUDE.md must explicitly forbid the git-style reset+replay escape hatch",
-    );
-}
-
-#[test]
-fn claude_md_explains_jj_rebase_for_conflict_resolution() {
-    // The idiomatic merge-conflict resolution flow in jj is
-    // `jj rebase -d main@origin` — agents should use this, not git-style
-    // merge commits or manual cherry-picks.
-    let input = sample_input();
-    let rendered = render_claude_md(&input);
-    assert!(
-        rendered.contains("jj rebase -d main@origin"),
-        "CLAUDE.md must show the idiomatic jj rebase conflict-resolution command",
-    );
-}
-
-#[test]
-fn claude_md_explains_rewriting_is_safe_in_jj() {
-    // Agents reached for merge-to-avoid-rewrite (a git habit). In jj,
-    // rebase/squash/amend are the intended workflow.
-    let input = sample_input();
-    let rendered = render_claude_md(&input);
-    assert!(
-        rendered.contains("Rewriting is safe"),
-        "CLAUDE.md must state that rewriting is safe and normal in jj",
-    );
-    assert!(
-        rendered.contains("op-log"),
-        "CLAUDE.md must mention that rewrites are recorded in the op-log",
-    );
 }
 
 #[test]
@@ -1315,15 +1218,21 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
         .iter()
         .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("create"))
         .expect("revision PreToolUse must include a gh-pr-create guard");
-    // Guard command must reference the deny decision and both gh pr create and cube pr ensure.
+    // Guard command must reference the deny decision and block PR *creation*
+    // (gh pr create, cube pr create, deprecated cube pr ensure) while pointing
+    // workers at the allowed `cube pr update` for advancing the existing PR.
     let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
     assert!(
         guard_cmd.contains("gh") && guard_cmd.contains("pr") && guard_cmd.contains("create"),
-        "guard command must inspect gh pr create: {guard_cmd}",
+        "guard command must inspect gh pr create / cube pr create: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("cube") && guard_cmd.contains("ensure"),
-        "guard command must also block cube pr ensure: {guard_cmd}",
+        "guard command must also block the deprecated cube pr ensure: {guard_cmd}",
+    );
+    assert!(
+        guard_cmd.contains("cube pr update"),
+        "guard block message must point workers at `cube pr update`: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("block"),
@@ -2014,10 +1923,44 @@ fn guard_blocks_cube_pr_ensure_in_compound_command() {
 }
 
 #[test]
-fn guard_block_message_names_matched_command() {
+fn guard_blocks_cube_pr_create() {
+    let decision = run_revision_guard("cube pr create --branch feat/foo --title 'My PR'");
+    assert_eq!(decision, "block", "guard must block a bare cube pr create",);
+}
+
+#[test]
+fn guard_blocks_cube_pr_create_in_compound_command() {
+    let decision = run_revision_guard(r#"jj describe -m "push changes" && cube pr create --branch feat/x"#);
+    assert_eq!(
+        decision, "block",
+        "guard must block cube pr create in a compound command",
+    );
+}
+
+// --- allowed-update tests (must APPROVE) ---
+
+#[test]
+fn guard_approves_cube_pr_update() {
+    // Revision workers advance the existing PR with `cube pr update` — this
+    // is the sanctioned verb and must NOT be blocked.
+    let decision = run_revision_guard("cube pr update --branch feat/foo");
+    assert_eq!(decision, "approve", "guard must allow cube pr update",);
+}
+
+#[test]
+fn guard_approves_cube_pr_update_in_compound_command() {
+    let decision = run_revision_guard(r#"jj describe -m "push" && cube pr update --branch feat/x"#);
+    assert_eq!(
+        decision, "approve",
+        "guard must allow cube pr update in a compound command",
+    );
+}
+
+/// Run the guard and return the full `reason` string from a block decision.
+fn run_revision_guard_reason(bash_command: &str) -> String {
     use std::io::Write as _;
     let stdin_payload = serde_json::json!({
-        "tool_input": {"command": "cube pr ensure --branch b"}
+        "tool_input": {"command": bash_command}
     })
     .to_string();
 
@@ -2039,10 +1982,37 @@ fn guard_block_message_names_matched_command() {
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    parsed["reason"].as_str().unwrap_or("").to_owned()
+}
 
-    let reason = parsed["reason"].as_str().unwrap_or("");
+#[test]
+fn guard_block_message_names_matched_command() {
+    let reason = run_revision_guard_reason("cube pr ensure --branch b");
     assert!(
         reason.contains("cube pr ensure"),
         "block reason must name the matched command, got: {reason}",
+    );
+}
+
+#[test]
+fn guard_block_message_suggests_cube_pr_update_with_branch() {
+    // The block message must hand the worker the exact recovery command,
+    // reusing the --branch value from the blocked invocation — no jj
+    // forensics required.
+    let reason = run_revision_guard_reason("cube pr create --branch boss/exec_abc123_01 --title 'x'");
+    assert!(
+        reason.contains("cube pr update --branch boss/exec_abc123_01"),
+        "block reason must suggest `cube pr update --branch <bookmark>`, got: {reason}",
+    );
+}
+
+#[test]
+fn guard_block_message_reuses_head_branch_from_gh_pr_create() {
+    // `gh pr create --head <branch>` should also surface the concrete branch
+    // in the `cube pr update` suggestion.
+    let reason = run_revision_guard_reason("gh pr create --head boss/exec_abc123_01 --title 'x'");
+    assert!(
+        reason.contains("cube pr update --branch boss/exec_abc123_01"),
+        "block reason must reuse the --head branch in the update suggestion, got: {reason}",
     );
 }

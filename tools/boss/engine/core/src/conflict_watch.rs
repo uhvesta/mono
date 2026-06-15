@@ -1313,7 +1313,6 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
             _: &[&str],
         ) -> anyhow::Result<crate::coordinator::CubeWorkspaceLease> {
             unreachable!("not used in conflict_watch tests")
@@ -1323,6 +1322,9 @@ mod tests {
             _: &std::path::Path,
             _: &str,
         ) -> anyhow::Result<crate::coordinator::CubeChangeHandle> {
+            unreachable!("not used in conflict_watch tests")
+        }
+        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> anyhow::Result<()> {
             unreachable!("not used in conflict_watch tests")
         }
         async fn release_workspace(&self, lease_id: &str) -> anyhow::Result<()> {

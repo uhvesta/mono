@@ -163,7 +163,7 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
     let draft_directive = if input.draft_pr_mode {
         "\n## PR creation mode\n\
          \n\
-         Default PR creation mode: pass `--draft` to `cube pr ensure`\n\
+         Default PR creation mode: pass `--draft` to `cube pr create`\n\
          (or `gh pr create`) unless the chore description explicitly says\n\
          to create a non-draft PR.\n"
     } else {
@@ -180,10 +180,11 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          **A task is not complete until a PR exists.** Local commits are NOT enough.\n\
          \n\
-         - Push your branch and open a PR with `cube pr ensure` once\n\
-           commits exist and tests pass.\n\
+         - Open a PR with `cube pr create` once commits exist and tests pass.\n\
          - **If a PR already exists** (resuming or addressing review),\n\
-           push new commits to update it; do NOT open a duplicate. Check:\n\
+           push new commits to it with `cube pr update`; do NOT open a\n\
+           duplicate. `cube pr create` errors if a PR already exists, and\n\
+           `cube pr update` errors if none does. Check first with:\n\
            `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
            or `gh pr view`.\n\
          - Do not hard-wrap PR bodies.\n\
@@ -225,59 +226,11 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          `$EDITOR` — commands that fall through to one fail. Fix by\n\
          re-running with `-m`.\n\
          \n\
-         ## jj-native operation: mental model and recovery\n\
-         \n\
-         This repo uses jj. Operate natively in jj terms — do NOT reach for raw\n\
-         git against the shared object store.\n\
-         \n\
-         **Forbidden:** `GIT_DIR=.jj/repo/store/git git ...` and `gh pr checkout`\n\
-         against the colocated store — these bypass jj's op-log and are how\n\
-         recoverable jj states turn into corruption. Use `jj git fetch`,\n\
-         `jj git push -b <name>`, and `jj new '<bookmark>@origin'` instead.\n\
-         \n\
-         **Conflicts are first-class in jj.** Conflicts are stored inside commits\n\
-         and propagate through rebase. A conflicted commit is NOT an emergency:\n\
-         keep working and resolve when ready. `jj status` and `jj diff` work\n\
-         normally on a conflicted working copy.\n\
-         \n\
-         **Divergent change-ids (`xxxxxxxx??`) are not corruption.** When jj shows\n\
-         a change-id with `??`, it means the same change-id resolves to more than\n\
-         one commit. This is jj surfacing a divergence for you to resolve: pick\n\
-         one and `jj abandon` the others. Do NOT panic-reset to remote.\n\
-         \n\
-         **Recover via the op-log, not git tricks.** jj almost never loses work:\n\
-         \n\
-         ```sh\n\
-         jj op log               # find the operation that caused the problem\n\
-         jj op undo              # step back one operation\n\
-         jj op restore <op-id>   # restore to a specific operation\n\
-         ```\n\
-         \n\
-         Do NOT reset-to-remote-and-replay-a-patch — that throws away jj's history\n\
-         and is fragile.\n\
-         \n\
-         **Rewriting is safe and normal.** `jj rebase`, `jj squash`, and `jj describe`\n\
-         produce new commit-ids with stable change-ids and are recorded in the\n\
-         op-log. Do not reach for git seatbelts (merge-to-avoid-rewrite,\n\
-         force-push fear) when jj's rewrite is the cleaner path.\n\
-         \n\
-         **Merge-conflict resolution:**\n\
-         \n\
-         ```sh\n\
-         jj rebase -d main@origin  # rebase onto latest main; conflicts materialize here\n\
-         # resolve conflicts in the working copy\n\
-         jj describe -m \"...\"     # set the commit message\n\
-         ```\n\
-         \n\
-         **Adding work to an existing PR:** when operator feedback adds new work,\n\
-         prefer creating a NEW commit (append) rather than amending — it is\n\
-         generally cleaner and easier to review.\n\
-         \n\
          ## Creating a PR from a jj workspace\n\
          \n\
          Cube workspaces are secondary jj workspaces. There is no `.git/`\n\
          at the workspace root, so bare `gh` calls fail with\n\
-         `fatal: not a git repository`. Use `cube pr ensure` instead —\n\
+         `fatal: not a git repository`. Use `cube pr create` instead —\n\
          it resolves the remote `owner/repo` from `jj git remote` and\n\
          passes `-R <owner/repo>` to `gh`, so no `GIT_DIR` guess is needed.\n\
          \n\
@@ -294,18 +247,18 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          ## Summary\n\
          Your description here. Inline code like `crate-name` and `$(cmd)` is safe.\n\
          PRBODY\n\
-         cube pr ensure --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
+         cube pr create --branch my-feature --title \"Your PR title\" --body-file \"$body\"\n\
          ```\n\
          \n\
-         `cube pr ensure` is idempotent: if a PR for `my-feature` already\n\
-         exists, it prints its URL and exits 0 without opening a duplicate.\n\
-         **Rule: `jj git push -b <bookmark>` requires `--allow-new` the first\n\
-         time when calling jj directly; `cube pr ensure` handles this for you.**\n\
+         `cube pr create` errors if an open PR already exists for the branch\n\
+         (use `cube pr update` for that — see below). **Rule: `jj git push -b\n\
+         <bookmark>` requires `--allow-new` the first time when calling jj\n\
+         directly; `cube pr create` handles this for you.**\n\
          \n\
-         To update an existing PR (just push new commits):\n\
+         To update an existing PR (push new commits to it):\n\
          \n\
          ```sh\n\
-         jj git push -b my-feature   # no --allow-new needed for subsequent pushes\n\
+         cube pr update --branch my-feature   # pushes to the PR; errors if none exists\n\
          ```\n\
          \n\
          ### `origin` is the real GitHub upstream (shared object store)\n\
@@ -315,8 +268,8 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          store has a single `origin` remote pointing at the real GitHub\n\
          upstream, so `jj git push -b my-feature` reaches GitHub directly.\n\
          \n\
-         - Prefer `cube pr ensure` for all pushes: it pushes to the\n\
-           github.com remote by URL and verifies the result against GitHub, and\n\
+         - Prefer `cube pr create` / `cube pr update` for all pushes: they push to the\n\
+           github.com remote by URL and verify the result against GitHub, and\n\
            — because the workspace has no top-level `.git` — it resolves\n\
            `-R <owner/repo>` for `gh` so PR creation Just Works.\n\
          - Because the store is shared, a `jj git fetch` in ANY workspace\n\
@@ -387,12 +340,22 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
 /// strings) do NOT trigger the block — only the actual invoked program +
 /// verb/subcommand tokens are inspected.
 ///
+/// Blocks PR *creation* (`gh pr create`, `cube pr create`, and the
+/// deprecated `cube pr ensure` which still create-or-reuses) and allows PR
+/// *updates* (`cube pr update`), matching a revision worker's intent: push
+/// commits to the existing parent PR, never open a new one. The block reason
+/// names the offending command AND prints the exact `cube pr update` command
+/// — reusing the `--branch`/`--head` value from the blocked command when the
+/// worker supplied one — so no jj forensics are needed to recover.
+///
 /// Specifically:
-///   • `jj describe -m "fix: intercept cube pr ensure"` → APPROVE
+///   • `jj describe -m "fix: intercept cube pr create"` → APPROVE
 ///   • `git commit -m "docs about gh pr create"` → APPROVE
+///   • `cube pr update --branch feat/foo` → APPROVE
+///   • `cube pr create --branch feat/foo` → BLOCK ("cube pr create")
 ///   • `cube pr ensure --branch feat/foo` → BLOCK ("cube pr ensure")
-///   • `gh pr create --title "x"` → BLOCK ("gh pr create")
-///   • `jj describe -m "msg" && cube pr ensure` → BLOCK ("cube pr ensure")
+///   • `gh pr create --head feat/foo` → BLOCK ("gh pr create")
+///   • `jj describe -m "msg" && cube pr create` → BLOCK ("cube pr create")
 ///
 /// Fallback: when `shlex.split` fails (unmatched quotes or exotic syntax)
 /// the script falls back to whitespace-splitting, which may have false
@@ -418,19 +381,31 @@ const REVISION_PR_GUARD_COMMAND: &str = concat!(
     "        cur.append(t)\n",
     "if cur:\n",
     "    groups.append(cur)\n",
+    "def branch_of(g):\n",
+    "    for j,t in enumerate(g):\n",
+    "        if t in ('--branch','--head') and j+1<len(g):\n",
+    "            return g[j+1]\n",
+    "        if t.startswith('--branch=') or t.startswith('--head='):\n",
+    "            return t.split('=',1)[1]\n",
+    "    return None\n",
     "matched=None\n",
+    "br=None\n",
     "for g in groups:\n",
     "    i=0\n",
     "    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n",
     "        i+=1\n",
-    "    if i+2<len(g) and g[i]=='gh' and g[i+1]=='pr' and g[i+2]=='create':\n",
+    "    rest=g[i:]\n",
+    "    if len(rest)>=3 and rest[0]=='gh' and rest[1]=='pr' and rest[2]=='create':\n",
     "        matched='gh pr create'\n",
+    "        br=branch_of(rest)\n",
     "        break\n",
-    "    if i+2<len(g) and g[i]=='cube' and g[i+1]=='pr' and g[i+2]=='ensure':\n",
-    "        matched='cube pr ensure'\n",
+    "    if len(rest)>=3 and rest[0]=='cube' and rest[1]=='pr' and rest[2] in ('create','ensure'):\n",
+    "        matched='cube pr '+rest[2]\n",
+    "        br=branch_of(rest)\n",
     "        break\n",
     "if matched:\n",
-    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Use jj git push to update the existing PR instead.'\n",
+    "    sug='cube pr update --branch '+br if br else 'cube pr update --branch <your-pr-bookmark>'\n",
+    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
     "    print(json.dumps({'decision':'block','reason':msg}))\n",
     "else:\n",
     "    print(json.dumps({'decision':'approve'}))\n",
@@ -486,11 +461,12 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
         ],
     });
 
-    // For revision tasks, add a PreToolUse guard that blocks any
-    // `gh pr create` or `cube pr ensure` invocation. Revision workers
-    // push commits to an existing PR; opening a new PR violates the
-    // one-PR-per-task invariant. The guard tokenises the command with
-    // shlex so PR-creation phrases inside quoted arguments (commit
+    // For revision tasks, add a PreToolUse guard that blocks any PR-creation
+    // invocation (`gh pr create`, `cube pr create`, or the deprecated
+    // `cube pr ensure`) while allowing PR updates (`cube pr update`).
+    // Revision workers push commits to an existing PR; opening a new PR
+    // violates the one-PR-per-task invariant. The guard tokenises the command
+    // with shlex so PR-creation phrases inside quoted arguments (commit
     // messages, --body strings) do NOT trigger the block.
     //
     // Defense-in-depth: the guard fires when EITHER the execution kind
@@ -756,7 +732,7 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 /// - VCS push — `jj git push` and `git push` in all their CLI forms
 /// - PR mutation via `gh` — create, merge, close, edit, comment, review
 /// - Issue write via `gh` — create, comment, close, edit
-/// - `cube pr ensure` — Boss's PR-opening helper
+/// - `cube pr create` / `cube pr update` — Boss's PR helpers
 ///
 /// # Why the file-write deny is scoped, not blanket
 ///
@@ -826,7 +802,7 @@ pub fn triage_deny_rules() -> Vec<String> {
 /// - VCS push — `jj git push` and `git push` in all their CLI forms
 /// - PR mutation via `gh` — create, merge, close, edit, comment, review
 /// - Issue write via `gh` — create, comment, close, edit
-/// - `cube pr ensure` — Boss's PR-opening helper
+/// - `cube pr create` / `cube pr update` — Boss's PR helpers
 ///
 /// Note: `jj describe`, `jj bookmark create`, and similar *local* VCS
 /// operations are intentionally not denied. They touch only the local

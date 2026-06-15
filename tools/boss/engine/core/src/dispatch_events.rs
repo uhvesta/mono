@@ -104,6 +104,14 @@ pub enum Stage {
     /// Distinct from `cube_workspace_leased` with `outcome=error` so
     /// readers don't have to disambiguate by outcome.
     CubeWorkspaceLeaseFailed,
+    /// `cube workspace goto` succeeded — `@` is now positioned as an editable
+    /// child commit atop the PR branch head. Emitted for dispatch paths that
+    /// target an existing PR (RevisionImplementation, PrReview, etc.).
+    CubeWorkspacePositioned,
+    /// `cube workspace goto` failed. The `error_message` field carries the
+    /// verbatim cube stderr so `bossctl dispatch diagnose` can render the
+    /// root cause without a log dive. Positioning failure aborts dispatch.
+    CubeWorkspacePositioningFailed,
     /// `cube change create` returned a change handle.
     CubeChangeCreated,
     /// `start_execution_run` committed and `tasks.status` flipped
@@ -238,6 +246,8 @@ impl Stage {
             Stage::CubeWorkspaceLeaseAttempted => "cube_workspace_lease_attempted",
             Stage::CubeWorkspaceLeased => "cube_workspace_leased",
             Stage::CubeWorkspaceLeaseFailed => "cube_workspace_lease_failed",
+            Stage::CubeWorkspacePositioned => "cube_workspace_positioned",
+            Stage::CubeWorkspacePositioningFailed => "cube_workspace_positioning_failed",
             Stage::CubeChangeCreated => "cube_change_created",
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",

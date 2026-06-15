@@ -554,7 +554,7 @@ pub(super) async fn open_review_terminal_async(
     // Step 2: lease workspace
     let task_label = format!("review terminal for {work_item_id}");
     let lease = cube_client
-        .lease_workspace(&repo.repo_id, &task_label, None, false, None, &[])
+        .lease_workspace(&repo.repo_id, &task_label, None, false, &[])
         .await
         .with_context(|| format!("cube workspace lease failed for repo {}", repo.repo_id))?;
 

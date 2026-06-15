@@ -550,7 +550,6 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
             _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
@@ -572,6 +571,9 @@ mod tests {
             Ok(())
         }
         async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
             unimplemented!()
         }
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {
@@ -857,7 +859,6 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
             _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
@@ -881,6 +882,9 @@ mod tests {
             Ok(())
         }
         async fn force_release_lease(&self, _: &str, _: Option<&str>) -> Result<()> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &std::path::Path, _: u64) -> Result<()> {
             unimplemented!()
         }
         async fn list_workspaces(&self) -> Result<Vec<CubeWorkspaceStatus>> {

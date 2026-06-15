@@ -222,14 +222,51 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Position the working copy on the head of a PR branch.
+    ///
+    /// Fetches from the GitHub remote, resolves the given bookmark or PR
+    /// head, and creates a fresh editable child commit atop the resolved
+    /// tip (`jj new <branch>@<remote>`). Idempotent: if `@` already
+    /// has the resolved tip as a direct parent, the `jj new` step is
+    /// skipped. Fails with a clear error if the bookmark does not exist
+    /// on the remote.
+    ///
+    /// Exactly one of `--bookmark` or `--pr` must be supplied. `--workspace`
+    /// is optional; when omitted the command operates on the current directory.
+    ///
+    /// Run from inside the leased cube workspace directory (or pass `--workspace`).
+    Goto {
+        /// Absolute workspace path. If omitted, uses the current directory.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Branch bookmark to position on (e.g. `boss/exec_18b7d99_2af`).
+        /// A trailing `@<remote>` suffix is accepted and stripped.
+        /// Mutually exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
+        bookmark: Option<String>,
+        /// Position on the head of PR N. Resolves the head branch from
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
+        #[arg(long, conflicts_with = "bookmark")]
+        pr: Option<u64>,
+    },
     /// Rebase the current workspace's boss branch onto the repo's integration branch.
     ///
     /// Fetches the latest integration branch (e.g. `main`, `master`, `trunk`)
     /// and boss branches from the GitHub remote, resolves this workspace's
-    /// current `boss/exec_*` branch automatically from the working copy state
-    /// (no branch name argument required), rebases it onto the configured
-    /// integration branch using `--ignore-immutable` to handle jj's
-    /// immutable-heads constraint, and reports the result clearly.
+    /// `boss/exec_*` branch, rebases it onto the configured integration branch
+    /// using `--ignore-immutable` to handle jj's immutable-heads constraint,
+    /// and — on a clean rebase — advances and pushes the boss bookmark so the
+    /// PR is updated in one verb (nothing left manual).
+    ///
+    /// Branch resolution when no explicit override is given: the nearest
+    /// `boss/exec_*` bookmark in `@`'s 5-ancestor window. When the workspace
+    /// is pre-positioned via `cube workspace goto` (the engine's normal path),
+    /// this window always contains the right bookmark. For repositioned or
+    /// manually managed workspaces, use `--bookmark` or `--pr` to override.
+    ///
+    /// Self-heals a mispositioned `@`: when `@` is not in the ancestry of the
+    /// resolved boss branch, the command repositions the workspace onto the
+    /// boss head before rebasing.
     ///
     /// The target branch is read from the repo pool configuration
     /// (`main_branch` field) — not hardcoded. Repos that use `master`,
@@ -237,11 +274,28 @@ pub enum WorkspaceCommand {
     ///
     /// Leaves any resulting conflicts materialized in the working copy for the
     /// agent to resolve. Exit signal:
-    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts.
-    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them.
+    ///   - `REBASED_CLEAN`: rebase succeeded with no conflicts (and the boss
+    ///     bookmark was advanced + pushed unless `--no-push`).
+    ///   - `REBASED_WITH_CONFLICTS`: conflicts in working copy — resolve them,
+    ///     then push with `jj git push -b <bookmark>`.
     ///
     /// Run from inside the leased cube workspace directory.
-    Rebase,
+    Rebase {
+        /// Explicitly name the `boss/exec_*` bookmark to rebase (e.g.
+        /// `boss/exec_18b7d99385981508_2af`). Overrides auto-discovery. A
+        /// trailing `@<remote>` suffix is accepted and stripped. Mutually
+        /// exclusive with `--pr`.
+        #[arg(long, conflicts_with = "pr")]
+        bookmark: Option<String>,
+        /// Rebase the branch backing PR N. Resolves N's head branch from
+        /// GitHub (`gh pr view`). Mutually exclusive with `--bookmark`.
+        #[arg(long, conflicts_with = "bookmark")]
+        pr: Option<u64>,
+        /// Rebase only; do not advance/push the boss bookmark afterward. Use
+        /// when you intend to push manually.
+        #[arg(long)]
+        no_push: bool,
+    },
     /// Reconcile cached workspace health in the DB with actual on-disk state.
     ///
     /// Re-runs `jj status` on every free workspace that the DB currently
@@ -356,14 +410,28 @@ pub struct StackRebaseArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum PrCommand {
-    /// Create or reuse a GitHub PR for the current jj bookmark.
+    /// Open a new GitHub PR for the current jj bookmark.
     ///
-    /// Resolves `owner/repo` from `jj git remote`, pushes the branch,
-    /// checks for an existing open PR, and creates one if none exists.
-    /// Prints the PR URL as the only stdout line. Idempotent — safe to
-    /// re-run: if the PR already exists its URL is returned unchanged.
-    /// Uses `-R <owner/repo>` with `gh` so no `GIT_DIR` guess is needed.
-    Ensure(PrEnsureArgs),
+    /// Resolves `owner/repo` from `jj git remote`, pushes the branch, and
+    /// opens a PR. Errors if an open PR already exists for the branch —
+    /// use `cube pr update` to push commits to an existing PR. Prints the
+    /// PR URL as the only stdout line. Uses `-R <owner/repo>` with `gh` so
+    /// no `GIT_DIR` guess is needed.
+    Create(PrCreateArgs),
+    /// Push new commits to the existing PR for the current jj bookmark.
+    ///
+    /// Resolves `owner/repo` from `jj git remote`, pushes the branch to its
+    /// open PR's head, and prints the PR URL. Errors if no open PR exists for
+    /// the branch — use `cube pr create` to open one. Never creates a PR.
+    Update(PrUpdateArgs),
+    /// Deprecated alias for `cube pr create` / `cube pr update`.
+    ///
+    /// Creates a PR if none exists, otherwise reuses the existing one. This
+    /// create-or-update behavior is being retired: use `cube pr create` to
+    /// open a new PR and `cube pr update` to push commits to an existing one.
+    /// Prints a deprecation pointer on stderr and will be removed in a future
+    /// release.
+    Ensure(PrCreateArgs),
     /// Advance an existing PR by pushing the current commit to its head branch.
     ///
     /// Advances both the remote head branch and the local `pr/<n>` bookmark to
@@ -396,7 +464,7 @@ pub struct PrPushArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct PrEnsureArgs {
+pub struct PrCreateArgs {
     /// Branch name to push and open a PR for.
     /// Defaults to the first bookmark on the current jj commit.
     #[arg(long)]
@@ -415,6 +483,14 @@ pub struct PrEnsureArgs {
     /// Open the PR as a draft.
     #[arg(long)]
     pub draft: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PrUpdateArgs {
+    /// Branch name whose open PR to push commits to.
+    /// Defaults to the first bookmark on the current jj commit.
+    #[arg(long)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -455,7 +531,9 @@ pub struct DoctorArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{ChangeCommand, Cli, Command, PrCommand, PrEnsureArgs, PrPushArgs, RepoCommand, WorkspaceCommand};
+    use super::{
+        ChangeCommand, Cli, Command, PrCommand, PrCreateArgs, PrPushArgs, PrUpdateArgs, RepoCommand, WorkspaceCommand,
+    };
 
     #[test]
     fn repo_ensure_matches_phase_a_shape() {
@@ -1034,6 +1112,80 @@ mod tests {
     }
 
     #[test]
+    fn workspace_goto_accepts_pr_flag() {
+        let cli = Cli::parse_from(["cube", "workspace", "goto", "--pr", "1467"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert!(bookmark.is_none());
+                assert_eq!(pr, Some(1467));
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_accepts_bookmark_flag() {
+        let cli = Cli::parse_from(["cube", "workspace", "goto", "--bookmark", "boss/exec_abc_01"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
+            } => {
+                assert!(workspace.is_none());
+                assert_eq!(bookmark.as_deref(), Some("boss/exec_abc_01"));
+                assert!(pr.is_none());
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_accepts_workspace_flag() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "goto",
+            "--workspace",
+            "/ws/mono-agent-007",
+            "--pr",
+            "42",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Goto {
+                        workspace,
+                        bookmark,
+                        pr,
+                    },
+            } => {
+                assert_eq!(workspace.as_deref(), Some("/ws/mono-agent-007"));
+                assert!(bookmark.is_none());
+                assert_eq!(pr, Some(42));
+            }
+            _ => panic!("expected workspace goto command"),
+        }
+    }
+
+    #[test]
+    fn workspace_goto_rejects_both_bookmark_and_pr() {
+        let result = Cli::try_parse_from(["cube", "workspace", "goto", "--bookmark", "boss/exec_abc", "--pr", "42"]);
+        assert!(result.is_err(), "--bookmark and --pr must be mutually exclusive");
+    }
+
+    #[test]
     fn change_create_accepts_workspace_or_parent() {
         let cli = Cli::parse_from([
             "cube",
@@ -1073,11 +1225,11 @@ mod tests {
     }
 
     #[test]
-    fn pr_ensure_accepts_all_flags() {
+    fn pr_create_accepts_all_flags() {
         let cli = Cli::parse_from([
             "cube",
             "pr",
-            "ensure",
+            "create",
             "--branch",
             "boss/exec_abc123_01",
             "--title",
@@ -1090,7 +1242,7 @@ mod tests {
         match cli.command {
             Command::Pr {
                 command:
-                    PrCommand::Ensure(PrEnsureArgs {
+                    PrCommand::Create(PrCreateArgs {
                         branch,
                         title,
                         body,
@@ -1104,18 +1256,18 @@ mod tests {
                 assert!(body_file.is_none());
                 assert!(draft);
             }
-            _ => panic!("expected pr ensure command"),
+            _ => panic!("expected pr create command"),
         }
     }
 
     #[test]
-    fn pr_ensure_branch_is_optional() {
-        let cli = Cli::parse_from(["cube", "pr", "ensure"]);
+    fn pr_create_branch_is_optional() {
+        let cli = Cli::parse_from(["cube", "pr", "create"]);
 
         match cli.command {
             Command::Pr {
                 command:
-                    PrCommand::Ensure(PrEnsureArgs {
+                    PrCommand::Create(PrCreateArgs {
                         branch,
                         title,
                         body,
@@ -1129,16 +1281,16 @@ mod tests {
                 assert!(body_file.is_none());
                 assert!(!draft);
             }
-            _ => panic!("expected pr ensure command"),
+            _ => panic!("expected pr create command"),
         }
     }
 
     #[test]
-    fn pr_ensure_accepts_body_file_flag() {
+    fn pr_create_accepts_body_file_flag() {
         let cli = Cli::parse_from([
             "cube",
             "pr",
-            "ensure",
+            "create",
             "--branch",
             "boss/exec_abc123_01",
             "--title",
@@ -1150,7 +1302,7 @@ mod tests {
         match cli.command {
             Command::Pr {
                 command:
-                    PrCommand::Ensure(PrEnsureArgs {
+                    PrCommand::Create(PrCreateArgs {
                         branch,
                         title,
                         body,
@@ -1163,6 +1315,58 @@ mod tests {
                 assert!(body.is_none());
                 assert_eq!(body_file.as_deref(), Some("/tmp/pr-body.md"));
                 assert!(!draft);
+            }
+            _ => panic!("expected pr create command"),
+        }
+    }
+
+    #[test]
+    fn pr_update_accepts_branch() {
+        let cli = Cli::parse_from(["cube", "pr", "update", "--branch", "boss/exec_abc123_01"]);
+
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Update(PrUpdateArgs { branch }),
+            } => {
+                assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
+            }
+            _ => panic!("expected pr update command"),
+        }
+    }
+
+    #[test]
+    fn pr_update_branch_is_optional() {
+        let cli = Cli::parse_from(["cube", "pr", "update"]);
+
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Update(PrUpdateArgs { branch }),
+            } => {
+                assert!(branch.is_none());
+            }
+            _ => panic!("expected pr update command"),
+        }
+    }
+
+    #[test]
+    fn pr_ensure_still_parses_as_deprecated_alias() {
+        // `cube pr ensure` remains a transitional alias for one release.
+        let cli = Cli::parse_from([
+            "cube",
+            "pr",
+            "ensure",
+            "--branch",
+            "boss/exec_abc123_01",
+            "--title",
+            "My PR",
+        ]);
+
+        match cli.command {
+            Command::Pr {
+                command: PrCommand::Ensure(PrCreateArgs { branch, title, .. }),
+            } => {
+                assert_eq!(branch.as_deref(), Some("boss/exec_abc123_01"));
+                assert_eq!(title.as_deref(), Some("My PR"));
             }
             _ => panic!("expected pr ensure command"),
         }

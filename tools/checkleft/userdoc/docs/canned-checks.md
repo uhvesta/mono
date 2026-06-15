@@ -262,11 +262,11 @@ Notes:
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 - There is only one bundled check for file size. The `check: file/size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
 
-## `file/forbidden-patterns`
+## `forbidden-imports-deps`
 
 Purpose:
 
-- A generic, line-by-line regex scanner scoped to path globs. For each changed (non-deleted) file matching a rule's `include_globs`, every line is scanned and a finding is emitted per regex match. The mechanism has no knowledge of import syntax — it matches any regex against any text file — so it covers forbidden imports/dependencies, banned APIs, deprecated call sites, and any other "this string must not appear" policy.
+- Flags line-level matches for forbidden import/dependency regex patterns.
 
 Config keys:
 
@@ -276,8 +276,8 @@ Per-rule keys:
 
 - `pattern` (required regex string)
 - `message` (required string)
-- `include_globs` (optional array of globs; repo-root-relative)
-- `exclude_globs` (optional array of globs; `exclude_files` is a supported alias)
+- `include_globs` (optional array of globs)
+- `exclude_globs` (optional array of globs)
 - `severity` (optional `error|warning|info`)
 - `remediation` (optional string)
 
@@ -285,12 +285,6 @@ Top-level defaults:
 
 - `severity` (optional default for rules, default `error`)
 - `remediation` (optional default for rules)
-
-Notes:
-
-- This is a preinstalled wasm bundle check; reference it with `check: file/forbidden-patterns`. (It is the generalization of the former `forbidden-imports-deps` check, which was import/dependency-specific in name only.)
-- **Instance-per-policy.** Give each logical prohibition its own `- id:` entry pointing at `check: file/forbidden-patterns`; findings, bypasses, and severity are keyed to that policy id. Rules listed under one `- id:` are sub-clauses of the *same* prohibition (e.g. several deprecated module paths under one "no deprecated API imports" policy). Distinct prohibitions — different owners, bypass lifecycles, or remediation — each get their own `- id:`.
-- Override severity per instance with `[checks.policy].severity`; enable bypass with `[checks.policy].allow_bypass`.
 
 ## `forbidden-paths`
 
@@ -316,6 +310,18 @@ Notes:
 - Rules match repository-relative paths, so filename policies can use patterns like `**/*.swp` or `**/package-lock.json`.
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
+
+## `frontend-no-legacy-api`
+
+Purpose:
+
+- Prevents frontend imports from deprecated module suffixes.
+
+Config keys:
+
+- `legacy_modules` (required array of module suffixes)
+- `severity` (optional `error|warning|info`, default `error`)
+- `remediation` (optional string)
 
 ## `file/ifchange`
 

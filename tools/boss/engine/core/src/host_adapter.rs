@@ -31,6 +31,7 @@ use crate::config::RuntimeConfig;
 use crate::coordinator::{
     CubeChangeHandle, CubeClient, CubeRepoHandle, CubeRepoSummary, CubeWorkspaceLease, CubeWorkspaceStatus,
 };
+use crate::cube_commands::CubeJsonTransport;
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
@@ -78,7 +79,6 @@ pub trait HostAdapter: Send + Sync {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
-        resume_pr: Option<u64>,
         exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease>;
 
@@ -89,6 +89,12 @@ pub trait HostAdapter: Send + Sync {
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()>;
 
     async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle>;
+
+    /// Position the working copy in `workspace_path` as a fresh editable
+    /// child commit atop PR `pr`'s current head. Delegates to
+    /// `cube workspace goto --workspace <path> --pr <n>`. Idempotent: a
+    /// no-op when `@` is already positioned on the PR branch head.
+    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()>;
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus>;
 
@@ -183,19 +189,19 @@ impl HostAdapter for LocalHostAdapter {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
-        resume_pr: Option<u64>,
         exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
         self.cube_client
-            .lease_workspace(
-                repo_id,
-                task,
-                prefer_workspace_id,
-                allow_dirty,
-                resume_pr,
-                exclude_workspace_ids,
-            )
+            .lease_workspace(repo_id, task, prefer_workspace_id, allow_dirty, exclude_workspace_ids)
             .await
+    }
+
+    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
+        self.cube_client.create_change(workspace_path, title).await
+    }
+
+    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
+        self.cube_client.goto_workspace(workspace_path, pr).await
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
@@ -208,10 +214,6 @@ impl HostAdapter for LocalHostAdapter {
 
     async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> Result<()> {
         self.cube_client.force_release_lease(lease_id, reason).await
-    }
-
-    async fn create_change(&self, workspace_path: &Path, title: &str) -> Result<CubeChangeHandle> {
-        self.cube_client.create_change(workspace_path, title).await
     }
 
     async fn workspace_status(&self, workspace_path: &Path) -> Result<CubeWorkspaceStatus> {
@@ -469,7 +471,6 @@ impl HostAdapter for SshHostAdapter {
         task: &str,
         prefer_workspace_id: Option<&str>,
         allow_dirty: bool,
-        resume_pr: Option<u64>,
         exclude_workspace_ids: &[&str],
     ) -> Result<CubeWorkspaceLease> {
         crate::cube_commands::lease_workspace(
@@ -478,10 +479,26 @@ impl HostAdapter for SshHostAdapter {
             task,
             prefer_workspace_id,
             allow_dirty,
-            resume_pr,
             exclude_workspace_ids,
         )
         .await
+    }
+
+    async fn goto_workspace(&self, workspace_path: &Path, pr: u64) -> Result<()> {
+        let workspace_arg = workspace_path.display().to_string();
+        let pr_str = pr.to_string();
+        let _ = self
+            .run_cube_json(&[
+                "--json",
+                "workspace",
+                "goto",
+                "--workspace",
+                workspace_arg.as_str(),
+                "--pr",
+                pr_str.as_str(),
+            ])
+            .await?;
+        Ok(())
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {

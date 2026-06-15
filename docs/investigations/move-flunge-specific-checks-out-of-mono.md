@@ -3,8 +3,6 @@
 Status: decided.
 Date: 2026-06-14.
 
-> **Implementation note (forbidden-patterns).** The mono-side change landed the generic check as a **wasm bundle** check under the `file/` namespace — `file/forbidden-patterns` — rather than a native rename. It ships in the single multiplexed preinstalled component alongside `file/size` and `file/ifchange`, following the same authorship pattern (an rlib check crate wired into `checkleft-preinstalled-bundle`). The native `forbidden-imports-deps` implementation was removed outright rather than kept as a deprecated alias (one implementation, not two); the flunge-side `CHECKS.yaml` migration to `check: file/forbidden-patterns` is a separate flunge change. The `rules`-array config surface in §1.1 is preserved exactly, so the flunge config below applies as written (only the `check:` id becomes `file/forbidden-patterns`). The `require-companion-change` half of this doc is unaffected and tracked separately.
-
 ## Summary
 
 Two checkleft built-in checks — `frontend-no-legacy-api` and `api-breaking-surface` — live in mono but are used only by flunge. Both are config-driven and generic in implementation; the flunge-specific parts are already entirely in flunge's `CHECKS.yaml`, not in the Rust code.
@@ -111,8 +109,6 @@ Two separate instances because the two deprecated modules are distinct prohibiti
 
 The pattern faithfully reproduces the original behavior: it matches ES import statements from any path ending in the legacy module name (covering `./api/fencingtracker`, `../../api/fencingtracker`, `@/api/fencingtracker`, etc.) in TypeScript/TSX files under `frontend/src/`. The `include_globs` reproduces the original `is_frontend_source_file` path filter.
 
-**Conscious tradeoff — static vs dynamic finding message.** The deleted `frontend-no-legacy-api` check produced a dynamic message that interpolated the matched module name (`import from deprecated frontend API module \`{legacy_match}\``). The generic `file/forbidden-patterns` check emits the rule's static `message` field with no capture interpolation. The message granularity is therefore per-rule (one static message per deprecated module), not per-match. This is acceptable for the generalization: the instance-per-policy model already gives each deprecated module its own rule with a fully descriptive message; the matched line appears in the finding's source context.
-
 ### 2.2 `api-breaking-surface` → config of `require-companion-change`
 
 No policy change required. Flunge's existing globs, message, remediation, and `allow_bypass` setting stay exactly as they are. The `id:` (flunge's local policy label) can remain `api-breaking-surface`. Only the `check:` field changes:
@@ -134,9 +130,7 @@ No policy change required. Flunge's existing globs, message, remediation, and `a
 
 ### 3.1 `forbidden-imports-deps` → `forbidden-patterns`
 
-> **Implementation note.** As recorded at the top of this doc, the landed change removed `forbidden-imports-deps` outright rather than keeping it as a deprecated alias. The migration sequence in §4 below has been updated accordingly.
-
-- Register the check under the new id `forbidden-patterns`; remove `forbidden-imports-deps` entirely (no deprecated alias).
+- Register the check under the new id `forbidden-patterns`; keep `forbidden-imports-deps` as a deprecated alias for one release window.
 - Update the description string and userdoc to describe the generic mechanism (line-by-line regex scanner over path globs, not import-specific).
 - The instance-per-policy model is the specified config convention; userdoc examples should demonstrate it — one `- id:` per logical prohibition, not one stanza with unrelated policies bundled under a single `rules:` list.
 - Delete `frontend-no-legacy-api`:
@@ -159,10 +153,9 @@ No policy change required. Flunge's existing globs, message, remediation, and `a
 
 ### `forbidden-patterns` and `frontend-no-legacy-api`
 
-> **Implementation note.** The mono/checkleft change (step 1 below) has already landed and removed `forbidden-imports-deps` outright — no deprecated alias was kept. The remaining step is flunge-side only, and it must land against the new checkleft release (not the old one, which no longer exists).
-
-1. ~~**Mono/checkleft:** rename `forbidden-imports-deps` → `forbidden-patterns` (keep alias); delete `frontend-no-legacy-api` and its references. Cut a checkleft release.~~ **Done.** `forbidden-imports-deps` and `frontend-no-legacy-api` were removed outright; `file/forbidden-patterns` is the only implementation.
-2. **Flunge:** replace the `frontend-no-legacy-api` stanza in `CHECKS.yaml` with `forbidden-patterns` instances per §2.1. **Ordering constraint:** flunge's checkleft binary must be bumped to the new release simultaneously — `forbidden-imports-deps` no longer exists as an alias, so any checkleft run that still references it will fail on an unknown check id. Bump `bin/checkleft.lock` to the new release in the same PR.
+1. **Mono/checkleft:** rename `forbidden-imports-deps` → `forbidden-patterns` (keep alias); delete `frontend-no-legacy-api` and its references. Cut a checkleft release.
+2. **Flunge:** replace the `frontend-no-legacy-api` stanza in `CHECKS.yaml` with `forbidden-patterns` instances per §2.1. This is safe to land against either the old or new checkleft release — the binary knows both `forbidden-imports-deps` (aliased) and `forbidden-patterns`. Bump `bin/checkleft.lock` to the new release.
+3. **Mono/checkleft:** remove the `forbidden-imports-deps` alias in a follow-on release once flunge has migrated.
 
 ### `require-companion-change` and `api-breaking-surface`
 

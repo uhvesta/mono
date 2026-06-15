@@ -103,19 +103,14 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     task: &str,
     prefer_workspace_id: Option<&str>,
     allow_dirty: bool,
-    resume_pr: Option<u64>,
     exclude_workspace_ids: &[&str],
 ) -> Result<CubeWorkspaceLease> {
-    let resume_pr_str = resume_pr.map(|n| n.to_string());
     let mut args: Vec<&str> = vec!["--json", "workspace", "lease", repo_id, "--task", task];
     if let Some(prefer) = prefer_workspace_id {
         args.extend_from_slice(&["--prefer", prefer]);
     }
     if allow_dirty {
         args.push("--allow-dirty");
-    }
-    if let Some(n) = resume_pr_str.as_deref() {
-        args.extend_from_slice(&["--resume-pr", n]);
     }
     for excluded in exclude_workspace_ids {
         args.extend_from_slice(&["--exclude", excluded]);

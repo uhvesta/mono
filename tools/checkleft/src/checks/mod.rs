@@ -2,6 +2,8 @@ mod api_breaking_surface;
 mod bazel;
 mod code_patterns;
 mod docs_link_integrity;
+mod forbidden_imports_deps;
+mod frontend_no_legacy_api;
 mod repo_visibility;
 mod rust_test_rule_coverage;
 mod todo_expiry;
@@ -21,6 +23,8 @@ pub fn register_builtin_checks(registry: &mut CheckRegistry) -> Result<()> {
     registry.register(bazel::BazelversionPoliciesCheck)?;
     registry.register(code_patterns::CodePatternsCheck)?;
     registry.register(docs_link_integrity::DocsLinkIntegrityCheck)?;
+    registry.register(forbidden_imports_deps::ForbiddenImportsDepsCheck)?;
+    registry.register(frontend_no_legacy_api::FrontendNoLegacyApiCheck)?;
     registry.register(repo_visibility::RepoVisibilityCheck)?;
     registry.register(rust_test_rule_coverage::RustTestRuleCoverageCheck)?;
     registry.register(todo_expiry::TodoExpiryCheck)?;

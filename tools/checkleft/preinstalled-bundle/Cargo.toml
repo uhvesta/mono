@@ -15,7 +15,6 @@ crate-type = ["cdylib"]
 [dependencies]
 checkleft-check-sdk = { path = "../sdk" }
 checkleft-file-forbidden-path = { path = "../checks/file/forbidden-path" }
-checkleft-file-forbidden-patterns = { path = "../checks/file/forbidden-patterns" }
 checkleft-file-ifchange = { path = "../checks/file/ifchange" }
 checkleft-file-size = { path = "../checks/file/size" }
 checkleft-rust-giant-structs = { path = "../checks/rust/giant-structs" }

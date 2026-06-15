@@ -253,12 +253,14 @@ mod tests {
             _task: &str,
             _prefer: Option<&str>,
             _allow_dirty: bool,
-            _resume_pr: Option<u64>,
             _exclude: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unreachable!()
         }
         async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
+            unreachable!()
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
             unreachable!()
         }
         async fn release_workspace(&self, _lease_id: &str) -> Result<()> {

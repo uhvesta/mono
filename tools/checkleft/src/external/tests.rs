@@ -139,7 +139,7 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 #[test]
 fn rejects_unknown_mode() {
     let manifest = r#"
-id = "some-external-check"
+id = "frontend-no-legacy-api"
 mode = "exec"
 runtime = "exec-v1"
 api_version = "v1"

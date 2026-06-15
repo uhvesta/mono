@@ -275,13 +275,16 @@ mod tests {
             _task: &str,
             _prefer: Option<&str>,
             _allow_dirty: bool,
-            _resume_pr: Option<u64>,
             _exclude: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!("not used by probe")
         }
 
         async fn create_change(&self, _workspace_path: &Path, _title: &str) -> Result<CubeChangeHandle> {
+            unimplemented!("not used by probe")
+        }
+
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
             unimplemented!("not used by probe")
         }
 

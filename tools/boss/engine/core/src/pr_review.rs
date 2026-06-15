@@ -524,7 +524,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str) -> String
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`).\n\
          - Interacting with GitHub issues in any write capacity.\n\
-         - Running `cube pr ensure` or any Boss PR helper.\n\
+         - Running `cube pr create`/`cube pr update` or any Boss PR helper.\n\
          \n\
          **The one permitted write** is your `ReviewResult` JSON, which you\n\
          write with the `Write` tool to the engine-owned artifact path given in\n\

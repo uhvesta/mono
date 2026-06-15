@@ -206,7 +206,6 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
             _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unimplemented!()
@@ -221,6 +220,9 @@ mod tests {
             unimplemented!()
         }
         async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
+            unimplemented!()
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
             unimplemented!()
         }
         async fn workspace_status(&self, _: &Path) -> Result<CubeWorkspaceStatus> {

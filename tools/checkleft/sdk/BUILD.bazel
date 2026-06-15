@@ -13,7 +13,6 @@ rust_library(
     # target so that unit tests (rust_test below) work without a wasm toolchain.
     visibility = [
         "//tools/checkleft/checks/file/forbidden-path:__pkg__",
-        "//tools/checkleft/checks/file/forbidden-patterns:__pkg__",
         "//tools/checkleft/checks/file/ifchange:__pkg__",
         "//tools/checkleft/checks/file/size:__pkg__",
         "//tools/checkleft/checks/rust/giant-structs:__pkg__",

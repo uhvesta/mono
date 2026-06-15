@@ -5005,12 +5005,14 @@ mod tests {
             _: &str,
             _: Option<&str>,
             _: bool,
-            _: Option<u64>,
             _: &[&str],
         ) -> Result<CubeWorkspaceLease> {
             unreachable!("not used in completion tests")
         }
         async fn create_change(&self, _: &Path, _: &str) -> Result<CubeChangeHandle> {
+            unreachable!("not used in completion tests")
+        }
+        async fn goto_workspace(&self, _: &Path, _: u64) -> Result<()> {
             unreachable!("not used in completion tests")
         }
         async fn release_workspace(&self, lease_id: &str) -> Result<()> {

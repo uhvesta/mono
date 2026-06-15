@@ -35,13 +35,16 @@ swept; `release` frees the slot and resets the working copy; and
 `force-release`/`remove`/`gc` exist for recovery, registry cleanup, and
 reclaiming merged bookmarks. Recovery flags (`--allow-dirty`,
 `--keep-dirty`, `--reason`) let a stranded dirty workspace be reclaimed
-or quarantined instead of being silently wiped. `pr ensure` pushes the
-current `jj` bookmark and creates-or-reuses a GitHub PR idempotently via
-`gh`. The `change`, `stack`, and `pr sync`/`pr merge` verbs are
-scaffolding for stacked-change management and are only partially
-implemented today.
+or quarantined instead of being silently wiped. `pr create` pushes the
+current `jj` bookmark and opens a GitHub PR via `gh` (erroring if one
+already exists), while `pr update` pushes new commits to an existing PR
+(erroring if none does); both resolve the GitHub remote and verify the
+push the same way. (`pr ensure`, the old create-or-reuse verb, is a
+deprecated alias kept for one transitional release.) The `change`,
+`stack`, and `pr sync`/`pr merge` verbs are scaffolding for
+stacked-change management and are only partially implemented today.
 
-### `pr ensure` pushes to GitHub, not a local mirror
+### `pr create` / `pr update` push to GitHub, not a local mirror
 
 A cube workspace carries **two** git remotes: a local on-disk mirror
 (often named `origin`, pointing at the source clone cube provisioned the
@@ -52,12 +55,12 @@ and a same-remote check like `git ls-remote origin <branch>` then reports
 the new sha — a convincing false confirmation that the work shipped when
 the PR head never moved and CI never re-ran.
 
-`pr ensure` avoids this in two ways. First, it resolves the push target
-by **URL, not by name**: it picks the remote whose URL is a `github.com`
-URL (skipping the local-path mirror) and pushes with an explicit
+`pr create` / `pr update` avoid this in two ways. First, they resolve the push target
+by **URL, not by name**: they pick the remote whose URL is a `github.com`
+URL (skipping the local-path mirror) and push with an explicit
 `--remote <name>`, so the push lands on GitHub regardless of which remote
-is called `origin`. Second, it **verifies against GitHub's own truth**
-after pushing — it reads the branch head sha via
+is called `origin`. Second, they **verify against GitHub's own truth**
+after pushing — they read the branch head sha via
 `gh api repos/<owner>/<repo>/branches/<branch> --jq .commit.sha` and
 asserts it equals the local commit, failing loudly on mismatch. A push
 that silently went to the mirror is caught here instead of being reported

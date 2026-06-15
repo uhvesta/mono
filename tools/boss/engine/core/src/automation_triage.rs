@@ -186,7 +186,7 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          - Committing or pushing (`jj git push`, `git push`).\n\
          - Opening, merging, closing, editing, or commenting on a PR\n\
            (`gh pr create/merge/close/edit/comment/review`) or running\n\
-           `cube pr ensure`.\n\
+           `cube pr create`/`cube pr update`.\n\
          - Filing or updating GitHub issues.\n\
          \n\
          Do NOT create a PR, do NOT push a branch, and do NOT print a PR URL —\n\

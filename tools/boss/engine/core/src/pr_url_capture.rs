@@ -145,11 +145,12 @@ pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
     let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
-    // `cube pr ensure` is the jj-aware create-or-reuse wrapper that
-    // outputs a PR URL as its only stdout line — treat it the same as
-    // `gh pr create` for capture purposes. It is not a `gh` invocation,
-    // so the shared classifier doesn't see it; check it directly.
-    if command.contains("cube pr ensure") {
+    // `cube pr create` / `cube pr update` (and the deprecated `cube pr
+    // ensure` alias) are the jj-aware wrappers that output a PR URL as their
+    // only stdout line — treat them the same as `gh pr create` for capture
+    // purposes. They are not `gh` invocations, so the shared classifier
+    // doesn't see them; check them directly.
+    if command.contains("cube pr create") || command.contains("cube pr update") || command.contains("cube pr ensure") {
         return true;
     }
     matches!(
@@ -467,9 +468,24 @@ mod tests {
     }
 
     #[test]
-    fn cube_pr_ensure_is_a_gh_pr_command() {
-        // `cube pr ensure` outputs a PR URL as its only stdout line and
+    fn cube_pr_create_is_a_gh_pr_command() {
+        // `cube pr create` outputs a PR URL as its only stdout line and
         // must be captured the same way as `gh pr create`.
+        assert!(is_gh_pr_command(&json!({
+            "command": "cube pr create --branch boss/exec_abc123_01 --title 'my feature'"
+        })));
+    }
+
+    #[test]
+    fn cube_pr_update_is_a_gh_pr_command() {
+        // `cube pr update` also prints the PR URL as its only stdout line.
+        assert!(is_gh_pr_command(&json!({
+            "command": "cube pr update --branch boss/exec_abc123_01"
+        })));
+    }
+
+    #[test]
+    fn deprecated_cube_pr_ensure_is_a_gh_pr_command() {
         assert!(is_gh_pr_command(&json!({
             "command": "cube pr ensure --branch boss/exec_abc123_01 --title 'my feature'"
         })));

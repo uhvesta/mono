@@ -21,15 +21,16 @@
 //! top-level `.git`, so `gh` is run with `GIT_DIR=.jj/repo/store/git`)
 //! and the command appearing after a shell delimiter (`&&`, `;`, `|`).
 //!
-//! ## `cube pr ensure` coverage
+//! ## `cube pr create` coverage
 //!
-//! Workers are instructed to create PRs via `cube pr ensure` rather than
-//! calling `gh pr create` directly. `cube pr ensure` resolves the repo
+//! Workers are instructed to create PRs via `cube pr create` rather than
+//! calling `gh pr create` directly. `cube pr create` resolves the repo
 //! remote and then shells out to `gh pr create` internally — but that
 //! subprocess is invisible to the PreToolUse hook, which only sees the
-//! outer `cube pr ensure ...` command. [`is_cube_pr_ensure`] detects this
-//! path so the editorial hook can enforce the same rules it applies to a
-//! literal `gh pr create`.
+//! outer `cube pr create ...` command. [`is_cube_pr_create`] detects this
+//! path (and the deprecated `cube pr ensure` alias, which also creates) so
+//! the editorial hook can enforce the same rules it applies to a literal
+//! `gh pr create`.
 //!
 //! ## Subprocess spawn helpers
 //!
@@ -147,37 +148,44 @@ pub fn classify(command: &str) -> Option<GhInvocation> {
     })
 }
 
-/// Matches `cube pr ensure` anywhere it would appear as a real command:
-/// at the start, after env-var assignments, or after a shell delimiter.
-static CUBE_PR_ENSURE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cube\s+pr\s+ensure\b")
-        .expect("cube pr ensure regex compiles")
+/// Matches a PR-creating `cube pr` invocation anywhere it would appear as a
+/// real command: at the start, after env-var assignments, or after a shell
+/// delimiter. Covers `cube pr create` and the deprecated `cube pr ensure`
+/// alias (both author a PR body); `cube pr update` is deliberately excluded
+/// because it never creates and carries no body to audit.
+static CUBE_PR_CREATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s;&|()])(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*cube\s+pr\s+(?:create|ensure)\b")
+        .expect("cube pr create regex compiles")
 });
 
-/// Returns `true` when `command` is a `cube pr ensure` invocation.
+/// Returns `true` when `command` is a PR-creating `cube pr` invocation
+/// (`cube pr create` or the deprecated `cube pr ensure` alias).
 ///
-/// Workers are instructed to create PRs via `cube pr ensure` rather than
+/// Workers are instructed to create PRs via `cube pr create` rather than
 /// calling `gh pr create` directly. `cube` shells out to `gh pr create`
 /// internally, making that call invisible to the PreToolUse hook. This
-/// predicate lets the editorial hook intercept the outer `cube pr ensure`
+/// predicate lets the editorial hook intercept the outer `cube pr create`
 /// command and apply the same checks it would apply to a `gh pr create`.
 ///
 /// Quoted argument values are stripped before matching so that a commit
-/// message mentioning `cube pr ensure` does not produce a false positive.
-pub fn is_cube_pr_ensure(command: &str) -> bool {
+/// message mentioning `cube pr create` does not produce a false positive.
+pub fn is_cube_pr_create(command: &str) -> bool {
     let stripped = strip_quoted_string_contents(command);
-    CUBE_PR_ENSURE_RE.is_match(&stripped)
+    CUBE_PR_CREATE_RE.is_match(&stripped)
 }
 
 /// Fast pre-filter for the editorial PreToolUse audit path. Returns `true`
 /// when `command` could be a `gh pr|issue {create,edit,comment,review}` or
-/// `cube pr ensure` invocation — the two surfaces the editorial hook covers.
+/// PR-creating `cube pr {create,ensure}` invocation — the two surfaces the
+/// editorial hook covers.
 ///
 /// This is a cheap substring check; the heavier [`classify`] /
-/// [`is_cube_pr_ensure`] parsing follows only when this returns `true`.
+/// [`is_cube_pr_create`] parsing follows only when this returns `true`.
 pub fn is_editorial_candidate(command: &str) -> bool {
     (command.contains("gh ") && (command.contains(" pr ") || command.contains(" issue ")))
-        || (command.contains("cube ") && command.contains(" pr ") && command.contains("ensure"))
+        || (command.contains("cube ")
+            && command.contains(" pr ")
+            && (command.contains("create") || command.contains("ensure")))
 }
 
 // ── Subprocess spawn helpers ──────────────────────────────────────────────────
@@ -278,39 +286,52 @@ mod tests {
         assert_eq!(classify("highgh pr create"), None);
     }
 
-    // --- is_cube_pr_ensure ---
+    // --- is_cube_pr_create ---
 
     #[test]
-    fn detects_cube_pr_ensure() {
-        assert!(is_cube_pr_ensure("cube pr ensure --branch feat/foo --title 'My PR'"));
+    fn detects_cube_pr_create() {
+        assert!(is_cube_pr_create("cube pr create --branch feat/foo --title 'My PR'"));
     }
 
     #[test]
-    fn detects_cube_pr_ensure_after_shell_delimiter() {
-        assert!(is_cube_pr_ensure("jj describe -m 'msg' && cube pr ensure --branch b"));
+    fn detects_deprecated_cube_pr_ensure() {
+        // The deprecated alias still create-or-reuses, so it must still be
+        // intercepted for editorial enforcement.
+        assert!(is_cube_pr_create("cube pr ensure --branch feat/foo --title 'My PR'"));
     }
 
     #[test]
-    fn detects_cube_pr_ensure_with_env_prefix() {
-        assert!(is_cube_pr_ensure("GIT_DIR=.git cube pr ensure --branch b"));
+    fn rejects_cube_pr_update() {
+        // `cube pr update` never creates and carries no body — not a create.
+        assert!(!is_cube_pr_create("cube pr update --branch feat/foo"));
+    }
+
+    #[test]
+    fn detects_cube_pr_create_after_shell_delimiter() {
+        assert!(is_cube_pr_create("jj describe -m 'msg' && cube pr create --branch b"));
+    }
+
+    #[test]
+    fn detects_cube_pr_create_with_env_prefix() {
+        assert!(is_cube_pr_create("GIT_DIR=.git cube pr create --branch b"));
     }
 
     #[test]
     fn rejects_cube_pr_list() {
-        // `cube pr list` is not ensure.
-        assert!(!is_cube_pr_ensure("cube pr list"));
+        // `cube pr list` is not create.
+        assert!(!is_cube_pr_create("cube pr list"));
     }
 
     #[test]
     fn rejects_non_cube_command() {
-        assert!(!is_cube_pr_ensure("gh pr create --title x"));
-        assert!(!is_cube_pr_ensure("cube workspace lease mono"));
+        assert!(!is_cube_pr_create("gh pr create --title x"));
+        assert!(!is_cube_pr_create("cube workspace lease mono"));
     }
 
     #[test]
     fn rejects_token_ending_in_cube() {
-        // `notcube pr ensure` must not match.
-        assert!(!is_cube_pr_ensure("notcube pr ensure --branch b"));
+        // `notcube pr create` must not match.
+        assert!(!is_cube_pr_create("notcube pr create --branch b"));
     }
 
     // ── false-positive regression tests ──────────────────────────────────
@@ -319,22 +340,22 @@ mod tests {
     // quoted argument (e.g. a commit message) caused a false positive.
 
     #[test]
-    fn cube_pr_ensure_not_matched_inside_double_quoted_commit_message() {
+    fn cube_pr_create_not_matched_inside_double_quoted_commit_message() {
         // Reproduces the T1031 bug: the phrase appears inside -m "..."
-        // but the command is `jj describe`, not `cube pr ensure`.
+        // but the command is `jj describe`, not `cube pr create`.
         assert!(
-            !is_cube_pr_ensure(
-                r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr ensure""#,
+            !is_cube_pr_create(
+                r#"jj describe -m "fix(boss-engine): extend editorial hook to intercept cube pr create""#,
             ),
-            "cube pr ensure inside a double-quoted commit message must not match",
+            "cube pr create inside a double-quoted commit message must not match",
         );
     }
 
     #[test]
-    fn cube_pr_ensure_not_matched_inside_single_quoted_commit_message() {
+    fn cube_pr_create_not_matched_inside_single_quoted_commit_message() {
         assert!(
-            !is_cube_pr_ensure("jj describe -m 'fix: intercept cube pr ensure'"),
-            "cube pr ensure inside a single-quoted commit message must not match",
+            !is_cube_pr_create("jj describe -m 'fix: intercept cube pr create'"),
+            "cube pr create inside a single-quoted commit message must not match",
         );
     }
 
@@ -347,13 +368,13 @@ mod tests {
     }
 
     #[test]
-    fn cube_pr_ensure_still_matches_after_quoted_arg() {
-        // A real `cube pr ensure` that happens to follow a quoted argument
-        // (e.g. `jj describe -m "msg" && cube pr ensure`) must still be
+    fn cube_pr_create_still_matches_after_quoted_arg() {
+        // A real `cube pr create` that happens to follow a quoted argument
+        // (e.g. `jj describe -m "msg" && cube pr create`) must still be
         // caught. Stripping quotes must not suppress the real command.
         assert!(
-            is_cube_pr_ensure(r#"jj describe -m "push fixes" && cube pr ensure --branch b"#),
-            "cube pr ensure after a quoted arg must still match",
+            is_cube_pr_create(r#"jj describe -m "push fixes" && cube pr create --branch b"#),
+            "cube pr create after a quoted arg must still match",
         );
     }
 

@@ -177,7 +177,10 @@ mod tests {
             bypass_name_for_check_id("api-breaking-surface"),
             "BYPASS_API_BREAKING_SURFACE"
         );
-        assert_eq!(bypass_name_for_check_id("forbidden-paths"), "BYPASS_FORBIDDEN_PATHS");
+        assert_eq!(
+            bypass_name_for_check_id("frontend-no-legacy-api"),
+            "BYPASS_FRONTEND_NO_LEGACY_API"
+        );
     }
 
     #[test]

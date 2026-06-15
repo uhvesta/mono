@@ -462,7 +462,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // dotfiles — which re-prepends `~/bin`, where a `repobin` shim of
         // `cube` / `boss` / `bossctl` typically lives. That shim is
         // independently versioned and has drifted from the bundled CLI
-        // (e.g. it lacks `cube pr ensure`), so a worker that resolves the
+        // (e.g. it lacks `cube pr create`), so a worker that resolves the
         // shim instead of the bundled binary silently breaks. BOSS_BIN_DIR
         // itself survives init (init scripts don't unset custom env vars),
         // so we re-prepend it here: this line runs *after* init completes
@@ -1321,7 +1321,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
                  - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark and pushing — do NOT invent a different name.\n\
                  - Push your branch (`jj bookmark create {expected_branch} -r @ && jj git push -b {expected_branch} --allow-new`) and open a PR with `gh pr create --head {expected_branch} --base main` if one does not already exist.\n\
-                 - Alternatively, use `cube pr ensure --branch {expected_branch}` which pushes the branch and creates or reuses the PR in one step (jj-aware, no GIT_DIR needed).\n\
+                 - Alternatively, use `cube pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It errors if a PR already exists — use `cube pr update --branch {expected_branch}` in that case.\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
                  - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
@@ -1583,7 +1583,7 @@ fn pr_terminal_directive() -> String {
     out.push_str(
         "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
     );
-    out.push_str("You will NOT get another turn after `gh pr create` / `cube pr ensure`. Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (subagent workflows, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
+    out.push_str("You will NOT get another turn after `gh pr create` / `cube pr create` (or `cube pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (subagent workflows, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
 }
@@ -1809,13 +1809,11 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("## Workspace state\n");
     // `pr_number != "?"` is equivalent to `execution.pr_url` being a parseable
-    // GitHub PR URL, which is exactly when the lease passed `--resume-pr N` and
-    // cube positioned the workspace at the PR head. Without a parseable URL,
-    // resume_pr = None, the lease reset the workspace to main, and the worker
-    // must position it manually — falsely claiming "pre-positioned" caused the
-    // T1727 incident where O'Brien wasted turns on the fallback path.
+    // GitHub PR URL, which is exactly when the engine called `cube workspace goto`
+    // to position the workspace at the PR head. Without a parseable URL,
+    // the workspace is on main and the worker must position it manually.
     if pr_number != "?" {
-        out.push_str("The engine pre-positioned this workspace via `cube workspace lease --resume_pr`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
+        out.push_str("The engine pre-positioned this workspace via `cube workspace goto`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
         out.push('\n');
         out.push_str(
             "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",
@@ -2872,7 +2870,7 @@ mod compose_prompt_tests {
             "acceptance criterion should guide fresh branch creation:\n{prompt}",
         );
         assert!(
-            prompt.contains("gh pr create") || prompt.contains("cube pr ensure"),
+            prompt.contains("gh pr create") || prompt.contains("cube pr create"),
             "acceptance criterion should guide opening a new PR:\n{prompt}",
         );
     }
@@ -4433,8 +4431,8 @@ mod pane_spawn_tests {
             "implementation prompt must tell the worker to print the URL on its own line: {prompt}",
         );
         assert!(
-            prompt.contains("gh pr create") || prompt.contains("gh pr view") || prompt.contains("cube pr ensure"),
-            "implementation prompt must mention gh pr commands or cube pr ensure: {prompt}",
+            prompt.contains("gh pr create") || prompt.contains("gh pr view") || prompt.contains("cube pr create"),
+            "implementation prompt must mention gh pr commands or cube pr create: {prompt}",
         );
         assert!(
             prompt.contains("jj diff -r @"),

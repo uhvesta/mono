@@ -195,16 +195,33 @@ fn three_denies_flip_to_allow_with_attention_item() {
 }
 
 // ---------------------------------------------------------------------------
-// cube pr ensure coverage
+// cube pr create coverage
 //
-// Workers are instructed to use `cube pr ensure` rather than `gh pr create`
+// Workers are instructed to use `cube pr create` rather than `gh pr create`
 // directly. `cube` shells out to `gh pr create` internally — invisible to the
 // PreToolUse hook. These tests verify that `evaluate_gh_pretooluse` intercepts
-// the outer `cube pr ensure` command and applies the same editorial rules.
+// the outer `cube pr create` command (and the deprecated `cube pr ensure`
+// alias) and applies the same editorial rules.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cube_pr_ensure_bad_body_is_denied() {
+fn cube_pr_create_bad_body_is_denied() {
+    let ws = TempDir::new().unwrap();
+    let cmd = "cube pr create --branch feat/foo --title 'My PR' --body 'Opened by a Boss worker for you.'";
+    let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
+    match &outcome.decision {
+        PreToolUseDecision::Deny { reason } => {
+            assert!(reason.contains("Boss worker"), "reason: {reason}");
+        }
+        other => panic!("expected Deny for cube pr create bad body, got {other:?}"),
+    }
+    assert_eq!(outcome.action, EditorialActionKind::Deny);
+}
+
+#[test]
+fn deprecated_cube_pr_ensure_bad_body_is_denied() {
+    // The deprecated alias still create-or-reuses, so it must still be
+    // intercepted and held to the editorial rules during the transition.
     let ws = TempDir::new().unwrap();
     let cmd = "cube pr ensure --branch feat/foo --title 'My PR' --body 'Opened by a Boss worker for you.'";
     let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
@@ -212,15 +229,15 @@ fn cube_pr_ensure_bad_body_is_denied() {
         PreToolUseDecision::Deny { reason } => {
             assert!(reason.contains("Boss worker"), "reason: {reason}");
         }
-        other => panic!("expected Deny for cube pr ensure bad body, got {other:?}"),
+        other => panic!("expected Deny for deprecated cube pr ensure bad body, got {other:?}"),
     }
     assert_eq!(outcome.action, EditorialActionKind::Deny);
 }
 
 #[test]
-fn cube_pr_ensure_redactable_body_is_rewritten() {
+fn cube_pr_create_redactable_body_is_rewritten() {
     let ws = TempDir::new().unwrap();
-    let cmd = format!("cube pr ensure --branch feat/foo --title 'My PR' --body 'Fixes {EXEC_ID} in prod.'");
+    let cmd = format!("cube pr create --branch feat/foo --title 'My PR' --body 'Fixes {EXEC_ID} in prod.'");
     let outcome = evaluate_gh_pretooluse(&cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     match &outcome.decision {
         PreToolUseDecision::AllowWithRewrite {
@@ -229,13 +246,13 @@ fn cube_pr_ensure_redactable_body_is_rewritten() {
         } => {
             assert!(!c.contains(EXEC_ID), "rewritten cube command still leaks id: {c:?}");
         }
-        other => panic!("expected AllowWithRewrite for cube pr ensure, got {other:?}"),
+        other => panic!("expected AllowWithRewrite for cube pr create, got {other:?}"),
     }
     assert_eq!(outcome.action, EditorialActionKind::Rewrite);
 }
 
 #[test]
-fn cube_pr_ensure_body_file_is_redacted_on_disk() {
+fn cube_pr_create_body_file_is_redacted_on_disk() {
     let ws = TempDir::new().unwrap();
     let body_path = ws.path().join("body.md");
     fs::write(
@@ -243,7 +260,7 @@ fn cube_pr_ensure_body_file_is_redacted_on_disk() {
         format!("## Summary\n\nThis execution {EXEC_ID} fixed login.\n"),
     )
     .unwrap();
-    let cmd = "cube pr ensure --branch feat/foo --title t --body-file body.md";
+    let cmd = "cube pr create --branch feat/foo --title t --body-file body.md";
     let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     match &outcome.decision {
         PreToolUseDecision::AllowWithRewrite { updated_command, .. } => {
@@ -258,22 +275,22 @@ fn cube_pr_ensure_body_file_is_redacted_on_disk() {
 }
 
 #[test]
-fn cube_pr_ensure_clean_body_is_allowed() {
+fn cube_pr_create_clean_body_is_allowed() {
     let ws = TempDir::new().unwrap();
-    let cmd = "cube pr ensure --branch feat/foo --title 'Clean title' --body 'No identifiers here.'";
+    let cmd = "cube pr create --branch feat/foo --title 'Clean title' --body 'No identifiers here.'";
     let outcome = evaluate_gh_pretooluse(cmd, ws.path(), &default_rules(), None, EXEC_ID, &DenyTracker::new());
     assert_eq!(outcome.decision, PreToolUseDecision::Allow);
     assert_eq!(outcome.action, EditorialActionKind::Allow);
 }
 
 #[test]
-fn cube_pr_ensure_applies_template_policy() {
-    // When a template is provided, cube pr ensure must trigger the template
+fn cube_pr_create_applies_template_policy() {
+    // When a template is provided, cube pr create must trigger the template
     // check (same as gh pr create / edit).
     let ws = TempDir::new().unwrap();
     let template = "## Summary\n\n## Test plan\n";
     // Body that is missing the required sections.
-    let cmd = "cube pr ensure --branch feat/foo --title t --body 'Just a sentence, no sections.'";
+    let cmd = "cube pr create --branch feat/foo --title t --body 'Just a sentence, no sections.'";
     let rules = {
         let r = EditorialRules {
             template_policy: TemplatePolicy::Enforce,
@@ -285,7 +302,7 @@ fn cube_pr_ensure_applies_template_policy() {
     // Template violation → deny.
     assert!(
         matches!(outcome.decision, PreToolUseDecision::Deny { .. }),
-        "expected template-policy deny for cube pr ensure, got {:?}",
+        "expected template-policy deny for cube pr create, got {:?}",
         outcome.decision
     );
 }

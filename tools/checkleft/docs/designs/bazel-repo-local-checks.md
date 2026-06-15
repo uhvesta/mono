@@ -191,15 +191,15 @@ new execution mode for repo-local executables.
 Suggested manifest shape:
 
 ```toml
-id = "no-legacy-imports"
+id = "frontend-no-legacy-api"
 runtime = "exec-v1"
 api_version = "v1"
 mode = "exec"
-executable_path = "bazel-bin/checks/no_legacy_imports/no_legacy_imports"
+executable_path = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api"
 
 [provenance]
 generator = "bazel"
-target = "//checks/no_legacy_imports:no_legacy_imports_bin"
+target = "//checks/frontend_no_legacy_api:frontend_no_legacy_api_bin"
 ```
 
 Required fields:
@@ -299,8 +299,8 @@ Suggested index shape:
 version = 1
 
 [[packages]]
-implementation = "generated:no-legacy-imports"
-manifest = "bazel-bin/checks/no_legacy_imports/no_legacy_imports.check.toml"
+implementation = "generated:frontend-no-legacy-api"
+manifest = "bazel-bin/checks/frontend_no_legacy_api/frontend_no_legacy_api.check.toml"
 ```
 
 Behavior should match the existing generated provider expectations:
@@ -322,19 +322,19 @@ load("//tools/checkleft/bazel:defs.bzl", "check_index", "local_check")
 package(default_visibility = ["//visibility:private"])
 
 py_binary(
-    name = "no_legacy_imports_bin",
+    name = "frontend_no_legacy_api_bin",
     srcs = ["check.py"],
     main = "check.py",
 )
 
 local_check(
-    name = "no_legacy_imports",
-    binary = ":no_legacy_imports_bin",
+    name = "frontend_no_legacy_api",
+    binary = ":frontend_no_legacy_api_bin",
 )
 
 check_index(
     name = "check_index",
-    checks = [":no_legacy_imports"],
+    checks = [":frontend_no_legacy_api"],
 )
 ```
 
@@ -401,7 +401,7 @@ load("//tools/checkleft/bazel:defs.bzl", "checkleft")
 
 checkleft(
     name = "run_checkleft",
-    checks = [":no_legacy_imports"],
+    checks = [":frontend_no_legacy_api"],
 )
 ```
 

@@ -239,7 +239,7 @@ fn is_enforced_subcommand(sub: &str) -> bool {
     matches!(sub, "create" | "edit" | "comment" | "review")
 }
 
-/// Evaluate one `gh pr|issue` or `cube pr ensure` Bash command against
+/// Evaluate one `gh pr|issue` or `cube pr create` Bash command against
 /// the editorial rules.
 ///
 /// - `command` — the worker's Bash command string (`tool_input.command`).
@@ -249,20 +249,20 @@ fn is_enforced_subcommand(sub: &str) -> bool {
 ///   always apply on top).
 /// - `template_body` — the repo's `PULL_REQUEST_TEMPLATE.md` text, or
 ///   `None`. Used only for `template_policy == Enforce` on `pr
-///   create`/`edit` (and always for `cube pr ensure`).
+///   create`/`edit` (and always for `cube pr create`).
 /// - `execution_id` / `deny_tracker` — the loop-guard state (R3).
 ///
 /// See the module docs for the full step list. Fails open on anything it
 /// cannot inspect.
 ///
-/// ## `cube pr ensure` coverage
+/// ## `cube pr create` coverage
 ///
-/// Workers are instructed to create PRs via `cube pr ensure` rather than
-/// calling `gh pr create` directly. `cube pr ensure` shells out to `gh pr
+/// Workers are instructed to create PRs via `cube pr create` rather than
+/// calling `gh pr create` directly. `cube pr create` shells out to `gh pr
 /// create` internally, making that call invisible to the PreToolUse hook.
-/// This function intercepts the outer `cube pr ensure` command directly
-/// and applies the same checks as for `gh pr create` (including template
-/// enforcement).
+/// This function intercepts the outer `cube pr create` command directly
+/// (and the deprecated `cube pr ensure` alias) and applies the same checks
+/// as for `gh pr create` (including template enforcement).
 ///
 /// ## Feature-flag gating
 ///
@@ -280,10 +280,11 @@ pub fn evaluate_gh_pretooluse(
     execution_id: &str,
     deny_tracker: &DenyTracker,
 ) -> EditorialOutcome {
-    // Step 0: classify the command. `cube pr ensure` is treated as
-    // equivalent to `gh pr create` — same template gating, same arg
-    // parsing (both accept --body / --body-file / --title).
-    let apply_template = if gh_invocation::is_cube_pr_ensure(command) {
+    // Step 0: classify the command. `cube pr create` (and the deprecated
+    // `cube pr ensure` alias) is treated as equivalent to `gh pr create` —
+    // same template gating, same arg parsing (all accept --body / --body-file
+    // / --title).
+    let apply_template = if gh_invocation::is_cube_pr_create(command) {
         true
     } else {
         let Some(inv) = gh_invocation::classify(command) else {
@@ -318,7 +319,7 @@ pub fn evaluate_gh_pretooluse(
     }
 
     // Step 3 gating: the template check only applies to PR create/edit
-    // (and to cube pr ensure, which always creates a PR).
+    // (and to cube pr create, which always creates a PR).
     let template_for_call = if apply_template { template_body } else { None };
 
     // Step 2 + 3: run the evaluator.
