@@ -8,12 +8,13 @@ use crate::external::{
     ExternalCheckComponentPackage, ExternalCheckPackage, ExternalCheckPackageImplementation,
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff};
-use crate::output::Severity;
+use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::source_tree::LocalSourceTree;
 
 use super::{
     BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
-    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, build_wasmtime_engine, is_interrupt_error, resolve_component_limits,
+    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_struct_exclusions, build_wasmtime_engine, is_interrupt_error,
+    lower_check_input, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -969,11 +970,16 @@ fn write_file(root: &std::path::Path, rel: &str, contents: &str) {
     fs::write(path, contents).expect("write file");
 }
 
-/// A qualified `relative/path.rs::Name` exclusion authored in a subdirectory
-/// CHECKS file (config_dir = "tools/boss") must exempt exactly that struct in
-/// exactly that file. A same-named struct in another file is still flagged, and
-/// the host resolves the config-relative entry path to repo-relative — all with
-/// no `config_dir` on `CheckInput`.
+/// Parity round-trip: a qualified `relative/path.rs::Name` exclusion authored in
+/// a subdirectory CHECKS file (config_dir = "tools/boss") must exempt exactly
+/// that struct in exactly that file when running the real bundled component. A
+/// same-named struct in another file is still flagged, and the host resolves the
+/// config-relative entry path to repo-relative — all with no `config_dir` on
+/// `CheckInput`.
+///
+/// This is the single real-component parity round-trip for host-side exclusion.
+/// The host logic it exercises (`apply_struct_exclusions`, qualified-entry form)
+/// is also covered directly by `apply_struct_exclusions_qualified_exempts_only_named_file`.
 #[test]
 fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
     let temp = tempdir().expect("temp dir");
@@ -1024,109 +1030,117 @@ fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
     );
 }
 
-/// A simple `Name` exclusion in a subdirectory CHECKS file is scoped to that
-/// CHECKS file's subtree: it exempts `Big` for any file under `tools/boss`, but
-/// a same-named struct outside the subtree is still flagged.
-#[test]
-fn giant_structs_simple_exclusion_is_scoped_to_the_config_subtree() {
-    let temp = tempdir().expect("temp dir");
-    write_file(temp.path(), "tools/boss/sub/types.rs", BIG_STRUCT_SOURCE);
-    write_file(temp.path(), "other/types.rs", BIG_STRUCT_SOURCE);
+// --- Host-side exclusion mock tests ---
+//
+// These test the host exclusion functions directly, without spinning up the real
+// bundled wasm component, so they run cheaply in `checkleft_lib_test`.
 
-    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
-    let changeset = ChangeSet::new(vec![
-        ChangedFile {
-            path: PathBuf::from("tools/boss/sub/types.rs"),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("other/types.rs"),
-            kind: ChangeKind::Modified,
-            old_path: None,
-        },
-    ]);
+fn make_big_struct_finding(path: &str) -> Finding {
+    Finding {
+        severity: Severity::Error,
+        message: "struct `Big` has more than 5 named fields but lacks `#[derive(..)]`".to_owned(),
+        location: Some(Location {
+            path: PathBuf::from(path),
+            line: Some(1),
+            column: None,
+        }),
+        remediations: vec![],
+        suggested_fix: None,
+    }
+}
+
+/// A simple `Name` exclusion in a subdirectory CHECKS file is scoped to that
+/// CHECKS file's subtree: `Big` is exempt for files under `tools/boss` but a
+/// same-named struct in `other/types.rs` (outside the subtree) is retained.
+/// Exercises `apply_struct_exclusions` directly — no wasm component required.
+#[test]
+fn apply_struct_exclusions_simple_scopes_to_config_subtree() {
+    let mut result = CheckResult {
+        check_id: "rust/giant-structs".to_owned(),
+        findings: vec![
+            make_big_struct_finding("tools/boss/sub/types.rs"),
+            make_big_struct_finding("other/types.rs"),
+        ],
+    };
 
     let config = toml::Value::Table(toml::toml! {
         exclude_structs = ["Big"]
     });
 
-    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
-    let result = executor
-        .execute(
-            &bundled_package("rust/giant-structs"),
-            &changeset,
-            &tree,
-            &config,
-            std::path::Path::new("tools/boss"),
-        )
-        .expect("execute");
+    apply_struct_exclusions(&mut result, &config, std::path::Path::new("tools/boss"));
 
     assert_eq!(
         result.findings.len(),
         1,
-        "only the struct outside the config subtree should remain; got: {:?}",
-        result.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
+        "only the struct outside the config subtree should remain"
     );
-    let loc = result.findings[0].location.as_ref().expect("finding has location");
-    assert_eq!(loc.path, std::path::Path::new("other/types.rs"));
+    assert_eq!(
+        result.findings[0].location.as_ref().unwrap().path,
+        PathBuf::from("other/types.rs")
+    );
+}
+
+/// A qualified `path::Name` exclusion is scoped to the exact (repo-relative
+/// path, struct-name) pair: it exempts `Big` in `tools/boss/sub/types.rs` but
+/// not the same-named struct in `other/types.rs`.
+/// Exercises `apply_struct_exclusions` directly — no wasm component required.
+#[test]
+fn apply_struct_exclusions_qualified_exempts_only_named_file() {
+    let mut result = CheckResult {
+        check_id: "rust/giant-structs".to_owned(),
+        findings: vec![
+            make_big_struct_finding("tools/boss/sub/types.rs"),
+            make_big_struct_finding("other/types.rs"),
+        ],
+    };
+
+    let config = toml::Value::Table(toml::toml! {
+        exclude_structs = ["sub/types.rs::Big"]
+    });
+
+    apply_struct_exclusions(&mut result, &config, std::path::Path::new("tools/boss"));
+
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "only the unexcluded same-named struct should remain"
+    );
+    assert_eq!(
+        result.findings[0].location.as_ref().unwrap().path,
+        PathBuf::from("other/types.rs")
+    );
 }
 
 /// An `exclude_files` glob authored in a subdirectory CHECKS file
-/// (config_dir = "sub/dir") is normalized host-side to a repo-relative glob: it
-/// excludes oversized files inside the subtree but never matches files outside
-/// it. The guest matches repo-relative paths with no `config_dir`.
+/// (config_dir = "sub/dir") is rewritten host-side to a repo-relative glob
+/// before the guest sees it. Verifies that `lower_check_input` rewrites `*.rs`
+/// to `sub/dir/*.rs` in the serialized config JSON handed to the executor —
+/// no wasm component required.
 #[test]
-fn file_size_exclude_files_is_scoped_to_the_config_subtree() {
-    // 3 lines, exceeding max_lines = 2; both files are freshly added (always "grew").
-    const OVERSIZED: &str = "a\nb\nc\n";
+fn lower_check_input_scopes_exclude_files_to_config_dir() {
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("sub/dir/inside.rs"),
+        kind: ChangeKind::Added,
+        old_path: None,
+    }]);
 
-    let temp = tempdir().expect("temp dir");
-    write_file(temp.path(), "sub/dir/inside.rs", OVERSIZED);
-    write_file(temp.path(), "outside.rs", OVERSIZED);
-
-    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
-    let changeset = ChangeSet::new(vec![
-        ChangedFile {
-            path: PathBuf::from("sub/dir/inside.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-        ChangedFile {
-            path: PathBuf::from("outside.rs"),
-            kind: ChangeKind::Added,
-            old_path: None,
-        },
-    ]);
-
-    // Pattern is relative to the CHECKS file's directory (sub/dir); the host
-    // rewrites it to the repo-relative glob `sub/dir/*.rs`.
     let config = toml::Value::Table(toml::toml! {
         max_lines = 2
         exclude_files = ["*.rs"]
     });
 
-    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
-    let result = executor
-        .execute(
-            &bundled_package("file/size"),
-            &changeset,
-            &tree,
-            &config,
-            std::path::Path::new("sub/dir"),
-        )
-        .expect("execute");
+    let input = lower_check_input(&changeset, &config, std::path::Path::new("sub/dir")).expect("lower_check_input");
 
+    let parsed: serde_json::Value = serde_json::from_str(&input.config_json).expect("parse config_json");
+    let exclude_files: Vec<&str> = parsed["exclude_files"]
+        .as_array()
+        .expect("exclude_files must be an array")
+        .iter()
+        .map(|v| v.as_str().expect("string element"))
+        .collect();
     assert_eq!(
-        result.findings.len(),
-        1,
-        "the in-subtree file must be excluded and the out-of-subtree file flagged; got: {:?}",
-        result.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
-    );
-    let loc = result.findings[0].location.as_ref().expect("finding has location");
-    assert_eq!(
-        loc.path,
-        std::path::Path::new("outside.rs"),
-        "only the file outside the config subtree should be flagged"
+        exclude_files,
+        vec!["sub/dir/*.rs"],
+        "exclude_files patterns must be rewritten to repo-relative before being handed to the guest"
     );
 }
