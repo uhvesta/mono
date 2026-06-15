@@ -1398,6 +1398,105 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
     assert_eq!(reason.as_deref(), Some("ci_failure"));
 }
 
+/// Defect #3 (the un-block side fighting the block): an InFlight head-branch
+/// CI probe must NOT clear a `merge_queue_rebounce` block.
+///
+/// The PR's own branch CI is green for a queue failure, and the rebounce
+/// attempt's `head_sha_at_trigger` is the synthetic merge commit — which never
+/// equals the PR head — so `on_ci_in_flight_supersedes_failure`'s stale-head
+/// heuristic would otherwise read "stale", abandon the attempt, and clear the
+/// block. The next sweep's rebounce check would re-block it: the observed
+/// blocked<->in_review flap. The block must stand and the attempt must stay
+/// pending (so `on_ci_resolved`'s guard keeps holding too).
+#[tokio::test]
+async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/504";
+    let (product, chore) = make_in_review(&db, "C-rebounce-inflight", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let flipped = on_merge_queue_rebounce_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature-branch"),
+        None,
+        "synthetic-sha-inflight",
+        &[],
+    )
+    .await;
+    assert!(flipped);
+
+    // Merge poller's next sweep probes the PR head and finds CI InFlight.
+    // `current_head_sha` (PR head) differs from the synthetic merge SHA the
+    // attempt was keyed on — exactly the condition that used to mis-fire.
+    let cleared = on_ci_in_flight_supersedes_failure(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        &[],
+        Some("pr-head-sha-different"),
+    )
+    .await;
+    assert!(
+        !cleared,
+        "InFlight head-branch CI must not supersede a merge_queue_rebounce block",
+    );
+
+    let (status, reason) = chore_state(&db, &chore);
+    assert_eq!(status, TaskStatus::Blocked);
+    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("rebounce attempt must still be active (not abandoned by the supersede path)");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
+}
+
+/// End-to-end anti-flap reproducer: across repeated sweeps of an UNCHANGED
+/// failing merge SHA — with both an InFlight supersede probe and a Clean
+/// `on_ci_resolved` probe running between rebounce checks every cycle — the
+/// chore bounces to blocked AT MOST ONCE and never oscillates back to
+/// in_review. This is the operator-reported symptom (~once-a-minute flap)
+/// pinned shut: defects #1 (per-sha idempotency) and #3 (sticky block) acting
+/// together.
+#[tokio::test]
+async fn rebounce_does_not_flap_across_repeated_sweeps() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/505";
+    let (product, chore) = make_in_review(&db, "C-rebounce-noflap", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cand = candidate(&product, &chore, pr);
+    let sha = "synthetic-merge-noflap";
+
+    let mut bounce_count = 0;
+    for cycle in 0..5 {
+        // The rebounce pass re-sees the same dequeue event on every sweep.
+        if on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), None, sha, &[]).await {
+            bounce_count += 1;
+        }
+        // The per-PR probe alternates between InFlight (supersede) and Clean
+        // (on_ci_resolved) — both opposing un-block paths must decline.
+        on_ci_in_flight_supersedes_failure(&db, pub_.as_ref(), &cand, &[], Some("pr-head")).await;
+        on_ci_resolved(&db, pub_.as_ref(), &cand, &[]).await;
+
+        // Invariant on every cycle after the first bounce: still blocked.
+        let (status, reason) = chore_state(&db, &chore);
+        assert_eq!(
+            status,
+            TaskStatus::Blocked,
+            "must stay blocked on cycle {cycle} (no flap)"
+        );
+        assert_eq!(reason.as_deref(), Some("ci_failure"), "cycle {cycle}");
+    }
+    assert_eq!(
+        bounce_count, 1,
+        "an unchanged failing merge SHA must bounce exactly once across all sweeps"
+    );
+}
+
 /// A second probe of the same dequeue event (same `before_commit_sha`)
 /// is idempotent: the INSERT OR IGNORE is a no-op, but the chore stays
 /// blocked and no new execution is created.
@@ -1509,22 +1608,28 @@ async fn rebounce_block_clears_after_worker_succeeds() {
 // ----- Back-to-back dequeue regression (T628 / PR #718 06:51Z miss) -----
 
 /// Reproducer for T628: a PR that was dequeued, manually re-queued,
-/// and dequeued again must end up with a parked `ci_remediation`
-/// execution for the second dequeue's SHA — without requiring the
-/// first dequeue's worker to have completed.
+/// and dequeued again must end up with a parked revision for the second
+/// dequeue's SHA — without requiring the first dequeue's worker to have
+/// completed.
+///
+/// This also pins the anti-flap contract: replaying an ALREADY-handled
+/// dequeue SHA must NOT re-bounce the chore. The merge-queue dequeue event
+/// stays in the PR timeline forever, so a resolved SHA would otherwise
+/// re-block on every sweep (the blocked<->in_review flap). Only a genuinely
+/// new failing merge SHA may flip an `in_review` chore back to blocked.
 ///
 /// Sequence:
-///   1. Chore in_review; first dequeue (SHA_1) detected → blocked, EXEC-1 created.
+///   1. Chore in_review; first dequeue (SHA_1) detected → blocked, revision-1 spawned.
 ///   2. Worker marks SHA_1 succeeded_via_rebase (human re-queued the PR).
 ///   3. on_ci_resolved clears the block → chore back to in_review.
 ///   4. Next sweep sees both SHA_1 and SHA_2 in the timeline:
-///      - SHA_1: INSERT IGNORED (key exists, row terminal) → attempt=None;
-///               mark_chore_blocked_ci_failure succeeds (chore in_review) →
-///               chore blocked, but NO execution (attempt is None).
-///      - SHA_2: INSERT succeeds → attempt=Some; mark_chore_blocked_ci_failure
-///               WHERE-guard misses (chore already blocked) → no execution.
-///   5. SHA_2's attempt gets a revision immediately via `maybe_spawn_ci_revision`
-///      (called even when task_transitioned=false), so it is never stranded.
+///      - SHA_1: INSERT IGNORED (key exists, row terminal) → per-sha
+///               idempotency returns false; chore STAYS in_review (no re-bounce).
+///      - SHA_2: INSERT succeeds → fresh attempt; chore is in_review so
+///               mark_chore_blocked_ci_failure flips it to blocked and the
+///               attempt gets its own revision immediately.
+///   5. End state: chore blocked on SHA_2, exactly two revisions, nothing
+///      stranded — and SHA_1's stale dequeue never caused a flap.
 ///
 /// Detection must not require a live worker on the chore.
 #[tokio::test]
@@ -1592,8 +1697,10 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     assert_eq!(status, TaskStatus::InReview);
 
     // Step 4a: next sweep replays SHA_1 — INSERT is ignored (key exists, row
-    // terminal). attempt=None → task flips (WHERE guard matches) but NO new
-    // revision (no attempt to stamp).
+    // terminal). Per-sha idempotency: we already bounced (and resolved) this
+    // failing merge SHA, so this is a no-op. The chore must NOT re-bounce — a
+    // resolved dequeue event re-blocking on every sweep is the flap this fix
+    // eliminates. The chore stays in_review.
     let sha1_replay = on_merge_queue_rebounce_detected(
         &db,
         pub_.as_ref(),
@@ -1605,12 +1712,15 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     )
     .await;
     assert!(
-        sha1_replay,
-        "sha1 replay must flip chore (INSERT ignored, task_transitioned=true)"
+        !sha1_replay,
+        "sha1 replay must be an idempotent no-op (already bounced + resolved); no re-flip"
     );
-    let (status, reason) = chore_state(&db, &chore);
-    assert_eq!(status, TaskStatus::Blocked);
-    assert_eq!(reason.as_deref(), Some("ci_failure"));
+    let (status, _reason) = chore_state(&db, &chore);
+    assert_eq!(
+        status,
+        TaskStatus::InReview,
+        "resolved SHA_1 replay must leave the chore in_review (no flap)"
+    );
     // Still just the original revision from step 1.
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1624,10 +1734,10 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         assert_eq!(r, 1, "sha1 replay must not spawn a second revision");
     }
 
-    // Step 4b: same sweep also sees SHA_2 — INSERT succeeds (new key), but
-    // mark_chore_blocked_ci_failure WHERE-guard misses (chore already blocked).
-    // Phase 5 fix: maybe_spawn_ci_revision is called regardless of
-    // task_transitioned, so SHA_2 gets its own revision immediately.
+    // Step 4b: same sweep also sees SHA_2 — a genuinely NEW failing merge SHA.
+    // INSERT succeeds (new key); the chore is in_review (SHA_1 replay was a
+    // no-op), so mark_chore_blocked_ci_failure flips it to blocked and the
+    // fresh attempt gets its own revision immediately.
     let sha2_detect = on_merge_queue_rebounce_detected(
         &db,
         pub_.as_ref(),
@@ -1639,8 +1749,8 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
     )
     .await;
     assert!(
-        !sha2_detect,
-        "sha2 detection must return false — task already blocked, WHERE guard missed"
+        sha2_detect,
+        "sha2 is a new failing merge SHA — it must bounce the in_review chore to blocked"
     );
     // SHA_2's ci_remediations row must exist as pending with revision_task_id stamped.
     let sha2_attempt = {

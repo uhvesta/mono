@@ -1781,13 +1781,13 @@ async fn check_merge_queue_rebounce(
         )
         .await
         {
+            // `ci_watch::on_merge_queue_rebounce_detected` is the single
+            // authority for the merge-queue-failure -> blocked transition and
+            // already logs it (at most once per before_commit_sha). Don't
+            // re-log the same flip here — two log lines for one transition,
+            // firing at the same instant, read like two redundant watchers.
+            // Just aggregate the sweep metric.
             outcome.merge_queue_rebounced += 1;
-            tracing::info!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                before_commit_sha,
-                "merge poller: merge-queue FAILED_CHECKS rebounce → blocked: ci_failure",
-            );
         }
     }
 }
