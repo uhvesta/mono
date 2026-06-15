@@ -392,6 +392,19 @@ pub fn parse_git_name_status(output: &str) -> Result<ChangeSet> {
             continue;
         }
 
+        if status.starts_with('C') {
+            if fields.len() != 3 {
+                bail!("invalid git copy line: {line}");
+            }
+
+            changed_files.push(ChangedFile {
+                path: PathBuf::from(fields[2]),
+                kind: ChangeKind::Added,
+                old_path: Some(PathBuf::from(fields[1])),
+            });
+            continue;
+        }
+
         if fields.len() < 2 {
             bail!("invalid git name-status line: {line}");
         }
@@ -654,6 +667,17 @@ R docs/old.md => docs/new.md
         assert_eq!(parsed.changed_files[3].kind, ChangeKind::Renamed);
         assert_eq!(parsed.changed_files[3].old_path, Some(PathBuf::from("docs/old.md")));
         assert_eq!(parsed.changed_files[3].path, PathBuf::from("docs/new.md"));
+    }
+
+    #[test]
+    fn parses_git_name_status_copy() {
+        let parsed = parse_git_name_status("C100\tsrc/old.rs\tsrc/new.rs\n").expect("parse git name-status copy");
+
+        assert_eq!(parsed.changed_files.len(), 1);
+        let f = &parsed.changed_files[0];
+        assert_eq!(f.kind, ChangeKind::Added, "copy destination should be Added");
+        assert_eq!(f.path, PathBuf::from("src/new.rs"));
+        assert_eq!(f.old_path, Some(PathBuf::from("src/old.rs")));
     }
 
     #[test]
