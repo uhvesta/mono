@@ -1818,20 +1818,19 @@ fn compose_revision_directive(
         out.push_str(
             "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",
         );
+        out.push_str("```\n");
+        out.push_str(&format!("cube workspace goto --pr {pr_number}\n"));
+        out.push_str("```\n");
     } else {
         out.push_str(
-            "**The engine could not determine the PR number from the pr_url field, \
-             so the workspace is positioned on `main` instead of the PR head. \
-             You MUST position the workspace manually before making any changes:**\n",
+            "**The engine could not determine the PR number from the pr_url field. \
+             You MUST position the workspace manually before making any changes \
+             (replace `<n>` with the actual PR number):**\n",
         );
+        out.push_str("```\n");
+        out.push_str("cube workspace goto --pr <n>\n");
+        out.push_str("```\n");
     }
-    out.push_str("```\n");
-    out.push_str("jj git fetch\n");
-    out.push_str("# Find the PR branch bookmark (look for boss/exec_... ending in @origin):\n");
-    out.push_str("jj bookmark list --all\n");
-    out.push_str("# Create an editable child change on top of it:\n");
-    out.push_str("jj new '<bookmark>@origin'\n");
-    out.push_str("```\n");
     out.push_str("IMPORTANT: NEVER run `jj edit`, `gh pr checkout`, or `git checkout` in this workspace — fetched remote commits are immutable and those tools do not work correctly in a jj workspace.\n");
     out.push('\n');
     out.push_str("Steps:\n");
@@ -1975,7 +1974,7 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          workspace's boss branch automatically (no branch name argument needed), rebases \
          it onto the repo's configured integration branch with `--ignore-immutable`, and \
          reports a clear signal:\n\n\
-         - `REBASED_CLEAN` — no conflicts; skip to step 4 (push).\n\
+         - `REBASED_CLEAN` — no conflicts; the branch has been pushed automatically. Skip to step 5 (update PR description).\n\
          - `REBASED_WITH_CONFLICTS` — conflicts are materialized in the working copy. \
          Inspect with `jj st` and `jj resolve --list`, read the diagnosis below for what \
          was touched on the upstream side, resolve each file, then continue to step 4.\n\n\

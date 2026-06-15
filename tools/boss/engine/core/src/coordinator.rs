@@ -2348,7 +2348,17 @@ impl ExecutionCoordinator {
             ExecutionKind::RevisionImplementation => execution
                 .pr_url
                 .as_deref()
-                .and_then(boss_github::pr_url::pr_number_from_url),
+                .and_then(boss_github::pr_url::pr_number_from_url)
+                // `execution.pr_url` is not reliably stamped on every revision dispatch
+                // path (e.g. orphan-sweep re-dispatch, user-initiated `bossctl work start`).
+                // Fall back to the chain root's PR URL — the same authoritative lookup
+                // used by completion.rs — so positioning is never skipped for revisions.
+                .or_else(|| {
+                    self.work_db
+                        .get_revision_chain_root_pr_url(&execution.work_item_id)
+                        .as_deref()
+                        .and_then(boss_github::pr_url::pr_number_from_url)
+                }),
             ExecutionKind::PrReview => match &work_item {
                 WorkItem::Task(task) | WorkItem::Chore(task) => task
                     .pr_url
@@ -9540,6 +9550,85 @@ mod tests {
         assert!(
             cube.create_calls.lock().await.is_empty(),
             "create_change must not be called for the revision positioning path"
+        );
+    }
+
+    /// Regression: a `revision_implementation` execution with `pr_url = None` (as
+    /// produced by the orphan-sweep re-dispatch and `bossctl work start` paths) must
+    /// still call `cube workspace goto` using the chain root's PR URL. Without the
+    /// chain-root fallback the positioning gate is silently skipped and the worker
+    /// lands on main instead of the PR head.
+    #[tokio::test]
+    async fn revision_without_pr_url_falls_back_to_chain_root_for_goto() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let root_pr_url = "https://github.com/spinyfin/mono/pull/88";
+        // Chain root: a chore with a bound PR URL.
+        let (_, root_id) = make_pr_review_fixture(&db, Some(root_pr_url));
+        // Revision hanging off the chain root, created without an execution.pr_url.
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, parent_task_id)
+                 SELECT 'task_rev_no_pr_url', product_id, 'revision', 'Fix review findings', '', 'todo', '1', '1', ?1
+                 FROM tasks WHERE id = ?1",
+                rusqlite::params![root_id],
+            )
+            .unwrap();
+        }
+
+        // Execution with pr_url absent — simulates orphan-sweep re-dispatch path.
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id("task_rev_no_pr_url")
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        assert!(execution.pr_url.is_none(), "test precondition: pr_url must be absent");
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
+        assert!(result.is_ok(), "schedule_execution must succeed: {result:?}");
+
+        // goto_workspace must have been called with pr=88 (from the chain root).
+        let goto_calls = cube.goto_calls.lock().await;
+        assert_eq!(
+            goto_calls.len(),
+            1,
+            "goto_workspace must be called exactly once via chain-root fallback"
+        );
+        assert_eq!(
+            goto_calls[0].1, 88,
+            "goto_workspace must receive pr=88 from the chain root PR URL"
+        );
+        drop(goto_calls);
+
+        // create_change must NOT have been called — positioning happened via goto.
+        assert!(
+            cube.create_calls.lock().await.is_empty(),
+            "create_change must not be called when chain-root fallback positions via goto"
         );
     }
 

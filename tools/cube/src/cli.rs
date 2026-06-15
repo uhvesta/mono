@@ -101,20 +101,8 @@ pub enum WorkspaceCommand {
         /// falls back: if the named workspace is missing, leased, or has
         /// no repo, the lease fails loudly rather than routing the
         /// recovering worker away from the only copy of the work.
-        /// Mutually exclusive with `--resume-pr`.
-        #[arg(long, requires = "prefer", conflicts_with = "resume_pr")]
+        #[arg(long, requires = "prefer")]
         allow_dirty: bool,
-        /// Resume an existing GitHub PR by number. After the workspace is
-        /// claimed, replaces the normal `jj new <main>` reset with a PR
-        /// positioning sequence: fetch from the GitHub remote, resolve
-        /// PR N's current head, reconcile the local `pr/<n>` and head-
-        /// branch bookmarks, then `jj new pr/<n>`. The working copy
-        /// lands as a fresh empty commit ready to edit on top of PR N's
-        /// head. Composes with `--prefer` (warm workspace uses the local
-        /// `pr/<n>` bookmark; cold workspace falls back to `gh pr view`).
-        /// Mutually exclusive with `--allow-dirty`.
-        #[arg(long, conflicts_with = "allow_dirty")]
-        resume_pr: Option<u64>,
         /// Workspace ids to skip even if they are otherwise free and healthy.
         /// May be repeated: `--exclude mono-agent-037 --exclude mono-agent-012`.
         /// Used by the engine to avoid re-offering a workspace that was just
@@ -586,7 +574,6 @@ mod tests {
                         task,
                         prefer,
                         allow_dirty,
-                        resume_pr,
                         ..
                     },
             } => {
@@ -594,7 +581,6 @@ mod tests {
                 assert_eq!(task, "implement parser");
                 assert!(prefer.is_none());
                 assert!(!allow_dirty);
-                assert!(resume_pr.is_none());
             }
             _ => panic!("expected workspace lease command"),
         }
@@ -621,7 +607,6 @@ mod tests {
                         task,
                         prefer,
                         allow_dirty,
-                        resume_pr,
                         ..
                     },
             } => {
@@ -629,7 +614,6 @@ mod tests {
                 assert_eq!(task, "resume parser work");
                 assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
                 assert!(!allow_dirty);
-                assert!(resume_pr.is_none());
             }
             _ => panic!("expected workspace lease command"),
         }
@@ -675,96 +659,6 @@ mod tests {
         ]);
         assert!(result.is_err());
     }
-
-    #[test]
-    fn workspace_lease_accepts_resume_pr_flag() {
-        let cli = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "resume PR 1364",
-            "--resume-pr",
-            "1364",
-        ]);
-
-        match cli.command {
-            Command::Workspace {
-                command:
-                    WorkspaceCommand::Lease {
-                        repo,
-                        task,
-                        prefer,
-                        allow_dirty,
-                        resume_pr,
-                        ..
-                    },
-            } => {
-                assert_eq!(repo, "mono");
-                assert_eq!(task, "resume PR 1364");
-                assert!(prefer.is_none());
-                assert!(!allow_dirty);
-                assert_eq!(resume_pr, Some(1364));
-            }
-            _ => panic!("expected workspace lease command"),
-        }
-    }
-
-    #[test]
-    fn workspace_lease_resume_pr_composes_with_prefer() {
-        let cli = Cli::parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "resume PR 42 on warm workspace",
-            "--prefer",
-            "mono-agent-007",
-            "--resume-pr",
-            "42",
-        ]);
-
-        match cli.command {
-            Command::Workspace {
-                command:
-                    WorkspaceCommand::Lease {
-                        prefer,
-                        resume_pr,
-                        allow_dirty,
-                        ..
-                    },
-            } => {
-                assert_eq!(prefer.as_deref(), Some("mono-agent-007"));
-                assert_eq!(resume_pr, Some(42));
-                assert!(!allow_dirty);
-            }
-            _ => panic!("expected workspace lease command"),
-        }
-    }
-
-    #[test]
-    fn workspace_lease_resume_pr_conflicts_with_allow_dirty() {
-        let result = Cli::try_parse_from([
-            "cube",
-            "workspace",
-            "lease",
-            "mono",
-            "--task",
-            "bad flags",
-            "--prefer",
-            "mono-agent-007",
-            "--allow-dirty",
-            "--resume-pr",
-            "42",
-        ]);
-        assert!(
-            result.is_err(),
-            "--allow-dirty and --resume-pr must be mutually exclusive"
-        );
-    }
-
     #[test]
     fn workspace_release_accepts_lease_or_workspace_id() {
         let by_lease = Cli::parse_from(["cube", "workspace", "release", "--lease", "abc-123"]);
