@@ -264,17 +264,36 @@ impl OpenPrStatus {
             ci: OpenPrCiStatus::Failing { failures },
         }
     }
+
+    /// GitHub returned `mergeable=UNKNOWN` — mergeability indeterminate,
+    /// CI clean. Used by tests that exercise the UNKNOWN skip path.
+    pub fn unknown_mergeability() -> Self {
+        Self {
+            mergeability: OpenPrMergeability::Unknown,
+            ci: OpenPrCiStatus::Clean,
+        }
+    }
 }
 
 /// Whether an open PR's head ref currently merges cleanly into its
 /// base. Derived from GitHub's `mergeable` + `mergeStateStatus`
-/// pair. Transient `UNKNOWN` (GitHub is mid-recompute) is mapped to
-/// `Clean` per design Q1 — we do not act on UNKNOWN; we wait for
-/// definitive `CONFLICTING` on the next sweep.
+/// pair.
+///
+/// `UNKNOWN` (GitHub is mid-recompute) maps to the `Unknown` variant —
+/// neither conflict-detection nor conflict-retire fires while mergeability
+/// is indeterminate; the next sweep picks up the definitive `MERGEABLE`
+/// or `CONFLICTING` result. Using `Unknown` instead of mapping to `Clean`
+/// prevents phantom `blocked→in_review` transitions when GitHub returns
+/// `UNKNOWN` transiently right after a base-branch move (root cause of
+/// the conflict_watch blocked↔in_review flap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenPrMergeability {
     Clean,
     Conflict,
+    /// GitHub's `mergeable` field is `UNKNOWN` — the mergeability check
+    /// is still being computed asynchronously. Skip all conflict-watch
+    /// transitions this sweep; re-poll next sweep for a definitive answer.
+    Unknown,
 }
 
 /// CI status of an open PR's required checks at probe time. Derived
@@ -1155,7 +1174,8 @@ pub fn pr_labels_opt_out(labels: &[String]) -> bool {
 ///   - `state=CLOSED` (and not merged) → `ClosedUnmerged`.
 ///   - `state=OPEN` (or unknown / empty, treated as still-open):
 ///       * `mergeable=CONFLICTING` AND `mergeStateStatus=DIRTY` → `Conflict`
-///       * everything else (incl. `UNKNOWN`) → `Clean`.
+///       * `mergeable=UNKNOWN` → `Unknown` (GitHub is recomputing; skip conflict transitions)
+///       * everything else → `Clean`.
 ///
 /// The `ci` axis is supplied by the caller from [`classify_ci`] — both axes
 /// share the `Open` wrapper.
@@ -1164,6 +1184,13 @@ pub fn pr_labels_opt_out(labels: &[String]) -> bool {
 /// either alone is the precise signal, but requiring both protects
 /// against `mergeStateStatus` lagging behind `mergeable` immediately
 /// after a base move.
+///
+/// `UNKNOWN` maps to `OpenPrMergeability::Unknown` rather than `Clean`
+/// so the conflict-watch retire path does not fire on transient
+/// recomputation windows (root cause of the blocked↔in_review flap —
+/// a PR left genuinely CONFLICTING would briefly read UNKNOWN during a
+/// base-move, trigger `on_resolved`, and then re-detect CONFLICTING on
+/// the next sweep).
 fn classify_state(
     raw_state: &str,
     merged_at: &str,
@@ -1181,6 +1208,8 @@ fn classify_state(
     let conflicting = mergeable.eq_ignore_ascii_case("CONFLICTING") && merge_state_status.eq_ignore_ascii_case("DIRTY");
     let mergeability = if conflicting {
         OpenPrMergeability::Conflict
+    } else if mergeable.eq_ignore_ascii_case("UNKNOWN") {
+        OpenPrMergeability::Unknown
     } else {
         OpenPrMergeability::Clean
     };
@@ -1859,6 +1888,62 @@ async fn sweep_one(
                         outcome.conflict_flagged += 1;
                     }
                 }
+                OpenPrMergeability::Unknown => {
+                    // GitHub's `mergeable` field is `UNKNOWN` — the mergeability
+                    // check is still being computed asynchronously (typically right
+                    // after a base-branch move or a race with the recompute cycle).
+                    // Treat as INDETERMINATE: skip conflict detection AND the
+                    // merge_conflict retire path so we don't emit phantom
+                    // blocked→in_review transitions. CI signals are on a separate
+                    // axis and are still processed normally.
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        "merge poller: mergeable=UNKNOWN (GitHub recomputing); \
+                         skipping conflict-watch transitions — retaining prior state \
+                         until next sweep returns a definitive MERGEABLE or CONFLICTING",
+                    );
+                    maybe_clear_blocked(
+                        work_db,
+                        publisher,
+                        cube_client,
+                        completion_handler,
+                        candidate,
+                        &probe_result.labels,
+                        ci,
+                        false, // mergeability_clean=false: skip merge_conflict retire on UNKNOWN
+                        outcome,
+                    )
+                    .await;
+                    if let OpenPrCiStatus::Failing { failures } = ci {
+                        if ci_watch::on_ci_failure_detected(
+                            work_db,
+                            publisher,
+                            &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
+                            candidate,
+                            &probe_result,
+                            failures,
+                        )
+                        .await
+                        {
+                            outcome.ci_flagged += 1;
+                        }
+                    }
+                    if matches!(ci, OpenPrCiStatus::InFlight) {
+                        if ci_watch::on_ci_in_flight_supersedes_failure(
+                            work_db,
+                            publisher,
+                            candidate,
+                            &probe_result.labels,
+                            probe_result.head_ref_oid.as_deref(),
+                        )
+                        .await
+                        {
+                            outcome.ci_cleared += 1;
+                        }
+                        ci_watch::on_ci_in_flight(work_db, publisher, candidate, &probe_result).await;
+                    }
+                }
                 OpenPrMergeability::Clean => {
                     // Polymorphic clear dispatch (design §Q5 Phase 10 #31):
                     // walk the `task_blocked_signals` side table and ask
@@ -1880,6 +1965,7 @@ async fn sweep_one(
                         candidate,
                         &probe_result.labels,
                         ci,
+                        true, // mergeability_clean=true: merge_conflict retire is safe
                         outcome,
                     )
                     .await;
@@ -2040,6 +2126,17 @@ async fn sweep_stranded_blocked_remediation(
             )
             .await;
         }
+        OpenPrMergeability::Unknown => {
+            // GitHub is mid-recompute — skip re-canonicalization. The
+            // stranded-blocked reconciler fires on the next sweep once
+            // GitHub returns a definitive CONFLICTING or MERGEABLE result.
+            tracing::debug!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                "merge poller: stranded-blocked probe returned mergeable=UNKNOWN; \
+                 deferring re-canonicalization to next sweep",
+            );
+        }
         OpenPrMergeability::Clean => {
             if matches!(open.ci, OpenPrCiStatus::Failing { .. }) {
                 reconcile_stranded(
@@ -2159,6 +2256,11 @@ async fn reconcile_stranded(
 /// A read of the side table when there are no active signals is one
 /// `SELECT … WHERE cleared_at IS NULL` returning zero rows; cheaper
 /// than the unconditional UPDATEs the old dispatch always sent.
+/// `mergeability_clean` mirrors the `ci_clean` gate for the CI arm: when
+/// `false` (i.e. `mergeable=UNKNOWN`), the `merge_conflict` retire path
+/// is skipped — GitHub is still computing mergeability, so we must not
+/// act on the absence of a CONFLICTING signal as evidence that the PR is
+/// now clean.
 async fn maybe_clear_blocked(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
@@ -2167,6 +2269,7 @@ async fn maybe_clear_blocked(
     candidate: &PendingMergeCheck,
     labels: &[String],
     ci: &OpenPrCiStatus,
+    mergeability_clean: bool,
     outcome: &mut SweepOutcome,
 ) {
     let signals = match work_db.active_blocked_signals(&candidate.work_item_id) {
@@ -2216,15 +2319,35 @@ async fn maybe_clear_blocked(
         signals
     };
 
-    // Mergeability is `Clean` at the caller (we're inside the Clean
-    // arm of `sweep_one`), so the merge-conflict probe condition is
-    // trivially true. CI's probe condition is `OpenPrCiStatus::Clean`
-    // — `InFlight` and `Failing` decline to retire.
+    // merge_conflict probe condition: mergeability must be definitive `Clean`.
+    // `Unknown` (GitHub recomputing) is skipped — see `mergeability_clean` param.
+    // CI's probe condition is `OpenPrCiStatus::Clean`; `InFlight` and `Failing`
+    // decline to retire.
     let ci_clean = matches!(ci, OpenPrCiStatus::Clean);
 
     for signal in signals {
         match signal.reason.as_str() {
             "merge_conflict" => {
+                if !mergeability_clean {
+                    // GitHub returned `mergeable=UNKNOWN` — mergeability is still
+                    // being computed asynchronously. Do not fire the conflict-watch
+                    // retire path: treating UNKNOWN as clean caused phantom
+                    // blocked→in_review transitions (the conflict_watch flap).
+                    // Re-poll next sweep for a definitive MERGEABLE or CONFLICTING.
+                    tracing::debug!(
+                        work_item_id = %candidate.work_item_id,
+                        pr_url = %candidate.pr_url,
+                        "merge poller: deferring merge_conflict retire — \
+                         mergeable=UNKNOWN (GitHub recomputing); re-polling next sweep",
+                    );
+                    continue;
+                }
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    "merge poller: dispatching conflict_watch::on_resolved \
+                     (mergeable=MERGEABLE/definitive Clean)",
+                );
                 if conflict_watch::on_resolved(work_db, publisher, cube_client, candidate, labels).await {
                     outcome.conflict_cleared += 1;
                 }
@@ -4203,13 +4326,13 @@ mod tests {
                 expect_base: Some("abc"),
             },
             Case {
-                label: "UNKNOWN mergeable is treated as Clean (transient post-base-move)",
+                label: "UNKNOWN mergeable maps to Unknown (indeterminate; skip conflict transitions)",
                 state: "OPEN",
                 merged_at: "",
                 mergeable: "UNKNOWN",
                 merge_state_status: "UNKNOWN",
                 base_ref_oid: "abc",
-                expect: PrLifecycleState::Open(OpenPrStatus::clean()),
+                expect: PrLifecycleState::Open(OpenPrStatus::unknown_mergeability()),
                 expect_base: Some("abc"),
             },
             Case {
@@ -5485,6 +5608,77 @@ mod tests {
             }
             other => panic!("expected chore, got {other:?}"),
         }
+    }
+
+    /// mergeable=UNKNOWN must NOT retire a merge_conflict signal.
+    ///
+    /// Root cause of the blocked↔in_review flap: GitHub returns `UNKNOWN`
+    /// transiently while recomputing mergeability (typically right after a
+    /// base-branch move or a poll that races the async recompute). Before
+    /// this fix, `UNKNOWN` was mapped to `Clean` and triggered
+    /// `conflict_watch::on_resolved`, unblocking the card. The next poll
+    /// read the definitive `CONFLICTING`/`DIRTY` and re-blocked it.
+    ///
+    /// After the fix: `UNKNOWN` maps to `OpenPrMergeability::Unknown` and
+    /// the `merge_conflict` retire path is skipped. The card must stay
+    /// `blocked: merge_conflict` across the entire UNKNOWN poll. CI signals
+    /// are on a separate axis and are still processed (tested separately).
+    #[tokio::test]
+    async fn unknown_mergeability_does_not_retire_merge_conflict() {
+        let dir = tempdir().unwrap();
+        let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+        let pr = "https://github.com/foo/bar/pull/912";
+        let (_product_id, chore) = make_chore_in_review(&db, "C-unknown-mc", pr);
+
+        // Manually install a blocked:merge_conflict signal (production
+        // path: on_conflict_detected fires first, blocks the card).
+        db.mark_chore_blocked_merge_conflict(&chore, pr).unwrap();
+        {
+            match db.get_work_item(&chore).unwrap() {
+                WorkItem::Chore(t) => {
+                    assert_eq!(t.status, TaskStatus::Blocked);
+                    assert_eq!(t.blocked_reason.as_deref(), Some("merge_conflict"));
+                }
+                other => panic!("expected chore, got {other:?}"),
+            }
+        }
+
+        let probe = StubProbe::new();
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        // Probe returns mergeable=UNKNOWN — GitHub is mid-recompute.
+        probe.set(pr, PrLifecycleState::Open(OpenPrStatus::unknown_mergeability()));
+        let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+
+        // The merge_conflict retire path must NOT have fired.
+        assert_eq!(
+            outcome.conflict_cleared, 0,
+            "UNKNOWN mergeability must not clear a merge_conflict signal"
+        );
+        assert_eq!(outcome.conflict_flagged, 0);
+
+        // Card must still be blocked:merge_conflict.
+        match db.get_work_item(&chore).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::Blocked,
+                    "card must remain blocked while mergeable=UNKNOWN"
+                );
+                assert_eq!(
+                    t.blocked_reason.as_deref(),
+                    Some("merge_conflict"),
+                    "blocked_reason must remain merge_conflict"
+                );
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+
+        // No lifecycle event must have been emitted.
+        assert!(
+            publisher.lifecycle_reasons().await.is_empty(),
+            "no lifecycle event expected while mergeable=UNKNOWN"
+        );
     }
 
     /// Phase 10 #31/#32 acceptance (case 2 / ci_failure alone): a
