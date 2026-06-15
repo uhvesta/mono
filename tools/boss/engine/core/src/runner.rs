@@ -1737,11 +1737,25 @@ fn compose_revision_directive(
     }
     out.push('\n');
     out.push_str("## Workspace state\n");
-    out.push_str("The engine pre-positioned this workspace via `cube workspace lease --resume_pr`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
-    out.push('\n');
-    out.push_str(
-        "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",
-    );
+    // `pr_number != "?"` is equivalent to `execution.pr_url` being a parseable
+    // GitHub PR URL, which is exactly when the lease passed `--resume-pr N` and
+    // cube positioned the workspace at the PR head. Without a parseable URL,
+    // resume_pr = None, the lease reset the workspace to main, and the worker
+    // must position it manually — falsely claiming "pre-positioned" caused the
+    // T1727 incident where O'Brien wasted turns on the fallback path.
+    if pr_number != "?" {
+        out.push_str("The engine pre-positioned this workspace via `cube workspace lease --resume_pr`, so you are already on a fresh editable commit whose parent is the PR head. Start making your changes directly — no branch discovery or checkout is needed.\n");
+        out.push('\n');
+        out.push_str(
+            "**Fallback** (only if the workspace is NOT already positioned on an editable change atop the PR head):\n",
+        );
+    } else {
+        out.push_str(
+            "**The engine could not determine the PR number from the pr_url field, \
+             so the workspace is positioned on `main` instead of the PR head. \
+             You MUST position the workspace manually before making any changes:**\n",
+        );
+    }
     out.push_str("```\n");
     out.push_str("jj git fetch\n");
     out.push_str("# Find the PR branch bookmark (look for boss/exec_... ending in @origin):\n");

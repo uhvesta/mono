@@ -9455,4 +9455,98 @@ mod tests {
             items.iter().map(|i| &i.kind).collect::<Vec<_>>(),
         );
     }
+
+    /// The soft-prefer fallback must propagate `--resume-pr` to the second
+    /// lease attempt. Before this fix, only the first attempt (with `--prefer`)
+    /// carried `resume_pr`; when that attempt failed (preferred workspace leased
+    /// by the parent chore worker), the fallback attempt leased any free workspace
+    /// WITHOUT `--resume-pr`, so cube ran `reset_workspace_guarded` and put `@`
+    /// on main — causing the T1727 O'Brien incident.
+    #[tokio::test]
+    async fn revision_soft_prefer_fallback_preserves_resume_pr() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+        let pr_url = "https://github.com/spinyfin/mono/pull/42";
+        let (_, chore_id) = make_pr_review_fixture(&db, None);
+
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore_id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .pr_url(pr_url.to_owned())
+                    .preferred_workspace_id("mono-agent-001")
+                    .prefer_is_soft(true)
+                    .build(),
+            )
+            .unwrap();
+
+        // Simulate the preferred workspace being held by the parent chore's worker.
+        // Attempt 1 (--prefer mono-agent-001 --resume-pr 42) fails; attempt 2
+        // (no --prefer, --resume-pr 42) must succeed and position the workspace.
+        let cube = Arc::new(FakeCubeClient {
+            fail_lease_when_prefer_set: true,
+            ..FakeCubeClient::default()
+        });
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+
+        let worker_id = coordinator
+            .pool_for_execution(&execution)
+            .claim_worker(&execution.id, None)
+            .await
+            .expect("worker pool slot available");
+
+        let result = coordinator.schedule_execution(&execution, &worker_id).await;
+        assert!(
+            result.is_ok(),
+            "schedule_execution must succeed via soft-prefer fallback: {result:?}"
+        );
+
+        let calls = cube.lease_calls.lock().await;
+        assert_eq!(
+            calls.len(),
+            2,
+            "two lease attempts expected: prefer failed then fallback succeeded"
+        );
+
+        // Both attempts must carry resume_pr = Some(42) — the fallback must not
+        // drop it just because it dropped --prefer.
+        assert_eq!(
+            calls[0].4,
+            Some(42),
+            "attempt 1 (--prefer) must carry resume_pr = Some(42)"
+        );
+        assert_eq!(
+            calls[1].4,
+            Some(42),
+            "attempt 2 (fallback, no --prefer) must also carry resume_pr = Some(42)"
+        );
+
+        // Attempt 1 targeted the preferred workspace; attempt 2 did not.
+        assert_eq!(
+            calls[0].2,
+            Some("mono-agent-001".to_owned()),
+            "attempt 1 must pass the preferred workspace"
+        );
+        assert_eq!(calls[1].2, None, "attempt 2 must not specify a preferred workspace");
+        drop(calls);
+
+        // Positioning happened in cube (--resume-pr), so create_change must NOT be called.
+        assert!(
+            cube.create_calls.lock().await.is_empty(),
+            "create_change must not be called when --resume-pr positioning succeeds in the fallback"
+        );
+    }
 }

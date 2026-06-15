@@ -662,10 +662,27 @@ pub(crate) fn reconcile_revision_execution(
                 && existing.status != effective_status =>
         {
             let updated = update_execution_status(conn, &existing.id, effective_status)?;
+            // Back-fill pr_url if missing: the execution may have been created by
+            // reconcile_active_dispatch before the parent chore opened its PR (a
+            // race that leaves pr_url = NULL, causing --resume-pr to be skipped
+            // and the workspace to be reset to main instead of the PR head).
+            if existing.pr_url.is_none() {
+                conn.execute(
+                    "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+                    params![existing.id, parent_pr_url],
+                )?;
+            }
             result.updated.push(updated);
         }
         Some(existing) if existing.kind == ExecutionKind::RevisionImplementation && existing.status.can_reconcile() => {
-            // Already in the right status — nothing to do.
+            // Same status — nothing to do except back-fill pr_url when missing
+            // (same race as the status-update arm above).
+            if existing.pr_url.is_none() {
+                conn.execute(
+                    "UPDATE work_executions SET pr_url = ?2 WHERE id = ?1",
+                    params![existing.id, parent_pr_url],
+                )?;
+            }
         }
         _ => {
             // No matching execution yet (or previous is terminal) — create one.
@@ -1411,6 +1428,79 @@ mod tests {
         assert_eq!(
             retired_spawning_attempt_status(&conn, &task).unwrap(),
             Some("succeeded".to_owned()),
+        );
+    }
+
+    // ── reconcile_revision_execution back-fill ──────────────────────────────
+
+    /// When a revision execution was created without `pr_url` (e.g. because
+    /// `reconcile_active_dispatch` ran before the parent chore pushed its PR),
+    /// `reconcile_revision_execution` must back-fill `pr_url` from the chain
+    /// root so the next lease attempt passes `--resume-pr` and the workspace
+    /// lands on the PR head instead of main.
+    #[test]
+    fn reconcile_revision_backfills_pr_url_on_existing_execution() {
+        let db = open_db();
+        let product = product_with_repo(&db, Some("git@github.com:spinyfin/mono.git"));
+
+        // Create the parent chore and give it an open PR.
+        let chore_id = insert_raw_task(&db.connect().unwrap(), &product, "chore", None);
+        db.connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = 'https://github.com/spinyfin/mono/pull/55' WHERE id = ?1",
+                params![chore_id],
+            )
+            .unwrap();
+
+        // Create the revision task with parent_task_id pointing to the chore.
+        let revision_id = next_id("task");
+        let now = now_string();
+        db.connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO tasks (id, product_id, kind, name, description, status, \
+                 created_at, updated_at, parent_task_id, autostart, priority, created_via) \
+                 VALUES (?1, ?2, 'revision', 'Rev', '', 'active', ?3, ?3, ?4, 1, 'medium', 'test')",
+                params![revision_id, product, now, chore_id],
+            )
+            .unwrap();
+
+        // Create a revision execution WITHOUT pr_url — simulates the race where
+        // reconcile_active_dispatch ran before the parent chore had a PR URL.
+        let exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(revision_id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        assert!(exec.pr_url.is_none(), "execution must start without pr_url");
+
+        // Fetch the revision task row and run reconcile.
+        let conn = db.connect().unwrap();
+        let revision_task = query_task(&conn, &revision_id)
+            .unwrap()
+            .expect("revision task must exist");
+        let mut result = ExecutionReconcileResult::default();
+        {
+            let mut conn2 = db.connect().unwrap();
+            let tx = conn2.transaction().unwrap();
+            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // After reconcile, the execution must have pr_url set from the chain root.
+        let updated = query_execution(&conn, &exec.id)
+            .unwrap()
+            .expect("execution must still exist");
+        assert_eq!(
+            updated.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/55"),
+            "reconcile_revision_execution must back-fill pr_url on an existing execution \
+             that was created without it"
         );
     }
 }
