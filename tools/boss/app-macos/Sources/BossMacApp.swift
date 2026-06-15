@@ -44,6 +44,7 @@ struct BossMacApp: App {
                 LogViewerCommand()
                 MetricsCommand()
                 UIStallsCommand()
+                TerminalLoopCommand()
             }
         }
 
@@ -145,6 +146,11 @@ struct BossMacApp: App {
             UIStallsViewer()
         }
         .defaultSize(width: 720, height: 520)
+
+        Window("Terminal Loop", id: "terminal-loop") {
+            TerminalLoopViewer()
+        }
+        .defaultSize(width: 720, height: 540)
     }
 }
 
@@ -230,6 +236,25 @@ private struct UIStallsCommand: View {
     }
 }
 
+private struct TerminalLoopCommand: View {
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    @AppStorage("boss.terminalLoopViewer.visible") private var isOpen = false
+
+    var body: some View {
+        Button("Terminal Loop") {
+            if isOpen {
+                isOpen = false
+                dismissWindow(id: "terminal-loop")
+            } else {
+                isOpen = true
+                openWindow(id: "terminal-loop")
+            }
+        }
+        .keyboardShortcut("t", modifiers: [.command, .shift])
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set by BossMacApp once the main window has appeared. Nil only in the
@@ -265,6 +290,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the main queue goes unresponsive. Surfaced via the "UI Stalls"
         // window (Cmd-Shift-U). See [[MainThreadStallMonitor]].
         MainThreadStallMonitor.shared.start()
+
+        // Start the terminal event-loop diagnostics sampler (1 Hz). Counts
+        // libghostty app-loop activity and probes each pane's pty/EOF/pid
+        // liveness to verify/refute the busy-spin high-CPU hypothesis.
+        // Surfaced via the "Terminal Loop" window (Cmd-Shift-T). See
+        // [[TerminalLoopMonitor]].
+        TerminalLoopMonitor.shared.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

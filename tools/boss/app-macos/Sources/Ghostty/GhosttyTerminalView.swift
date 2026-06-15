@@ -99,6 +99,11 @@ final class GhosttyTerminalHostView: NSView {
     private var lastAppliedContentScale: CGFloat = 0
     private var lastSizeSyncTimestamp: TimeInterval = 0
     private var pendingGeometrySync: DispatchWorkItem?
+    /// Hash of the last viewport read taken by the deep-mode event-loop
+    /// probe ([[TerminalLoopMonitor]]). Lets the probe report whether the
+    /// pane's rendered content is still flowing (genuine output) or frozen
+    /// (consistent with a dead-fd spin). nil until the first deep sample.
+    private var lastLoopContentHash: Int?
     /// Cap on how often we forward layout-driven size changes to
     /// libghostty. Reflowing the scrollback inside
     /// `ghostty_surface_set_size` is O(history); without a cap, a
@@ -206,6 +211,10 @@ final class GhosttyTerminalHostView: NSView {
         removeScreenObserver()
         session.statusMessage = nil
         session.attach(hostView: self)
+        // Register with the event-loop diagnostics so the 1 Hz sampler can
+        // probe this pane's pty/EOF/pid liveness (idempotent; safe across
+        // restarts). See [[TerminalLoopMonitor]].
+        TerminalLoopMonitor.shared.register(self)
         syncGeometry()
         reconcileClaudeMonitor()
     }
@@ -358,6 +367,9 @@ final class GhosttyTerminalHostView: NSView {
         pendingGeometrySync?.cancel()
         claudeMonitorTimer?.invalidate()
         removeScreenObserver()
+        // Stop the event-loop sampler from probing a pane that's going
+        // away (the bypass teardown path that skips `tearDown`).
+        TerminalLoopMonitor.shared.unregister(self)
         // The normal teardown path frees the surface off the main thread in
         // `tearDown()` (driven by `GhosttyTerminalView.dismantleNSView` while
         // SwiftUI still holds a strong reference to this view) and nils
@@ -411,6 +423,12 @@ final class GhosttyTerminalHostView: NSView {
     func tearDown() {
         guard let surface else { return }
         self.surface = nil
+
+        // Record the teardown for the tab-switch relayout instrumentation
+        // (a teardown during a tab switch would refute the keep-alive
+        // assumption) and stop probing this pane. See [[TerminalLoopMonitor]].
+        TerminalLoopMonitor.shared.recordTeardown(paneId: session.id)
+        TerminalLoopMonitor.shared.unregister(self)
 
         pendingGeometrySync?.cancel()
         pendingGeometrySync = nil
@@ -682,6 +700,10 @@ final class GhosttyTerminalHostView: NSView {
             let reflow = UISignpost.signposter.beginInterval(UISignpost.Name.geometryReflow)
             ghostty_surface_set_size(surface, UInt32(target.width), UInt32(target.height))
             UISignpost.signposter.endInterval(UISignpost.Name.geometryReflow, reflow)
+
+            // Attribute this reflow to an in-flight tab switch, if any, so
+            // the tab-switch relayout cost is measurable (no-op otherwise).
+            TerminalLoopMonitor.shared.recordRelayout(paneId: session.id)
         }
 
         lastSizeSyncTimestamp = timestamp
@@ -1060,5 +1082,63 @@ final class GhosttyTerminalHostView: NSView {
         default:
             return GHOSTTY_MOUSE_UNKNOWN
         }
+    }
+}
+
+// MARK: - Event-loop diagnostics probe
+
+extension GhosttyTerminalHostView: PaneLoopProbe {
+    var loopPaneId: String { session.id }
+
+    /// Capture this pane's current event-loop liveness for the 1 Hz
+    /// sampler. Reads the libghostty surface state that pins the high-CPU
+    /// hypothesis: `ghostty_surface_process_exited` (pty at EOF) and the
+    /// foreground pid (which `pidIsAlive` checks). Correlates the surface
+    /// back to its slot/worker via the session role + id. Returns nil when
+    /// there is no live surface to probe.
+    ///
+    /// `includeContent` (deep mode) additionally reads the rendered
+    /// viewport and compares a hash against the previous sample, so a
+    /// frozen pane (spin) is distinguishable from one still producing
+    /// output (flood). That read is the only non-trivial cost here, hence
+    /// it is gated.
+    func loopProbe(includeContent: Bool) -> PaneLoopSample? {
+        guard let surface else { return nil }
+
+        let role: String
+        let slotId: Int?
+        switch session.role {
+        case .boss:
+            role = "boss"
+            slotId = nil
+        case .worker(let slot):
+            role = "worker"
+            slotId = slot
+        }
+        let runId = session.id.hasPrefix("run-")
+            ? String(session.id.dropFirst("run-".count))
+            : nil
+
+        let pid = foregroundPid
+        let exited = ghostty_surface_process_exited(surface)
+
+        var contentChanged: Bool?
+        if includeContent {
+            let hash = readVisibleContents(from: surface).hashValue
+            contentChanged = lastLoopContentHash.map { $0 != hash }
+            lastLoopContentHash = hash
+        }
+
+        return PaneLoopSample(
+            paneId: session.id,
+            role: role,
+            slotId: slotId,
+            runId: runId,
+            title: session.displayTitle,
+            foregroundPid: pid,
+            pidAlive: pidIsAlive(pid),
+            processExited: exited,
+            contentChanged: contentChanged
+        )
     }
 }

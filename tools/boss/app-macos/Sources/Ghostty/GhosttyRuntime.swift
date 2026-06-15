@@ -141,6 +141,10 @@ final class GhosttyRuntime: @unchecked Sendable {
     }
 
     func tick() {
+        // Count the app-loop tick for the terminal event-loop diagnostics
+        // (see [[TerminalLoopMonitor]]). Cheap, and on a path the spin
+        // cannot bypass.
+        TerminalLoopMonitor.shared.recordTick()
         ghostty_app_tick(app)
     }
 
@@ -191,6 +195,13 @@ final class GhosttyRuntime: @unchecked Sendable {
 
     fileprivate static func wakeup(_ userdata: UnsafeMutableRawPointer?) {
         guard let runtime = runtime(from: userdata) else { return }
+        // Count every libghostty wakeup for the terminal event-loop
+        // diagnostics. A surface IO loop spinning on a dead fd floods the
+        // app mailbox and drives this callback, so a hot wakeup rate is
+        // the Swift-side signature of the spin (see [[TerminalLoopMonitor]]).
+        // The increment is an unfair-lock bump — negligible next to the
+        // main-queue hop this path already performs.
+        TerminalLoopMonitor.shared.recordWakeup()
         OperationQueue.main.addOperation {
             MainActor.assumeIsolated {
                 runtime.tick()

@@ -904,6 +904,16 @@ final class ChatViewModel: ObservableObject {
     }
 
     func setNavigationMode(_ mode: NavigationMode) {
+        // Instrument the tab switch so the pane-grid relayout it provokes
+        // (how many panes rebuild, the settle wall-time, any unexpected
+        // teardown) is measurable for the high-CPU investigation. See
+        // [[TerminalLoopMonitor]].
+        if navigationMode != mode {
+            TerminalLoopMonitor.shared.noteTabSwitch(
+                from: navigationMode.rawValue,
+                to: mode.rawValue
+            )
+        }
         navigationMode = mode
         defaults.set(mode.rawValue, forKey: navigationModeDefaultsKey)
         if mode == .work {
