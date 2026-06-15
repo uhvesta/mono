@@ -1099,7 +1099,7 @@ fn run_workspace(
 
             // ── Health-check phase ──────────────────────────────────────────
             // Before claiming any workspace, inspect each free candidate:
-            //   - Clean → use immediately
+            //   - Clean → use immediately (update DB if stale-dirty)
             //   - ConflictedBookmarks → save as first repairable candidate
             //     (keep looking for a clean one; repair before claim)
             //   - DirtyWorkingCopy → skip and mark in the store so
@@ -1107,22 +1107,60 @@ fn run_workspace(
             //
             // The repo lock is held throughout, so no concurrent lease can
             // steal a workspace between the health check and the claim.
+            //
+            // Stale health reconciliation: workspaces previously marked
+            // dirty/conflicted in the DB are included as secondary candidates
+            // (after effective-free ones). If on-disk `jj status` shows they
+            // are now clean, the DB is updated and they are used. This prevents
+            // stale DB health from permanently hiding a recovered workspace.
 
-            let free_workspaces = store.list_workspaces_filtered(&WorkspaceListFilter {
+            let effective_free = store.list_workspaces_filtered(&WorkspaceListFilter {
                 repo: Some(&repo),
                 effective_state: Some(EffectiveState::Free),
                 ..Default::default()
             })?;
 
-            // Ordering: try the --prefer workspace first, then others by id.
+            // Secondary candidates: free workspaces whose cached health in the
+            // DB is dirty or conflicted. Checked only after all effective-free
+            // candidates fail, so we avoid running `jj status` on them when a
+            // clean workspace is already available.
+            let stale_unhealthy: Vec<WorkspaceRecord> = {
+                let mut d = store.list_workspaces_filtered(&WorkspaceListFilter {
+                    repo: Some(&repo),
+                    effective_state: Some(EffectiveState::FreeDirty),
+                    ..Default::default()
+                })?;
+                let mut c = store.list_workspaces_filtered(&WorkspaceListFilter {
+                    repo: Some(&repo),
+                    effective_state: Some(EffectiveState::FreeConflicted),
+                    ..Default::default()
+                })?;
+                d.append(&mut c);
+                d.sort_by(|a, b| a.workspace_id.cmp(&b.workspace_id));
+                d
+            };
+
+            // All free candidates: effective-free first (preferred), then
+            // stale-unhealthy. This combined list is used for the ordered_ids
+            // below so --prefer can reference either category.
+            let all_free: Vec<&WorkspaceRecord> = effective_free.iter().chain(stale_unhealthy.iter()).collect();
+
+            // Ordering: try the --prefer workspace first; effective-free before
+            // stale-dirty so we skip the stale-dirty jj-status cost when a clean
+            // candidate is already available.
             let ordered_ids: Vec<String> = {
                 let mut v = Vec::new();
                 if let Some(pref) = prefer.as_deref()
-                    && free_workspaces.iter().any(|w| w.workspace_id == pref)
+                    && all_free.iter().any(|w| w.workspace_id == pref)
                 {
                     v.push(pref.to_string());
                 }
-                for w in &free_workspaces {
+                for w in &effective_free {
+                    if !v.contains(&w.workspace_id) {
+                        v.push(w.workspace_id.clone());
+                    }
+                }
+                for w in &stale_unhealthy {
                     if !v.contains(&w.workspace_id) {
                         v.push(w.workspace_id.clone());
                     }
@@ -1142,10 +1180,10 @@ fn run_workspace(
             let mut broken_empty: Vec<(String, PathBuf)> = Vec::new();
 
             for ws_id in &ordered_ids {
-                let ws = free_workspaces
+                let ws = all_free
                     .iter()
                     .find(|w| w.workspace_id == *ws_id)
-                    .expect("ordered_ids came from free_workspaces");
+                    .expect("ordered_ids built from all_free");
 
                 if !workspace_path_exists(ws) {
                     // Will be reconciled; skip for health-check purposes.
@@ -1160,11 +1198,30 @@ fn run_workspace(
                 let outcome = check_workspace_health(runner, database_path, &ws.workspace_path)?;
                 match outcome {
                     WorkspaceHealthOutcome::Clean => {
+                        let was_stale_dirty = matches!(
+                            ws.health_status,
+                            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+                        );
                         health_checks.push(json!({
                             "workspace_id": ws_id,
                             "health": "clean",
                             "skipped": false,
+                            "was_stale_dirty": was_stale_dirty,
                         }));
+                        // If the workspace was previously marked unhealthy in the
+                        // DB (stale dirty/conflicted), update the DB so
+                        // subsequent `list` and GC passes see the correct state.
+                        if was_stale_dirty {
+                            store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Clean)?;
+                            audit!(
+                                database_path,
+                                "workspace.health_reconciled",
+                                repo = repo,
+                                workspace_id = ws_id,
+                                prior_health = ws.health_status.map(|h| h.as_str()).unwrap_or("unknown"),
+                                new_health = "clean",
+                            );
+                        }
                         clean_candidate = Some(ws_id.clone());
                         break;
                     }
@@ -1779,6 +1836,51 @@ fn run_workspace(
                     "workspace": record,
                     "forced": force,
                     "expunged": expunge,
+                }),
+            )
+        }
+        WorkspaceCommand::Reconcile {
+            repo,
+            workspace,
+            dry_run,
+        } => {
+            let report = reconcile_free_workspace_health(
+                runner,
+                &store,
+                database_path,
+                repo.as_deref(),
+                workspace.as_deref(),
+                dry_run,
+            );
+
+            let promoted = report.promoted_to_clean.len();
+            let still = report.still_unhealthy.len();
+            let skipped = report.skipped.len();
+
+            let message = if dry_run {
+                format!(
+                    "Dry run: {} workspace(s) would be promoted to clean, {} still unhealthy, {} skipped.",
+                    promoted, still, skipped,
+                )
+            } else if promoted > 0 {
+                format!(
+                    "Promoted {} workspace(s) to clean, {} still unhealthy, {} skipped.",
+                    promoted, still, skipped,
+                )
+            } else {
+                format!(
+                    "No workspaces promoted. {} still unhealthy, {} skipped.",
+                    still, skipped,
+                )
+            };
+
+            RunResult::new(
+                message,
+                json!({
+                    "dry_run": dry_run,
+                    "promoted_to_clean": report.promoted_to_clean,
+                    "still_unhealthy": report.still_unhealthy,
+                    "skipped": report.skipped,
                 }),
             )
         }
@@ -3425,8 +3527,20 @@ fn run_pool_gc_background(database_path: Option<std::path::PathBuf>) {
     };
     let runner = RealCommandRunner;
 
-    // Run the aged-unhealthy recycler FIRST so it is never blocked by a slow
-    // or hanging per-workspace fetch in the bookmark loop below.
+    // Reconcile stale health cache: re-check dirty/conflicted workspaces
+    // against their on-disk state and promote any that have recovered to
+    // clean. This runs before the aged-unhealthy reset so the aged-unhealthy
+    // pass only fires on workspaces that are genuinely still dirty on disk.
+    let health_report = reconcile_free_workspace_health(&runner, &store, database_path.as_deref(), None, None, false);
+    if !health_report.promoted_to_clean.is_empty() {
+        eprintln!(
+            "cube: auto gc: promoted {} workspace(s) from dirty/conflicted to clean",
+            health_report.promoted_to_clean.len(),
+        );
+    }
+
+    // Run the aged-unhealthy recycler before the bookmark loop so it is never
+    // blocked by a slow or hanging per-workspace fetch in the loop below.
     let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
@@ -4940,6 +5054,192 @@ fn reconcile_missing_workspaces(
     Ok(report)
 }
 
+/// Result of one health-reconciliation pass entry.
+#[derive(Debug, Clone, Serialize)]
+struct ReconcileHealthEntry {
+    repo: String,
+    workspace_id: String,
+    /// The health status recorded in the DB before this pass.
+    prior_health: String,
+    /// The health status found on disk (and written to DB). `None` when the
+    /// workspace was skipped without a health check.
+    new_health: Option<String>,
+    /// Why this workspace was skipped without being fully reconciled.
+    skip_reason: Option<String>,
+}
+
+/// Summary of a `reconcile_free_workspace_health` pass.
+#[derive(Debug, Default, Clone, Serialize)]
+struct ReconcileHealthReport {
+    /// Workspaces that were marked dirty/conflicted in the DB but are now clean
+    /// on disk. The DB has been updated to reflect this.
+    promoted_to_clean: Vec<ReconcileHealthEntry>,
+    /// Workspaces that are still dirty or conflicted on disk (DB refreshed).
+    still_unhealthy: Vec<ReconcileHealthEntry>,
+    /// Workspaces skipped (leased, directory missing, broken-empty, or error).
+    skipped: Vec<ReconcileHealthEntry>,
+}
+
+/// Re-check on-disk health for free workspaces that are cached as dirty or
+/// conflicted in the DB, and update the cache to match.
+///
+/// This is the primary repair path for stale health entries: a workspace reset
+/// out-of-band (manual `jj new main`, crashed worker that left it clean)
+/// previously stayed `free-dirty` forever because health was only refreshed on
+/// the lease/release path. This function closes that gap.
+///
+/// Called from:
+/// - `run_pool_gc_background` (daily, in a background thread)
+/// - `WorkspaceCommand::Reconcile` (explicit operator command)
+/// - Indirectly: `cube workspace lease` also lazily promotes stale-dirty
+///   workspaces when it finds them clean during the health-check phase.
+///
+/// When `dry_run` is true the DB is not modified but the report reflects what
+/// would change.
+fn reconcile_free_workspace_health(
+    runner: &dyn CommandRunner,
+    store: &Store,
+    database_path: Option<&Path>,
+    repo_filter: Option<&str>,
+    workspace_filter: Option<&str>,
+    dry_run: bool,
+) -> ReconcileHealthReport {
+    let all = match store.list_workspaces_filtered(&WorkspaceListFilter {
+        repo: repo_filter,
+        workspace_id: workspace_filter,
+        ..Default::default()
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cube: health reconcile: failed to list workspaces: {e}");
+            return ReconcileHealthReport::default();
+        }
+    };
+
+    let candidates: Vec<WorkspaceRecord> = all
+        .into_iter()
+        .filter(|r| {
+            r.state == WorkspaceState::Free
+                && matches!(
+                    r.health_status,
+                    Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+                )
+        })
+        .collect();
+
+    let mut report = ReconcileHealthReport::default();
+
+    for record in candidates {
+        let prior_health = record
+            .health_status
+            .map(|h| h.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        if !workspace_path_exists(&record) {
+            report.skipped.push(ReconcileHealthEntry {
+                repo: record.repo,
+                workspace_id: record.workspace_id,
+                prior_health,
+                new_health: None,
+                skip_reason: Some("directory_missing".to_string()),
+            });
+            continue;
+        }
+
+        let outcome = match check_workspace_health(runner, database_path, &record.workspace_path) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!(
+                    "cube: health reconcile: {}: health check failed: {e}",
+                    record.workspace_id,
+                );
+                report.skipped.push(ReconcileHealthEntry {
+                    repo: record.repo,
+                    workspace_id: record.workspace_id,
+                    prior_health,
+                    new_health: None,
+                    skip_reason: Some("health_check_error".to_string()),
+                });
+                continue;
+            }
+        };
+
+        match outcome {
+            WorkspaceHealthOutcome::Clean => {
+                if !dry_run {
+                    if let Err(e) =
+                        store.update_workspace_health(&record.repo, &record.workspace_id, WorkspaceHealth::Clean)
+                    {
+                        eprintln!(
+                            "cube: health reconcile: {}: failed to update store: {e}",
+                            record.workspace_id,
+                        );
+                    } else {
+                        audit!(
+                            database_path,
+                            "workspace.health_reconciled",
+                            repo = record.repo,
+                            workspace_id = record.workspace_id,
+                            prior_health = prior_health,
+                            new_health = "clean",
+                        );
+                    }
+                }
+                report.promoted_to_clean.push(ReconcileHealthEntry {
+                    repo: record.repo,
+                    workspace_id: record.workspace_id,
+                    prior_health,
+                    new_health: Some("clean".to_string()),
+                    skip_reason: None,
+                });
+            }
+            WorkspaceHealthOutcome::DirtyWorkingCopy => {
+                if !dry_run {
+                    // Refresh the DB entry. `update_workspace_health` preserves
+                    // `unhealthy_since_epoch_s` via COALESCE, so the age clock
+                    // is not reset.
+                    let _ = store.update_workspace_health(&record.repo, &record.workspace_id, WorkspaceHealth::Dirty);
+                }
+                report.still_unhealthy.push(ReconcileHealthEntry {
+                    repo: record.repo,
+                    workspace_id: record.workspace_id,
+                    prior_health,
+                    new_health: Some("dirty".to_string()),
+                    skip_reason: None,
+                });
+            }
+            WorkspaceHealthOutcome::ConflictedBookmarks(_) => {
+                if !dry_run {
+                    let _ =
+                        store.update_workspace_health(&record.repo, &record.workspace_id, WorkspaceHealth::Conflicted);
+                }
+                report.still_unhealthy.push(ReconcileHealthEntry {
+                    repo: record.repo,
+                    workspace_id: record.workspace_id,
+                    prior_health,
+                    new_health: Some("conflicted".to_string()),
+                    skip_reason: None,
+                });
+            }
+            WorkspaceHealthOutcome::BrokenEmpty => {
+                // Don't re-classify broken-empty as dirty — leave the existing
+                // health marker intact and report as skipped. The broken-empty
+                // state requires a clone, not a health re-classification.
+                report.skipped.push(ReconcileHealthEntry {
+                    repo: record.repo,
+                    workspace_id: record.workspace_id,
+                    prior_health,
+                    new_health: None,
+                    skip_reason: Some("broken_empty".to_string()),
+                });
+            }
+        }
+    }
+
+    report
+}
+
 /// Returns the human-readable effective status string for a workspace,
 /// combining the lease state with the last-known health status. Free
 /// workspaces with a recorded health issue show `free-dirty` or
@@ -5320,6 +5620,22 @@ mod tests {
                 orig_cube_bin,
             }
         }
+
+        // Sets CUBE_CHECKLEFT_BIN to a nonexistent path so resolve_checkleft_bin
+        // returns None (gate is a no-op) without modifying PATH. Use in tests that
+        // call ensure_pr / run_with_dependencies but don't want to test the gate
+        // itself. Always hold ENV_MUTEX before calling this.
+        fn with_gate_disabled() -> Self {
+            let orig_path = std::env::var_os("PATH");
+            let orig_cube_bin = std::env::var_os("CUBE_CHECKLEFT_BIN");
+            unsafe {
+                std::env::set_var("CUBE_CHECKLEFT_BIN", "");
+            }
+            CheckleftEnvGuard {
+                orig_path,
+                orig_cube_bin,
+            }
+        }
     }
 
     impl Drop for CheckleftEnvGuard {
@@ -5329,8 +5645,11 @@ mod tests {
                     Some(v) => std::env::set_var("PATH", v),
                     None => std::env::remove_var("PATH"),
                 }
-                if let Some(v) = &self.orig_cube_bin {
-                    std::env::set_var("CUBE_CHECKLEFT_BIN", v);
+                // Restore CUBE_CHECKLEFT_BIN to its original state, including
+                // removing it if it was absent before (e.g. after with_gate_disabled).
+                match &self.orig_cube_bin {
+                    Some(v) => std::env::set_var("CUBE_CHECKLEFT_BIN", v),
+                    None => std::env::remove_var("CUBE_CHECKLEFT_BIN"),
                 }
             }
         }
@@ -7415,6 +7734,367 @@ mod tests {
         let store = Store::open_at(&database_path).unwrap();
         let ws = store.get_workspace_by_path(&dirty_path).unwrap().unwrap();
         assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+    }
+
+    #[test]
+    fn workspace_lease_promotes_stale_dirty_db_entry_to_clean_when_recovered() {
+        // Regression test for stale `free-dirty` DB entries hiding recovered workspaces.
+        // Setup: mono-agent-008 is marked `health_status=dirty` in the DB (mimicking
+        // a workspace that was left dirty by a crashed worker and then manually reset),
+        // but `jj status` now reports a clean working copy. The lease path must:
+        //   - re-check mono-agent-008 via jj status
+        //   - find it clean
+        //   - update the DB health to 'clean'
+        //   - claim and use it (not auto-create a new workspace)
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-008");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        // Seed the workspace row and mark it dirty in the DB, simulating a
+        // workspace that was cleaned on disk but whose DB cache is stale.
+        {
+            use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-008".to_string(),
+                        workspace_path: ws_path.clone(),
+                    }],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-008", WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+
+        // The stale-dirty workspace is now clean on disk.
+        let runner = FakeRunner::new(vec![
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(ws_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                ws_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "recovered1",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "recover stale dirty"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        // The stale-dirty workspace must have been claimed — no new workspace created.
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-008");
+        assert_eq!(result.payload["workspace"]["head_commit"], "recovered1");
+
+        // Health check entry must reflect that this was a stale-dirty workspace
+        // that got promoted to clean.
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc.len(), 1);
+        assert_eq!(hc[0]["workspace_id"], "mono-agent-008");
+        assert_eq!(hc[0]["health"], "clean");
+        assert_eq!(hc[0]["was_stale_dirty"], true);
+
+        // The DB must now record the workspace as clean (health cleared).
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        // The workspace is now leased; claim clears health_status to NULL.
+        assert_eq!(ws.state, crate::metadata::WorkspaceState::Leased);
+        assert!(ws.health_status.is_none(), "health_status should be NULL after claim");
+        assert!(
+            ws.unhealthy_since_epoch_s.is_none(),
+            "unhealthy_since should be cleared"
+        );
+    }
+
+    #[test]
+    fn workspace_lease_stale_dirty_workspace_checked_last_after_effective_free() {
+        // Ordering invariant: stale-dirty workspaces (DB says dirty) are checked
+        // AFTER effective-free (null/clean health) ones so we don't pay the `jj
+        // status` cost on a stale-dirty slot when a clean slot is already there.
+        //
+        // Pool:
+        //   mono-agent-005: effective-free (null health), jj status → dirty (truly dirty)
+        //   mono-agent-007: stale-dirty in DB, jj status → clean (recovered!)
+        //
+        // Expected traversal: check 005 first (effective-free), find dirty, then
+        // check 007 (stale-dirty), find clean, update DB and lease it.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let eff_free_path = workspace_root.join("mono-agent-005");
+        let stale_path = workspace_root.join("mono-agent-007");
+        std::fs::create_dir_all(eff_free_path.join(".jj")).expect("eff-free dir");
+        std::fs::create_dir_all(stale_path.join(".jj")).expect("stale-dirty dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        {
+            use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[
+                        WorkspaceCandidate {
+                            workspace_id: "mono-agent-005".to_string(),
+                            workspace_path: eff_free_path.clone(),
+                        },
+                        WorkspaceCandidate {
+                            workspace_id: "mono-agent-007".to_string(),
+                            workspace_path: stale_path.clone(),
+                        },
+                    ],
+                )
+                .unwrap();
+            // Mark 007 as dirty in the DB (stale entry — it's actually clean on disk).
+            store
+                .update_workspace_health("mono", "mono-agent-007", WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+
+        let runner = FakeRunner::new(vec![
+            // 1. effective-free 005 checked first → truly dirty → skip
+            ExpectedCommand::ok(
+                eff_free_path.clone(),
+                "jj",
+                &["status", "--no-pager"],
+                jj_status_dirty(),
+            ),
+            // 2. stale-dirty 007 checked second → clean on disk → promote and use
+            ExpectedCommand::ok(stale_path.clone(), "jj", &["status", "--no-pager"], jj_status_clean()),
+            ExpectedCommand::ok(stale_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                stale_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                stale_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(stale_path.clone(), "jj", &["new", "main"], ""),
+            ExpectedCommand::ok(
+                stale_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "stale007",
+            ),
+        ]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "ordering test"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+        runner.assert_exhausted();
+
+        // The stale-dirty workspace was promoted and claimed.
+        assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-007");
+        let hc = result.payload["health_check"].as_array().expect("health_check");
+        assert_eq!(hc.len(), 2);
+        assert_eq!(hc[0]["workspace_id"], "mono-agent-005");
+        assert_eq!(hc[0]["health"], "dirty");
+        assert_eq!(hc[1]["workspace_id"], "mono-agent-007");
+        assert_eq!(hc[1]["health"], "clean");
+        assert_eq!(hc[1]["was_stale_dirty"], true);
+    }
+
+    #[test]
+    fn workspace_reconcile_promotes_stale_dirty_to_clean() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-008");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        {
+            use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-008".to_string(),
+                        workspace_path: ws_path.clone(),
+                    }],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-008", WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            ws_path.clone(),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_clean(),
+        )]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "reconcile"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("reconcile");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["promoted_to_clean"].as_array().unwrap().len(), 1);
+        assert_eq!(result.payload["promoted_to_clean"][0]["workspace_id"], "mono-agent-008");
+        assert_eq!(result.payload["still_unhealthy"].as_array().unwrap().len(), 0);
+
+        // DB must reflect the promoted health.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Clean));
+        assert!(
+            ws.unhealthy_since_epoch_s.is_none(),
+            "unhealthy_since must be cleared after promotion"
+        );
+    }
+
+    #[test]
+    fn workspace_reconcile_still_unhealthy_when_dirty_on_disk() {
+        // `cube workspace reconcile` on a workspace that is STILL dirty on disk
+        // must report it as `still_unhealthy` and NOT update the DB to clean.
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-008");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        {
+            use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-008".to_string(),
+                        workspace_path: ws_path.clone(),
+                    }],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-008", WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            ws_path.clone(),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_dirty(),
+        )]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "reconcile"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("reconcile");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["promoted_to_clean"].as_array().unwrap().len(), 0);
+        assert_eq!(result.payload["still_unhealthy"].as_array().unwrap().len(), 1);
+        assert_eq!(result.payload["still_unhealthy"][0]["workspace_id"], "mono-agent-008");
+        assert_eq!(result.payload["still_unhealthy"][0]["new_health"], "dirty");
+
+        // DB must still show dirty.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(ws.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+    }
+
+    #[test]
+    fn workspace_reconcile_dry_run_does_not_update_db() {
+        let (tempdir, database_path) = with_database_path();
+        let workspace_root = tempdir.path().join("workspaces");
+        let ws_path = workspace_root.join("mono-agent-008");
+        std::fs::create_dir_all(ws_path.join(".jj")).expect("workspace dir");
+
+        seed_mono_repo(&workspace_root, &database_path);
+
+        {
+            use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+            use crate::store::Store;
+            let mut store = Store::open_at(&database_path).unwrap();
+            store
+                .sync_workspaces(
+                    "mono",
+                    &[WorkspaceCandidate {
+                        workspace_id: "mono-agent-008".to_string(),
+                        workspace_path: ws_path.clone(),
+                    }],
+                )
+                .unwrap();
+            store
+                .update_workspace_health("mono", "mono-agent-008", WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+
+        let runner = FakeRunner::new(vec![ExpectedCommand::ok(
+            ws_path.clone(),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_clean(),
+        )]);
+
+        let result = run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "reconcile", "--dry-run"]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("reconcile dry-run");
+        runner.assert_exhausted();
+
+        assert_eq!(result.payload["dry_run"], true);
+        assert_eq!(result.payload["promoted_to_clean"].as_array().unwrap().len(), 1);
+
+        // DB must NOT have been updated — health stays dirty.
+        use crate::store::Store;
+        let store = Store::open_at(&database_path).unwrap();
+        let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+        assert_eq!(
+            ws.health_status,
+            Some(crate::metadata::WorkspaceHealth::Dirty),
+            "dry-run must not modify the DB"
+        );
     }
 
     #[test]
@@ -13506,6 +14186,8 @@ steps:
         ]);
 
         let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr created");
         runner.assert_exhausted();
 
@@ -13573,6 +14255,8 @@ steps:
             "--title",
             "Existing PR",
         ]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr exists");
         runner.assert_exhausted();
 
@@ -13695,6 +14379,8 @@ steps:
         ]);
 
         let cli = Cli::parse_from(["cube", "pr", "ensure", "--branch", "my-feature", "--title", "New PR"]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let err = run_with_dependencies(cli, None, &runner)
             .expect_err("ensure_pr should fail when push did not reach GitHub");
         runner.assert_exhausted();
@@ -13807,6 +14493,8 @@ steps:
             "--title",
             "My Feature",
         ]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let result = run_with_dependencies(cli, None, &runner).expect("ensure_pr create+bookmark");
         runner.assert_exhausted();
 
@@ -13939,6 +14627,8 @@ steps:
             "--title",
             "My Feature",
         ]);
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let _env = CheckleftEnvGuard::with_gate_disabled();
         let err = run_with_dependencies(cli, None, &runner).expect_err("ensure_pr should fail on >1 open PRs");
         runner.assert_exhausted();
         let msg = err.to_string();

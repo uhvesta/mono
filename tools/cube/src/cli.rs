@@ -235,6 +235,33 @@ pub enum WorkspaceCommand {
     ///
     /// Run from inside the leased cube workspace directory.
     Rebase,
+    /// Reconcile cached workspace health in the DB with actual on-disk state.
+    ///
+    /// Re-runs `jj status` on every free workspace that the DB currently
+    /// shows as `dirty` or `conflicted`, then updates the DB to match.
+    /// Workspaces that are genuinely clean on disk are promoted back to
+    /// `free`; workspaces that are still dirty/conflicted keep their
+    /// current health marker (refreshed so `unhealthy_since_epoch_s`
+    /// stays accurate).
+    ///
+    /// Use this after a manual workspace reset, after crash recovery, or
+    /// whenever `cube workspace list` shows a `free-dirty` entry that you
+    /// believe has been cleaned up. Without this command the only
+    /// other path that updates health is `cube workspace lease`.
+    ///
+    /// Exit code 0 always (reconcile errors are printed to stderr and
+    /// the rest of the pool is still processed).
+    Reconcile {
+        /// Only reconcile workspaces in this repo.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Only reconcile this specific workspace id.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Show what would be updated without making any changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove a workspace row from the registry.
     ///
     /// Deletes the `workspaces` row (and cascades `workspace_setup`)
@@ -944,6 +971,55 @@ mod tests {
                 assert!(dry_run);
             }
             _ => panic!("expected workspace gc command"),
+        }
+    }
+
+    #[test]
+    fn workspace_reconcile_parses_default() {
+        let cli = Cli::parse_from(["cube", "workspace", "reconcile"]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Reconcile {
+                        repo,
+                        workspace,
+                        dry_run,
+                    },
+            } => {
+                assert!(repo.is_none());
+                assert!(workspace.is_none());
+                assert!(!dry_run);
+            }
+            _ => panic!("expected workspace reconcile command"),
+        }
+    }
+
+    #[test]
+    fn workspace_reconcile_parses_with_filters_and_dry_run() {
+        let cli = Cli::parse_from([
+            "cube",
+            "workspace",
+            "reconcile",
+            "--repo",
+            "mono",
+            "--workspace",
+            "mono-agent-008",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Command::Workspace {
+                command:
+                    WorkspaceCommand::Reconcile {
+                        repo,
+                        workspace,
+                        dry_run,
+                    },
+            } => {
+                assert_eq!(repo.as_deref(), Some("mono"));
+                assert_eq!(workspace.as_deref(), Some("mono-agent-008"));
+                assert!(dry_run);
+            }
+            _ => panic!("expected workspace reconcile command"),
         }
     }
 

@@ -38,6 +38,18 @@ pub const DEEPEN_LADDER: &[u32] = &[50, 250, 1000];
 /// git repo via the `.git` directory at the workspace root and then run
 /// `jj git import` to sync jj's op log after deepening.
 pub fn ensure_history(root: &Path, kind: VcsKind, needed_ref: &str, scenario: &Scenario) -> Result<bool> {
+    // Secondary jj workspaces have no colocated .git at their root. These are
+    // local development environments, not CI shallow clones, so there is no
+    // shallow history to deepen. Skip the check and report history as available.
+    // Invariant: secondary jj workspaces always share a non-shallow primary
+    // store (cube workspaces are full clones), so skipping the depth check
+    // here is safe — if this assumption ever breaks (shallow primary store),
+    // this early return must be removed.
+    if kind == VcsKind::Jujutsu && !root.join(".git").exists() {
+        info!("secondary jj workspace (no colocated .git) — skipping shallow history check");
+        return Ok(true);
+    }
+
     let git_root = resolve_git_root(root, kind)?;
 
     // For PR and push-to-branch scenarios, always refresh the remote tracking
@@ -535,6 +547,29 @@ mod tests {
         let result = resolve_git_root(dir.path(), VcsKind::Git).expect("resolve");
         assert_eq!(result, dir.path());
     }
+
+    // ── ensure_history: secondary jj workspace skips check ───────────────────
+
+    #[test]
+    fn ensure_history_is_noop_for_secondary_jj_workspace() {
+        // A directory with no .git is a secondary jj workspace.
+        // ensure_history must return Ok(true) rather than bailing.
+        let dir = tempdir().expect("tempdir");
+        let result = ensure_history(
+            dir.path(),
+            VcsKind::Jujutsu,
+            "origin/main",
+            &Scenario::PullRequest {
+                base_branch: "main".to_owned(),
+            },
+        );
+        assert!(
+            matches!(result, Ok(true)),
+            "secondary jj workspace must return Ok(true), got {result:?}"
+        );
+    }
+
+    // ── resolve_git_root ──────────────────────────────────────────────────────
 
     #[test]
     fn resolve_git_root_errors_for_jj_without_colocated_git() {
