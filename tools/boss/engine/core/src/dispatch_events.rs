@@ -196,6 +196,25 @@ pub enum Stage {
     /// (slot has a live-state entry whose PID is gone) — here the slot
     /// has NO live-state entry at all.
     PoolClaimReconcile,
+    /// The periodic terminal-work reconciler found a LIVE worker pane whose
+    /// bound work item (or its execution) is already terminal — the
+    /// O'Brien zombie: a worker that sat alive in `waiting_for_input` for
+    /// days after its task went `done` and its PR merged, holding a slot
+    /// long after its work was finished. Every other reconciler skips this
+    /// case: the dead-pid sweep needs a dead PID *and* a non-terminal
+    /// status, the stale-worker sweep only inspects `working` slots, the
+    /// transient-recovery sweep recovers unfinished work (never checks
+    /// work-item terminality), and the pool-claim sweep deliberately leaves
+    /// live-backed claims to the completion path. When that completion
+    /// teardown never lands (laptop closed, API call wedged), the worker is
+    /// stranded. The `details` object carries the reap `reason`
+    /// (`work_item_terminal` / `execution_terminal`), the `slot_id`, and the
+    /// terminal `execution_status` so the strand is diagnosable from
+    /// `bossctl dispatch tail`. Reaping uses the same idempotent,
+    /// run-id-keyed `release_worker_pane` teardown the completion path uses,
+    /// so a slot recycled to a different execution between snapshot and reap
+    /// is a no-op — an active worker is never reaped.
+    TerminalWorkReconcile,
 }
 
 impl Stage {
@@ -222,6 +241,7 @@ impl Stage {
             Stage::TransientRecoveryNudge => "transient_recovery_nudge",
             Stage::StaleWorkerReconcile => "stale_worker_reconcile",
             Stage::PoolClaimReconcile => "pool_claim_reconcile",
+            Stage::TerminalWorkReconcile => "terminal_work_reconcile",
         }
     }
 }
@@ -717,6 +737,7 @@ mod tests {
         assert_eq!(Stage::TransientRecoveryNudge.as_str(), "transient_recovery_nudge");
         assert_eq!(Stage::StaleWorkerReconcile.as_str(), "stale_worker_reconcile");
         assert_eq!(Stage::PoolClaimReconcile.as_str(), "pool_claim_reconcile");
+        assert_eq!(Stage::TerminalWorkReconcile.as_str(), "terminal_work_reconcile");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;

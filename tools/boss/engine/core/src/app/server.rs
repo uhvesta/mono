@@ -123,6 +123,21 @@ pub fn process_is_alive(pid: libc::pid_t) -> bool {
 /// `Ok`/`NeedsOrgApproval`/`NeedsSso` does not re-trigger a probe; a probe that
 /// returns `Unknown` (transient / no org binding) leaves the state unchanged,
 /// so the loop simply waits for the next real transition rather than spinning.
+// Lets `Arc<ServerState>` be coerced to `Arc<dyn WorkerReaper>` for the
+// terminal-work reconciler (wired in `run` below). Reaping a stranded worker
+// is exactly the completion path's pane teardown: `release_worker_pane`
+// resolves the slot from the run id via an atomic `take_slot_for_run`, so it
+// is idempotent and a no-op once the slot has been freed or recycled to a
+// different execution — the reconciler relies on that to never reap the wrong
+// worker. (Defined here rather than in `app.rs` so the new impl doesn't
+// re-touch app.rs's grandfathered `ServerState` giant struct.)
+#[async_trait::async_trait]
+impl crate::terminal_work_sweep::WorkerReaper for ServerState {
+    async fn reap_terminal_worker(&self, run_id: &str) {
+        self.release_worker_pane(run_id).await;
+    }
+}
+
 fn spawn_github_auth_forwarder(server_state: Arc<ServerState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let controller = server_state.github_auth.clone();
@@ -588,6 +603,27 @@ pub async fn serve(
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         crate::pool_claim_sweep::DEFAULT_INTERVAL,
+    );
+
+    // Periodic terminal-work reconciler: reaps a LIVE worker pane whose
+    // bound work item (or its execution) is already terminal — the O'Brien
+    // zombie. A worker's normal terminal act is opening its PR, after which
+    // the completion path tears it down; but when that teardown never lands
+    // (laptop closed, a wedged API call), the worker sits alive holding its
+    // slot for days after its task went `done` and its PR merged. Every
+    // other sweep skips it: the dead-pid sweep needs a dead PID, the
+    // stale-worker sweep only inspects `working` slots, transient-recovery
+    // recovers unfinished work, and the pool-claim sweep leaves live-backed
+    // claims to the (failed) completion path. This sweep reaps such strands
+    // via the same idempotent, run-id-keyed `release_worker_pane` teardown,
+    // gated by a two-pass confirmation so a teardown still in flight is never
+    // raced and an active worker is never reaped. Runs every 60s.
+    let _terminal_work_sweep_handle = crate::terminal_work_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        Arc::clone(&server_state) as Arc<dyn crate::terminal_work_sweep::WorkerReaper>,
+        server_state.dispatch_events.clone(),
+        crate::terminal_work_sweep::DEFAULT_INTERVAL,
     );
 
     // Periodic stale-worker liveness backstop: detects worker slots whose

@@ -110,6 +110,7 @@ rust_library(
         "src/stale_worker_sweep.rs",
         "src/structured_output.rs",
         "src/syspolicyd_monitor.rs",
+        "src/terminal_work_sweep.rs",
         "src/trace_rotation.rs",
         "src/transient_error.rs",
         "src/transient_recovery.rs",

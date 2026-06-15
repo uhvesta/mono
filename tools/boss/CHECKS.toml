@@ -67,7 +67,6 @@ exclude_structs = [
 
   "engine/core/src/coordinator.rs::CubeRepoSummary",
   "engine/core/src/coordinator.rs::ExecutionCoordinator",
-  "engine/core/src/dispatch_events.rs::DispatchEvent",
   "engine/core/src/dispatch_reader.rs::GhostActiveEntry",
   "engine/core/src/dispatch_reader.rs::StalledStage",
   "engine/core/src/external_tracker/github.rs::GitHubConfig",
