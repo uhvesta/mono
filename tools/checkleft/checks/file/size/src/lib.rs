@@ -20,7 +20,9 @@
 //! ```
 //!
 //! `exclude_files` / `exclude_globs` (alias): glob patterns matched against the
-//! file's repo-root-relative path.
+//! file's repo-root-relative path. Patterns authored relative to a subdirectory
+//! CHECKS file are normalized to repo-root-relative by the host before they
+//! reach this check, so matching here is a plain repo-relative glob test.
 
 use checkleft_check_sdk::{ChangeKind, ChangeSet, ChangedFile, CheckInput, Finding, check, export_checks};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -52,10 +54,7 @@ fn file_size_check(input: CheckInput) -> Vec<Finding> {
         if file.kind == ChangeKind::Deleted {
             continue;
         }
-        if exclude_globs
-            .as_ref()
-            .is_some_and(|globs| is_excluded(&file.path, globs, &input.config_dir))
-        {
+        if exclude_globs.as_ref().is_some_and(|globs| globs.is_match(&file.path)) {
             continue;
         }
 
@@ -108,21 +107,6 @@ fn growth_message_for_file(path: &str, changeset: &ChangeSet) -> String {
     let added: u32 = diff.hunks.iter().map(|h| h.added_lines).sum();
     let removed: u32 = diff.hunks.iter().map(|h| h.removed_lines).sum();
     format!(" File grew by +{added} / -{removed} lines in this change.")
-}
-
-/// Returns true if `path` is within `config_dir` and matches `globs` (relative to config_dir).
-/// Files outside the config_dir subtree are never excluded.
-fn is_excluded(path: &str, globs: &GlobSet, config_dir: &str) -> bool {
-    let relative = if config_dir.is_empty() {
-        path
-    } else {
-        let prefix = format!("{config_dir}/");
-        let Some(r) = path.strip_prefix(prefix.as_str()) else {
-            return false;
-        };
-        r
-    };
-    globs.is_match(relative)
 }
 
 fn build_globset(patterns: Option<&[String]>) -> Option<GlobSet> {
@@ -181,11 +165,7 @@ mod tests {
     }
 
     fn run_with_config(changeset: ChangeSet, config_json: &str) -> Vec<Finding> {
-        run_with_config_and_dir(changeset, config_json, "")
-    }
-
-    fn run_with_config_and_dir(changeset: ChangeSet, config_json: &str, config_dir: &str) -> Vec<Finding> {
-        let input = CheckInput::__from_parts(changeset, config_json.to_owned(), config_dir.to_owned());
+        let input = CheckInput::__from_parts(changeset, config_json.to_owned());
         file_size_check(input)
     }
 
@@ -328,30 +308,32 @@ mod tests {
     }
 
     #[test]
-    fn exclude_files_does_not_apply_outside_config_dir_subtree() {
+    fn repo_relative_glob_does_not_match_outside_its_subtree() {
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let old_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
-        // File lives at "oversized.rs" (repo root), but the check is configured
-        // from "sub/dir". Pattern "oversized.rs" should only match
-        // "sub/dir/oversized.rs", NOT "oversized.rs".
+        // The host normalizes a subdirectory CHECKS file's `oversized.rs` pattern
+        // to the repo-relative glob `sub/dir/oversized.rs` before it reaches the
+        // guest. That repo-relative glob must NOT match a root-level file.
         fs::write(dir.path().join("oversized.rs"), "a\nb\nc\n").unwrap();
 
-        let findings = run_with_config_and_dir(
+        let findings = run_with_config(
             make_changeset("oversized.rs", ChangeKind::Modified, 2, 0),
-            r#"{"max_lines": 2, "exclude_files": ["oversized.rs"]}"#,
-            "sub/dir",
+            r#"{"max_lines": 2, "exclude_files": ["sub/dir/oversized.rs"]}"#,
         );
 
         std::env::set_current_dir(old_cwd).unwrap();
 
-        // Pattern "oversized.rs" from sub/dir context does NOT match root-level "oversized.rs".
-        assert_eq!(findings.len(), 1, "file outside config_dir should not be excluded");
+        assert_eq!(
+            findings.len(),
+            1,
+            "repo-relative glob scoped to sub/dir should not exclude a root-level file"
+        );
     }
 
     #[test]
-    fn exclude_files_matches_within_config_dir_subtree() {
+    fn repo_relative_glob_matches_within_its_subtree() {
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let old_cwd = std::env::current_dir().unwrap();
@@ -359,15 +341,16 @@ mod tests {
         fs::create_dir_all(dir.path().join("sub/dir")).unwrap();
         fs::write(dir.path().join("sub/dir/oversized.rs"), "a\nb\nc\n").unwrap();
 
-        let findings = run_with_config_and_dir(
+        let findings = run_with_config(
             make_changeset("sub/dir/oversized.rs", ChangeKind::Modified, 2, 0),
-            r#"{"max_lines": 2, "exclude_files": ["oversized.rs"]}"#,
-            "sub/dir",
+            r#"{"max_lines": 2, "exclude_files": ["sub/dir/oversized.rs"]}"#,
         );
 
         std::env::set_current_dir(old_cwd).unwrap();
 
-        // Pattern "oversized.rs" from sub/dir context matches "sub/dir/oversized.rs".
-        assert!(findings.is_empty(), "file inside config_dir should be excluded");
+        assert!(
+            findings.is_empty(),
+            "repo-relative glob should exclude the matching repo-relative path"
+        );
     }
 }

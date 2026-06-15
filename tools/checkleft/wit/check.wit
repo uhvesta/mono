@@ -98,14 +98,14 @@ interface types {
         changeset: change-set,
         /// Serialised TOML config for this check, re-encoded as JSON for
         /// cross-language portability.
+        ///
+        /// A check operates purely in repo-root-relative coordinates: changeset
+        /// paths and finding locations are repo-relative, and any
+        /// directory-relative config (e.g. `exclude_files` globs authored
+        /// relative to the CHECKS file) is resolved to repo-relative coordinates
+        /// by the host before it reaches the guest. The CHECKS file's directory
+        /// is deliberately never exposed to the sandboxed guest.
         config-json: string,
-        /// Repo-root-relative directory of the CHECKS file that configures this
-        /// check (e.g. `"tools/checkleft"` or `""` for the repo root).
-        /// Used by checks to scope `exclude_files` patterns to the config subtree:
-        /// a pattern only matches files whose repo-root-relative path starts with
-        /// `config-dir`, preventing a subdirectory CHECKS file from accidentally
-        /// excluding files in other parts of the tree.
-        config-dir: string,
     }
 
     /// Diagnostic severity, matching checkleft's display conventions.

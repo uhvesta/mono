@@ -726,10 +726,88 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     // for the entire run-check call above.
     drop(sandbox);
 
-    Ok(CheckResult {
+    let mut result = CheckResult {
         check_id: package.id.clone(),
         findings: findings.into_iter().map(lift_finding).collect(),
-    })
+    };
+    apply_struct_exclusions(&mut result, config, config_dir);
+    Ok(result)
+}
+
+/// Suppress findings host-side for the framework-level `exclude_structs`
+/// grandfathering convention.
+///
+/// `exclude_structs` entries are authored relative to the CHECKS file's
+/// directory; findings are repo-root-relative. Reconciling the two coordinate
+/// systems is a host concern — the guest emits a finding for every violating
+/// struct (in repo-relative coordinates, with no knowledge of `config_dir`) and
+/// the host drops the ones that a CHECKS author has grandfathered. Two entry
+/// forms are honored, mirroring the native check:
+///
+/// * `relative/path.rs::Name` — qualified. Exempts struct `Name` only in the
+///   file at `config_dir/relative/path.rs`. A same-named struct in any other
+///   file is still flagged.
+/// * `Name` — simple. Exempts struct `Name` in any file within the CHECKS
+///   file's subtree (`config_dir`). A same-named struct outside the subtree is
+///   still flagged.
+///
+/// No-op when the check declares no `exclude_structs` (the common case), so this
+/// is safe to call for every component check.
+fn apply_struct_exclusions(result: &mut CheckResult, config: &toml::Value, config_dir: &Path) {
+    let entries = config.get("exclude_structs").and_then(|v| v.as_array());
+    let Some(entries) = entries else {
+        return;
+    };
+
+    // Qualified `repo_path::Name` exemptions and subtree-scoped simple names.
+    let mut qualified: std::collections::HashSet<(PathBuf, String)> = std::collections::HashSet::new();
+    let mut simple: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in entries.iter().filter_map(|v| v.as_str()) {
+        match entry.split_once("::") {
+            Some((path_part, name)) => {
+                qualified.insert((config_dir.join(path_part), name.to_owned()));
+            }
+            None => {
+                simple.insert(entry.to_owned());
+            }
+        }
+    }
+    if qualified.is_empty() && simple.is_empty() {
+        return;
+    }
+
+    result.findings.retain(|finding| {
+        let Some(location) = &finding.location else {
+            return true;
+        };
+        let Some(struct_name) = struct_name_from_finding(&finding.message) else {
+            return true;
+        };
+        // Qualified exemption: exact (path, name) match.
+        if qualified.contains(&(location.path.clone(), struct_name.to_owned())) {
+            return false;
+        }
+        // Simple exemption: name matches and the file is within the CHECKS subtree.
+        if simple.contains(struct_name) && path_within_subtree(&location.path, config_dir) {
+            return false;
+        }
+        true
+    });
+}
+
+/// Extract the struct name a giant-structs finding names. The message form is
+/// ``struct `Name` has more than …``; the struct name is the first
+/// backtick-delimited token. Returns `None` when no such token is present (the
+/// finding is then never suppressed — fail-safe).
+fn struct_name_from_finding(message: &str) -> Option<&str> {
+    let rest = message.split_once('`')?.1;
+    rest.split_once('`').map(|(name, _)| name)
+}
+
+/// True when `path` lies within `subtree` (repo-root-relative). An empty subtree
+/// is the repo root and contains every path.
+fn path_within_subtree(path: &Path, subtree: &Path) -> bool {
+    subtree.as_os_str().is_empty() || path.starts_with(subtree)
 }
 
 // --- Exclusion-audit WIT calls (no filesystem, uses with_empty_wasi) ---
@@ -831,13 +909,49 @@ fn lower_changeset(changeset: &ChangeSet) -> wit_types::ChangeSet {
 }
 
 fn lower_check_input(changeset: &ChangeSet, config: &toml::Value, config_dir: &Path) -> Result<wit_types::CheckInput> {
+    // The guest operates purely in repo-root-relative coordinates and never sees
+    // the CHECKS file's directory. `exclude_files`/`exclude_globs` patterns are
+    // authored relative to that directory, so the host rewrites them to
+    // repo-relative globs here — the guest then matches repo-relative changeset
+    // paths against repo-relative globs with no notion of `config_dir`.
+    let scoped_config = scope_exclude_globs_to_repo(config, config_dir);
     let config_json =
-        serde_json::to_string(config).context("failed to serialize config to JSON for component input")?;
+        serde_json::to_string(&scoped_config).context("failed to serialize config to JSON for component input")?;
     Ok(wit_types::CheckInput {
         changeset: lower_changeset(changeset),
         config_json,
-        config_dir: config_dir.to_string_lossy().into_owned(),
     })
+}
+
+/// Rewrite the framework-level `exclude_files`/`exclude_globs` glob patterns in
+/// `config` from CHECKS-file-relative to repo-root-relative by prefixing
+/// `config_dir`.
+///
+/// Exclude globs are authored relative to the CHECKS file that declares them,
+/// but the guest only ever sees repo-relative changeset paths. Reconciling the
+/// two coordinate systems is a host concern (the host located and parsed the
+/// CHECKS file, so it holds `config_dir`); resolving here keeps the directory
+/// out of the sandboxed guest entirely. A repo-root CHECKS file (`config_dir`
+/// empty) needs no rewrite. Non-glob config is returned untouched.
+fn scope_exclude_globs_to_repo(config: &toml::Value, config_dir: &Path) -> toml::Value {
+    let mut config = config.clone();
+    if config_dir.as_os_str().is_empty() {
+        return config;
+    }
+    let prefix = config_dir.to_string_lossy();
+    if let Some(table) = config.as_table_mut() {
+        for key in ["exclude_files", "exclude_globs"] {
+            let Some(toml::Value::Array(globs)) = table.get_mut(key) else {
+                continue;
+            };
+            for glob in globs.iter_mut() {
+                if let toml::Value::String(pattern) = glob {
+                    *pattern = format!("{prefix}/{pattern}");
+                }
+            }
+        }
+    }
+    config
 }
 
 // --- Type lifting: WIT types → host types ---
