@@ -111,7 +111,6 @@ final class KanbanShortIDBadgeTests: XCTestCase {
     /// would be caught here without relying on the view layer.
     func testShortIDSurvivesWorkItemsJoin() {
         let model = makeModel()
-        let productID = "prod_test"
         let projectID = "proj_test"
 
         let tasks: [(String, Int?)] = [

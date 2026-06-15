@@ -54,7 +54,7 @@ final class ReviewNotificationTests: XCTestCase {
     /// must NOT add it again (idempotent). The set size stays 1.
     func testRepeatedInReviewEventIsIdempotent() {
         let model = makeModel()
-        var task = makeTask(id: "t_repeat", status: "in_review")
+        let task = makeTask(id: "t_repeat", status: "in_review")
 
         // Seed as if the task was already in review at startup.
         model.knownReviewTaskIDs.insert("t_repeat")

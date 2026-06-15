@@ -32,7 +32,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptMoveTask(task.id, to: .doing)
 
         // Engine has not yet responded; tasksByProjectID still has old status.
         // The card must stay in Doing via the optimistic override.
@@ -46,7 +46,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptMoveTask(task.id, to: .doing)
 
         // Engine confirms the move via work_item_updated alone — no full tree fetch.
         let confirmedTask = makeTask(status: "active", id: task.id)
@@ -68,7 +68,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeProjectTask(status: "todo", projectID: project.id)
         model.tasksByProjectID = [project.id: [task]]
 
-        model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptMoveTask(task.id, to: .doing)
 
         let confirmedTask = makeProjectTask(status: "active", id: task.id, projectID: project.id)
         model.applyEventForTest(.workItemUpdated(item: .task(confirmedTask)))
@@ -84,7 +84,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptMoveTask(task.id, to: .doing)
 
         // Simulate engine sending back a work_item_updated with the new status,
         // then a work tree that reflects the updated status.
@@ -114,7 +114,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptMoveTask(task.id, to: .doing)
         // Card is now optimistically in Doing.
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
 
@@ -134,7 +134,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptMoveTask(task.id, to: .doing)
         model.applyEventForTest(.workError(message: "test error"))
 
         // Inline drag-refusal notice is set for the affected task.

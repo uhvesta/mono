@@ -43,10 +43,10 @@ enum MainThreadBacktrace {
                 )
             }
             let image = info.dli_fname
-                .flatMap { String(validatingUTF8: $0) }
+                .flatMap { String(validatingCString: $0) }
                 .map { ($0 as NSString).lastPathComponent } ?? "???"
             let symbol = info.dli_sname
-                .flatMap { String(validatingUTF8: $0) } ?? hex(addr)
+                .flatMap { String(validatingCString: $0) } ?? hex(addr)
             let symAddr = UInt(bitPattern: info.dli_saddr)
             let offset = (symAddr != 0 && addr >= symAddr) ? addr - symAddr : 0
             return formatFrame(
