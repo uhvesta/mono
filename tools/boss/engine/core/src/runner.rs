@@ -1395,6 +1395,52 @@ pub(crate) fn bazel_prepush_gate_text() -> String {
         .to_string()
 }
 
+/// Pre-push gate for a **conflict-resolution** revision, when the
+/// workspace is a Bazel workspace. Returns `None` for non-Bazel repos.
+///
+/// This deliberately differs from [`bazel_prepush_gate_block`]: a
+/// conflict-resolution revision's job is to make the PR mergeable again
+/// (the *merge-correctness* gate), not to certify the whole PR's test
+/// suite. The full `bazel test //...` belongs to the PR's own CI, which
+/// runs on the branch the worker pushes. Blocking the push behind a long
+/// or flaky full-suite run is exactly how a correct resolution gets
+/// stranded unpushed and lost on reap (the loop this fix addresses).
+///
+/// The verify gate is NOT skipped: the merged code must COMPILE
+/// (`bazel build` of the touched/upstream targets) and any rebase-
+/// invalidated generated artifact (e.g. `MODULE.bazel.lock`) must be
+/// regenerated before pushing. Tests run post-push in CI.
+fn bazel_conflict_resolution_gate_block(workspace_path: &Path) -> Option<String> {
+    if !is_bazel_workspace(workspace_path) {
+        return None;
+    }
+    Some(bazel_conflict_resolution_gate_text())
+}
+
+/// The conflict-resolution pre-push gate prompt block, independent of any
+/// filesystem probe (so the SSH remote adapter can inject it after an
+/// over-SSH marker probe). See [`bazel_conflict_resolution_gate_block`]
+/// for why this is build-before-push rather than build-and-test-before-push.
+pub(crate) fn bazel_conflict_resolution_gate_text() -> String {
+    "\n## Pre-push gate for conflict resolution (Bazel workspace) — merge correctness first, then push\n\
+         \n\
+         This repository is a Bazel workspace. For a conflict-resolution revision the gate you MUST clear before pushing is **merge correctness**, not the full test suite.\n\
+         \n\
+         Required BEFORE you push (step 4):\n\
+         - Regenerate any generated/lock artifact the rebase invalidated and include it in your commit. The common one is `MODULE.bazel.lock`: run `bazel mod deps --lockfile_mode=update` (or build any target, which refreshes it) and stage the result.\n\
+         - `bazel build` the targets your resolution touched AND the targets the rebased-in upstream change touches. Use `bazel query` to resolve labels if unsure. The merged code MUST COMPILE — a conflict resolution that does not build is wrong and must not be pushed.\n\
+         - Run the build in the FOREGROUND with a timeout (e.g. `timeout 1800 bazel build <targets>`) and read its exit code directly. Do NOT background it and idle in a wait-loop.\n\
+         \n\
+         Then PUSH (step 4) as soon as the build is clean. Do NOT block the push on a full `bazel test //...`.\n\
+         \n\
+         Why push before the full test suite: making the PR mergeable again is the conflict-resolution step's deliverable. The PR's own CI runs the full `bazel test` suite on the branch you push — that is where test regressions are caught and remediated, NOT a precondition for landing the resolution. Stalling the push behind a long or flaky full-suite run is exactly how a correct resolution gets stranded and never reaches the PR.\n\
+         \n\
+         After pushing you MAY run `bazel test` on the affected targets as a courtesy and report what you saw, but the push must not wait on it.\n\
+         \n\
+         If `bazel build` fails (the merge does not compile) and you cannot make it compile within this run, do NOT push. Fix the resolution, or — if it needs a human decision — follow the stop conditions below. Do NOT idle waiting on a wedged build; emit an `[effort-escalation]` marker and stop.\n"
+        .to_string()
+}
+
 /// Hard constraint text forbidding check/CI bypasses. Injected into every
 /// prompt surface where a worker might encounter a failing check or CI failure.
 fn check_bypass_prohibition_text() -> &'static str {
@@ -1723,6 +1769,11 @@ fn compose_revision_directive(
         .unwrap_or_else(|| "?".into());
     let repo_slug =
         crate::completion::parse_repo_slug(&execution.repo_remote_url).unwrap_or_else(|_| "<owner/repo>".to_owned());
+    // A conflict-resolution revision pushes the merge-corrected branch as
+    // soon as it COMPILES (the merge-correctness gate); the PR's own CI
+    // runs the full test suite post-push. Other revisions keep the
+    // build-and-test-before-push gate.
+    let is_conflict_resolution = conflict_attempt.is_some();
 
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
@@ -1730,9 +1781,17 @@ fn compose_revision_directive(
     out.push_str(&format!("- The parent PR is #{pr_number} at {parent_pr_url}.\n"));
     out.push_str(&format!("- What this revision should change: {description}\n"));
     // Issue #804: revision chores (T30–T34 on PR #250) were the worst
-    // offenders for pushing red code. Apply the same pre-push build gate
-    // when the workspace is a Bazel workspace.
-    if let Some(gate) = bazel_prepush_gate_block(workspace_path) {
+    // offenders for pushing red code. Apply the pre-push build gate when
+    // the workspace is a Bazel workspace. Conflict-resolution revisions
+    // get the merge-correctness variant (build before push; tests run in
+    // the PR's CI after the push) so a correct resolution is never
+    // stranded behind a slow/flaky full-suite run.
+    let prepush_gate = if is_conflict_resolution {
+        bazel_conflict_resolution_gate_block(workspace_path)
+    } else {
+        bazel_prepush_gate_block(workspace_path)
+    };
+    if let Some(gate) = prepush_gate {
         out.push_str(&gate);
     }
     out.push('\n');
@@ -1802,7 +1861,12 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str("Preserve revision history — each revision is a new commit on the PR branch; never amend, squash, or rename existing commits on the branch.\n");
     out.push('\n');
-    out.push_str("Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n");
+    let rebase_gate_clause = if is_conflict_resolution {
+        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the merge-correctness build gate. Any rebase, merge, or conflict resolution MUST run the `bazel build` merge-correctness gate (compile the touched/upstream targets, regenerate invalidated lockfiles) before pushing, even when the rebase appeared clean — a rebase merges upstream changes in and the resulting code is new and must compile. The full `bazel test` suite is NOT a precondition for this push; it runs in the PR's CI after you push (see the conflict-resolution gate above).\n"
+    } else {
+        "Rebase-only exception (VCS only — not a build-gate skip): if the ONLY thing needed to satisfy this revision is a rebase (e.g. rebasing the branch onto updated main) and the rebase produces NO diff whatsoever (zero changed files), it is valid to have NO new commit. Do not manufacture an empty or cosmetic commit. In that case, push the rebased branch and explain in your response that the revision was satisfied by a rebase with no code change. IMPORTANT: this exception covers VCS mechanics only — whether to add a new commit. It does NOT exempt you from the pre-push build gate. Any revision that involves a rebase, merge, or conflict resolution MUST run the full `bazel build` + `bazel test` gate before pushing, even when the rebase appeared clean. A rebase merges upstream changes into your branch — the resulting code is new and must be compiled and tested. This is exactly where compile errors get reintroduced.\n"
+    };
+    out.push_str(rebase_gate_clause);
     out.push('\n');
     out.push_str("Constraints:\n");
     out.push_str("- Do NOT run `gh pr create` — this revision has no PR of its own.\n");
@@ -3391,6 +3455,85 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("Do NOT create a `boss/exec_*` bookmark"),
             "base revision directive must still be present:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn conflict_revision_uses_merge_correctness_gate_not_full_test_gate() {
+        // A conflict-resolution revision must push the merge-corrected
+        // branch as soon as it COMPILES (the merge-correctness gate); the
+        // full `bazel test` suite is the PR's own CI's job, run after the
+        // push. Blocking the push behind the full suite is what stranded
+        // correct resolutions unpushed (the loop this fix addresses).
+        let ws = bazel_workspace();
+        let work_item = revision_task_with_created_via(None, "merge-conflict:crz_frag_01");
+        let attempt = sample_conflict_attempt();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(ws.path())
+                .conflict_attempt(&attempt)
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("## Pre-push gate for conflict resolution (Bazel workspace)"),
+            "conflict revision must get the merge-correctness gate:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Do NOT block the push on a full `bazel test //...`"),
+            "conflict gate must defer the full test suite to CI:\n{prompt}",
+        );
+        // The generic build-AND-test-before-push gate must NOT be present
+        // for conflict revisions — it is what caused the pre-push stall.
+        assert!(
+            !prompt.contains("## Pre-push build gate (Bazel workspace)"),
+            "conflict revision must NOT carry the generic build+test gate:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("Both `bazel build` and `bazel test` must finish clean"),
+            "conflict revision must not require a full test pass before push:\n{prompt}",
+        );
+        // The rebase clause must reference the merge-correctness gate, not
+        // the full build+test gate.
+        assert!(
+            prompt.contains("The full `bazel test` suite is NOT a precondition for this push"),
+            "conflict rebase clause must defer tests to CI:\n{prompt}",
+        );
+        // Verification is NOT skipped — the merged code must still build.
+        assert!(
+            prompt.contains("The merged code MUST COMPILE"),
+            "conflict gate must still require a clean build:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn non_conflict_revision_keeps_full_build_and_test_gate() {
+        // A plain operator revision (no conflict attempt) keeps the
+        // build-AND-test-before-push gate — the merge-correctness rescope
+        // is conflict-resolution-specific.
+        let ws = bazel_workspace();
+        let work_item = revision_task_with_created_via(None, "operator");
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+                .work_item(&work_item)
+                .workspace_path(ws.path())
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains("## Pre-push build gate (Bazel workspace)"),
+            "non-conflict revision must keep the generic build+test gate:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Both `bazel build` and `bazel test` must finish clean"),
+            "non-conflict revision must still require a full test pass before push:\n{prompt}",
+        );
+        assert!(
+            !prompt.contains("## Pre-push gate for conflict resolution"),
+            "non-conflict revision must NOT get the conflict merge-correctness gate:\n{prompt}",
         );
     }
 

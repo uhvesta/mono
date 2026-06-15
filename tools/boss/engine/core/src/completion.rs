@@ -1031,10 +1031,24 @@ impl WorkerCompletionHandler {
         let outcome = self.on_stop_inner(execution_id).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
-        if let Ok(execution) = self.work_db.get_execution(execution_id)
-            && execution.kind == ExecutionKind::CiRemediation
-        {
-            self.finalize_ci_remediation_attempt(&execution, &outcome).await;
+        if let Ok(execution) = self.work_db.get_execution(execution_id) {
+            if execution.kind == ExecutionKind::CiRemediation {
+                self.finalize_ci_remediation_attempt(&execution, &outcome).await;
+            }
+            // Conflict resolution now dispatches through
+            // `revision_implementation` (the legacy `conflict_resolution`
+            // kind is kept for fallback). Either kind that stops without a
+            // push must retire its `conflict_resolutions` ledger row, or
+            // the attempt strands `pending` forever — the stall the
+            // operator sees as "revision tasks that do nothing", and the
+            // reason the engine later re-mints a fresh conflict revision
+            // once `main` moves again.
+            if matches!(
+                execution.kind,
+                ExecutionKind::RevisionImplementation | ExecutionKind::ConflictResolution
+            ) {
+                self.finalize_conflict_resolution_attempt(&execution, &outcome).await;
+            }
         }
         outcome
     }
@@ -2931,6 +2945,154 @@ must not be asked to open one",
                 )
                 .await;
         }
+    }
+
+    /// Catch-all finaliser for conflict-resolution workers — the
+    /// merge-conflict twin of [`Self::finalize_ci_remediation_attempt`].
+    /// Fires for every Stop event on a conflict-resolution revision
+    /// (`revision_implementation` whose `created_via` is `merge-conflict:*`)
+    /// or a legacy `conflict_resolution` execution.
+    ///
+    /// **Why this exists.** Conflict resolution was unified onto the
+    /// revision substrate (`unify-pr-remediation-on-revisions.md`); the
+    /// fix vehicle is now a `revision_implementation` execution. When such
+    /// a worker stops WITHOUT pushing — it stalled before the push step,
+    /// hit a stop condition without classifying, or was nudged to
+    /// exhaustion — nothing retired the bound `conflict_resolutions`
+    /// ledger row. It stranded `pending` forever: the operator sees a
+    /// "revision task that does nothing", and once `main` moves again the
+    /// detector mints a fresh conflict revision against the new base SHA
+    /// (the re-mint loop). This finaliser closes that gap: a worker that
+    /// the auto-nudge breaker has parked (no push, no resume coming) marks
+    /// the attempt `failed` with [`CONFLICT_NO_PUSH_REASON`], so the
+    /// parent surfaces `blocked: merge_conflict` for human attention
+    /// instead of looping, and the ledger is honest.
+    ///
+    /// **Conservatism.** Unlike the CI twin (which marks failed on the
+    /// first idle Stop), this fires ONLY on
+    /// [`StopOutcome::NudgeBreakerParked`] — the genuine "no push, and the
+    /// engine has stopped trying" terminal. While the worker is still
+    /// being nudged (`AwaitingInput`) the attempt is left `pending` so a
+    /// worker that resumes and pushes is never prematurely failed and the
+    /// detector's in-flight dedup keeps holding (no duplicate revision).
+    ///
+    /// Idempotent — [`WorkDb::mark_conflict_resolution_failed`] WHERE-guards
+    /// on `status IN ('pending', 'running')`, so a duplicate call after a
+    /// terminal transition writes nothing.
+    pub async fn finalize_conflict_resolution_attempt(
+        &self,
+        execution: &crate::work::WorkExecution,
+        outcome: &StopOutcome,
+    ) {
+        // Only the genuine "stopped, no push, breaker gave up" terminal
+        // retires the attempt. Bail early on every other outcome so we
+        // never touch the ledger for a worker that pushed, is still being
+        // nudged, or hit a transient probe failure.
+        if !matches!(outcome, StopOutcome::NudgeBreakerParked { .. }) {
+            return;
+        }
+
+        // Resolve the parent chore that owns the `conflict_resolutions`
+        // row. Mirrors `try_retire_cleared_blocking_signal`: for a
+        // revision the chore is `parent_task_id`, and we only act when the
+        // revision is merge-conflict provenance (a `ci-fix:` revision has
+        // no conflict attempt to retire).
+        let parent_chore_id = match execution.kind {
+            ExecutionKind::ConflictResolution => execution.work_item_id.clone(),
+            ExecutionKind::RevisionImplementation => {
+                let task = match self.work_db.get_work_item(&execution.work_item_id) {
+                    Ok(WorkItem::Task(t)) if t.kind == TaskKind::Revision => t,
+                    _ => return,
+                };
+                if !task.created_via.as_str().starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
+                    return;
+                }
+                match task.parent_task_id {
+                    Some(parent) => parent,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+
+        let attempt = match self.work_db.active_conflict_resolution_for_work_item(&parent_chore_id) {
+            Ok(Some(attempt)) => attempt,
+            Ok(None) => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %parent_chore_id,
+                    "conflict-resolution finalizer: no active attempt; nothing to do",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    work_item_id = %parent_chore_id,
+                    ?err,
+                    "conflict-resolution finalizer: failed to look up active attempt",
+                );
+                return;
+            }
+        };
+        // Already past the "live attempt with no recorded outcome" window
+        // — a push retired it `succeeded`, the worker classified it via
+        // `mark-failed`, or some other path closed the row. Note that
+        // revision-backed attempts stay `pending` in production
+        // (`mark_conflict_resolution_running` is only used by the legacy
+        // bespoke dispatch), so `pending` is a live state here, not a
+        // no-op.
+        if !matches!(attempt.status.as_str(), "pending" | "running")
+            || attempt.head_sha_after.is_some()
+            || attempt.failure_reason.is_some()
+        {
+            return;
+        }
+
+        let updated = match self
+            .work_db
+            .mark_conflict_resolution_failed(&attempt.id, CONFLICT_NO_PUSH_REASON)
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::debug!(
+                    attempt_id = %attempt.id,
+                    "conflict-resolution finalizer: attempt already terminal between probes",
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    attempt_id = %attempt.id,
+                    ?err,
+                    "conflict-resolution finalizer: failed to mark attempt failed",
+                );
+                return;
+            }
+        };
+
+        tracing::warn!(
+            execution_id = %execution.id,
+            work_item_id = %parent_chore_id,
+            attempt_id = %updated.id,
+            pr_url = %updated.pr_url,
+            reason = CONFLICT_NO_PUSH_REASON,
+            ?outcome,
+            "conflict-resolution finalizer: worker parked without pushing; attempt marked failed",
+        );
+
+        self.publisher
+            .publish_frontend_event_on_product(
+                &updated.product_id,
+                FrontendEvent::ConflictResolutionFailed {
+                    product_id: updated.product_id.clone(),
+                    work_item_id: updated.work_item_id.clone(),
+                    attempt_id: updated.id.clone(),
+                    pr_url: updated.pr_url.clone(),
+                    failure_reason: CONFLICT_NO_PUSH_REASON.to_owned(),
+                },
+            )
+            .await;
     }
 
     /// Phase 10 #33: catch-all finaliser for `ci_remediation` workers.
@@ -9574,6 +9736,95 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             1,
             "exactly one nudge probe must be queued; got {queued:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_parked_without_push_marks_attempt_failed() {
+        // Defect #2a: a conflict-resolution revision worker that stops
+        // without pushing and is parked by the auto-nudge breaker must
+        // retire its `conflict_resolutions` ledger row as `failed`.
+        // Otherwise the attempt strands `pending` forever (the "revision
+        // task does nothing" stall the operator reports), and once `main`
+        // moves again the detector mints a fresh conflict revision against
+        // the new base SHA — the re-mint loop.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher.clone(), pane, probes);
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        handler
+            .finalize_conflict_resolution_attempt(
+                &execution,
+                &StopOutcome::NudgeBreakerParked {
+                    reason: "max unproductive nudges".into(),
+                },
+            )
+            .await;
+
+        let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+        assert_eq!(
+            attempt.status, "failed",
+            "a parked-without-push conflict attempt must be marked failed",
+        );
+        assert_eq!(
+            attempt.failure_reason.as_deref(),
+            Some(CONFLICT_NO_PUSH_REASON),
+            "failure_reason must be the no-push catch-all",
+        );
+
+        let typed = publisher.typed_events.lock().await.clone();
+        assert!(
+            typed.iter().any(|(pid, ev)| {
+                pid == &product_id
+                    && matches!(
+                        ev,
+                        FrontendEvent::ConflictResolutionFailed { attempt_id: aid, failure_reason, .. }
+                            if aid == &attempt_id && failure_reason == CONFLICT_NO_PUSH_REASON
+                    )
+            }),
+            "ConflictResolutionFailed must be published; typed events: {typed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_revision_awaiting_input_leaves_attempt_pending() {
+        // The finalizer must NOT fire while the worker is still being
+        // nudged (AwaitingInput): a worker that resumes and pushes must
+        // never be prematurely failed, and the detector's in-flight dedup
+        // must keep holding so no duplicate conflict revision is minted.
+        // Only the genuine "parked, no push" terminal retires the attempt.
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/966";
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (db, _product_id, _parent_chore_id, _revision_id, execution_id, attempt_id) =
+            conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(db.clone(), detector, cube, publisher.clone(), pane, probes);
+
+        let execution = db.get_execution(&execution_id).unwrap();
+        for outcome in [StopOutcome::AwaitingInput, StopOutcome::DetectorFailed] {
+            handler.finalize_conflict_resolution_attempt(&execution, &outcome).await;
+            let attempt = db.get_conflict_resolution(&attempt_id).unwrap().unwrap();
+            assert_eq!(
+                attempt.status, "pending",
+                "attempt must stay pending for non-parked outcome {outcome:?}",
+            );
+            assert!(attempt.failure_reason.is_none());
+        }
     }
 
     /// Build a CI-remediation revision fixture. The parent chore is
