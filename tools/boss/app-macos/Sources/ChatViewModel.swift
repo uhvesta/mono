@@ -61,7 +61,7 @@ final class ChatViewModel: ObservableObject {
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render
     /// "Blocked by <prereq title>" on gated cards.
-    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:] { didSet { rebuildPrereqCache() } }
+    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:] { didSet { invalidateWorkCache() } }
     /// Attention items keyed by work-item id (product id for external-tracker
     /// items). Populated on product selection and on every workTree refresh.
     @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
@@ -2365,33 +2365,8 @@ final class ChatViewModel: ObservableObject {
     }
 
     func task(withID id: String) -> WorkTask? {
-        for tasks in tasksByProjectID.values {
-            if let task = tasks.first(where: { $0.id == id }) {
-                return task
-            }
-        }
-        for chores in choresByProductID.values {
-            if let chore = chores.first(where: { $0.id == id }) {
-                return chore
-            }
-        }
-        // Chore-parented revisions are not in either bucket above; they live
-        // in the product-level revision bucket (issue #789). Search it so the
-        // revision card's parent lookup and other id resolution find them.
-        for revisions in productLevelRevisionsByProductID.values {
-            if let revision = revisions.first(where: { $0.id == id }) {
-                return revision
-            }
-        }
-        // Product-level investigations (and any other product-level kind) live
-        // here; search it so card selection and detail lookups resolve them
-        // (issue #886).
-        for tasks in productLevelTasksByProductID.values {
-            if let task = tasks.first(where: { $0.id == id }) {
-                return task
-            }
-        }
-        return nil
+        if taskIndexByID == nil { rebuildTaskIndex() }
+        return taskIndexByID?[id]
     }
 
     /// Look up any task or chore by id. Used by the kanban to resolve
@@ -2762,16 +2737,28 @@ final class ChatViewModel: ObservableObject {
     private var cachedItemsByColumn: [WorkBoardColumnKey: [WorkTask]] = [:]
     private var cachedSectionsByColumn: [WorkBoardColumnKey: [WorkBoardSection]] = [:]
     private var cachedAmbiguousRepoNames: Set<String>?
-    // Prereq caches; rebuilt by rebuildPrereqCache() on data changes, read O(1) per card.
-    var gatingPrereqsByTaskID: [String: [WorkDependencyRow]] = [:]
-    var dependencyPrereqsByTaskID: [String: [WorkDependencyRow]] = [:]
+    /// O(1) id → work-item index over every task/chore/revision bucket.
+    /// Built lazily on first lookup after any change (see `rebuildTaskIndex`);
+    /// replaces a linear scan of all four buckets per `task(withID:)` call.
+    /// Invalidated alongside the other caches whenever a published input
+    /// changes (every bucket `didSet` routes through `invalidateWorkCache`).
+    var taskIndexByID: [String: WorkTask]?
+    /// Backing storage for the `dependencyPrereqsByTaskID` / `gatingPrereqsByTaskID`
+    /// accessors (in ChatViewModel+Dependencies). `nil` means "invalidated —
+    /// rebuild on next read". Rebuilt lazily so a burst of engine events during
+    /// startup coalesces into a single rebuild at the next render instead of one
+    /// full graph walk per event.
+    var cachedDependencyPrereqs: [String: [WorkDependencyRow]]?
+    var cachedGatingPrereqs: [String: [WorkDependencyRow]]?
 
     func invalidateWorkCache() {
         cachedVisibleItems = nil
         cachedItemsByColumn.removeAll(keepingCapacity: true)
         cachedSectionsByColumn.removeAll(keepingCapacity: true)
         cachedAmbiguousRepoNames = nil
-        rebuildPrereqCache()
+        taskIndexByID = nil
+        cachedDependencyPrereqs = nil
+        cachedGatingPrereqs = nil
     }
 
     /// Inline drag-refusal banner shown next to the source card when a

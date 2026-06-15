@@ -1,6 +1,45 @@
 import Foundation
 
 extension ChatViewModel {
+    /// All prereqs per task, resolved to display rows. Read O(1) per card;
+    /// rebuilt lazily on first read after invalidation (see `rebuildPrereqCache`).
+    var dependencyPrereqsByTaskID: [String: [WorkDependencyRow]] {
+        if cachedDependencyPrereqs == nil { rebuildPrereqCache() }
+        return cachedDependencyPrereqs ?? [:]
+    }
+
+    /// Unsatisfied (still-gating) prereqs per task. Read O(1) per card.
+    var gatingPrereqsByTaskID: [String: [WorkDependencyRow]] {
+        if cachedGatingPrereqs == nil { rebuildPrereqCache() }
+        return cachedGatingPrereqs ?? [:]
+    }
+
+    /// Build the O(1) id → work-item index from the four task buckets. First
+    /// writer wins, preserving the bucket-search precedence the previous
+    /// linear `task(withID:)` had (ids are unique across buckets, so this only
+    /// matters defensively). Buckets, in order:
+    /// - `tasksByProjectID` / `choresByProductID`: project-laned tasks/chores.
+    /// - `productLevelRevisionsByProductID`: chore-parented revisions, which
+    ///   live in neither bucket above (issue #789).
+    /// - `productLevelTasksByProductID`: product-level investigations and any
+    ///   other product-level kind (issue #886).
+    func rebuildTaskIndex() {
+        var index: [String: WorkTask] = [:]
+        for tasks in tasksByProjectID.values {
+            for task in tasks where index[task.id] == nil { index[task.id] = task }
+        }
+        for chores in choresByProductID.values {
+            for chore in chores where index[chore.id] == nil { index[chore.id] = chore }
+        }
+        for revisions in productLevelRevisionsByProductID.values {
+            for revision in revisions where index[revision.id] == nil { index[revision.id] = revision }
+        }
+        for tasks in productLevelTasksByProductID.values {
+            for task in tasks where index[task.id] == nil { index[task.id] = task }
+        }
+        taskIndexByID = index
+    }
+
     /// Resolve the human-readable label for the rows currently gating
     /// `task` — i.e. its incomplete `blocks` prerequisites. Used by
     /// the kanban card to show "Blocked by <prereq title>" under the
@@ -192,11 +231,27 @@ extension ChatViewModel {
             for (taskID, taskEdges) in byDependent {
                 let rows = taskEdges.map { workDependencyRow(forID: $0.prerequisiteID) }
                 prereqs[taskID] = rows
-                gating[taskID] = rows.filter { !isWorkItemSatisfied($0.id) }
+                // Filter on the status already resolved into each row rather
+                // than calling isWorkItemSatisfied(_:), which would look the
+                // same id up a second time — halving the lookups per edge.
+                gating[taskID] = rows.filter { !isWorkItemRowSatisfied($0) }
             }
         }
-        dependencyPrereqsByTaskID = prereqs
-        gatingPrereqsByTaskID = gating
+        cachedDependencyPrereqs = prereqs
+        cachedGatingPrereqs = gating
+    }
+
+    /// Row-status equivalent of `isWorkItemSatisfied(_:)`: a task/chore is
+    /// satisfied at `done`; a project at `done` or `archived`. An unresolved
+    /// prereq (kind `.unknown`, status `"unknown"`) is treated as unsatisfied,
+    /// matching the id-based helper's nil-lookup behaviour.
+    private func isWorkItemRowSatisfied(_ row: WorkDependencyRow) -> Bool {
+        switch row.kind {
+        case .project:
+            return row.status == "done" || row.status == "archived"
+        case .task, .chore, .unknown:
+            return row.status == "done"
+        }
     }
 
     private func workDependencyRow(forID id: String) -> WorkDependencyRow {
