@@ -52,6 +52,7 @@ rust_library(
         "src/conflict_watch.rs",
         "src/coordinator.rs",
         "src/cube_commands.rs",
+        "src/cube_lease_heartbeat.rs",
         "src/database_backup.rs",
         "src/dead_pid_sweep.rs",
         "src/dep_unblock_sweep.rs",

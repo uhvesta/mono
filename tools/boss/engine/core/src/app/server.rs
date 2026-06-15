@@ -463,6 +463,28 @@ pub async fn serve(
     };
     let skip_dispatch_ids: HashSet<String> = probe_report.skip_dispatch_ids().map(|s| s.to_owned()).collect();
 
+    // Re-adopt still-live leases across the restart. The periodic
+    // heartbeat sweep keys off the in-memory live-worker registry, which
+    // is empty until each worker re-sends its first post-restart hook;
+    // until then a long-running worker's lease could lapse. For every run
+    // the cube probe just classified `Live` (lease still bound to our id
+    // and not expired), push the expiry forward now so the worker is safe
+    // through that gap. Best-effort; never blocks startup.
+    if !in_flight.is_empty() {
+        let readopted = crate::cube_lease_heartbeat::reheartbeat_live_runs(
+            server_state.cube_client.as_ref(),
+            &in_flight,
+            &probe_report,
+        )
+        .await;
+        if readopted > 0 {
+            tracing::info!(
+                readopted,
+                "engine startup: re-heartbeated still-live cube leases to survive the restart gap",
+            );
+        }
+    }
+
     // Reap orphans before reconcile dispatch fires. For every Dead
     // verdict the cube probe returned, mark the execution row
     // `orphaned` (terminal) so the subsequent `reconcile_active_dispatch`
@@ -580,6 +602,26 @@ pub async fn serve(
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         Duration::from_secs(60),
+    );
+
+    // Periodic cube-lease heartbeat: refreshes the TTL on every live
+    // worker's cube workspace lease so a worker that runs longer than the
+    // lease TTL (~30 min) never has its workspace TTL-reclaimed out from
+    // under it. Before this, the engine never heartbeated anything, so any
+    // long-running worker had its lease expire mid-run — cube flipped the
+    // workspace to `free` while a live worker kept editing it, cube and the
+    // engine desynced, and the pool collapsed with "phantom-free"
+    // workspaces. Keys off the live-worker registry + a PID liveness probe
+    // (mirrors the dead-PID sweep): a dead worker is left alone so its lease
+    // expires and cube frees the workspace within ~TTL. Cadence is
+    // deliberately well under the TTL (default 300 s, overridable via
+    // BOSS_CUBE_LEASE_HEARTBEAT_INTERVAL_SECS). See `crate::cube_lease_heartbeat`.
+    let _cube_lease_heartbeat_handle = crate::cube_lease_heartbeat::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.live_worker_states.clone(),
+        server_state.cube_client.clone(),
+        server_state.dispatch_events.clone(),
+        crate::cube_lease_heartbeat::heartbeat_interval(),
     );
 
     // Periodic pool-claim reconciler: detects worker-pool slots still

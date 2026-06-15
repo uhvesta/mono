@@ -148,12 +148,28 @@ const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 ///
 /// Background: cube treats any lease whose `lease_expires_at_epoch_s`
 /// has passed as eligible for reclamation. Without periodic
-/// heartbeats from the engine, every worker that runs longer than
-/// the TTL is silently susceptible to having its workspace's `@`
-/// reset by the next lease call. The investigation chore for
-/// `mono-agent-001` (2026-05-12) traced Worf's "`@` got re-pointed
-/// mid-flight" symptom to exactly this — the engine never called
-/// `heartbeat_lease`, despite both cube and the trait defining it.
+/// heartbeats, every worker that ran longer than the TTL was silently
+/// susceptible to having its workspace's `@` reset by the next lease
+/// call. The investigation chore for `mono-agent-001` (2026-05-12)
+/// traced Worf's "`@` got re-pointed mid-flight" symptom to exactly
+/// this.
+///
+/// ## Coverage split with `cube_lease_heartbeat`
+///
+/// This guard covers in-process / blocking runners: for any
+/// `spawn_worker` implementation that blocks until the run completes
+/// (test fakes, ACP-style runners), the guard is alive throughout the
+/// run and fires at [`LEASE_HEARTBEAT_INTERVAL`].
+///
+/// For the production *pane-spawn* path, `spawn_worker` returns as soon
+/// as the pane is handed off, and `run_execution` drops this guard
+/// immediately afterwards — meaning the guard almost never fires a
+/// single beat for a pane worker. That was the accurate root cause of
+/// the recurrence: the guard existed but was dropped before it could
+/// cover the pane worker's lifetime. The complementary fix is the
+/// engine-wide periodic sweep in `crate::cube_lease_heartbeat`, which
+/// covers pane workers via the live-worker registry and a DB-fallback
+/// path for the post-restart gap.
 struct HeartbeatGuard {
     handle: tokio::task::JoinHandle<()>,
 }
@@ -3140,18 +3156,12 @@ impl ExecutionCoordinator {
         change: Option<CubeChangeHandle>,
         adapter: Arc<dyn HostAdapter>,
     ) {
-        // Keep the cube lease alive for the lifetime of the run. Without
-        // this, the lease ages past `DEFAULT_LEASE_TTL_SECS` (30 min) in
-        // the middle of any long-running worker, and the next
-        // `cube workspace lease` call from another execution silently
-        // reclaims the slot, runs `jj new <main>` against the workspace,
-        // and moves the still-active worker's `@`. That's the
-        // 2026-05-12 incident Worf reported on `mono-agent-001`.
-        //
-        // The heartbeat task is scoped to this function: it's aborted
-        // on the JoinHandle drop at the end, so it can't outlive the
-        // run and accidentally extend a lease the engine has already
-        // released downstream.
+        // Keep the cube lease alive for blocking runners (in-process test
+        // fakes, ACP-style runners). For pane-spawn (the production path),
+        // spawn_worker returns immediately and this guard is dropped below
+        // without ever firing — pane workers are covered instead by the
+        // engine-wide periodic sweep in `crate::cube_lease_heartbeat`.
+        // See the HeartbeatGuard doc comment for the full coverage split.
         let heartbeat = HeartbeatGuard::spawn(
             Arc::clone(&adapter),
             lease.lease_id.clone(),

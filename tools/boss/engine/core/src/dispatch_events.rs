@@ -215,6 +215,15 @@ pub enum Stage {
     /// so a slot recycled to a different execution between snapshot and reap
     /// is a no-op — an active worker is never reaped.
     TerminalWorkReconcile,
+    /// The periodic cube-lease heartbeat sweep tried to refresh the TTL on a
+    /// live worker's cube workspace lease and the `cube workspace heartbeat`
+    /// call failed (e.g. the lease was reclaimed out from under us, or cube
+    /// errored). Emitted ONLY on failure — routine successful heartbeats are
+    /// logged, not evented, because every live worker is refreshed every
+    /// interval and per-success events would bloat the stream. A run of these
+    /// for one lease means cube and the engine have desynced for that
+    /// workspace; see `crate::cube_lease_heartbeat`.
+    CubeLeaseHeartbeat,
 }
 
 impl Stage {
@@ -242,6 +251,7 @@ impl Stage {
             Stage::StaleWorkerReconcile => "stale_worker_reconcile",
             Stage::PoolClaimReconcile => "pool_claim_reconcile",
             Stage::TerminalWorkReconcile => "terminal_work_reconcile",
+            Stage::CubeLeaseHeartbeat => "cube_lease_heartbeat",
         }
     }
 }
@@ -738,6 +748,7 @@ mod tests {
         assert_eq!(Stage::StaleWorkerReconcile.as_str(), "stale_worker_reconcile");
         assert_eq!(Stage::PoolClaimReconcile.as_str(), "pool_claim_reconcile");
         assert_eq!(Stage::TerminalWorkReconcile.as_str(), "terminal_work_reconcile");
+        assert_eq!(Stage::CubeLeaseHeartbeat.as_str(), "cube_lease_heartbeat");
     }
 
     /// `Outcome::as_str` strings are the on-disk outcome identifiers;
