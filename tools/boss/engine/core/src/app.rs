@@ -530,6 +530,12 @@ struct ServerState {
     /// boot, mutated by `SetFeatureFlag` RPC, consulted by callers
     /// via `is_enabled(...)`. See `crate::feature_flags`.
     feature_flags: Arc<crate::feature_flags::FeatureFlagsStore>,
+    /// Registry of capability IDs present in the current running
+    /// build. Populated by `RegisterCapabilities` RPC when the macOS
+    /// app connects, and by engine-side startup for engine-built
+    /// features. Consulted by `snapshot_all` to populate
+    /// `capability_present` on every `FeatureFlagSnapshot`.
+    capability_registry: Arc<crate::feature_flags::CapabilityRegistry>,
     /// Per-installation settings (e.g. default_pr_draft_mode). Loaded
     /// from `~/Library/Application Support/Boss/settings.toml` at boot,
     /// mutated by `SetSetting` RPC, consulted by the spawn flow to
@@ -1046,6 +1052,7 @@ impl ServerState {
                 ipc_logger,
                 _self_weak: weak_self.clone(),
                 feature_flags: feature_flags_for_state,
+                capability_registry: Arc::new(crate::feature_flags::CapabilityRegistry::new()),
                 settings: settings_for_state,
                 metrics: metrics_for_state,
                 pr_reconciler_kick: pr_reconciler_kick_for_state,
@@ -2422,6 +2429,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RecordEffortEscalation { .. } => effort::handle_record_effort_escalation(ctx, r).await,
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
             r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
+            r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,
             r @ FrontendRequest::ReleaseReviewTerminal { .. } => review::handle_release_review_terminal(ctx, r).await,
             r @ FrontendRequest::RemoveDependency { .. } => dependencies::handle_remove_dependency(ctx, r).await,
             r @ FrontendRequest::RemoveHost { .. } => hosts::handle_remove_host(ctx, r).await,

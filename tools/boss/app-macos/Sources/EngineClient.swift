@@ -515,6 +515,17 @@ final class EngineClient: @unchecked Sendable {
         ])
     }
 
+    /// Report the capability IDs compiled into this build to the
+    /// engine. Called once per session after `RegisterAppSession` is
+    /// acknowledged. The engine replies with `feature_flags_list` so
+    /// the flag pane immediately reflects `capability_present`.
+    func sendRegisterCapabilities(capabilityIds: [String]) {
+        sendLine([
+            "type": "register_capabilities",
+            "capability_ids": capabilityIds,
+        ])
+    }
+
     func sendSubscribe(topics: [String]) {
         sendLine([
             "type": "subscribe",
@@ -2282,12 +2293,14 @@ final class EngineClient: @unchecked Sendable {
         else {
             return nil
         }
+        let capabilityPresent = (payload["capability_present"] as? NSNumber)?.boolValue
         return FeatureFlag(
             name: name,
             description: description,
             category: category,
             defaultEnabled: defaultEnabled,
-            enabled: enabled
+            enabled: enabled,
+            capabilityPresent: capabilityPresent
         )
     }
 

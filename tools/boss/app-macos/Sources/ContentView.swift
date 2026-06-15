@@ -204,6 +204,9 @@ struct ContentView: View {
             model.reviewTerminalOpener = { [openWindow] in
                 openWindow(id: "review-terminal")
             }
+            // Register capabilities compiled into this build so the engine can
+            // detect flag ↔ capability mismatches and surface a warning badge.
+            CapabilityRegistry.shared.register("toolbar_search_standard")
             model.startIfNeeded()
         }
         .toolbar {

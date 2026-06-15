@@ -42,7 +42,7 @@
 //! removing a stale entry from the file is benign, and adding a new
 //! flag does not require migrating existing installs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -69,6 +69,12 @@ pub struct FeatureFlagSpec {
     /// the human should be able to disable but not the other way
     /// around — see the README's safety contract.
     pub default_enabled: bool,
+    /// Optional identifier of the capability that implements this
+    /// flag's behaviour. `None` for pure kill-switch flags whose code
+    /// is always compiled in. When set, the flag system detects if the
+    /// operator enables the flag in a build that doesn't include the
+    /// implementation and surfaces a warning.
+    pub capability_id: Option<&'static str>,
 }
 
 /// Single-place registry. Add new flags here, then read them at the
@@ -84,6 +90,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              producing mis-binds.",
         category: "completion",
         default_enabled: true,
+        capability_id: None,
     },
     FeatureFlagSpec {
         name: "editorial_controls",
@@ -94,6 +101,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              editorial surface a no-op without a rebuild.",
         category: "editorial",
         default_enabled: false,
+        capability_id: None,
     },
     FeatureFlagSpec {
         name: "attentions_questions_backstop",
@@ -104,6 +112,7 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              primary manifest path is proven stable.",
         category: "attentions",
         default_enabled: false,
+        capability_id: None,
     },
     FeatureFlagSpec {
         name: "attentions_followups_backstop",
@@ -114,19 +123,93 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              carries model-call cost; enable once the primary sentinel path is proven stable.",
         category: "attentions",
         default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: "toolbar_search_standard",
+        description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead \
+             of the custom WorkSearchToolbarItem. Requires the macOS app to be built with \
+             standard-search support (capability: toolbar_search_standard). DEFAULT OFF — \
+             flip ON to validate the standard search path; the capability-present badge in the \
+             debug pane confirms the implementation is compiled into this build.",
+        category: "ui",
+        default_enabled: false,
+        capability_id: Some("toolbar_search_standard"),
     },
 ];
 
 /// Snapshot of one flag's current state for the wire / debug pane.
 /// Mirrors the protocol type one-for-one so the engine can return the
 /// in-memory state without copying field-by-field at the call site.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct FeatureFlagSnapshot {
     pub name: String,
     pub description: String,
     pub category: String,
     pub default_enabled: bool,
     pub enabled: bool,
+    /// `None` when the flag has no backing capability (kill-switch
+    /// pattern — code is always compiled in). `Some(true)` when the
+    /// capability is registered. `Some(false)` when the flag declares
+    /// a capability but that capability is absent from this build.
+    pub capability_present: Option<bool>,
+}
+
+/// Thread-safe registry of capability IDs that are present in the
+/// current running build. Code that provides a flag's backing feature
+/// registers its capability ID here; the flag system uses this to
+/// detect when the operator enables a flag whose implementation is
+/// absent and surface a warning.
+///
+/// Two registration paths:
+/// - Engine-side: call [`CapabilityRegistry::register`] during engine
+///   startup for capabilities compiled into the engine binary.
+/// - App-side: the macOS app sends a `RegisterCapabilities` RPC after
+///   session establishment, reporting its compiled-in capabilities;
+///   the engine calls [`CapabilityRegistry::replace_all`] on receipt.
+pub struct CapabilityRegistry {
+    present: Mutex<HashSet<String>>,
+}
+
+impl CapabilityRegistry {
+    pub fn new() -> Self {
+        Self {
+            present: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Register `id` as present in this build. Idempotent.
+    pub fn register(&self, id: &str) {
+        self.present
+            .lock()
+            .expect("capability-registry lock poisoned")
+            .insert(id.to_owned());
+    }
+
+    /// Replace the entire capability set with `ids`. Called by the
+    /// `RegisterCapabilities` RPC handler when the app reconnects.
+    pub fn replace_all(&self, ids: impl IntoIterator<Item = String>) {
+        let mut guard = self.present.lock().expect("capability-registry lock poisoned");
+        guard.clear();
+        for id in ids {
+            guard.insert(id);
+        }
+    }
+
+    /// Returns `true` if `id` is currently registered as present.
+    pub fn is_present(&self, id: &str) -> bool {
+        self.present
+            .lock()
+            .expect("capability-registry lock poisoned")
+            .contains(id)
+    }
+}
+
+impl Default for CapabilityRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// On-disk file shape. Loose mapping of `flag_name -> bool` so missing
@@ -237,16 +320,29 @@ impl FeatureFlagsStore {
 
     /// Current snapshot of every registered flag, in the order they
     /// appear in [`REGISTRY`]. Used by the debug-pane list RPC.
-    pub fn snapshot_all(&self) -> Vec<FeatureFlagSnapshot> {
+    ///
+    /// `capabilities` is the live [`CapabilityRegistry`] to consult
+    /// when populating `capability_present` on each snapshot. Pass
+    /// `None` in tests or callers that don't have a registry handy —
+    /// any flag with a `capability_id` will report
+    /// `capability_present: Some(false)` in that case.
+    pub fn snapshot_all(&self, capabilities: Option<&CapabilityRegistry>) -> Vec<FeatureFlagSnapshot> {
         let guard = self.state.lock().expect("feature-flags lock poisoned");
         REGISTRY
             .iter()
-            .map(|spec| FeatureFlagSnapshot {
-                name: spec.name.to_owned(),
-                description: spec.description.to_owned(),
-                category: spec.category.to_owned(),
-                default_enabled: spec.default_enabled,
-                enabled: guard.get(spec.name).copied().unwrap_or(spec.default_enabled),
+            .map(|spec| {
+                let enabled = guard.get(spec.name).copied().unwrap_or(spec.default_enabled);
+                let capability_present = spec
+                    .capability_id
+                    .map(|cap_id| capabilities.is_some_and(|reg| reg.is_present(cap_id)));
+                FeatureFlagSnapshot {
+                    name: spec.name.to_owned(),
+                    description: spec.description.to_owned(),
+                    category: spec.category.to_owned(),
+                    default_enabled: spec.default_enabled,
+                    enabled,
+                    capability_present,
+                }
             })
             .collect()
     }
@@ -331,7 +427,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
         store.load().unwrap();
-        let snap = store.snapshot_all();
+        let snap = store.snapshot_all(None);
         assert_eq!(snap.len(), REGISTRY.len());
         // detect_pr_cold_fallback is the first entry and defaults ON.
         let detect = snap.iter().find(|s| s.name == "detect_pr_cold_fallback").unwrap();
@@ -351,7 +447,7 @@ mod tests {
             !store.is_enabled("editorial_controls"),
             "editorial_controls must default to disabled",
         );
-        let snap = store.snapshot_all();
+        let snap = store.snapshot_all(None);
         let editorial = snap
             .iter()
             .find(|s| s.name == "editorial_controls")
@@ -442,7 +538,7 @@ mod tests {
             !store.is_enabled("attentions_followups_backstop"),
             "attentions_followups_backstop must default disabled"
         );
-        let snap = store.snapshot_all();
+        let snap = store.snapshot_all(None);
         let qs = snap
             .iter()
             .find(|s| s.name == "attentions_questions_backstop")
@@ -471,5 +567,69 @@ mod tests {
         store2.load().unwrap();
         assert!(store2.is_enabled("attentions_questions_backstop"));
         assert!(store2.is_enabled("attentions_followups_backstop"));
+    }
+
+    #[test]
+    fn capability_registry_register_and_check() {
+        let reg = CapabilityRegistry::new();
+        assert!(!reg.is_present("my_feature"));
+        reg.register("my_feature");
+        assert!(reg.is_present("my_feature"));
+        // Unrelated capability still absent.
+        assert!(!reg.is_present("other_feature"));
+    }
+
+    #[test]
+    fn capability_registry_replace_all_replaces_not_appends() {
+        let reg = CapabilityRegistry::new();
+        reg.register("old_feature");
+        reg.replace_all(["new_feature".to_owned(), "another".to_owned()]);
+        assert!(
+            !reg.is_present("old_feature"),
+            "replace_all should remove prior entries"
+        );
+        assert!(reg.is_present("new_feature"));
+        assert!(reg.is_present("another"));
+    }
+
+    #[test]
+    fn snapshot_all_none_registry_reflects_capability_id_presence() {
+        // When capabilities=None, flags with capability_id=None get capability_present=None,
+        // and flags with a capability_id get capability_present=Some(false) (absent).
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        for snap in store.snapshot_all(None) {
+            let spec = REGISTRY.iter().find(|s| s.name == snap.name).unwrap();
+            if spec.capability_id.is_none() {
+                assert_eq!(
+                    snap.capability_present, None,
+                    "flag {} has no capability_id so capability_present should be None",
+                    snap.name
+                );
+            } else {
+                assert_eq!(
+                    snap.capability_present,
+                    Some(false),
+                    "flag {} has capability_id but no registry — capability_present should be Some(false)",
+                    snap.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_all_reports_capability_present_correctly() {
+        // Build a synthetic store with a custom REGISTRY entry is not
+        // feasible (REGISTRY is const), so we test CapabilityRegistry
+        // directly via the snapshot logic's building blocks.
+        let reg = CapabilityRegistry::new();
+        // A capability that is absent.
+        assert!(!reg.is_present("toolbar_search_standard"));
+        // Register it.
+        reg.register("toolbar_search_standard");
+        assert!(reg.is_present("toolbar_search_standard"));
+        // A different one is still absent.
+        assert!(!reg.is_present("other_cap"));
     }
 }

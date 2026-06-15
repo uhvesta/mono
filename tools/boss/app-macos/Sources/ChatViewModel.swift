@@ -534,6 +534,7 @@ final class ChatViewModel: ObservableObject {
         engine.sendSetSetting(key: key, enabled: enabled)
     }
 
+
     var selectedProduct: WorkProduct? {
         guard let productID = currentSelectedProductID else { return nil }
         return product(withID: productID)
@@ -1785,6 +1786,7 @@ final class ChatViewModel: ObservableObject {
         case .appSessionRegistered:
             isAppSessionRegistered = true
             maybeRegisterBossSession()
+            engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
         case .bossSessionRegistered:
             break
         case .engineRequest(let requestId, let request):
@@ -2023,7 +2025,8 @@ final class ChatViewModel: ObservableObject {
                     description: prior.description,
                     category: prior.category,
                     defaultEnabled: prior.defaultEnabled,
-                    enabled: enabled
+                    enabled: enabled,
+                    capabilityPresent: prior.capabilityPresent
                 )
             }
         case .engineHealthResult(let apiKeyPresent, let issues):

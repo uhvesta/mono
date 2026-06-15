@@ -217,6 +217,18 @@ private struct FeatureFlagRow: View {
                             )
                             .foregroundStyle(Color.accentColor)
                     }
+                    if flag.enabled, flag.capabilityPresent == false {
+                        Text("capability absent")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                    .fill(Color.orange.opacity(0.2))
+                            )
+                            .foregroundStyle(Color.orange)
+                            .help("This flag is ON but its backing implementation is not compiled into this build — the flag will have no effect.")
+                    }
                 }
                 Text(flag.description)
                     .font(.callout)

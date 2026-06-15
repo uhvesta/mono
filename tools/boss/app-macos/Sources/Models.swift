@@ -2185,6 +2185,10 @@ struct FeatureFlag: Identifiable, Hashable {
     let category: String
     let defaultEnabled: Bool
     let enabled: Bool
+    /// `nil` when the flag has no backing capability requirement.
+    /// `false` when the flag is enabled but its capability is absent
+    /// from this build — the debug pane shows a warning badge.
+    let capabilityPresent: Bool?
 }
 
 /// Snapshot of one engine metric (counter or gauge), decoded from a

@@ -351,6 +351,7 @@ name = "boss-feature-flags"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
  "serde",
  "tempfile",
  "toml",

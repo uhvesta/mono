@@ -41,7 +41,8 @@ extension ChatViewModel {
                 description: prior.description,
                 category: prior.category,
                 defaultEnabled: prior.defaultEnabled,
-                enabled: enabled
+                enabled: enabled,
+                capabilityPresent: prior.capabilityPresent
             )
         }
         engine.sendSetFeatureFlag(name: name, enabled: enabled)

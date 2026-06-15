@@ -142,18 +142,7 @@ pub(super) async fn handle_list_feature_flags(ctx: Dispatch, req: FrontendReques
         unreachable!()
     };
     {
-        let flags = server_state
-            .feature_flags
-            .snapshot_all()
-            .into_iter()
-            .map(|snap| boss_protocol::FeatureFlagSnapshot {
-                name: snap.name,
-                description: snap.description,
-                category: snap.category,
-                default_enabled: snap.default_enabled,
-                enabled: snap.enabled,
-            })
-            .collect();
+        let flags = feature_flags_snapshot_to_wire(&server_state);
         send_response(&sink, &request_id, FrontendEvent::FeatureFlagsList { flags });
     }
 }
@@ -171,6 +160,22 @@ pub(super) async fn handle_set_feature_flag(ctx: Dispatch, req: FrontendRequest)
     {
         match server_state.feature_flags.set(&name, enabled) {
             Ok(()) => {
+                // Warn the operator when a flag is enabled but its
+                // backing capability is absent from this build.
+                if enabled {
+                    if let Some(spec) = crate::feature_flags::REGISTRY.iter().find(|s| s.name == name) {
+                        if let Some(cap_id) = spec.capability_id {
+                            if !server_state.capability_registry.is_present(cap_id) {
+                                tracing::warn!(
+                                    flag = %name,
+                                    capability = %cap_id,
+                                    "feature-flags: flag enabled but its backing capability \
+                                     is absent from this build — the flag will have no effect",
+                                );
+                            }
+                        }
+                    }
+                }
                 tracing::info!(
                     flag = %name,
                     enabled,
@@ -187,6 +192,43 @@ pub(super) async fn handle_set_feature_flag(ctx: Dispatch, req: FrontendRequest)
             ),
         }
     }
+}
+
+/// Update the engine's capability registry with the IDs reported by the
+/// macOS app and reply with the updated flag list so the debug pane
+/// reflects accurate `capability_present` values immediately.
+pub(super) async fn handle_register_capabilities(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::RegisterCapabilities { capability_ids } = req else {
+        unreachable!()
+    };
+    server_state.capability_registry.replace_all(capability_ids.into_iter());
+    let flags = feature_flags_snapshot_to_wire(&server_state);
+    send_response(&sink, &request_id, FrontendEvent::FeatureFlagsList { flags });
+}
+
+/// Build the wire-protocol flag list from the live store + capability
+/// registry. Extracted so both `ListFeatureFlags` and
+/// `RegisterCapabilities` share the same mapping code.
+fn feature_flags_snapshot_to_wire(server_state: &ServerState) -> Vec<boss_protocol::FeatureFlagSnapshot> {
+    server_state
+        .feature_flags
+        .snapshot_all(Some(&server_state.capability_registry))
+        .into_iter()
+        .map(|snap| boss_protocol::FeatureFlagSnapshot {
+            name: snap.name,
+            description: snap.description,
+            category: snap.category,
+            default_enabled: snap.default_enabled,
+            enabled: snap.enabled,
+            capability_present: snap.capability_present,
+        })
+        .collect()
 }
 
 pub(super) async fn handle_get_settings(ctx: Dispatch, req: FrontendRequest) {

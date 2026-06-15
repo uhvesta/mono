@@ -6,6 +6,7 @@ workspace = "../../../.."
 
 [dependencies]
 anyhow = { workspace = true }
+bon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 

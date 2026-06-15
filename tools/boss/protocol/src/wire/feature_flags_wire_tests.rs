@@ -44,6 +44,7 @@ fn feature_flags_list_event_round_trips() {
         category: "completion".into(),
         default_enabled: true,
         enabled: false,
+        capability_present: None,
     };
     let original = FrontendEvent::FeatureFlagsList {
         flags: vec![snap.clone()],
@@ -54,6 +55,48 @@ fn feature_flags_list_event_round_trips() {
     match parsed {
         FrontendEvent::FeatureFlagsList { flags } => {
             assert_eq!(flags, vec![snap]);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+}
+
+#[test]
+fn feature_flags_list_event_round_trips_with_capability_present() {
+    let snap = FeatureFlagSnapshot {
+        name: "toolbar_search_standard".into(),
+        description: "Standard SwiftUI search in toolbar".into(),
+        category: "search".into(),
+        default_enabled: false,
+        enabled: true,
+        capability_present: Some(false),
+    };
+    let json = serde_json::to_string(&snap).unwrap();
+    assert!(json.contains("capability_present"));
+    let parsed: FeatureFlagSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.capability_present, Some(false));
+}
+
+#[test]
+fn feature_flag_snapshot_capability_present_defaults_to_none_on_old_payload() {
+    // Payloads from older engine builds omit capability_present.
+    // The #[serde(default)] annotation must round-trip them as None.
+    let json = r#"{"name":"detect_pr_cold_fallback","description":"d","category":"completion","default_enabled":true,"enabled":true}"#;
+    let parsed: FeatureFlagSnapshot = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.capability_present, None);
+}
+
+#[test]
+fn register_capabilities_request_round_trips() {
+    let original = FrontendRequest::RegisterCapabilities {
+        capability_ids: vec!["toolbar_search_standard".into(), "other_cap".into()],
+    };
+    let json = serde_json::to_string(&original).unwrap();
+    assert!(json.contains("register_capabilities"));
+    assert!(json.contains("toolbar_search_standard"));
+    let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
+    match parsed {
+        FrontendRequest::RegisterCapabilities { capability_ids } => {
+            assert_eq!(capability_ids, &["toolbar_search_standard", "other_cap"]);
         }
         other => panic!("unexpected variant: {other:?}"),
     }
