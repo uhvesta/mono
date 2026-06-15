@@ -1174,16 +1174,26 @@ def main():
 
     findings = (proc.stdout or "").strip()
     extra = (proc.stderr or "").strip()
-    detail = findings if findings else extra
-    reason = (
-        "Push blocked: checkleft found errors that must be fixed before "
-        "pushing to GitHub.\n\n"
-        + detail
-        + "\n\nFix the findings above and retry the push. If a finding is a "
-        "genuine false positive, add a `BYPASS_<CHECK_NAME>=<reason>` line to "
-        "your commit message (jj describe) or the PR description, then retry. "
-        "Do not bypass without a real justification."
-    )
+    # Empty stdout with non-empty stderr means checkleft crashed before
+    # producing any findings -- this is an internal/parser error, not a
+    # policy violation. Use a clearly distinct message so users don't try
+    # to fix policy or reach for BYPASS unnecessarily.
+    if not findings:
+        reason = (
+            "Push blocked: checkleft internal error — parser crashed; this is "
+            "a bug, not a policy violation. Please report it.\n\n"
+            + extra
+        )
+    else:
+        reason = (
+            "Push blocked: checkleft found errors that must be fixed before "
+            "pushing to GitHub.\n\n"
+            + findings
+            + "\n\nFix the findings above and retry the push. If a finding is a "
+            "genuine false positive, add a `BYPASS_<CHECK_NAME>=<reason>` line to "
+            "your commit message (jj describe) or the PR description, then retry. "
+            "Do not bypass without a real justification."
+        )
     emit("block", reason)
 
 

@@ -2370,9 +2370,19 @@ fn run_checkleft_gate_impl(cwd: &Path, checkleft: Option<PathBuf>) -> Result<()>
     let findings = String::from_utf8_lossy(&output.stdout);
     let findings = findings.trim();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = if findings.is_empty() { stderr.trim() } else { findings };
+    let stderr = stderr.trim();
+    // Empty stdout with non-empty stderr means checkleft crashed before it
+    // could produce any findings — this is an internal/parser error, not a
+    // policy violation. Use a clearly distinct message so users don't try to
+    // fix policy or reach for BYPASS unnecessarily.
+    if findings.is_empty() {
+        return Err(CubeError::InvalidArgument(format!(
+            "checkleft internal error — parser crashed; this is a bug, not a policy \
+             violation. Please report it.\n\n{stderr}"
+        )));
+    }
     Err(CubeError::InvalidArgument(format!(
-        "checkleft found errors that must be fixed before pushing to GitHub:\n\n{detail}\n\n\
+        "checkleft found errors that must be fixed before pushing to GitHub:\n\n{findings}\n\n\
          Fix the findings above and retry. If a finding is a genuine false positive, add a \
          `BYPASS_<CHECK_NAME>=<reason>` line to your commit message or the PR description \
          (the PR description wins), then retry."
@@ -5204,6 +5214,22 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
     }
 
+    /// Write an executable fake `checkleft` into `<root>/bin/checkleft` that
+    /// produces nothing on stdout and `stderr_msg` on stderr, then exits with
+    /// `exit_code`. Models a parser/internal crash where checkleft emits an
+    /// error to stderr without printing any findings to stdout.
+    fn write_fake_checkleft_stderr_only(root: &std::path::Path, exit_code: i32, stderr_msg: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = bin.join("checkleft");
+        let script = format!("#!/bin/sh\necho '{stderr_msg}' >&2\nexit {exit_code}\n");
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+    }
+
     /// Write an executable fake `checkleft` directly inside `dir` (not in a `bin/`
     /// subdirectory) so it can be placed on PATH without being the `bin/checkleft`
     /// repobin-artifact path.
@@ -5339,6 +5365,32 @@ mod tests {
         assert!(
             msg.contains("error[rustfmt]"),
             "refusal must echo the PATH-checkleft findings: {msg}",
+        );
+    }
+
+    #[test]
+    fn checkleft_gate_reports_internal_error_when_only_stderr() {
+        // When checkleft exits non-zero with nothing on stdout but an error on
+        // stderr (a parser/internal crash), the gate must use the "internal
+        // error" message rather than "found errors that must be fixed". This
+        // prevents users from thinking they have policy violations to fix.
+        let dir = TempDir::new().unwrap();
+        write_fake_checkleft_stderr_only(dir.path(), 1, "error: unsupported jj diff summary line: X some/file.rs");
+        let err = run_checkleft_gate(dir.path()).expect_err("gate must block when checkleft exits non-zero");
+        let CubeError::InvalidArgument(msg) = err else {
+            panic!("expected InvalidArgument, got {err:?}");
+        };
+        assert!(
+            msg.contains("internal error"),
+            "message must say 'internal error', not 'errors that must be fixed': {msg}",
+        );
+        assert!(
+            !msg.contains("BYPASS_"),
+            "internal error message must NOT include bypass guidance: {msg}",
+        );
+        assert!(
+            msg.contains("unsupported jj diff summary line"),
+            "message must include the stderr detail: {msg}",
         );
     }
 

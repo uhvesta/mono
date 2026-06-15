@@ -1632,6 +1632,19 @@ fn write_fake_checkleft(dir: &Path, name: &str, exit_code: i32, stdout: &str) ->
     path
 }
 
+/// Write a fake checkleft that emits `stderr_msg` on stderr only (empty
+/// stdout) and exits with `exit_code`. Models a parser/internal crash.
+fn write_fake_checkleft_stderr_only(dir: &Path, name: &str, exit_code: i32, stderr_msg: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let script = format!("#!/bin/sh\necho '{stderr_msg}' >&2\nexit {exit_code}\n");
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
 /// Run the checkleft push guard against a simulated Bash command and
 /// return the decision JSON. `checkleft_bin` is passed via
 /// `BOSS_CHECKLEFT_BIN` (a nonexistent path simulates "no checkleft").
@@ -1746,6 +1759,40 @@ fn push_guard_approves_when_no_checkleft_binary() {
     assert_eq!(
         decision["decision"], "approve",
         "a repo without a checkleft binary must allow the push (fail open): {decision}",
+    );
+}
+
+#[test]
+fn push_guard_reports_internal_error_when_only_stderr() {
+    // When checkleft exits non-zero with nothing on stdout but an error on
+    // stderr (e.g. a parser crash on an unknown VCS status code), the guard
+    // must use the "internal error" message rather than "errors that must be
+    // fixed". This prevents workers from thinking they have policy violations
+    // to fix or from reaching for BYPASS_ directives unnecessarily.
+    let dir = TempDir::new().unwrap();
+    let checkleft = write_fake_checkleft_stderr_only(
+        dir.path(),
+        "checkleft",
+        1,
+        "error: unsupported jj diff summary line: X some/file.rs",
+    );
+    let decision = run_push_guard("jj git push -b boss/foo --allow-new", dir.path(), &checkleft);
+    assert_eq!(
+        decision["decision"], "block",
+        "a crashing checkleft must still block the push: {decision}",
+    );
+    let reason = decision["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("internal error"),
+        "block reason must say 'internal error', not 'errors that must be fixed': {reason}",
+    );
+    assert!(
+        !reason.contains("BYPASS_"),
+        "internal error message must NOT include bypass guidance: {reason}",
+    );
+    assert!(
+        reason.contains("unsupported jj diff summary line"),
+        "block reason must include the stderr detail: {reason}",
     );
 }
 
