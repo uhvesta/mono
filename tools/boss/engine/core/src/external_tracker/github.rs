@@ -1,13 +1,11 @@
 //! GitHub Projects backend for [`ExternalTracker`].
 //!
-//! Shells out to `gh` for all network operations. `GhRunner` is an internal
-//! trait so tests can inject a fake without spawning real processes.
-
-use std::process::Stdio;
+//! Shells out to `gh` for all network operations. [`boss_github::gh_runner::GhRunner`] is
+//! re-exported here so tests can inject a fake without spawning real processes.
 
 use async_trait::async_trait;
+use boss_github::gh_runner::{CommandGhRunner, GhRunner, GhRunnerError};
 use serde_json::Value;
-use tokio::process::Command;
 
 use super::{
     CloseReason, ClosedReason, ExternalTracker, Result, TrackerConfigError, TrackerContext, TrackerError, UpstreamItem,
@@ -17,7 +15,8 @@ use super::{
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Deserialized shape of `products.external_tracker_config` for GitHub.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, bon::Builder)]
+#[builder(on(String, into))]
 pub struct GitHubConfig {
     pub org: String,
     pub repo: String,
@@ -42,232 +41,6 @@ impl GitHubConfig {
     fn from_ctx(ctx: &TrackerContext) -> Result<Self> {
         serde_json::from_value(ctx.config.clone())
             .map_err(|e| TrackerError::ConfigInvalid(format!("invalid GitHub tracker config: {e}")))
-    }
-}
-
-// ── GhRunner abstraction ──────────────────────────────────────────────────────
-
-/// Error from a `gh` invocation, carrying an optional HTTP status code for
-/// classification by the caller.
-#[derive(Debug)]
-pub(crate) struct GhRunnerError {
-    pub http_status: Option<u16>,
-    pub message: String,
-}
-
-impl GhRunnerError {
-    fn transient(message: impl Into<String>) -> Self {
-        Self {
-            http_status: None,
-            message: message.into(),
-        }
-    }
-
-    fn with_status(status: u16, message: impl Into<String>) -> Self {
-        Self {
-            http_status: Some(status),
-            message: message.into(),
-        }
-    }
-}
-
-/// Response from a successful `gh` REST call.
-#[derive(Debug)]
-pub(crate) struct GhResponse {
-    pub body: Value,
-}
-
-/// Internal abstraction over `gh` shellouts for testability.
-#[async_trait]
-pub(crate) trait GhRunner: Send + Sync {
-    /// Run `gh api graphql -f query=<query> -F k=v ...` and return parsed JSON.
-    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
-    async fn graphql(
-        &self,
-        query: &str,
-        vars: &[(&str, &str)],
-        token: Option<&str>,
-    ) -> std::result::Result<Value, GhRunnerError>;
-
-    /// Run `gh api <path>` (GET) and return parsed JSON body.
-    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
-    async fn rest_get(&self, path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError>;
-
-    /// Run `gh api -X PATCH <path> -f k=v ...` and return parsed JSON body.
-    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
-    async fn rest_patch(
-        &self,
-        path: &str,
-        fields: &[(&str, &str)],
-        token: Option<&str>,
-    ) -> std::result::Result<GhResponse, GhRunnerError>;
-
-    /// Run `gh api -X POST <path> --input -` with a JSON body and return parsed JSON body.
-    /// When `token` is `Some`, sets `GH_TOKEN` on the process.
-    async fn rest_post(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-        token: Option<&str>,
-    ) -> std::result::Result<GhResponse, GhRunnerError>;
-}
-
-// ── CommandGhRunner (production) ──────────────────────────────────────────────
-
-pub(crate) struct CommandGhRunner;
-
-/// Scan `gh`'s stderr for an HTTP status code pattern like "(HTTP 404)" or "HTTP 404".
-fn parse_http_status_from_stderr(stderr: &str) -> Option<u16> {
-    let lower = stderr.to_lowercase();
-    if let Some(pos) = lower.find("http ") {
-        let after = &stderr[pos + 5..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(code) = digits.parse::<u16>() {
-            return Some(code);
-        }
-    }
-    None
-}
-
-#[async_trait]
-impl GhRunner for CommandGhRunner {
-    async fn graphql(
-        &self,
-        query: &str,
-        vars: &[(&str, &str)],
-        token: Option<&str>,
-    ) -> std::result::Result<Value, GhRunnerError> {
-        let mut cmd = Command::new("gh");
-        if let Some(t) = token {
-            cmd.env("GH_TOKEN", t);
-        }
-        cmd.args(["api", "graphql", "-f", &format!("query={query}")]);
-        for (k, v) in vars {
-            cmd.args(["-F", &format!("{k}={v}")]);
-        }
-        let output = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let status = parse_http_status_from_stderr(&stderr);
-            return Err(GhRunnerError::with_status(
-                status.unwrap_or(0),
-                stderr.trim().to_owned(),
-            ));
-        }
-
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| GhRunnerError::transient(format!("failed to parse graphql response: {e}")))
-    }
-
-    async fn rest_get(&self, path: &str, token: Option<&str>) -> std::result::Result<GhResponse, GhRunnerError> {
-        let mut cmd = Command::new("gh");
-        if let Some(t) = token {
-            cmd.env("GH_TOKEN", t);
-        }
-        let output = cmd
-            .args(["api", path])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let status = parse_http_status_from_stderr(&stderr).unwrap_or(0);
-            return Err(GhRunnerError::with_status(status, stderr.trim().to_owned()));
-        }
-
-        let body = serde_json::from_slice(&output.stdout)
-            .map_err(|e| GhRunnerError::transient(format!("failed to parse REST response: {e}")))?;
-        Ok(GhResponse { body })
-    }
-
-    async fn rest_patch(
-        &self,
-        path: &str,
-        fields: &[(&str, &str)],
-        token: Option<&str>,
-    ) -> std::result::Result<GhResponse, GhRunnerError> {
-        let mut cmd = Command::new("gh");
-        if let Some(t) = token {
-            cmd.env("GH_TOKEN", t);
-        }
-        cmd.args(["api", "-X", "PATCH", path]);
-        for (k, v) in fields {
-            cmd.args(["-f", &format!("{k}={v}")]);
-        }
-        let output = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let status = parse_http_status_from_stderr(&stderr).unwrap_or(0);
-            return Err(GhRunnerError::with_status(status, stderr.trim().to_owned()));
-        }
-
-        let body = serde_json::from_slice(&output.stdout)
-            .map_err(|e| GhRunnerError::transient(format!("failed to parse PATCH response: {e}")))?;
-        Ok(GhResponse { body })
-    }
-
-    async fn rest_post(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-        token: Option<&str>,
-    ) -> std::result::Result<GhResponse, GhRunnerError> {
-        use tokio::io::AsyncWriteExt as _;
-        let stdin_bytes = serde_json::to_vec(body)
-            .map_err(|e| GhRunnerError::transient(format!("failed to serialize POST body: {e}")))?;
-        let mut cmd = Command::new("gh");
-        if let Some(t) = token {
-            cmd.env("GH_TOKEN", t);
-        }
-        cmd.args(["api", "-X", "POST", "--input", "-", path])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&stdin_bytes)
-                .await
-                .map_err(|e| GhRunnerError::transient(format!("failed to write POST body: {e}")))?;
-        }
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| GhRunnerError::transient(format!("failed to wait for gh: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let status = parse_http_status_from_stderr(&stderr).unwrap_or(0);
-            return Err(GhRunnerError::with_status(status, stderr.trim().to_owned()));
-        }
-
-        let body = serde_json::from_slice(&output.stdout)
-            .map_err(|e| GhRunnerError::transient(format!("failed to parse POST response: {e}")))?;
-        Ok(GhResponse { body })
     }
 }
 
@@ -362,6 +135,14 @@ mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
 ";
 
 // ── Parsing helpers ───────────────────────────────────────────────────────────
+
+/// Pull and validate the `issue_number` stored in an [`UpstreamRef`]'s raw blob.
+fn extract_issue_number(ref_: &UpstreamRef) -> Result<u64> {
+    ref_.raw
+        .get("issue_number")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned()))
+}
 
 /// Parse an ISO 8601 datetime string (e.g. `"2026-05-17T10:00:00Z"`) to Unix
 /// seconds. Avoids pulling in a datetime crate.
@@ -751,10 +532,7 @@ impl ExternalTracker for GitHubTracker {
 
     async fn fetch_item(&self, ctx: &TrackerContext, ref_: &UpstreamRef) -> Result<Option<UpstreamItem>> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number =
-            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
-                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
-            })?;
+        let issue_number = extract_issue_number(ref_)?;
 
         let path = format!("repos/{}/{}/issues/{}", config.org, config.repo, issue_number);
         match self.runner.rest_get(&path, opt_token(ctx)).await {
@@ -766,10 +544,7 @@ impl ExternalTracker for GitHubTracker {
 
     async fn close_issue(&self, ctx: &TrackerContext, ref_: &UpstreamRef, reason: CloseReason) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number =
-            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
-                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
-            })?;
+        let issue_number = extract_issue_number(ref_)?;
 
         let state_reason = match reason {
             CloseReason::Completed => "completed",
@@ -789,10 +564,7 @@ impl ExternalTracker for GitHubTracker {
 
     async fn post_closing_pr_comment(&self, ctx: &TrackerContext, ref_: &UpstreamRef, pr_url: &str) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number =
-            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
-                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
-            })?;
+        let issue_number = extract_issue_number(ref_)?;
 
         let comments_path = format!("repos/{}/{}/issues/{}/comments", config.org, config.repo, issue_number);
 
@@ -921,10 +693,7 @@ impl ExternalTracker for GitHubTracker {
 
     async fn add_label(&self, ctx: &TrackerContext, ref_: &UpstreamRef, label: &str) -> Result<()> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let issue_number =
-            ref_.raw.get("issue_number").and_then(|v| v.as_u64()).ok_or_else(|| {
-                TrackerError::ConfigInvalid("upstream ref missing 'issue_number' in raw blob".to_owned())
-            })?;
+        let issue_number = extract_issue_number(ref_)?;
 
         // The repo lives in the canonical_id ("owner/repo#number") rather
         // than the config, because GitHub Projects items can reference
@@ -955,6 +724,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    use boss_github::gh_runner::GhResponse;
     use serde_json::json;
 
     use super::*;

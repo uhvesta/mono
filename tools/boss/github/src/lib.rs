@@ -10,8 +10,8 @@
 //! the one-time developer setup instructions.
 
 pub mod contents;
+pub mod gh_runner;
 pub mod pr_url;
-pub mod spawn;
 
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

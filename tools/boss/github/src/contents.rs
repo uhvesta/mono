@@ -3,7 +3,7 @@
 //! Uses `gh api` rather than a direct HTTP call so that credentials are
 //! handled by the `gh` CLI installation (same pattern as the rest of Boss).
 
-use crate::spawn::gh_output;
+use crate::gh_runner::gh_output;
 
 /// Fetch the raw content of `path` from `owner/repo` at `ref_name` using
 /// `gh api`.

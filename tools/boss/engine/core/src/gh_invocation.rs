@@ -33,7 +33,7 @@
 //!
 //! ## Subprocess spawn helpers
 //!
-//! [`gh_output`] and [`run_gh`] are re-exported from `boss_github::spawn`.
+//! [`gh_output`] and [`run_gh`] are re-exported from `boss_github::gh_runner`.
 //! The implementation lives in the shared `boss-github` crate so both the
 //! engine's direct `gh` shellouts (completion, merge polling, runner,
 //! merge-when-ready, design detection) and the Contents helper share one
@@ -185,7 +185,7 @@ pub fn is_editorial_candidate(command: &str) -> bool {
 // The implementation lives in the shared `boss-github` crate so engine and
 // the Contents helper share one copy. Re-exported here as `pub(crate)` so
 // all existing call sites within `boss-engine` need no changes.
-pub(crate) use boss_github::spawn::{gh_output, run_gh};
+pub(crate) use boss_github::gh_runner::{gh_output, run_gh};
 
 #[cfg(test)]
 mod tests {

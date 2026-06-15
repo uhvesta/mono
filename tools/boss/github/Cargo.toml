@@ -6,6 +6,7 @@ workspace = "../../.."
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
 reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
