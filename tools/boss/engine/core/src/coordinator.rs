@@ -2006,6 +2006,22 @@ impl ExecutionCoordinator {
                         "spawn_attempt: failed to mark redundant execution abandoned",
                     );
                 }
+                // Emit a terminal event so the dispatch timeline doesn't
+                // silently stall at `worker_claimed/ok` for 30s until the
+                // watchdog fires. The execution is already marked redundant
+                // (terminal DB state), so `host_selected:error` is the
+                // correct closer — no `record_start_failure` needed.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "reason": "redundant_spawn",
+                                "live_execution_id": live.id,
+                            })),
+                    )
+                    .await;
                 return Err(anyhow::anyhow!(
                     "redundant spawn: execution {} for work_item {} superseded by live execution {}",
                     execution.id,
@@ -2063,6 +2079,27 @@ impl ExecutionCoordinator {
                 // Leave the execution `ready` (do NOT abandon). The caller
                 // releases the claimed worker on this `Err`, and the next
                 // kick re-evaluates the still-`ready` row.
+                //
+                // Emit a terminal event so the dispatch timeline advances
+                // past `worker_claimed/ok` immediately — otherwise the
+                // stall watchdog fires ~30s later, masking the real reason
+                // (chain serialization) in the timeline. The execution is
+                // not actually failed; on the next kick it will re-attempt
+                // and may succeed. The `error` outcome is necessary here
+                // because `is_terminal_event` only recognises `outcome ==
+                // "error"` (besides `pane_spawned/ok`) as closing the stage.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "reason": "chain_serialized_backstop",
+                                "live_sibling_execution_id": sibling.id,
+                                "live_sibling_work_item_id": sibling.work_item_id,
+                            })),
+                    )
+                    .await;
                 return Err(anyhow::anyhow!(
                     "serialized: execution {} for work_item {} deferred behind live chain sibling {} (work_item {})",
                     execution.id,
@@ -2108,6 +2145,23 @@ impl ExecutionCoordinator {
                         "spawn_attempt: failed to downgrade gated execution",
                     );
                 }
+                // Emit a terminal event so the dispatch timeline advances
+                // past `worker_claimed/ok` immediately and the stall
+                // watchdog doesn't misattribute the hold to worker claim.
+                // The execution is downgraded to `waiting_dependency` (not
+                // failed); on gate clearance `dep_unblock_sweep` re-promotes
+                // it to `ready` and the next kick re-dispatches.
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::HostSelected, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(worker_id)
+                            .with_details(serde_json::json!({
+                                "reason": "gating_prereqs_blocked",
+                                "gating_prereqs": prereqs,
+                            })),
+                    )
+                    .await;
                 return Err(anyhow::anyhow!(
                     "gated: execution {} for {} blocked by [{}]",
                     execution.id,
@@ -6191,6 +6245,108 @@ mod tests {
         assert!(
             !stages.contains(&"stage_stalled"),
             "automation execution must not stall; got {stages:?}",
+        );
+    }
+
+    /// Regression for the regular-pool dispatch stall (T1849): a
+    /// `revision_implementation` execution (main pool) must drive PAST
+    /// `worker_claimed` — through host selection and the cube repo-ensure
+    /// handoff — to `cube_workspace_lease_attempted`, exactly like the
+    /// automation pool. The original symptom was the three early-exit guards
+    /// in `schedule_execution` (redundant-spawn, chain-serializer,
+    /// gating-prereqs) returning `Err` without emitting any dispatch event,
+    /// so the timeline sat at `worker_claimed/ok` until the stall watchdog
+    /// fired ~30s later and the orphan sweep abandoned the execution.
+    #[tokio::test]
+    async fn revision_implementation_execution_advances_past_worker_claimed_to_lease() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Boss".to_owned(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".to_owned()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        // autostart=false so the reconcile sweep never enqueues a second
+        // execution in parallel — only the one we inject reaches the dispatcher.
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Impl chore")
+                    .autostart(false)
+                    .build(),
+            )
+            .unwrap();
+        let impl_exec = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::RevisionImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+                .with_dispatch_events(recording.clone()),
+        );
+        coordinator.kick();
+
+        // Poll the dispatch stream directly — the contract is "advances to
+        // the lease stage", independent of the final run state.
+        let mut reached_lease = false;
+        for _ in 0..200 {
+            let events = recording.events_for(&impl_exec.id).await;
+            if events.iter().any(|e| e.stage == "cube_workspace_lease_attempted") {
+                reached_lease = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        let events = recording.events_for(&impl_exec.id).await;
+        let stages: Vec<&str> = events.iter().map(|e| e.stage.as_str()).collect();
+        assert!(
+            reached_lease,
+            "revision_implementation execution never reached `cube_workspace_lease_attempted` \
+             (stalled at worker_claimed?); timeline was {stages:?}",
+        );
+
+        // The previously-silent gap must now emit explicit milestones.
+        for expected in [
+            "worker_claimed",
+            "host_selected",
+            "cube_repo_ensure_attempted",
+            "cube_workspace_lease_attempted",
+        ] {
+            assert!(
+                stages.contains(&expected),
+                "revision_implementation execution must advance through `{expected}`; got {stages:?}",
+            );
+        }
+
+        // Host selection resolved successfully — it must not have failed out.
+        let host_selected = events
+            .iter()
+            .find(|e| e.stage == "host_selected")
+            .expect("host_selected event present");
+        assert_eq!(
+            host_selected.outcome, "ok",
+            "revision_implementation host selection must succeed; got {host_selected:?}",
+        );
+
+        // The stall-watchdog signature we are fixing must be absent.
+        assert!(
+            !stages.contains(&"stage_stalled"),
+            "revision_implementation execution must not stall; got {stages:?}",
         );
     }
 
