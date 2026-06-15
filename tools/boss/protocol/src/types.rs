@@ -1136,6 +1136,23 @@ pub struct CreateChoreInput {
     /// URL at write time so the stored row is always dispatchable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_remote_url: Option<String>,
+
+    /// Optional kind override. `None` → `'chore'` (the historical default).
+    /// Pass `TaskKind::Followup` when creating a review-finding follow-up
+    /// task; the engine uses this to write the correct `kind` column and
+    /// to store provenance in `origin_task_short_id` / `origin_pr_number`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_override: Option<TaskKind>,
+
+    /// Short id of the task whose PR-review produced this follow-up.
+    /// Set only when `kind_override = Followup`; ignored for plain chores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_task_short_id: Option<i64>,
+
+    /// GitHub PR number that was under review when the findings were filed.
+    /// Set only when `kind_override = Followup`; ignored for plain chores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_pr_number: Option<i64>,
 }
 
 /// `comments_create` request body. The renderer supplies `doc_version` (it
@@ -2597,6 +2614,11 @@ pub struct SetProjectDesignDocInput {
 pub enum TaskKind {
     Chore,
     Design,
+    /// A review-finding follow-up task created when a PR-review revision's
+    /// parent PR merges before all findings are addressed. Behaviorally
+    /// identical to `Chore` for dispatch/execution purposes; distinct for
+    /// UI rendering and provenance tracking.
+    Followup,
     Investigation,
     ProjectTask,
     Revision,
@@ -2608,6 +2630,7 @@ impl TaskKind {
         match self {
             Self::Chore => "chore",
             Self::Design => "design",
+            Self::Followup => "followup",
             Self::Investigation => "investigation",
             Self::ProjectTask => "project_task",
             Self::Revision => "revision",
@@ -2628,13 +2651,14 @@ impl std::str::FromStr for TaskKind {
         match s {
             "chore" => Ok(Self::Chore),
             "design" => Ok(Self::Design),
+            "followup" => Ok(Self::Followup),
             "investigation" => Ok(Self::Investigation),
             "project_task" => Ok(Self::ProjectTask),
             "revision" => Ok(Self::Revision),
             "task" => Ok(Self::Task),
             other => Err(format!(
                 "unknown task kind: `{other}`; expected one of: \
-                 chore, design, investigation, project_task, revision, task"
+                 chore, design, followup, investigation, project_task, revision, task"
             )),
         }
     }
@@ -2905,6 +2929,19 @@ pub struct Task {
     /// the affordance exactly like `ProjectDesignDocState::NotSet`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doc_link_state: Option<ProjectDesignDocState>,
+
+    /// Per-product short id of the task whose PR-review produced this
+    /// follow-up. Set only on `kind = 'followup'` rows created by
+    /// `block_pending_revisions_on_parent_close` when the reviewed PR
+    /// merges before all findings are addressed. `None` for every other
+    /// task kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_task_short_id: Option<i64>,
+
+    /// GitHub PR number that was under review when the findings were
+    /// filed. Set only on `kind = 'followup'` rows; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_pr_number: Option<i64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -4550,6 +4587,7 @@ mod tests {
         let all = [
             TaskKind::Chore,
             TaskKind::Design,
+            TaskKind::Followup,
             TaskKind::Investigation,
             TaskKind::ProjectTask,
             TaskKind::Revision,
@@ -4568,6 +4606,7 @@ mod tests {
     fn task_kind_serde_uses_wire_strings() {
         assert_eq!(serde_json::to_string(&TaskKind::Chore).unwrap(), r#""chore""#);
         assert_eq!(serde_json::to_string(&TaskKind::Design).unwrap(), r#""design""#);
+        assert_eq!(serde_json::to_string(&TaskKind::Followup).unwrap(), r#""followup""#);
         assert_eq!(
             serde_json::to_string(&TaskKind::Investigation).unwrap(),
             r#""investigation""#
@@ -4581,6 +4620,8 @@ mod tests {
 
         let chore: TaskKind = serde_json::from_str(r#""chore""#).unwrap();
         assert_eq!(chore, TaskKind::Chore);
+        let followup: TaskKind = serde_json::from_str(r#""followup""#).unwrap();
+        assert_eq!(followup, TaskKind::Followup);
         let project_task: TaskKind = serde_json::from_str(r#""project_task""#).unwrap();
         assert_eq!(project_task, TaskKind::ProjectTask);
     }

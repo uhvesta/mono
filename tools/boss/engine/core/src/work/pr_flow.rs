@@ -140,16 +140,16 @@ impl WorkDb {
     /// PR-on-merge lifecycle yet.
     pub fn list_chores_pending_merge_check(&self) -> Result<Vec<PendingMergeCheck>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task', 'design', 'investigation')
+             WHERE kind IN ({CHORE_LIKE_KINDS_SQL})
                AND status = 'in_review'
                AND pr_url IS NOT NULL
                AND pr_url != ''
                AND deleted_at IS NULL
              ORDER BY updated_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(PendingMergeCheck {
                 work_item_id: row.get(0)?,
@@ -174,12 +174,13 @@ impl WorkDb {
     /// other query (`list_chores_pending_merge_check`) only sees rows
     /// already in `in_review`.
     ///
-    /// `kind IN ('chore', 'project_task', 'design')` matches the same
-    /// kinds the in-review poller watches — `task` is excluded for the
-    /// same reason (non-project tasks don't share the PR lifecycle).
+    /// `CHORE_LIKE_KINDS_SQL` matches the same kinds the in-review poller
+    /// watches; `task` is excluded for the same reason (non-project tasks
+    /// don't share the PR lifecycle). `revision` is also included because
+    /// its on-Stop hook stamps the parent pr_url, not its own.
     pub fn list_executions_pending_pr_detection(&self) -> Result<Vec<String>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT we.id
              FROM work_executions we
              JOIN tasks t ON t.id = we.work_item_id
@@ -187,11 +188,11 @@ impl WorkDb {
                AND we.workspace_path IS NOT NULL
                AND we.workspace_path != ''
                AND t.deleted_at IS NULL
-               AND t.kind IN ('chore', 'project_task', 'design', 'investigation', 'revision')
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL}, 'revision')
                AND t.status = 'active'
                AND (t.pr_url IS NULL OR t.pr_url = '')
              ORDER BY we.created_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         collect_rows(rows)
     }
@@ -223,7 +224,7 @@ impl WorkDb {
             .as_secs()
             .saturating_sub(lookback_secs)
             .to_string();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
              FROM work_executions we
              JOIN tasks t ON t.id = we.work_item_id
@@ -233,11 +234,11 @@ impl WorkDb {
                AND we.finished_at IS NOT NULL
                AND CAST(we.finished_at AS INTEGER) >= ?1
                AND t.deleted_at IS NULL
-               AND t.kind IN ('chore', 'project_task', 'design', 'investigation')
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
                AND t.status = 'active'
                AND (t.pr_url IS NULL OR t.pr_url = '')
              ORDER BY we.finished_at DESC, we.id DESC",
-        )?;
+        ))?;
         let rows = stmt.query_map([cutoff], |row| {
             let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
             Ok(LatePrCandidate {

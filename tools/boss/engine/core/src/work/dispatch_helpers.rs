@@ -171,7 +171,7 @@ pub(crate) fn repo_unresolved_kind_label(conn: &Connection, work_item_id: &str) 
                 .filter(|task| task.deleted_at.is_none())
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
             match task.kind {
-                TaskKind::Chore => "chore",
+                TaskKind::Chore | TaskKind::Followup => "chore",
                 TaskKind::Design
                 | TaskKind::Investigation
                 | TaskKind::ProjectTask

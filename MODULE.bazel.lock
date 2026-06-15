@@ -7428,6 +7428,75 @@
         }
       }
     },
+    "@@rules_swift_package_manager+//:extensions.bzl%swift_deps": {
+      "general": {
+        "bzlTransitiveDigest": "RGI634EPwcBOjzpFvVbW/K9UbE/G+rDCMcSnBZ+z6zA=",
+        "usagesDigest": "9aGGg0VnvzGufT6B7isS8jsW8XS1wMHm3m1/zfSOMf0=",
+        "recordedInputs": [
+          "REPO_MAPPING:rules_swift_package_manager+,bazel_skylib bazel_skylib+",
+          "REPO_MAPPING:rules_swift_package_manager+,bazel_tools bazel_tools",
+          "REPO_MAPPING:rules_swift_package_manager+,cgrindel_bazel_starlib cgrindel_bazel_starlib+",
+          "FILE:@@//tools/boss/app-macos/Package.resolved d5808e10fe876ab02d0f51ad6abf16ed78a7e0aa993ced4f8471308f9c191adb"
+        ],
+        "generatedRepoSpecs": {
+          "swift_package": {
+            "repoRuleId": "@@rules_swift_package_manager+//swiftpkg/internal:swift_package_tool_repo.bzl%swift_package_tool_repo",
+            "attributes": {
+              "env": {},
+              "package": "tools/boss/app-macos/Package.swift"
+            }
+          },
+          "swiftpkg_textual": {
+            "repoRuleId": "@@rules_swift_package_manager+//swiftpkg/internal:swift_package.bzl%swift_package",
+            "attributes": {
+              "bazel_package_name": "swiftpkg_textual",
+              "commit": "5b06b811c0f5313b6b84bbef98c635a630638c38",
+              "remote": "https://github.com/gonzalezreal/textual",
+              "version": "0.3.1",
+              "env": {},
+              "env_inherit": [],
+              "cached_json_directory": "",
+              "replace_scm_with_registry": false
+            }
+          },
+          "swiftpkg_swift_concurrency_extras": {
+            "repoRuleId": "@@rules_swift_package_manager+//swiftpkg/internal:swift_package.bzl%swift_package",
+            "attributes": {
+              "bazel_package_name": "swiftpkg_swift_concurrency_extras",
+              "commit": "5a3825302b1a0d744183200915a47b508c828e6f",
+              "remote": "https://github.com/pointfreeco/swift-concurrency-extras",
+              "version": "1.3.2",
+              "env": {},
+              "env_inherit": [],
+              "cached_json_directory": "",
+              "replace_scm_with_registry": false
+            }
+          },
+          "swiftpkg_swiftui_math": {
+            "repoRuleId": "@@rules_swift_package_manager+//swiftpkg/internal:swift_package.bzl%swift_package",
+            "attributes": {
+              "bazel_package_name": "swiftpkg_swiftui_math",
+              "commit": "0b5c2cfaaec8d6193db206f675048eeb5ce95f71",
+              "remote": "https://github.com/gonzalezreal/swiftui-math",
+              "version": "0.1.0",
+              "env": {},
+              "env_inherit": [],
+              "cached_json_directory": "",
+              "replace_scm_with_registry": false
+            }
+          }
+        },
+        "moduleExtensionMetadata": {
+          "explicitRootModuleDirectDeps": [
+            "swiftpkg_textual",
+            "swift_package"
+          ],
+          "explicitRootModuleDirectDevDeps": [],
+          "useAllRepos": "NO",
+          "reproducible": false
+        }
+      }
+    },
     "@@tar.bzl+//tar:extensions.bzl%toolchains": {
       "general": {
         "bzlTransitiveDigest": "/2afh6fPjq/rcyE/jztQDK3ierehmFFngfvmqyRv72M=",

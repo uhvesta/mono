@@ -113,7 +113,7 @@ pub(crate) fn resolve_dependency_edge(conn: &Connection, peer_id: &str, relation
         && let Some(task) = query_task(conn, peer_id)?
     {
         let kind = match task.kind {
-            TaskKind::Chore => "chore",
+            TaskKind::Chore | TaskKind::Followup => "chore",
             _ => "task",
         };
         return Ok(DependencyEdge {

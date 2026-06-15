@@ -409,7 +409,7 @@ impl WorkDb {
         let mut project_tasks: HashMap<String, Vec<Task>> = HashMap::new();
         for task in tasks {
             match task.kind {
-                TaskKind::Chore => {
+                TaskKind::Chore | TaskKind::Followup => {
                     if task_accepts_execution(&task) {
                         reconcile_work_item_execution(
                             &tx,
@@ -481,6 +481,7 @@ impl WorkDb {
                     // the other variants are handled before being bucketed here.
                     TaskKind::ProjectTask
                     | TaskKind::Chore
+                    | TaskKind::Followup
                     | TaskKind::Investigation
                     | TaskKind::Revision
                     | TaskKind::Task => ExecutionKind::TaskImplementation,

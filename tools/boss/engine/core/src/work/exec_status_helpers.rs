@@ -16,7 +16,7 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
                 .filter(|task| task.deleted_at.is_none())
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
             match task.kind {
-                TaskKind::Chore => ExecutionKind::ChoreImplementation,
+                TaskKind::Chore | TaskKind::Followup => ExecutionKind::ChoreImplementation,
                 TaskKind::Design => ExecutionKind::ProjectDesign,
                 TaskKind::Revision => ExecutionKind::RevisionImplementation,
                 TaskKind::Investigation => ExecutionKind::InvestigationImplementation,
@@ -167,7 +167,7 @@ pub(crate) fn resolve_repo_for_work_item(conn: &Connection, work_item_id: &str) 
             }
         }
         // All other kinds use the product's default code repo.
-        TaskKind::Chore | TaskKind::ProjectTask | TaskKind::Revision | TaskKind::Task => {}
+        TaskKind::Chore | TaskKind::Followup | TaskKind::ProjectTask | TaskKind::Revision | TaskKind::Task => {}
     }
     Ok(product.repo_remote_url)
 }

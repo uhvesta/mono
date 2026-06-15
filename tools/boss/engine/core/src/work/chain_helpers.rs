@@ -1,5 +1,12 @@
 use super::*;
 
+/// Extract the numeric PR number from a GitHub pull-request URL.
+/// Accepts the canonical form `https://github.com/<owner>/<repo>/pull/<n>`.
+/// Returns `None` for any URL that does not end with a parseable integer.
+fn extract_pr_number_from_url(pr_url: &str) -> Option<i64> {
+    pr_url.rsplit('/').next().and_then(|s| s.parse::<i64>().ok())
+}
+
 /// `true` when `created_via` identifies the revision as an engine-managed
 /// kind that is automatically resolved when the parent PR merges: a
 /// merge-conflict-resolution revision or a CI-fix revision.
@@ -187,6 +194,25 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
             }
         } else {
             let is_wip = rev.status == TaskStatus::Active;
+            let is_pr_review = rev.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX);
+
+            // For PR-review revisions, emit a `followup` with provenance.
+            // For all other non-moot revisions, keep the historical `chore`.
+            let (kind_override, origin_task_short_id, origin_pr_number, description) = if is_pr_review {
+                let root = query_task(conn, chain_root_id)?;
+                let origin_short_id = root.as_ref().and_then(|r| r.short_id);
+                let origin_pr_num = root
+                    .as_ref()
+                    .and_then(|r| r.pr_url.as_deref().and_then(extract_pr_number_from_url));
+                let desc = rev.description.replace(
+                    "Address all findings before finalising this revision.",
+                    "Address all findings before closing this follow-up.",
+                );
+                (Some(TaskKind::Followup), origin_short_id, origin_pr_num, desc)
+            } else {
+                (None, None, None, rev.description.clone())
+            };
+
             let new_chore = insert_chore_in_tx(
                 conn,
                 CreateChoreInput::builder()
@@ -195,13 +221,17 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                     .force_duplicate(true)
                     .name(rev.name.clone())
                     .maybe_created_via(Some(CREATED_VIA_ENGINE_AUTO.to_owned()))
-                    .maybe_description(Some(rev.description.clone()))
+                    .maybe_description(Some(description))
                     .maybe_effort_level(rev.effort_level)
                     .maybe_model_override(rev.model_override.clone())
                     .maybe_priority(Some(rev.priority.clone()))
                     .maybe_repo_remote_url(rev.repo_remote_url.clone())
+                    .maybe_kind_override(kind_override)
+                    .maybe_origin_task_short_id(origin_task_short_id)
+                    .maybe_origin_pr_number(origin_pr_number)
                     .build(),
             )?;
+
             conn.execute(
                 "UPDATE tasks
                  SET status            = 'archived',
@@ -215,10 +245,13 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
             tracing::info!(
                 revision_id = %rev_id,
                 new_chore_id = %new_chore.id,
+                new_chore_kind = %new_chore.kind,
                 chain_root_id,
                 is_wip,
-                "block_pending_revisions: revision converted to standalone chore \
-                 (parent PR merged; chore will {})",
+                is_pr_review,
+                "block_pending_revisions: revision converted to standalone {} \
+                 (parent PR merged; will {})",
+                if is_pr_review { "followup" } else { "chore" },
                 if is_wip { "auto-dispatch" } else { "stay in backlog" },
             );
         }

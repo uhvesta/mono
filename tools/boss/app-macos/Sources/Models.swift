@@ -847,8 +847,17 @@ struct WorkTask: Identifiable, Hashable {
     /// item has no per-task pointer (hides the affordance).
     var docLinkState: ProjectDesignDocState? = nil
 
+    /// Short id of the reviewed task that produced this follow-up.
+    /// `nil` for every task whose `kind` is not `"followup"`.
+    /// Mirrors `Task.origin_task_short_id` on the wire.
+    var originTaskShortId: Int? = nil
+    /// GitHub PR number that was under review when the findings were filed.
+    /// `nil` for every task whose `kind` is not `"followup"`.
+    /// Mirrors `Task.origin_pr_number` on the wire.
+    var originPrNumber: Int? = nil
+
     var isChore: Bool {
-        kind == "chore"
+        kind == "chore" || kind == "followup"
     }
 
     /// Human-readable label for the work item's kind, shown in the card
@@ -858,6 +867,7 @@ struct WorkTask: Identifiable, Hashable {
     var kindLabel: String {
         switch kind {
         case "chore": return "Chore"
+        case "followup": return "Followup"
         case "investigation": return "Investigation"
         case "revision": return "Revision"
         case "design": return "Design"

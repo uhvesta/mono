@@ -16,17 +16,17 @@ impl WorkDb {
     /// poller can chain both iterators through one sweep loop.
     pub fn list_chores_blocked_on_merge_conflict(&self) -> Result<Vec<PendingMergeCheck>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task', 'design', 'investigation')
+             WHERE kind IN ({CHORE_LIKE_KINDS_SQL})
                AND status = 'blocked'
                AND blocked_reason = 'merge_conflict'
                AND pr_url IS NOT NULL
                AND pr_url != ''
                AND deleted_at IS NULL
              ORDER BY updated_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(PendingMergeCheck {
                 work_item_id: row.get(0)?,
@@ -107,17 +107,17 @@ impl WorkDb {
     ///     (design §Q1 "Probe-pool extension").
     pub fn list_chores_blocked_on_ci_failure(&self) -> Result<Vec<PendingMergeCheck>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, product_id, pr_url
              FROM tasks
-             WHERE kind IN ('chore', 'project_task', 'design', 'investigation')
+             WHERE kind IN ({CHORE_LIKE_KINDS_SQL})
                AND status = 'blocked'
                AND blocked_reason IN ('ci_failure', 'ci_failure_exhausted')
                AND pr_url IS NOT NULL
                AND pr_url != ''
                AND deleted_at IS NULL
              ORDER BY updated_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(PendingMergeCheck {
                 work_item_id: row.get(0)?,
@@ -158,10 +158,10 @@ impl WorkDb {
     /// dependency-unblock sweep.
     pub fn list_chores_stranded_blocked_remediation(&self) -> Result<Vec<PendingMergeCheck>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT t.id, t.product_id, t.pr_url
              FROM tasks t
-             WHERE t.kind IN ('chore', 'project_task', 'design', 'investigation')
+             WHERE t.kind IN ({CHORE_LIKE_KINDS_SQL})
                AND t.status = 'blocked'
                AND t.blocked_reason IS NULL
                AND t.pr_url IS NOT NULL
@@ -185,7 +185,7 @@ impl WorkDb {
                    )
                )
              ORDER BY t.updated_at ASC",
-        )?;
+        ))?;
         let rows = stmt.query_map([], |row| {
             Ok(PendingMergeCheck {
                 work_item_id: row.get(0)?,

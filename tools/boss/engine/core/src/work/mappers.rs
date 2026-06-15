@@ -223,6 +223,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // get_work_tree from the task's `doc_*` columns; None everywhere
         // else (the standard SELECT omits those columns).
         doc_link_state: None,
+        // Followup provenance; populated by map_task_with_parent_and_provenance
+        // and map_task_with_external_ref_parent_source_and_provenance when the
+        // SELECT includes those columns. None in all standard query paths.
+        origin_task_short_id: None,
+        origin_pr_number: None,
     })
 }
 
@@ -244,6 +249,16 @@ pub(crate) fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Res
 pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
     task.parent_task_id = row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
+/// Like [`map_task_with_parent`] but also reads `origin_task_short_id`
+/// (index 32) and `origin_pr_number` (index 33). Used by `query_task`
+/// when those columns are appended to the standard SELECT.
+pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_parent(row)?;
+    task.origin_task_short_id = row.get(32)?;
+    task.origin_pr_number = row.get(33)?;
     Ok(task)
 }
 
@@ -301,6 +316,16 @@ pub(crate) fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::
 pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_and_parent(row)?;
     task.source_automation_id = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
+/// Like [`map_task_with_external_ref_parent_and_source_automation_id`] but
+/// also reads `origin_task_short_id` (index 38) and `origin_pr_number`
+/// (index 39). Used by `get_work_tree` chore/followup queries.
+pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
+    task.origin_task_short_id = row.get(38)?;
+    task.origin_pr_number = row.get(39)?;
     Ok(task)
 }
 

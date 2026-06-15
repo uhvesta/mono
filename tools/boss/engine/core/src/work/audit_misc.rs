@@ -298,7 +298,7 @@ pub(crate) fn apply_optional_string_patch(target: &mut Option<String>, patch: Op
 }
 
 pub(crate) fn task_to_item(task: Task) -> WorkItem {
-    if task.kind == TaskKind::Chore {
+    if task.kind == TaskKind::Chore || task.kind == TaskKind::Followup {
         WorkItem::Chore(task)
     } else {
         WorkItem::Task(task)

@@ -178,7 +178,8 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     let description = input.description.unwrap_or_default();
     let autostart_value: i64 = if input.autostart { 1 } else { 0 };
     let priority = normalize_priority(input.priority.as_deref())?;
-    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "chore");
+    let kind_str = input.kind_override.as_ref().map(|k| k.as_str()).unwrap_or("chore");
+    let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, kind_str);
     let repo_remote_url = enforce_task_repo_invariant(&product, input.repo_remote_url)?;
     let effort_level = input.effort_level.map(|level| level.as_str().to_owned());
     let model_override = normalize_model_override(input.model_override);
@@ -186,9 +187,9 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id)
-         VALUES (?1, ?2, NULL, 'chore', ?3, ?4, 'todo', NULL, NULL, NULL, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, input.product_id, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, origin_task_short_id, origin_pr_number)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, driver, short_id, input.origin_task_short_id, input.origin_pr_number],
     )?;
 
     query_task(conn, &id)?.with_context(|| format!("missing chore after insert: {id}"))

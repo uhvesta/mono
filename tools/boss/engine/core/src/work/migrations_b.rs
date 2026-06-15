@@ -1447,3 +1447,29 @@ pub(crate) fn migrate_products_default_driver(conn: &Connection) -> Result<()> {
     }
     Ok(())
 }
+
+/// Add `origin_task_short_id` and `origin_pr_number` to `tasks`.
+///
+/// These columns are set only on `kind = 'followup'` rows created by
+/// `block_pending_revisions_on_parent_close` when a PR-review revision's
+/// parent PR merges before all review findings are addressed. The engine
+/// stores provenance at creation time so the UI can render
+/// "Followup from T<n> / PR #<n>" without a back-join. Both columns are
+/// `NULL` for every other task kind.
+pub(crate) fn migrate_tasks_followup_provenance_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "origin_task_short_id",
+            "ALTER TABLE tasks ADD COLUMN origin_task_short_id INTEGER",
+        ),
+        (
+            "origin_pr_number",
+            "ALTER TABLE tasks ADD COLUMN origin_pr_number INTEGER",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}

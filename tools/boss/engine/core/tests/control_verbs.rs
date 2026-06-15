@@ -1456,19 +1456,13 @@ async fn mark_ci_remediation_noop_pre_probe_guards() -> Result<()> {
         docs_repo: None,
         worker_branch_prefix: None,
     })?;
-    let chore = work_db.create_chore(CreateChoreInput {
-        product_id: product.id.clone(),
-        name: "C".to_owned(),
-        description: None,
-        autostart: false,
-        priority: None,
-        created_via: None,
-        repo_remote_url: None,
-        effort_level: None,
-        model_override: None,
-        force_duplicate: false,
-        driver: None,
-    })?;
+    let chore = work_db.create_chore(
+        CreateChoreInput::builder()
+            .product_id(product.id.clone())
+            .name("C")
+            .autostart(false)
+            .build(),
+    )?;
     let pr = "https://github.com/foo/bar/pull/77";
     work_db.update_work_item(
         &chore.id,
