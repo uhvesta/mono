@@ -1169,6 +1169,120 @@ fn lower_check_input_scopes_exclude_files_to_config_dir() {
     );
 }
 
+// --- Shared whole-repo sandbox tests ---
+
+/// A SourceTree that counts `glob` calls. Used to verify the whole-repo tree
+/// is enumerated exactly once when multiple checks share the sandbox.
+struct GlobCountingTree {
+    files: std::collections::HashMap<PathBuf, Vec<u8>>,
+    glob_count: std::sync::atomic::AtomicUsize,
+}
+
+impl GlobCountingTree {
+    fn new(files: &[(&str, &[u8])]) -> Self {
+        Self {
+            files: files.iter().map(|(p, c)| (PathBuf::from(p), c.to_vec())).collect(),
+            glob_count: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn glob_call_count(&self) -> usize {
+        self.glob_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl crate::input::SourceTree for GlobCountingTree {
+    fn read_file(&self, path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("not found: {}", path.display()))
+    }
+
+    fn exists(&self, path: &std::path::Path) -> bool {
+        self.files.contains_key(path)
+    }
+
+    fn list_dir(&self, _path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(vec![])
+    }
+
+    fn glob(&self, pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
+        self.glob_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if pattern == "**" {
+            let mut paths: Vec<PathBuf> = self.files.keys().cloned().collect();
+            paths.sort();
+            Ok(paths)
+        } else {
+            Ok(vec![])
+        }
+    }
+}
+
+/// Calling `get_or_build_whole_repo_sandbox` twice on the same executor must
+/// build the sandbox exactly once: the second call returns a clone of the
+/// existing Arc rather than re-enumerating and re-materializing the tree.
+#[test]
+fn whole_repo_sandbox_built_once_and_shared_across_calls() {
+    let temp = tempdir().expect("temp dir");
+    let tree = GlobCountingTree::new(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+
+    let executor =
+        super::DefaultExternalCheckExecutor::new_with_cache(temp.path(), temp.path().join("cache")).expect("executor");
+
+    let sb1 = executor
+        .get_or_build_whole_repo_sandbox(&tree)
+        .expect("first call must succeed");
+    let sb2 = executor
+        .get_or_build_whole_repo_sandbox(&tree)
+        .expect("second call must succeed");
+
+    // The sandbox directory must be the same physical path — same TempDir.
+    assert_eq!(
+        sb1.root.path(),
+        sb2.root.path(),
+        "both calls must return the same sandbox directory"
+    );
+
+    // The tree's glob("**") must have been invoked exactly once.
+    assert_eq!(
+        tree.glob_call_count(),
+        1,
+        "whole-repo tree enumeration must happen exactly once, not once per WholeRepo check"
+    );
+
+    // Both calls must have seen the same content.
+    assert_eq!(sb1.allowed_paths, sb2.allowed_paths);
+    assert_eq!(
+        sb1.allowed_paths,
+        vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+        "sandbox must contain all tree files"
+    );
+}
+
+/// A third call after the first two must still return the same sandbox and
+/// not trigger another glob enumeration.
+#[test]
+fn whole_repo_sandbox_three_calls_still_enumerate_once() {
+    let temp = tempdir().expect("temp dir");
+    let tree = GlobCountingTree::new(&[("x.txt", b"x")]);
+
+    let executor =
+        super::DefaultExternalCheckExecutor::new_with_cache(temp.path(), temp.path().join("cache")).expect("executor");
+
+    let sb1 = executor.get_or_build_whole_repo_sandbox(&tree).expect("call 1");
+    let sb2 = executor.get_or_build_whole_repo_sandbox(&tree).expect("call 2");
+    let sb3 = executor.get_or_build_whole_repo_sandbox(&tree).expect("call 3");
+
+    assert_eq!(sb1.root.path(), sb2.root.path());
+    assert_eq!(sb2.root.path(), sb3.root.path());
+    assert_eq!(
+        tree.glob_call_count(),
+        1,
+        "three calls must still enumerate exactly once"
+    );
+}
+
 /// An `exclude_structs` entry in a CHECKS config suppresses a
 /// `rust/giant-structs-create` finding: the host's `struct_name_from_finding`
 /// helper parses the create-check message format (`struct \`Name\` is constructed

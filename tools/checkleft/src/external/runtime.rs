@@ -16,7 +16,7 @@ use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, Suggeste
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
-use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
+use super::sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
 use super::{
     EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
     ExternalCheckPackage, ExternalCheckPackageImplementation, run_declarative_check,
@@ -275,6 +275,11 @@ pub struct DefaultExternalCheckExecutor {
     /// for every `declared_exclusions_for_component` / `evaluate_exclusion_for_component`
     /// call when many exclusion entries share the same component.
     audit_component_cache: Mutex<HashMap<String, Component>>,
+    /// Lazily-built whole-repo sandbox shared across every check in this run
+    /// that declares `AccessScope::WholeRepo`. Built at most once per executor
+    /// instance; `None` until the first WholeRepo check triggers materialization.
+    /// Dropped (and the temp dir cleaned up) when the executor itself is dropped.
+    whole_repo_sandbox: Mutex<Option<Arc<SandboxResult>>>,
 }
 
 impl DefaultExternalCheckExecutor {
@@ -309,6 +314,7 @@ impl DefaultExternalCheckExecutor {
             ticker,
             component_cache,
             audit_component_cache: Mutex::new(HashMap::new()),
+            whole_repo_sandbox: Mutex::new(None),
         })
     }
 
@@ -334,7 +340,31 @@ impl DefaultExternalCheckExecutor {
             ticker,
             component_cache,
             audit_component_cache: Mutex::new(HashMap::new()),
+            whole_repo_sandbox: Mutex::new(None),
         })
+    }
+
+    /// Return the shared whole-repo sandbox, building it lazily on first call.
+    ///
+    /// Subsequent calls return a clone of the same `Arc`; the underlying
+    /// `TempDir` is not recreated. Concurrent calls are serialized by the
+    /// internal mutex so the tree is materialized exactly once per executor
+    /// lifetime regardless of how many WholeRepo checks run in parallel.
+    fn get_or_build_whole_repo_sandbox(&self, source_tree: &dyn SourceTree) -> Result<Arc<SandboxResult>> {
+        let mut guard = self.whole_repo_sandbox.lock().unwrap();
+        if let Some(sb) = guard.as_ref() {
+            return Ok(Arc::clone(sb));
+        }
+        let sb = create_sandbox(
+            &ChangeSet::new(vec![]),
+            AccessScope::WholeRepo,
+            source_tree,
+            &HostCeiling::new(&self.root),
+        )
+        .context("failed to create shared whole-repo sandbox")?;
+        let sb = Arc::new(sb);
+        *guard = Some(Arc::clone(&sb));
+        Ok(sb)
     }
 
     fn execute_component_check(
@@ -374,9 +404,30 @@ impl DefaultExternalCheckExecutor {
 
         let wasm_component =
             self.load_or_compile_component(&package.id, &component_bytes, &component.artifact_sha256)?;
-        run_component_check(
+
+        // Phase 1: discover the check's declared access scope via list-checks.
+        // This instantiation uses an empty WASI context (no preopens); only the
+        // static descriptor is needed, no filesystem access.
+        let access_scope = discover_access_scope(&self.engine, &wasm_component, package, &component.check_name)?;
+
+        // Acquire the sandbox. WholeRepo checks share a single sandbox that is
+        // built at most once per executor lifetime — avoids materializing the
+        // entire tree N times when N whole-repo checks run in the same pass.
+        // All other scopes get a per-check sandbox limited to their declared files.
+        let sandbox: Arc<SandboxResult> = match access_scope {
+            AccessScope::WholeRepo => self
+                .get_or_build_whole_repo_sandbox(source_tree)
+                .with_context(|| format!("failed to acquire whole-repo sandbox for check `{}`", package.id))?,
+            other_scope => Arc::new(
+                create_sandbox(changeset, other_scope, source_tree, &HostCeiling::new(&self.root))
+                    .with_context(|| format!("failed to create FS sandbox for check `{}`", package.id))?,
+            ),
+        };
+
+        // Phase 2: run the check with the capability-scoped sandbox preopened.
+        let result = run_component_check(
             &self.engine,
-            &self.root,
+            sandbox.root.path(),
             ComponentRun {
                 package,
                 check_name: &component.check_name,
@@ -387,7 +438,15 @@ impl DefaultExternalCheckExecutor {
                 config,
                 config_dir,
             },
-        )
+        )?;
+
+        // Release this task's reference. For per-check sandboxes this triggers
+        // cleanup immediately; for the shared whole-repo sandbox the executor's
+        // Arc keeps the TempDir alive until the executor itself is dropped at
+        // end of run.
+        drop(sandbox);
+
+        Ok(result)
     }
 
     /// Load a `Component` from the AOT cache or compile it from bytes.
@@ -667,7 +726,46 @@ struct ComponentRun<'a> {
     config_dir: &'a Path,
 }
 
-fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Result<CheckResult> {
+/// Discover the access scope declared by `check_name` inside `component` by
+/// calling `list-checks` with an empty WASI context (no filesystem access).
+/// This is phase 1 of component execution; it returns purely static metadata.
+fn discover_access_scope(
+    engine: &Engine,
+    component: &Component,
+    package: &ExternalCheckPackage,
+    check_name: &str,
+) -> Result<AccessScope> {
+    let linker = build_component_v1_linker(engine)?;
+    let mut store = Store::new(engine, HostState::with_empty_wasi());
+    // list-checks must never be interrupted by epoch; it returns static
+    // metadata so there is no meaningful wall-clock bound to enforce here.
+    store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
+    let instance = wasmtime(linker.instantiate(&mut store, component))
+        .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
+    let bindings = wasmtime(WitCheck::new(&mut store, &instance))
+        .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
+    let descriptors = wasmtime(bindings.call_list_checks(&mut store))
+        .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?;
+
+    let descriptor = descriptors.iter().find(|d| d.name == check_name).ok_or_else(|| {
+        let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
+        anyhow::anyhow!(
+            "component `{}` does not export a check named `{}`; available: [{}]",
+            package.id,
+            check_name,
+            exported.join(", ")
+        )
+    })?;
+
+    Ok(lift_access_scope(descriptor.access_scope.as_ref()))
+}
+
+/// Run a component check (phase 2) using an already-built capability sandbox.
+///
+/// `sandbox_root` is the root of the pre-populated sandbox directory that will
+/// be preopened at `"/"` for the guest. The caller is responsible for keeping
+/// the sandbox alive for the duration of this call.
+fn run_component_check(engine: &Engine, sandbox_root: &Path, run: ComponentRun) -> Result<CheckResult> {
     let ComponentRun {
         package,
         check_name,
@@ -681,44 +779,10 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let (timeout_ticks, max_memory_bytes) = resolve_component_limits(limits, changeset.changed_files.len());
     let linker = build_component_v1_linker(engine)?;
 
-    // Phase 1: instantiate with an empty WASI context (no preopens) to call
-    // list-checks() and discover the check's declared access-scope. The
-    // descriptor is purely static metadata; no filesystem access is needed.
-    let descriptors = {
-        let mut store = Store::new(engine, HostState::with_empty_wasi());
-        // list-checks must never be interrupted by epoch; it returns static
-        // metadata so there is no meaningful wall-clock bound to enforce here.
-        store.set_epoch_deadline(EPOCH_DEADLINE_NEVER);
-        let instance = wasmtime(linker.instantiate(&mut store, component))
-            .with_context(|| format!("failed to instantiate component for `{}`", package.id))?;
-        let bindings = wasmtime(WitCheck::new(&mut store, &instance))
-            .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
-        wasmtime(bindings.call_list_checks(&mut store))
-            .with_context(|| format!("`list-checks` failed for component `{}`", package.id))?
-    };
-
-    let descriptor = descriptors.iter().find(|d| d.name == check_name).ok_or_else(|| {
-        let exported: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
-        anyhow::anyhow!(
-            "component `{}` does not export a check named `{}`; available: [{}]",
-            package.id,
-            check_name,
-            exported.join(", ")
-        )
-    })?;
-
-    let access_scope = lift_access_scope(descriptor.access_scope.as_ref());
-
-    // Build the capability sandbox from the declared scope. Files outside
-    // the scope are not materialized; the guest cannot name them.
-    let ceiling = HostCeiling::new(root);
-    let sandbox = create_sandbox(changeset, access_scope, source_tree, &ceiling)
-        .with_context(|| format!("failed to create FS sandbox for check `{}`", package.id))?;
-
-    // Phase 2: re-instantiate with a WASI context that preopens the sandbox
-    // root at "/". The guest reads via std::fs with no checkleft-specific
-    // call; enforcement is structural (only sandboxed files exist).
-    let host_state = HostState::with_sandbox_root(sandbox.root.path(), max_memory_bytes)
+    // Instantiate with a WASI context that preopens the sandbox root at "/".
+    // The guest reads via std::fs with no checkleft-specific call; enforcement
+    // is structural (only sandboxed files exist in the preopened directory).
+    let host_state = HostState::with_sandbox_root(sandbox_root, max_memory_bytes)
         .with_context(|| format!("failed to configure WASI context for check `{}`", package.id))?;
     let mut store = Store::new(engine, host_state);
     store.limiter(|state| &mut state.limiter);
@@ -759,10 +823,6 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
             anyhow::anyhow!("check `{}` in component `{}` failed: {}", check_name, package.id, msg)
         }
     })?;
-
-    // `sandbox` is kept alive until here so the preopened directory persists
-    // for the entire run-check call above.
-    drop(sandbox);
 
     let mut result = CheckResult {
         check_id: package.id.clone(),
