@@ -88,6 +88,7 @@ rust_library(
         "src/metrics/mod.rs",
         "src/metrics/persistence.rs",
         "src/metrics/registry.rs",
+        "src/no_op_signal.rs",
         "src/nudge_breaker.rs",
         "src/orphan_sweep.rs",
         "src/pane_summary.rs",

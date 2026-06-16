@@ -1338,6 +1338,21 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
         // so it stops once CI is effectively green rather than polling
         // forever on human-gated checks (e.g. LinkedIn's `Owner Approval`).
         prompt.push_str(&ci_monitoring_directive(execution));
+        // T1868: give a fresh-PR chore/task implementation worker a SANCTIONED
+        // way to terminate as "the work was already done". Without it, a worker
+        // that correctly finds an empty diff stops and explains — and the
+        // engine's Stop-boundary handler then nudges it to "produce a PR"
+        // forever. Only for the no-existing-PR flow: when a PR already exists,
+        // an empty diff means "already pushed", handled by the push-to-existing
+        // path, not by closing the task as a no-op.
+        if existing_pr_url.is_none()
+            && matches!(
+                execution.kind,
+                ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation
+            )
+        {
+            prompt.push_str(&no_op_completion_directive());
+        }
     }
     // Attentions creation pipeline (design: attentions.md): implementation
     // workers may surface out-of-scope follow-on work as a `FOLLOWUPS:` block
@@ -1588,6 +1603,50 @@ fn pr_terminal_directive() -> String {
     );
     out.push_str("You will NOT get another turn after `gh pr create` / `cube pr create` (or `cube pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (subagent workflows, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
+    out
+}
+
+/// Sanctioned no-op completion directive (T1868). A `chore_implementation`
+/// / `task_implementation` worker sometimes investigates and finds the work
+/// is *already done* — the change is already on `main`, so `jj diff -r @` is
+/// empty and there is nothing to commit/push/open a PR for. That is a
+/// legitimate success, not a failure. Before this directive the worker was
+/// told only to "stop and explain", and the engine's Stop-boundary handler
+/// then read the empty branch as "stopped without producing a PR" and nudged
+/// it to `gh pr create` — the two instructions were in direct conflict and
+/// the worker churned against the nudge until the breaker parked it.
+///
+/// This block reframes the already-done empty-diff case as a success and
+/// gives the worker an unambiguous terminal signal: emit the
+/// [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER) marker
+/// on its own line and stop. The engine accepts that marker (combined with a
+/// genuinely empty contribution — no PR pushed, none bound) as a clean
+/// terminal and closes the task as done WITHOUT a PR, sending no nudge. The
+/// marker is the *only* sanctioned way to signal this; a worker that simply
+/// stops without it is still nudged, so this must NOT be used to bail out of
+/// work that is merely hard or blocked.
+fn no_op_completion_directive() -> String {
+    let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
+    let mut out = String::new();
+    out.push_str("\n## If the work is already done: signal a sanctioned no-op\n\n");
+    out.push_str(
+        "Run `jj diff -r @` before you conclude. If the diff is empty because the work is ALREADY \
+         DONE — the change is already present on `main` (e.g. another PR landed it), and there is \
+         genuinely nothing left to change — that is a legitimate, SUCCESSFUL outcome, not a \
+         failure.\n\n",
+    );
+    out.push_str(&format!(
+        "In that case, do NOT commit, push, or open a PR, and do NOT push an empty/no-op PR to \
+         manufacture a deliverable. Instead, emit a line containing exactly `{marker}` as the \
+         final line of your response, then stop. The engine recognizes this marker and closes the \
+         task as already-done — no PR is required and you will not be nudged to produce one.\n\n"
+    ));
+    out.push_str(&format!(
+        "This replaces the generic \"stop and explain what went wrong\" for the already-done case: \
+         an empty diff because the work is done is a success terminal, not an error. Do NOT emit \
+         `{marker}` to abandon work you simply found hard or are blocked on — if you are blocked, \
+         say what you need instead, and the engine will help you proceed.\n"
+    ));
     out
 }
 
@@ -3068,6 +3127,48 @@ mod compose_prompt_tests {
         assert!(
             !prompt.contains("Owner Approval"),
             "no human-gated check should be named for a plain org:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn no_op_directive_present_for_fresh_chore_without_pr() {
+        // T1868: a fresh chore_implementation worker (no existing PR) must
+        // be told the sanctioned way to terminate when the work is already
+        // done — emit NO_CHANGES_NEEDED — instead of only "stop and explain".
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_without_pr())
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
+            "fresh-chore prompt must name the NO_CHANGES_NEEDED marker:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("signal a sanctioned no-op"),
+            "fresh-chore prompt must carry the no-op completion directive:\n{prompt}",
+        );
+    }
+
+    #[test]
+    fn no_op_directive_absent_when_pr_already_exists() {
+        // When a PR already exists (resume / existing-PR flow), an empty diff
+        // means "already pushed" and is handled by the push-to-existing path
+        // — NOT by closing the task as a no-op. The directive must not appear.
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&base_execution())
+                .work_item(&chore_with_pr("https://github.com/org/repo/pull/7"))
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        assert!(
+            !prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
+            "existing-PR prompt must NOT carry the no-op marker directive:\n{prompt}",
         );
     }
 

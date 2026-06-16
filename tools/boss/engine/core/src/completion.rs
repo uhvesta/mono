@@ -1481,6 +1481,35 @@ must not be asked to open one",
                         )
                         .await;
                 }
+                // Sanctioned no-op terminal (T1868): a primary-implementation
+                // worker (chore / task) that investigated and found the work
+                // ALREADY DONE — the change is already on `main`, `jj diff -r @`
+                // is empty, nothing to commit/push. We are at a real Stop
+                // boundary (`waiting_human`), there is no PR on this branch
+                // (PrStatus::None) and none bound to the chore (the
+                // resolve_bound_pr_url branch above returned), so the structural
+                // state confirms an empty contribution. If the worker emitted the
+                // sanctioned NO_CHANGES_NEEDED marker, this is a SUCCESS, not a
+                // failure to be nudged: close the task as done without a PR.
+                //
+                // Requiring the explicit marker is what distinguishes "verified
+                // already done" from "gave up without trying": a worker that
+                // stopped with no marker still falls through to the legitimate
+                // produce-a-PR nudge below (and the breaker that bounds it). We
+                // must NOT globally suppress that nudge, and we must NOT push an
+                // empty PR — both are the band-aids the incident forbids.
+                if should_enqueue_reviewer_for_primary(&execution.kind)
+                    && self.worker_signalled_no_op(execution_id).await
+                {
+                    tracing::info!(
+                        execution_id,
+                        expected_branch = %expected_branch,
+                        kind = %execution.kind,
+                        "stop event: worker emitted NO_CHANGES_NEEDED with no PR produced — \
+                         work already done; closing task as a no-op (no PR, no nudge)"
+                    );
+                    return self.finalize_no_op_completion(&execution).await;
+                }
                 tracing::info!(
                     execution_id,
                     expected_branch = %expected_branch,
@@ -3228,6 +3257,10 @@ must not be asked to open one",
             | StopOutcome::ReviewPassCompleted { .. }
             | StopOutcome::ReviewPassRevisionCreated { .. }
             | StopOutcome::ReviewPassAwaitingResult => false,
+            // Unreachable: the no-op terminal only fires for chore/task
+            // implementation kinds, never ci_remediation. A verified
+            // already-done run is a success, not a failure.
+            StopOutcome::NoChangesNeeded { .. } => false,
             // Catch-all branches: worker exited without evidence of a
             // push and without classifying via `mark-failed`.
             StopOutcome::AwaitingInput
@@ -3617,6 +3650,85 @@ must not be asked to open one",
             "auto-nudge circuit breaker tripped — parked execution, no further nudges"
         );
         StopOutcome::NudgeBreakerParked { reason }
+    }
+
+    /// Whether the worker emitted the sanctioned [`NO_CHANGES_NEEDED`
+    /// marker](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER) in its final
+    /// assistant prose — its unambiguous signal that the assigned work is
+    /// already done and there is genuinely nothing to commit/push/open a PR
+    /// for. Reads the run transcript (reusing the triage-marker reader) and
+    /// scans it for an own-line emission of the marker.
+    ///
+    /// Returns `false` on any read failure or when no transcript is recorded
+    /// — absence of the marker must never be guessed at: a worker that
+    /// stopped without the explicit signal is treated as "gave up / not done"
+    /// and falls through to the normal produce-a-PR nudge.
+    async fn worker_signalled_no_op(&self, execution_id: &str) -> bool {
+        match self.read_final_triage_message(execution_id).await.into_message() {
+            Some(text) => crate::no_op_signal::transcript_signals_no_op(&text),
+            None => false,
+        }
+    }
+
+    /// Finalize a sanctioned no-op completion: the worker verified its work
+    /// is already done (empty diff, no PR produced and none bound), so the
+    /// task is closed cleanly as `done` WITHOUT a PR and the execution is
+    /// finalised. No nudge is sent. Mirrors [`Self::finalize_pr_transition`]'s
+    /// lease/pane release and event publishing, but never stamps a `pr_url`
+    /// (there is none — fabricating one is the empty-PR the worker refused).
+    ///
+    /// Idempotent against an already-finalized execution: the DB write
+    /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
+    async fn finalize_no_op_completion(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        let detail = "Worker verified the assigned work was already done (empty diff — no changes \
+                      needed); closed as a no-op without a PR.";
+        let completion = match self.work_db.record_worker_no_op_completion(&execution.id, detail) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "no-op completion: failed to record",
+                );
+                return StopOutcome::DbError;
+            }
+        };
+        // The worker reached a clean terminal — drop any staged URL and reset
+        // the nudge counter so nothing lingers for this finalized execution.
+        self.staged_pr_urls.forget(&execution.id);
+        self.nudge_breaker.forget(&execution.id);
+        if let Some(lease_id) = completion.released_lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id,
+                ?err,
+                "no-op completion: cube release failed"
+            );
+        }
+        self.pane_releaser.release_pane(&execution.id).await;
+        let work_item_id = completion.execution.work_item_id.clone();
+        self.publisher
+            .publish(
+                &completion.execution.id,
+                &work_item_id,
+                completion.execution.status.as_str(),
+                "worker_no_op_completed",
+            )
+            .await;
+        let product_id = work_item_product_id(&completion.work_item);
+        self.publisher
+            .publish_work_item_changed(&product_id, &work_item_id, "worker_no_op_completed")
+            .await;
+        tracing::info!(
+            execution_id = %execution.id,
+            work_item_id = %work_item_id,
+            kind = %execution.kind,
+            "no-op completion: task closed as done without a PR (work already done)"
+        );
+        StopOutcome::NoChangesNeeded { work_item_id }
     }
 
     /// File a human-visible attention item recording that a reviewer worker
@@ -4607,6 +4719,16 @@ pub enum StopOutcome {
     /// advanced to `in_review`; the revision is dispatched on the general
     /// worker pool to apply the feedback. Nothing is posted to GitHub.
     ReviewPassRevisionCreated { pr_url: String, revision_task_id: String },
+    /// T1868: a primary-implementation worker (`chore_implementation` /
+    /// `task_implementation`) verified its assigned work was already done —
+    /// the change is already on `main`, the diff is empty, and there is
+    /// genuinely nothing to commit/push/open a PR for — and emitted the
+    /// sanctioned [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
+    /// marker. The task is closed as `done` WITHOUT a PR and the execution is
+    /// finalised. No nudge is sent. This is the fix for the produce-a-PR nudge
+    /// loop on a worker that correctly found nothing to do. `work_item_id` is
+    /// the closed task/chore.
+    NoChangesNeeded { work_item_id: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }
@@ -8136,6 +8258,176 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
             "parking must file an attention item",
         );
+    }
+
+    // -----------------------------------------------------------
+    // T1868: sanctioned no-op terminal for chore_implementation.
+    //
+    // A fresh chore_implementation worker whose work is already done on
+    // main (empty diff, no PR) must be able to terminate cleanly. When it
+    // emits the NO_CHANGES_NEEDED marker the engine closes the task as
+    // done WITHOUT a PR and sends NO nudge — replacing the produce-a-PR
+    // nudge loop. A worker that stops with no marker is still nudged.
+    // -----------------------------------------------------------
+
+    /// Write a single-turn assistant transcript JSONL for `execution_id`
+    /// and register its path, so the no-op gate's transcript read finds
+    /// `text`. Mirrors the pr_review fixtures' transcript seeding.
+    fn write_assistant_transcript(db: &WorkDb, workspace_path: &Path, execution_id: &str, text: &str) {
+        let obj = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [{"type": "text", "text": text}] }
+        });
+        let jsonl = format!("{obj}\n");
+        let transcript_path = workspace_path.join(format!("transcript-{execution_id}.jsonl"));
+        std::fs::write(&transcript_path, jsonl.as_bytes()).unwrap();
+        db.set_run_transcript_path_if_unset(execution_id, transcript_path.to_str().unwrap())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_op_marker_closes_task_as_done_without_nudge() {
+        // The incident path: a chore_implementation worker verified the
+        // work was already done (empty diff, no PR) and emitted
+        // NO_CHANGES_NEEDED. It must terminate ONCE as a clean no-op: task
+        // → done (no pr_url), NO probe queued, lease + pane released, NO
+        // breaker attention item.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "## Summary\nPRs #1559 and #1561 already cleaned all three breadcrumb patterns on \
+             main; the working copy has no diff.\n\nNO_CHANGES_NEEDED\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(&outcome, StopOutcome::NoChangesNeeded { work_item_id } if work_item_id == &chore_id),
+            "expected NoChangesNeeded for the chore; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "a sanctioned no-op must NOT queue a produce-a-PR probe; got {:?}",
+            probes.snapshot(),
+        );
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(t.status, TaskStatus::Done, "no-op must close the task as done");
+                assert!(t.pr_url.is_none(), "no-op must not stamp a pr_url; got {:?}", t.pr_url);
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
+        let execution = db.get_execution(&execution_id).unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert!(execution.cube_lease_id.is_none());
+        assert!(execution.finished_at.is_some());
+        assert_eq!(
+            cube.release_calls.lock().await.as_slice(),
+            ["lease-1"],
+            "no-op completion must release the cube lease",
+        );
+        assert_eq!(
+            pane.calls.lock().await.as_slice(),
+            [execution_id.as_str()],
+            "no-op completion must tear down the worker pane",
+        );
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert!(
+            !items.iter().any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND),
+            "a clean no-op must not masquerade as a parked nudge-breaker trip",
+        );
+        assert!(
+            publisher
+                .events
+                .lock()
+                .await
+                .iter()
+                .any(|(_, _, _, reason)| reason == "worker_no_op_completed"),
+            "no-op completion must publish a worker_no_op_completed event",
+        );
+
+        // Idempotent: a second Stop (hook re-fire) is a quiet terminal — no
+        // second nudge, no re-loop.
+        let outcome2 = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome2, StopOutcome::AlreadyTerminal),
+            "a re-fired Stop on an already-closed no-op must be AlreadyTerminal; got {outcome2:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "the re-fired Stop must not queue a probe either",
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_without_marker_still_nudges_to_produce_pr() {
+        // Guardrail: a worker that stopped with NO PR and did NOT emit the
+        // NO_CHANGES_NEEDED marker is "gave up / not done", not "verified
+        // already done". The legitimate produce-a-PR nudge must still fire —
+        // the no-op gate must NOT globally suppress it.
+        let workspace = tempdir().unwrap();
+        let (db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        // A real transcript exists, but it does NOT contain the marker.
+        write_assistant_transcript(
+            &db,
+            workspace.path(),
+            &execution_id,
+            "## Summary\nI made some progress but have not finished the change yet.\n",
+        );
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        );
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::AwaitingInput),
+            "no marker → normal produce-a-PR nudge; got {outcome:?}",
+        );
+        let queued = probes.snapshot();
+        assert_eq!(
+            queued.len(),
+            1,
+            "the no-PR worker without a marker is still nudged once"
+        );
+        assert_eq!(queued[0].1, PROBE_NO_PR, "the nudge is the produce-a-PR probe");
+        match db.get_work_item(&chore_id).unwrap() {
+            WorkItem::Chore(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::Active,
+                    "no marker → task is NOT closed as a no-op"
+                );
+                assert!(t.pr_url.is_none());
+            }
+            other => panic!("expected chore, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------

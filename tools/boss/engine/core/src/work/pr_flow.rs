@@ -130,6 +130,124 @@ impl WorkDb {
         }))
     }
 
+    /// Record that a primary-implementation worker (`chore_implementation`
+    /// / `task_implementation`) verified its assigned work is **already
+    /// done** — the change is already present on `main`, the working-copy
+    /// diff is empty, and there is genuinely nothing to commit, push, or
+    /// open a PR for. This is the sanctioned no-op terminal (see
+    /// [`crate::no_op_signal`]). In a single transaction:
+    ///   - the linked task/chore moves to `done` (with **no** `pr_url` —
+    ///     there is no PR), unless it is already terminal (`done` /
+    ///     `archived` / `cancelled`), in which case its status is left
+    ///     alone;
+    ///   - the execution transitions from `waiting_human` (or `running`)
+    ///     to `completed`, the cube workspace lease columns are cleared,
+    ///     and `finished_at` is stamped;
+    ///   - the most-recent run captures `detail` as its result summary if
+    ///     it does not already have one.
+    ///
+    /// Mirrors [`Self::record_worker_pr_completion`] — including the
+    /// dependent-cascade on a real status change and the returned
+    /// lease/workspace ids for out-of-band cube release — but stamps NO
+    /// `pr_url`: fabricating one would be exactly the empty PR the worker
+    /// correctly refused to push.
+    ///
+    /// Returns `Ok(None)` if the execution has already been finalised
+    /// (terminal status), making this safe to call from a hook handler
+    /// that may fire repeatedly.
+    pub fn record_worker_no_op_completion(
+        &self,
+        execution_id: &str,
+        detail: &str,
+    ) -> Result<Option<WorkerPrCompletion>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if execution.status.is_terminal() {
+            return Ok(None);
+        }
+        if !execution.status.is_live() {
+            bail!(
+                "execution {execution_id} cannot complete from worker no-op signal in status `{}`",
+                execution.status
+            );
+        }
+
+        let original_lease_id = execution.cube_lease_id.clone();
+        let original_workspace_id = execution.cube_workspace_id.clone();
+
+        let work_item_id = execution.work_item_id.clone();
+        let task =
+            query_task(&tx, &work_item_id)?.with_context(|| format!("unknown task for execution: {work_item_id}"))?;
+        if task.deleted_at.is_some() {
+            bail!("cannot complete a deleted task: {work_item_id}");
+        }
+
+        let now = now_string();
+        // A no-op completion closes the task as done. If it is already
+        // terminal (done / archived / cancelled), leave the status alone.
+        // `pr_url` is left untouched — a no-op produced none, and the
+        // worker correctly refused to fabricate one.
+        let new_status = if task.status.is_terminal() {
+            task.status.clone()
+        } else {
+            TaskStatus::Done
+        };
+        tx.execute(
+            "UPDATE tasks
+             SET status             = ?2,
+                 updated_at         = ?3,
+                 last_status_actor  = 'engine',
+                 blocked_reason     = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1",
+            params![task.id, new_status.as_str(), now],
+        )?;
+
+        if new_status != task.status {
+            cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
+        }
+
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'completed',
+                 cube_lease_id = NULL,
+                 cube_workspace_id = NULL,
+                 workspace_path = NULL,
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        // Capture the no-op explanation as the run summary if the run
+        // hasn't already recorded one.
+        let trimmed = detail.trim();
+        if !trimmed.is_empty() {
+            tx.execute(
+                "UPDATE work_runs
+                 SET result_summary = COALESCE(NULLIF(result_summary, ''), ?2)
+                 WHERE execution_id = ?1
+                   AND id = (
+                       SELECT id FROM work_runs
+                       WHERE execution_id = ?1
+                       ORDER BY created_at DESC, id DESC
+                       LIMIT 1
+                   )",
+                params![execution_id, trimmed],
+            )?;
+        }
+
+        let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
+        tx.commit()?;
+        Ok(Some(WorkerPrCompletion {
+            execution: updated_execution,
+            work_item: task_to_item(updated_task),
+            released_lease_id: original_lease_id,
+            released_workspace_id: original_workspace_id,
+        }))
+    }
+
     /// Chores and project_tasks currently in `in_review` whose
     /// `pr_url` is set. The merge poller iterates this list, asks
     /// GitHub whether each PR is merged, and calls

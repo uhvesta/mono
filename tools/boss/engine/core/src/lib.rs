@@ -48,6 +48,7 @@ pub mod magic_wand;
 pub mod merge_poller;
 pub mod merge_when_ready;
 pub mod metrics;
+pub mod no_op_signal;
 pub mod nudge_breaker;
 pub mod orphan_sweep;
 pub mod pane_summary;
