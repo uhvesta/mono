@@ -980,6 +980,7 @@ pub struct ExecutionCoordinator {
     /// [`crate::host_adapter::SshHostAdapterProvider`] via
     /// [`Self::set_host_adapter_provider`].
     host_adapter_provider: Arc<dyn HostAdapterProvider>,
+    #[builder(default = Arc::new(NoopExecutionPublisher))]
     publisher: Arc<dyn ExecutionPublisher>,
     /// Structured stream of dispatch-pipeline events. Defaults to a
     /// no-op so legacy tests and short-lived callers don't need to
@@ -992,7 +993,7 @@ pub struct ExecutionCoordinator {
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
-    #[builder(default = AtomicBool::new(false))]
+    #[builder(default)]
     scheduling_active: AtomicBool,
     /// Wakeup flag set by every `kick()` (whether or not it spawned a
     /// fresh scheduler). The running scheduler reads + resets this on
@@ -1002,7 +1003,7 @@ pub struct ExecutionCoordinator {
     /// the drain loop instead of being silently dropped. Closes the
     /// TOCTOU between "queue saw empty" and "active=false" that left
     /// fresh `ready` executions stranded with no scheduler running.
-    #[builder(default = AtomicBool::new(false))]
+    #[builder(default)]
     scheduling_pending: AtomicBool,
     /// Repo origin URLs the cold-pool probe has already inspected in
     /// this engine's lifetime. The probe runs once per URL on the
@@ -1011,7 +1012,7 @@ pub struct ExecutionCoordinator {
     /// round-trip and the attention-item write. Engine restart resets
     /// this; per `multi-repo-work-modeling.md` R4 the deduplication
     /// scope is engine-lifetime, not durable.
-    #[builder(default = Mutex::new(HashSet::new()))]
+    #[builder(default)]
     repo_cold_probe_seen: Mutex<HashSet<String>>,
     /// Backoff delays between successive pre-start retry attempts.
     /// Defaults to [`PRE_START_RETRY_DELAYS`]. Tests may override via
@@ -1035,11 +1036,11 @@ pub struct ExecutionCoordinator {
     /// immediately without claiming any slots. Seeded from the `dispatch_paused`
     /// metadata key at engine startup; persisted there on every toggle so the
     /// pause survives an engine restart.
-    #[builder(default = AtomicBool::new(false))]
+    #[builder(default)]
     dispatch_paused: AtomicBool,
     /// Epoch seconds when dispatch was last paused. Zero means "not paused".
     /// Seeded at startup from `dispatch_paused_since_epoch_s` in `state.db`.
-    #[builder(default = AtomicU64::new(0))]
+    #[builder(default)]
     dispatch_paused_since_epoch_s: AtomicU64,
     /// Live per-slot worker registry, used by the lease-time occupancy
     /// guard to refuse leasing a workspace that is still the cwd of a
