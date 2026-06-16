@@ -388,6 +388,47 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Abandon a stale `conflict_resolutions` row for supersede when the base
+    /// SHA has NOT changed. Nullifies `base_sha_at_trigger` to free the
+    /// `UNIQUE (work_item_id, base_sha_at_trigger)` slot so the INSERT in
+    /// `on_conflict_detected` can create a fresh row with the current base SHA
+    /// and the churn guard can count this supersede toward the rolling window.
+    ///
+    /// SQLite treats NULL as distinct from every other value (including other
+    /// NULLs) in UNIQUE constraints, so clearing the column releases the slot
+    /// without conflicting with any future row.
+    ///
+    /// Use this for same-base supersedes (head moved or revision terminal, base
+    /// unchanged). For base-SHA-changed supersedes, a plain
+    /// `mark_conflict_resolution_abandoned` suffices because the new row will
+    /// use a different UNIQUE key.
+    pub fn abandon_conflict_resolution_for_supersede(
+        &self,
+        attempt_id: &str,
+        reason: &str,
+    ) -> Result<Option<ConflictResolution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let now = now_string();
+        let rows = tx.execute(
+            "UPDATE conflict_resolutions
+                SET status              = 'abandoned',
+                    failure_reason      = ?2,
+                    base_sha_at_trigger = NULL,
+                    finished_at         = COALESCE(finished_at, ?3)
+              WHERE id = ?1
+                AND status IN ('pending', 'running')",
+            params![attempt_id, reason, now],
+        )?;
+        if rows == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let updated = query_conflict_resolution(&tx, attempt_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Read-only list of `conflict_resolutions` rows for the Phase 5
     /// `boss engine conflicts list` CLI. Filters are AND-ed; an empty
     /// `status` slice means "any status." Rows come back freshest first

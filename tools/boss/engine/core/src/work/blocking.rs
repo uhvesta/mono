@@ -1345,6 +1345,30 @@ impl WorkDb {
         Ok(n > 0)
     }
 
+    /// Is the revision task identified by `revision_task_id` still live
+    /// (i.e. status in `todo`, `active`, or `blocked`)?
+    ///
+    /// Used by `conflict_watch::on_conflict_detected` as the secondary gate
+    /// in the stale-crz supersede check: if the linked revision task has
+    /// reached a terminal status (`in_review`, `done`, `cancelled`, …) but
+    /// `finalize_conflict_resolution_attempt` was never called (the exec was
+    /// abandoned by the orphan sweep rather than via `NudgeBreakerParked`),
+    /// the crz stays `pending` with `revision_task_id` set. Checking for a
+    /// terminal revision lets conflict_watch abandon the stale crz and
+    /// re-detect rather than spinning as an idempotent no-op forever.
+    pub fn is_conflict_resolution_revision_live(&self, revision_task_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE id = ?1
+               AND status IN ('todo', 'active', 'blocked')
+               AND deleted_at IS NULL",
+            params![revision_task_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Does the work item have a `ci_failure_suppressions` row for
     /// `head_sha`? Set by manual moves out of `blocked: ci_failure`
     /// to keep the next probe from immediately re-flipping the row
