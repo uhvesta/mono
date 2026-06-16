@@ -24,6 +24,22 @@
 //! The two mechanisms are independent and additive: a single instance can rely
 //! on markers, on glob couplings, or on both.
 //!
+//! ## Multi-target `LINT.ThenChange`
+//!
+//! A single `LINT.ThenChange` can list multiple comma-separated targets.
+//! Every listed target must be updated in the same change when the guarded
+//! region changes:
+//!
+//! ```text
+//! LINT.ThenChange(fileA, fileB)
+//! LINT.ThenChange(fileA:region, fileB, path/to/fileC:other-region)
+//! ```
+//!
+//! Each entry in the list uses the same forms accepted for a single target
+//! (bare file, `file:region`). Whitespace around entries is ignored; empty
+//! entries (e.g. trailing commas) are also ignored. A violation names only the
+//! specific targets that were not updated.
+//!
 //! ## Supported comment styles (markers)
 //!
 //! The `LINT.IfChange` / `LINT.ThenChange` directives are recognized when preceded
@@ -95,7 +111,7 @@ struct IfChangeBlock {
     source_label: Option<String>,
     ifchange_line: usize,
     thenchange_line: usize,
-    target: ThenChangeTarget,
+    targets: Vec<ThenChangeTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,17 +147,28 @@ fn marker_findings(changeset: &ChangeSet) -> Vec<Finding> {
                 continue;
             }
 
-            let status = target_status(block, changeset, &analyses);
-            match status {
-                TargetStatus::Satisfied => continue,
-                TargetStatus::MissingFile => {
-                    findings.push(broken_target_finding(&analysis.path, block, TargetStatus::MissingFile))
-                }
-                TargetStatus::MissingLabel => {
-                    findings.push(broken_target_finding(&analysis.path, block, TargetStatus::MissingLabel))
-                }
-                TargetStatus::NotChanged => {
-                    findings.push(broken_target_finding(&analysis.path, block, TargetStatus::NotChanged))
+            for target in &block.targets {
+                let status = target_status(target, changeset, &analyses);
+                match status {
+                    TargetStatus::Satisfied => {}
+                    TargetStatus::MissingFile => findings.push(broken_target_finding(
+                        &analysis.path,
+                        block,
+                        target,
+                        TargetStatus::MissingFile,
+                    )),
+                    TargetStatus::MissingLabel => findings.push(broken_target_finding(
+                        &analysis.path,
+                        block,
+                        target,
+                        TargetStatus::MissingLabel,
+                    )),
+                    TargetStatus::NotChanged => findings.push(broken_target_finding(
+                        &analysis.path,
+                        block,
+                        target,
+                        TargetStatus::NotChanged,
+                    )),
                 }
             }
         }
@@ -250,10 +277,9 @@ fn analyze_file(changed_file: &ChangedFile, changeset: &ChangeSet) -> FileAnalys
         && let Ok(base_parsed) = parse_ifchange_file(&path, base_content)
     {
         for base_block in &base_parsed.blocks {
-            let still_present = parsed
-                .blocks
-                .iter()
-                .any(|b| b.source_label == base_block.source_label && targets_match(&b.target, &base_block.target));
+            let still_present = parsed.blocks.iter().any(|b| {
+                b.source_label == base_block.source_label && targets_list_match(&b.targets, &base_block.targets)
+            });
             if !still_present {
                 let was_touched = diff.is_some_and(|d| {
                     d.hunks
@@ -284,8 +310,8 @@ enum TargetStatus {
     NotChanged,
 }
 
-fn target_status(block: &IfChangeBlock, changeset: &ChangeSet, analyses: &[FileAnalysis]) -> TargetStatus {
-    match &block.target {
+fn target_status(target: &ThenChangeTarget, changeset: &ChangeSet, analyses: &[FileAnalysis]) -> TargetStatus {
+    match target {
         ThenChangeTarget::File { path } => {
             // A target that was itself changed (even deleted) satisfies the constraint.
             if file_changed(changeset, path) {
@@ -364,6 +390,12 @@ fn targets_match(a: &ThenChangeTarget, b: &ThenChangeTarget) -> bool {
     }
 }
 
+fn targets_list_match(a: &[ThenChangeTarget], b: &[ThenChangeTarget]) -> bool {
+    // Order-insensitive: reordering targets in an existing ThenChange is not
+    // treated as marker removal.
+    a.len() == b.len() && a.iter().all(|ta| b.iter().any(|tb| targets_match(ta, tb)))
+}
+
 // ── Hunk / range overlap ──────────────────────────────────────────────────────
 
 fn hunk_touches_range_new(hunk: &DiffHunk, range_start: usize, range_end: usize) -> bool {
@@ -384,10 +416,15 @@ fn hunk_touches_range(start: usize, len: usize, range_start: usize, range_end: u
 
 // ── Finding construction ──────────────────────────────────────────────────────
 
-fn broken_target_finding(source_path: &str, block: &IfChangeBlock, status: TargetStatus) -> Finding {
+fn broken_target_finding(
+    source_path: &str,
+    block: &IfChangeBlock,
+    target: &ThenChangeTarget,
+    status: TargetStatus,
+) -> Finding {
     Finding {
         severity: Severity::Error,
-        message: format_violation_message(source_path, block, status),
+        message: format_violation_message(source_path, block, target, status),
         location: Some(Location {
             path: source_path.to_owned(),
             line: Some(block.ifchange_line as u32),
@@ -401,12 +438,17 @@ fn broken_target_finding(source_path: &str, block: &IfChangeBlock, status: Targe
     }
 }
 
-fn format_violation_message(source_path: &str, block: &IfChangeBlock, status: TargetStatus) -> String {
+fn format_violation_message(
+    source_path: &str,
+    block: &IfChangeBlock,
+    target: &ThenChangeTarget,
+    status: TargetStatus,
+) -> String {
     let source_clause = match &block.source_label {
         Some(label) => format!("when changing `{label}` in `{source_path}`"),
         None => format!("when changing `{source_path}`"),
     };
-    match (&block.target, status) {
+    match (target, status) {
         (ThenChangeTarget::File { path }, TargetStatus::NotChanged) => {
             format!("{source_clause}, you must also change `{path}`")
         }
@@ -460,7 +502,7 @@ fn parse_ifchange_file(path: &str, contents: &str) -> Result<IfChangeFile, Strin
                     "{path}:{line_number}: `LINT.ThenChange(...)` must close a preceding `LINT.IfChange` block"
                 ));
             };
-            let target = parse_thenchange_target(raw_target).map_err(|e| format!("{path}:{line_number}: {e}"))?;
+            let targets = parse_thenchange_targets(raw_target).map_err(|e| format!("{path}:{line_number}: {e}"))?;
             let block_index = blocks.len();
             if let Some(ref label) = source_label {
                 label_map.insert(label.clone(), block_index);
@@ -469,7 +511,7 @@ fn parse_ifchange_file(path: &str, contents: &str) -> Result<IfChangeFile, Strin
                 source_label,
                 ifchange_line,
                 thenchange_line: line_number,
-                target,
+                targets,
             });
         }
     }
@@ -523,6 +565,20 @@ fn parse_thenchange_directive(text: &str) -> Option<&str> {
         return None;
     }
     Some(target)
+}
+
+fn parse_thenchange_targets(raw: &str) -> Result<Vec<ThenChangeTarget>, String> {
+    let targets: Result<Vec<_>, _> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_thenchange_target)
+        .collect();
+    let targets = targets?;
+    if targets.is_empty() {
+        return Err("`LINT.ThenChange(...)` must have at least one non-empty target".to_owned());
+    }
+    Ok(targets)
 }
 
 fn parse_thenchange_target(raw: &str) -> Result<ThenChangeTarget, String> {
@@ -1458,7 +1514,8 @@ mod tests {
         assert_eq!(parsed.blocks[0].source_label, None);
         assert_eq!(parsed.blocks[0].ifchange_line, 1);
         assert_eq!(parsed.blocks[0].thenchange_line, 3);
-        match &parsed.blocks[0].target {
+        assert_eq!(parsed.blocks[0].targets.len(), 1);
+        match &parsed.blocks[0].targets[0] {
             ThenChangeTarget::File { path } => assert_eq!(path, "tools/release/version.txt"),
             other => panic!(
                 "expected File target; got {other:?}",
@@ -1476,7 +1533,8 @@ mod tests {
         .expect("parse");
         assert_eq!(parsed.blocks.len(), 1);
         assert_eq!(parsed.blocks[0].source_label.as_deref(), Some("schema"));
-        match &parsed.blocks[0].target {
+        assert_eq!(parsed.blocks[0].targets.len(), 1);
+        match &parsed.blocks[0].targets[0] {
             ThenChangeTarget::Block { path, label } => {
                 assert_eq!(path, "frontend/src/types.ts");
                 assert_eq!(label, "user_schema");
@@ -1827,6 +1885,211 @@ mod tests {
         assert!(
             findings[0].message.contains("trigger_globs"),
             "error must mention trigger_globs; got: {}",
+            findings[0].message
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Multi-target ThenChange tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn multi_target_both_updated_passes() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt, c.txt)\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        fs::write(dir.path().join("c.txt"), "c\n").unwrap();
+
+        let cs = make_changeset(
+            vec![
+                ("a.txt", ChangeKind::Modified),
+                ("b.txt", ChangeKind::Modified),
+                ("c.txt", ChangeKind::Modified),
+            ],
+            vec![("a.txt", vec![hunk_new(2, 1)])],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert!(
+            findings.is_empty(),
+            "both targets updated — no finding expected; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn multi_target_only_first_updated_reports_second_missing() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt, c.txt)\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        fs::write(dir.path().join("c.txt"), "c\n").unwrap();
+
+        // Only b.txt is updated; c.txt is not.
+        let cs = make_changeset(
+            vec![("a.txt", ChangeKind::Modified), ("b.txt", ChangeKind::Modified)],
+            vec![("a.txt", vec![hunk_new(2, 1)])],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected 1 finding for missing c.txt; got {findings:?}"
+        );
+        assert!(
+            findings[0].message.contains("c.txt"),
+            "finding must name the missing target c.txt; message: {}",
+            findings[0].message
+        );
+        assert!(
+            !findings[0].message.contains("b.txt"),
+            "finding must not mention the satisfied target b.txt; message: {}",
+            findings[0].message
+        );
+    }
+
+    #[test]
+    fn multi_target_neither_updated_reports_both_missing() {
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt, c.txt)\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        fs::write(dir.path().join("c.txt"), "c\n").unwrap();
+
+        // Neither b.txt nor c.txt is updated.
+        let cs = make_changeset(
+            vec![("a.txt", ChangeKind::Modified)],
+            vec![("a.txt", vec![hunk_new(2, 1)])],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            findings.len(),
+            2,
+            "expected 2 findings (one per missing target); got {findings:?}"
+        );
+        let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("b.txt")),
+            "one finding must name b.txt; messages: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("c.txt")),
+            "one finding must name c.txt; messages: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn multi_target_whitespace_variants_parsed_correctly() {
+        // ThenChange(A,B) and ThenChange( A , B ) are both valid.
+        let no_space =
+            parse_ifchange_file("a.txt", "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt,c.txt)\n").unwrap();
+        assert_eq!(no_space.blocks[0].targets.len(), 2);
+
+        let with_space = parse_ifchange_file(
+            "a.txt",
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange( b.txt , c.txt )\n",
+        )
+        .unwrap();
+        assert_eq!(with_space.blocks[0].targets.len(), 2);
+        match &with_space.blocks[0].targets[0] {
+            ThenChangeTarget::File { path } => assert_eq!(path, "b.txt"),
+            other => panic!("expected File; got {other:?}", other = std::mem::discriminant(other)),
+        }
+        match &with_space.blocks[0].targets[1] {
+            ThenChangeTarget::File { path } => assert_eq!(path, "c.txt"),
+            other => panic!("expected File; got {other:?}", other = std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn multi_target_trailing_comma_ignored() {
+        // A trailing comma produces an empty entry that is silently dropped.
+        let parsed =
+            parse_ifchange_file("a.txt", "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt,c.txt,)\n").unwrap();
+        assert_eq!(
+            parsed.blocks[0].targets.len(),
+            2,
+            "trailing comma must not add an extra target"
+        );
+    }
+
+    #[test]
+    fn multi_target_mixed_file_and_block_targets() {
+        let parsed = parse_ifchange_file(
+            "a.txt",
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt, c.txt:my-label)\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.blocks[0].targets.len(), 2);
+        match &parsed.blocks[0].targets[0] {
+            ThenChangeTarget::File { path } => assert_eq!(path, "b.txt"),
+            other => panic!("expected File; got {other:?}", other = std::mem::discriminant(other)),
+        }
+        match &parsed.blocks[0].targets[1] {
+            ThenChangeTarget::Block { path, label } => {
+                assert_eq!(path, "c.txt");
+                assert_eq!(label, "my-label");
+            }
+            other => panic!("expected Block; got {other:?}", other = std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn single_target_regression_unchanged() {
+        // A single-entry ThenChange still works exactly as before.
+        let _guard = CWD_LOCK.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        fs::write(
+            dir.path().join("a.txt"),
+            "// LINT.IfChange\ncontent\n// LINT.ThenChange(b.txt)\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+
+        let cs = make_changeset(
+            vec![("a.txt", ChangeKind::Modified)],
+            vec![("a.txt", vec![hunk_new(2, 1)])],
+        );
+        let findings = run_check(cs);
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "single target not updated → one finding; got {findings:?}"
+        );
+        assert!(
+            findings[0].message.contains("b.txt"),
+            "message: {}",
             findings[0].message
         );
     }

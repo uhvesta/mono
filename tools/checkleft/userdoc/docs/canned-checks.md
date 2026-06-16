@@ -309,6 +309,8 @@ LINT.IfChange
 LINT.IfChange(label)
 LINT.ThenChange(path)
 LINT.ThenChange(path:label)
+LINT.ThenChange(fileA, fileB)
+LINT.ThenChange(fileA:region, fileB)
 ```
 
 - Directives should live on their own lines inside normal source comments
@@ -316,6 +318,12 @@ LINT.ThenChange(path:label)
 - `ThenChange(path)` requires any change to the linked file.
 - `ThenChange(path:label)` requires a touched `LINT.IfChange(label)` block in the
   linked file.
+- `ThenChange(fileA, fileB)` — comma-separated list of targets; every listed target
+  must be changed. Targets can be file paths or `path:label` block references and can
+  be mixed freely (e.g. `ThenChange(schema.rs, docs/api.md:endpoints)`).
+- When a multi-target `ThenChange` is violated, a separate finding is emitted for each
+  unmet target, naming only that specific target, so each finding is independently
+  actionable.
 - Enforced even when a marked region is deleted or its markers are removed (via
   base-revision content).
 
