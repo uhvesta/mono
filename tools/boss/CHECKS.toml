@@ -36,25 +36,6 @@ exclude_files = [
 #                                    `exclude_globs` (T828/T829): it exempts exactly the
 #                                    known-existing violation and nothing more.
 exclude_structs = [
-  # tools/boss/protocol/src/types.rs (migrated from exclude_globs in T819/T828)
-  "WorkItemExternalRef",
-  "WorkRun",
-  "WorkAttentionItem",
-  "EffortEscalation",
-  "EffortAuditMarkerRow",
-  "EffortAuditReport",
-  "ConflictResolution",
-  "CiRemediation",
-  "CiBudgetSnapshot",
-  "EngineAttemptListEntry",
-  "WorkTree",
-  "CreateProjectInput",
-  "CreateTaskInput",
-  "CreateInvestigationInput",
-  "CreateRunInput",
-  "CreateAttentionItemInput",
-  "WorkItemPatch",
-
   # Migrated off exclude_globs (qualified per-file form). Each line is the exact giant
   # struct that existed in that file when it was grandfathered; new giant structs in
   # these files are now flagged. host_adapter.rs, settings.rs, and worker_registry.rs
@@ -65,7 +46,6 @@ exclude_structs = [
   "engine/core/src/audit.rs::StartContext",
   "engine/core/src/dispatch_reader.rs::GhostActiveEntry",
   "engine/core/src/dispatch_reader.rs::StalledStage",
-  "engine/core/src/external_tracker/github.rs::GitHubConfig",
   "engine/core/src/external_tracker/mod.rs::UpstreamItem",
   "engine/core/src/host_registry.rs::Host",
   "engine/core/src/live_status_loop.rs::SlotDebugSnapshot",
