@@ -134,21 +134,15 @@ fn marker_findings(changeset: &ChangeSet) -> Vec<Finding> {
             let status = target_status(block, changeset, &analyses);
             match status {
                 TargetStatus::Satisfied => continue,
-                TargetStatus::MissingFile => findings.push(broken_target_finding(
-                    &analysis.path,
-                    block,
-                    "linked target file does not exist in the current tree".to_owned(),
-                )),
-                TargetStatus::MissingLabel => findings.push(broken_target_finding(
-                    &analysis.path,
-                    block,
-                    "linked target label does not exist in the current tree".to_owned(),
-                )),
-                TargetStatus::NotChanged => findings.push(broken_target_finding(
-                    &analysis.path,
-                    block,
-                    "linked target was not updated in the same change".to_owned(),
-                )),
+                TargetStatus::MissingFile => {
+                    findings.push(broken_target_finding(&analysis.path, block, TargetStatus::MissingFile))
+                }
+                TargetStatus::MissingLabel => {
+                    findings.push(broken_target_finding(&analysis.path, block, TargetStatus::MissingLabel))
+                }
+                TargetStatus::NotChanged => {
+                    findings.push(broken_target_finding(&analysis.path, block, TargetStatus::NotChanged))
+                }
             }
         }
     }
@@ -390,10 +384,10 @@ fn hunk_touches_range(start: usize, len: usize, range_start: usize, range_end: u
 
 // ── Finding construction ──────────────────────────────────────────────────────
 
-fn broken_target_finding(source_path: &str, block: &IfChangeBlock, detail: String) -> Finding {
+fn broken_target_finding(source_path: &str, block: &IfChangeBlock, status: TargetStatus) -> Finding {
     Finding {
         severity: Severity::Error,
-        message: format!("{}: {detail}", render_target(&block.target)),
+        message: format_violation_message(source_path, block, status),
         location: Some(Location {
             path: source_path.to_owned(),
             line: Some(block.ifchange_line as u32),
@@ -407,10 +401,31 @@ fn broken_target_finding(source_path: &str, block: &IfChangeBlock, detail: Strin
     }
 }
 
-fn render_target(target: &ThenChangeTarget) -> String {
-    match target {
-        ThenChangeTarget::File { path } => format!("`LINT.ThenChange({path})`"),
-        ThenChangeTarget::Block { path, label } => format!("`LINT.ThenChange({path}:{label})`"),
+fn format_violation_message(source_path: &str, block: &IfChangeBlock, status: TargetStatus) -> String {
+    let source_clause = match &block.source_label {
+        Some(label) => format!("when changing `{label}` in `{source_path}`"),
+        None => format!("when changing `{source_path}`"),
+    };
+    match (&block.target, status) {
+        (ThenChangeTarget::File { path }, TargetStatus::NotChanged) => {
+            format!("{source_clause}, you must also change `{path}`")
+        }
+        (ThenChangeTarget::File { path }, TargetStatus::MissingFile) => {
+            format!("{source_clause}, required companion `{path}` does not exist in the current tree")
+        }
+        (ThenChangeTarget::Block { path, label }, TargetStatus::NotChanged) => {
+            format!("{source_clause}, you must also change `{path}` (`{label}`)")
+        }
+        (ThenChangeTarget::Block { path, label }, TargetStatus::MissingLabel) => {
+            format!(
+                "{source_clause}, required companion block `{label}` in `{path}` does not exist in the current tree"
+            )
+        }
+        (ThenChangeTarget::Block { path, .. }, TargetStatus::MissingFile) => {
+            format!("{source_clause}, required companion `{path}` does not exist in the current tree")
+        }
+        (_, TargetStatus::Satisfied) => unreachable!("Satisfied findings are filtered before reaching here"),
+        _ => unreachable!("unexpected target/status combination"),
     }
 }
 
@@ -882,7 +897,7 @@ mod tests {
             findings[0].message
         );
         assert!(
-            findings[0].message.contains("not updated in the same change"),
+            findings[0].message.contains("you must also change"),
             "message: {}",
             findings[0].message
         );
@@ -1000,7 +1015,7 @@ mod tests {
             findings[0].message
         );
         assert!(
-            findings[0].message.contains("not updated in the same change"),
+            findings[0].message.contains("you must also change"),
             "message: {}",
             findings[0].message
         );
@@ -1081,7 +1096,7 @@ mod tests {
             findings[0].message
         );
         assert!(
-            findings[0].message.contains("not updated in the same change"),
+            findings[0].message.contains("you must also change"),
             "message: {}",
             findings[0].message
         );
@@ -1236,12 +1251,13 @@ mod tests {
         std::env::set_current_dir(old_cwd).unwrap();
         assert_eq!(findings.len(), 1, "expected 1 finding; got {findings:?}");
         assert!(
-            findings[0].message.contains("frontend/schema.txt:view"),
+            findings[0].message.contains("frontend/schema.txt"),
             "message: {}",
             findings[0].message
         );
+        assert!(findings[0].message.contains("view"), "message: {}", findings[0].message);
         assert!(
-            findings[0].message.contains("not updated in the same change"),
+            findings[0].message.contains("you must also change"),
             "message: {}",
             findings[0].message
         );
@@ -1273,12 +1289,13 @@ mod tests {
         std::env::set_current_dir(old_cwd).unwrap();
         assert_eq!(findings.len(), 1);
         assert!(
-            findings[0].message.contains("frontend/schema.txt:view"),
+            findings[0].message.contains("frontend/schema.txt"),
             "message: {}",
             findings[0].message
         );
+        assert!(findings[0].message.contains("view"), "message: {}", findings[0].message);
         assert!(
-            findings[0].message.contains("label does not exist"),
+            findings[0].message.contains("does not exist"),
             "message: {}",
             findings[0].message
         );
