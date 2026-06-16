@@ -1,12 +1,74 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
 
 use crate::input::{ChangeSet, SourceTree};
 use crate::path::validate_relative_path;
+
+/// Prefix applied to every sandbox temp directory name so stale-sweep can
+/// identify directories that belong to checkleft.
+const SANDBOX_DIR_PREFIX: &str = "clsandbox-";
+
+/// Stale sandbox directories older than this are swept on startup.
+const STALE_SANDBOX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Return the base directory under which sandbox temp dirs should be created.
+///
+/// Prefers the platform cache dir (`~/Library/Caches/checkleft/sandbox` on
+/// macOS, `$XDG_CACHE_HOME/checkleft/sandbox` on Linux) so that sandboxes
+/// live on the same filesystem as the repo and the hardlink ceiling, enabling
+/// zero-copy population via `fs::hard_link`.
+///
+/// Returns `None` when the cache dir cannot be determined or created (the
+/// caller falls back to the system temp dir in that case).
+fn sandbox_base_dir() -> Option<PathBuf> {
+    let base = directories::ProjectDirs::from("", "", "checkleft").map(|p| p.cache_dir().join("sandbox"))?;
+    fs::create_dir_all(&base).ok()?;
+    Some(base)
+}
+
+/// Create a uniquely-named temp directory for a sandbox.
+///
+/// Tries the XDG / platform cache dir first (same filesystem as the repo →
+/// hardlinks work). Falls back to the system temp dir when the cache dir is
+/// unavailable or unwritable.
+fn make_sandbox_dir(base: Option<&Path>) -> Result<TempDir> {
+    if let Some(Ok(tmp)) = base.map(|dir| tempfile::Builder::new().prefix(SANDBOX_DIR_PREFIX).tempdir_in(dir)) {
+        return Ok(tmp);
+    }
+    tempfile::Builder::new()
+        .prefix(SANDBOX_DIR_PREFIX)
+        .tempdir()
+        .context("failed to create sandbox temp directory")
+}
+
+/// Remove sandbox directories under `base` whose mtime is older than
+/// [`STALE_SANDBOX_AGE`].  Best-effort: errors are silently ignored.
+fn sweep_stale_sandboxes(base: &Path) {
+    let cutoff = match SystemTime::now().checked_sub(STALE_SANDBOX_AGE) {
+        Some(t) => t,
+        None => return,
+    };
+    let Ok(entries) = fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(SANDBOX_DIR_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < cutoff {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 /// Declares how much of the repository a check needs to read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -80,7 +142,11 @@ pub fn create_sandbox(
 ) -> Result<SandboxResult> {
     let allowlist = resolve_allowlist(changeset, &scope, source_tree)?;
 
-    let sandbox_root = tempdir().context("failed to create sandbox temp directory")?;
+    let base = sandbox_base_dir();
+    if let Some(ref dir) = base {
+        sweep_stale_sandboxes(dir);
+    }
+    let sandbox_root = make_sandbox_dir(base.as_deref())?;
 
     let mut allowed_paths = Vec::with_capacity(allowlist.len());
     for path in &allowlist {
@@ -572,6 +638,59 @@ mod tests {
 
         let content = fs::read(result.root.path().join("src/real.rs")).expect("read hardlinked file");
         assert_eq!(content, b"fn real() {}");
+    }
+
+    // --- Sandbox location ---
+
+    #[test]
+    fn sandbox_is_not_under_tmp_when_cache_dir_available() {
+        // When the platform cache dir is available (it always is in a normal dev
+        // environment), the sandbox root must NOT live under /tmp — otherwise
+        // hardlinks from the repo volume fail with EXDEV on macOS.
+        let (dir, tree) = disk_source_tree(&[("src/lib.rs", b"fn f() {}")]);
+        let cs = changeset(&["src/lib.rs"]);
+        let result = create_sandbox(&cs, AccessScope::ModifiedOnly, &tree, &HostCeiling::new(dir.path()))
+            .expect("create sandbox");
+
+        if super::sandbox_base_dir().is_some() {
+            let sandbox_path = result.root.path();
+            let tmp_path = std::env::temp_dir();
+            assert!(
+                !sandbox_path.starts_with(&tmp_path),
+                "sandbox {:?} must not live under system temp dir {:?} — hardlinks would fail on darwin (EXDEV)",
+                sandbox_path,
+                tmp_path,
+            );
+        }
+    }
+
+    // --- Stale sandbox sweep ---
+
+    #[test]
+    fn stale_sandbox_sweep_removes_old_dirs() {
+        use std::time::{Duration, SystemTime};
+
+        let base = tempdir().unwrap();
+
+        // Create a "stale" sandbox dir with an old mtime.
+        let stale = base.path().join("clsandbox-stale");
+        fs::create_dir(&stale).unwrap();
+        let old_time = filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(48 * 60 * 60));
+        filetime::set_file_mtime(&stale, old_time).unwrap();
+
+        // Create a "fresh" sandbox dir with a current mtime.
+        let fresh = base.path().join("clsandbox-fresh");
+        fs::create_dir(&fresh).unwrap();
+
+        // Create a non-sandbox dir — must never be touched.
+        let unrelated = base.path().join("other-dir");
+        fs::create_dir(&unrelated).unwrap();
+
+        super::sweep_stale_sandboxes(base.path());
+
+        assert!(!stale.exists(), "stale sandbox dir must be removed");
+        assert!(fresh.exists(), "fresh sandbox dir must be kept");
+        assert!(unrelated.exists(), "unrelated dir must not be touched");
     }
 
     // --- Ordering consistency ---
