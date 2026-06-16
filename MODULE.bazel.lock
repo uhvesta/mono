@@ -1008,7 +1008,7 @@
           "FILE:@@//tools/boss/cli/Cargo.toml d715c1b517b875b4729ffad639b2df3be1f70c3f4e657a7ac3afa410889dedca",
           "FILE:@@//tools/boss/event-shim/Cargo.toml 128bc37fe2272c0cdb8045976d39f1f083169475af3a8bbfb8f427f6fe56c6a3",
           "FILE:@@//tools/hood/Cargo.toml 1535a68c6e400f6311a47fcb0f590aae06d257d063065f49166533f06dc254a6",
-          "FILE:@@//tools/checkleft/Cargo.toml dc3b0f012ffd2f6deaa316bfb4b3a79bb21428eb9ea3608de2af376644653a8a",
+          "FILE:@@//tools/checkleft/Cargo.toml 56071b8b1d17bad75ea685253fb7c6ff8300a0e2bf91dcf575d140490aba9141",
           "FILE:@@//tools/checkleft/sdk/Cargo.toml 910d1f444d7d3d4bd5ca4b51d5c042f83bd02a1c9fbefa3cc745b73daad5233d",
           "FILE:@@//tools/checkleft/sdk-macro/Cargo.toml 079ddc11e022261bdbe72737c044b1ec522f8e8867f5ffe3b6865edae9cfd257",
           "FILE:@@//tools/checkleft/sdk/examples/trivial-check/Cargo.toml b35c05e66fdea75326386803009de5a6df0a9b457ae5fed4f6195c9974fba36b",

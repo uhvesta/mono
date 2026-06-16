@@ -63,7 +63,7 @@ syn = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "std"] }
+tracing-subscriber = { version = "0.3.19", default-features = false, features = ["fmt", "std", "env-filter"] }
 tree-sitter = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-starlark = { workspace = true }

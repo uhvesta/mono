@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use checkleft::change_detection::environment::CiEnvironment;
 use checkleft::change_detection::scenario::Scenario;
 use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
@@ -28,7 +28,7 @@ use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Args, Clone)]
 struct RunArgs {
@@ -44,13 +44,49 @@ struct RunArgs {
     format: OutputFormat,
 }
 
+/// Explicit log-level override (higher precedence than -v count and RUST_LOG).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Off => "off",
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "checkleft")]
 #[command(version = option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
 #[command(about = "Run repository convention checks")]
 struct Cli {
-    #[arg(long, global = true)]
-    verbose: bool,
+    /// Enable verbose tracing output (INFO level). Repeat for more detail:
+    /// -v=INFO, -vv=DEBUG, -vvv=TRACE. Alias: --verbose.
+    #[arg(short = 'v', long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Set an explicit log level, overriding -v and RUST_LOG.
+    /// Precedence: --log-level > -v > RUST_LOG > default (off).
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<LogLevel>,
+
+    /// Write tracing output to this file instead of stderr.
+    /// The file is created or truncated at startup.
+    #[arg(long, global = true, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 
     // Top-level run args: active when no subcommand is given (bare `checkleft` == `checkleft run`).
     #[command(flatten)]
@@ -137,7 +173,7 @@ async fn main() -> ExitCode {
 
 async fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
-    init_tracing(cli.verbose)?;
+    init_tracing(cli.verbose, cli.log_level, cli.log_file.clone())?;
     let root = std::env::current_dir()?;
     info!(root = %root.display(), "starting checkleft");
 
@@ -147,6 +183,8 @@ async fn run_cli() -> Result<ExitCode> {
 
     let Cli {
         verbose: _,
+        log_level: _,
+        log_file: _,
         run_args: default_run_args,
         command,
     } = cli;
@@ -671,14 +709,43 @@ fn detect_current_branch(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
     normalize_optional_description(vcs.current_branch().ok())
 }
 
-fn init_tracing(verbose: bool) -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(if verbose { LevelFilter::INFO } else { LevelFilter::OFF })
-        .with_writer(stderr)
-        .try_init()
-        .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
+fn init_tracing(verbose: u8, log_level: Option<LogLevel>, log_file: Option<PathBuf>) -> Result<()> {
+    let filter = build_env_filter(verbose, log_level);
+    let result = if let Some(path) = log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open log file {}", path.display()))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .try_init()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(stderr)
+            .try_init()
+    };
+    result.map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))
+}
 
-    Ok(())
+/// Build an `EnvFilter` with the precedence: explicit `--log-level` > `-v` count > `RUST_LOG` > off.
+fn build_env_filter(verbose: u8, log_level: Option<LogLevel>) -> EnvFilter {
+    if let Some(level) = log_level {
+        return EnvFilter::new(level.as_str());
+    }
+    if verbose > 0 {
+        let level = match verbose {
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        };
+        return EnvFilter::new(level);
+    }
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"))
 }
 
 fn detect_github_token() -> Option<String> {
