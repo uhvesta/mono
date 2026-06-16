@@ -76,6 +76,19 @@ exercised without touching a real repo. Workspace provisioning can also
 run a declarative per-workspace setup file (`.cube/setup.yaml`) whose
 steps are gated by run policies and input fingerprints recorded in the
 registry, so idempotent first-time setup isn't repeated needlessly.
+Each step's `command` is executed with two environment variables injected
+automatically: `CUBE_WORKSPACE` (absolute path to the leased workspace
+directory the command runs in) and `CUBE_BASE_REPO` (absolute path to the
+repo pool's source checkout, i.e. the `source` path from `cube repo info`
+— present only when the repo has a source path configured). These let
+checked-in setup commands reference machine-independent paths:
+
+```yaml
+steps:
+  - id: copy-config-secrets
+    command: cp "$CUBE_BASE_REPO/backend/config-secrets.toml" backend/config-secrets.toml
+    run_when: on-create
+```
 
 Every command supports a `--json` mode, making `cube` scriptable: Boss
 parses the JSON lease result (workspace path, lease id) to place a

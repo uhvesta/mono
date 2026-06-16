@@ -11,6 +11,9 @@ pub struct CommandInvocation {
     pub cwd: PathBuf,
     pub program: String,
     pub args: Vec<String>,
+    /// Extra environment variables to inject into the child process.
+    /// Applied after cube's standard env (NO_COLOR, GIT_SSH_COMMAND, etc.).
+    pub env: Vec<(String, String)>,
 }
 
 pub trait CommandRunner {
@@ -38,6 +41,7 @@ impl RealCommandRunner {
             cwd: cwd.to_path_buf(),
             program: program.to_string(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            env: vec![],
         }
     }
 
@@ -76,6 +80,9 @@ impl CommandRunner for RealCommandRunner {
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args).current_dir(&invocation.cwd);
         Self::configure_env(&mut cmd);
+        for (k, v) in &invocation.env {
+            cmd.env(k, v);
+        }
 
         let output = cmd.output().map_err(CubeError::Io)?;
 
@@ -99,6 +106,9 @@ impl CommandRunner for RealCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         Self::configure_env(&mut cmd);
+        for (k, v) in &invocation.env {
+            cmd.env(k, v);
+        }
 
         let mut child = cmd.spawn().map_err(CubeError::Io)?;
 

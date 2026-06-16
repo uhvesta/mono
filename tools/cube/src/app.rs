@@ -664,6 +664,7 @@ fn materialize_repo_source_if_missing(runner: &dyn CommandRunner, record: &RepoR
                     cwd: source.to_path_buf(),
                     program: "jj".to_string(),
                     args: vec!["git".to_string(), "init".to_string(), "--colocate".to_string()],
+                    env: vec![],
                 })?;
             }
             return Ok(None);
@@ -708,6 +709,7 @@ fn materialize_repo_source_if_missing(runner: &dyn CommandRunner, record: &RepoR
                 cwd: parent.to_path_buf(),
                 program,
                 args,
+                env: vec![],
             })
             .map_err(|err| match err {
                 CubeError::CommandFailed { stderr, .. } => {
@@ -720,6 +722,7 @@ fn materialize_repo_source_if_missing(runner: &dyn CommandRunner, record: &RepoR
             cwd: source.to_path_buf(),
             program: "jj".to_string(),
             args: vec!["git".to_string(), "init".to_string(), "--colocate".to_string()],
+            env: vec![],
         })?;
         // The colocated clone already exposes the remote's branches as local
         // jj bookmarks, so there is nothing to promote here; we only need the
@@ -740,6 +743,7 @@ fn materialize_repo_source_if_missing(runner: &dyn CommandRunner, record: &RepoR
                 record.origin.clone(),
                 source.display().to_string(),
             ],
+            env: vec![],
         })?;
         track_remote_bookmarks(runner, source, default_branch.as_deref())?;
         Ok(default_branch)
@@ -766,6 +770,7 @@ fn detect_remote_default_branch(runner: &dyn CommandRunner, cwd: &Path, origin: 
                     origin.to_string(),
                     "HEAD".to_string(),
                 ],
+                env: vec![],
             },
             network_cmd_timeout(),
         )
@@ -821,6 +826,7 @@ fn track_remote_bookmarks(runner: &dyn CommandRunner, repo_path: &Path, default_
             cwd: repo_path.to_path_buf(),
             program: "jj".to_string(),
             args: vec!["bookmark".to_string(), "track".to_string(), format!("{branch}@origin")],
+            env: vec![],
         });
         match result {
             Ok(_) => tracked_any = true,
@@ -1261,6 +1267,7 @@ fn run_workspace(
                             cwd: ws.workspace_path.clone(),
                             program: "jj".to_string(),
                             args: vec!["workspace".to_string(), "update-stale".to_string()],
+                            env: vec![],
                         };
                         match runner.run(&update_stale_inv) {
                             Ok(_) => {
@@ -2150,6 +2157,7 @@ fn run_change(command: ChangeCommand, database_path: Option<&Path>, runner: &dyn
                             "-m".to_string(),
                             args.title.clone(),
                         ],
+                        env: vec![],
                     },
                 )?;
             } else {
@@ -2160,6 +2168,7 @@ fn run_change(command: ChangeCommand, database_path: Option<&Path>, runner: &dyn
                         cwd: workspace_path.clone(),
                         program: "jj".to_string(),
                         args: vec!["describe".to_string(), "-m".to_string(), args.title.clone()],
+                        env: vec![],
                     },
                 )?;
             }
@@ -3693,6 +3702,7 @@ fn auto_create_workspace(
                 "forget".to_string(),
                 workspace_id.clone(),
             ],
+            env: vec![],
         });
         fs::remove_dir_all(&staging_path).map_err(|source| CubeError::WorkspaceDirRemove {
             path: staging_path.clone(),
@@ -3719,6 +3729,7 @@ fn auto_create_workspace(
                 workspace_id.clone(),
                 staging_path.display().to_string(),
             ],
+            env: vec![],
         },
         network_cmd_timeout(),
     )?;
@@ -4738,6 +4749,7 @@ fn check_workspace_health(
         cwd: workspace_path.to_path_buf(),
         program: "jj".to_string(),
         args: vec!["status".to_string(), "--no-pager".to_string()],
+        env: vec![],
     };
 
     // Run jj status directly (not via run_jj) so we can intercept the
@@ -4852,6 +4864,7 @@ fn repair_conflicted_bookmarks(
                 cwd: workspace_path.to_path_buf(),
                 program: "jj".to_string(),
                 args: vec!["bookmark".to_string(), "forget".to_string(), bookmark.clone()],
+                env: vec![],
             },
         )?;
     }
@@ -4915,6 +4928,7 @@ fn read_head_status(
                 "-T".to_string(),
                 template.to_string(),
             ],
+            env: vec![],
         },
     )?;
     let trimmed = output.trim();
@@ -5193,6 +5207,7 @@ fn current_workspace_commit(
                 "-T".to_string(),
                 "commit_id.short()".to_string(),
             ],
+            env: vec![],
         },
     )
 }
@@ -5216,6 +5231,7 @@ fn current_change_identity(
                 "-T".to_string(),
                 "change_id ++ \"\\n\" ++ commit_id.short()".to_string(),
             ],
+            env: vec![],
         },
     )?;
     let mut lines = output.lines().map(str::trim).filter(|line| !line.is_empty());
@@ -12018,8 +12034,8 @@ steps:
             "abc1234",
             vec![ExpectedCommand::ok(
                 workspace_path.clone(),
-                "pnpm",
-                &["install", "--frozen-lockfile"],
+                "sh",
+                &["-c", "pnpm install --frozen-lockfile"],
                 "",
             )],
         );
@@ -12105,7 +12121,12 @@ steps:
         let lease_runner = lease_runner_with_setup(
             &workspace_path,
             "abc1234",
-            vec![ExpectedCommand::ok(workspace_path.clone(), "pnpm", &["install"], "")],
+            vec![ExpectedCommand::ok(
+                workspace_path.clone(),
+                "sh",
+                &["-c", "pnpm install"],
+                "",
+            )],
         );
         run_with_dependencies(
             Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "demo"]),
@@ -12121,8 +12142,8 @@ steps:
 
         let setup_runner = FakeRunner::new(vec![ExpectedCommand::ok(
             workspace_path.clone(),
-            "pnpm",
-            &["install"],
+            "sh",
+            &["-c", "pnpm install"],
             "",
         )]);
         let setup_result = run_with_dependencies(
@@ -12166,8 +12187,8 @@ steps:
             "abc1234",
             vec![ExpectedCommand::ok(
                 workspace_path.clone(),
-                "./decode-secrets.sh",
-                &[],
+                "sh",
+                &["-c", "./decode-secrets.sh"],
                 "",
             )],
         );
@@ -12251,11 +12272,11 @@ steps:
 
         let failing = ExpectedCommand {
             cwd: workspace_path.clone(),
-            program: "pnpm".to_string(),
-            args: vec!["install".to_string()],
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "pnpm install".to_string()],
             result: Err(CubeError::CommandFailed {
-                program: "pnpm".to_string(),
-                args: vec!["install".to_string()],
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "pnpm install".to_string()],
                 status: Some(1),
                 stderr: "boom".to_string(),
             }),
@@ -13702,6 +13723,7 @@ steps:
             cwd: PathBuf::from("/tmp/ws"),
             program: "jj".to_string(),
             args: vec!["status".to_string()],
+            env: vec![],
         };
         let err = super::run_jj(&runner, None, &invocation).expect_err("non-stale failure should propagate");
         runner.assert_exhausted();

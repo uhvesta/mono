@@ -204,6 +204,15 @@ pub fn run_setup_engine(
     config: &SetupConfig,
     now_epoch_s: i64,
 ) -> Result<SetupReport, CubeError> {
+    let source_path = store.get_repo(&workspace.repo)?.and_then(|r| r.source);
+    let mut step_env = vec![(
+        "CUBE_WORKSPACE".to_string(),
+        workspace.workspace_path.display().to_string(),
+    )];
+    if let Some(ref source) = source_path {
+        step_env.push(("CUBE_BASE_REPO".to_string(), source.display().to_string()));
+    }
+
     let mut report = SetupReport::empty();
     for step in &config.steps {
         let started = Instant::now();
@@ -219,7 +228,7 @@ pub fn run_setup_engine(
                     duration_ms: started.elapsed().as_millis() as u64,
                 });
             }
-            StepAction::Run => match invoke_step(runner, &workspace.workspace_path, step) {
+            StepAction::Run => match invoke_step(runner, &workspace.workspace_path, step, &step_env) {
                 Ok(()) => {
                     store.upsert_workspace_setup_state(&WorkspaceSetupState {
                         repo: workspace.repo.clone(),
@@ -275,22 +284,19 @@ fn decide_action(policy: RunPolicy, stored: Option<&WorkspaceSetupState>, finger
     }
 }
 
-fn invoke_step(runner: &dyn CommandRunner, workspace_path: &Path, step: &SetupStep) -> Result<(), CubeError> {
-    let parts = shlex::split(&step.command).ok_or_else(|| {
-        CubeError::InvalidArgument(format!(
-            "setup step `{}` has an unparseable command: {}",
-            step.id, step.command
-        ))
-    })?;
-    let mut iter = parts.into_iter();
-    let program = iter
-        .next()
-        .ok_or_else(|| CubeError::InvalidArgument(format!("setup step `{}` resolved to an empty command", step.id)))?;
-    let args: Vec<String> = iter.collect();
+fn invoke_step(
+    runner: &dyn CommandRunner,
+    workspace_path: &Path,
+    step: &SetupStep,
+    extra_env: &[(String, String)],
+) -> Result<(), CubeError> {
+    // Run setup commands through a shell so that env var references like
+    // $CUBE_BASE_REPO are expanded by the shell before the program executes.
     runner.run(&CommandInvocation {
         cwd: workspace_path.to_path_buf(),
-        program,
-        args,
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), step.command.clone()],
+        env: extra_env.to_vec(),
     })?;
     Ok(())
 }
@@ -490,5 +496,173 @@ steps:
 "#;
         let parsed: SetupConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.steps[0].run_when, RunPolicy::OnFingerprintChange);
+    }
+
+    // ── env-var injection tests ──────────────────────────────────────────────
+
+    use super::run_setup_engine;
+    use crate::app::CubeError;
+    use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
+    use crate::metadata::{RepoRecord, WorkspaceRecord, WorkspaceState};
+    use crate::store::Store;
+    use std::cell::RefCell;
+
+    struct CapturingRunner {
+        invocations: RefCell<Vec<CommandInvocation>>,
+    }
+
+    impl CapturingRunner {
+        fn new() -> Self {
+            Self {
+                invocations: RefCell::new(vec![]),
+            }
+        }
+        fn into_invocations(self) -> Vec<CommandInvocation> {
+            self.invocations.into_inner()
+        }
+    }
+
+    impl CommandRunner for CapturingRunner {
+        fn run(&self, invocation: &CommandInvocation) -> Result<String, CubeError> {
+            self.invocations.borrow_mut().push(invocation.clone());
+            Ok(String::new())
+        }
+    }
+
+    fn make_store_with_repo(tmp: &TempDir, source: Option<&std::path::Path>) -> Store {
+        let mut store = Store::open_at(tmp.path().join("state.db")).unwrap();
+        let ws_root = tmp.path().join("workspaces");
+        std::fs::create_dir_all(&ws_root).unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:org/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: ws_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: source.map(|p| p.to_path_buf()),
+                clone_command: None,
+            })
+            .unwrap();
+        let ws_path = ws_root.join("mono-agent-001");
+        std::fs::create_dir_all(&ws_path).unwrap();
+        store
+            .sync_workspaces(
+                "mono",
+                &[crate::metadata::WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: ws_path,
+                }],
+            )
+            .unwrap();
+        store
+    }
+
+    fn workspace_record(tmp: &TempDir) -> WorkspaceRecord {
+        WorkspaceRecord {
+            repo: "mono".to_string(),
+            workspace_id: "mono-agent-001".to_string(),
+            workspace_path: tmp.path().join("workspaces/mono-agent-001"),
+            state: WorkspaceState::Free,
+            lease_id: None,
+            holder: None,
+            task: None,
+            leased_at_epoch_s: None,
+            lease_expires_at_epoch_s: None,
+            head_commit: None,
+            last_release_reason: None,
+            health_status: None,
+            unhealthy_since_epoch_s: None,
+        }
+    }
+
+    fn one_step_config() -> SetupConfig {
+        serde_yaml::from_str(
+            r#"version: 1
+steps:
+  - id: copy-config
+    command: echo hello
+    run_when: always
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn setup_engine_injects_cube_workspace_always() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store_with_repo(&tmp, None);
+        let ws = workspace_record(&tmp);
+        let runner = CapturingRunner::new();
+
+        run_setup_engine(&store, &runner, &ws, &one_step_config(), 0).unwrap();
+
+        let invocations = runner.into_invocations();
+        assert_eq!(invocations.len(), 1);
+        let env: std::collections::HashMap<_, _> = invocations[0].env.iter().cloned().collect();
+        assert_eq!(
+            env.get("CUBE_WORKSPACE").map(String::as_str),
+            Some(ws.workspace_path.display().to_string()).as_deref()
+        );
+        assert!(
+            !env.contains_key("CUBE_BASE_REPO"),
+            "CUBE_BASE_REPO should be absent when source_path is None"
+        );
+    }
+
+    #[test]
+    fn setup_engine_injects_cube_base_repo_when_source_path_present() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let store = make_store_with_repo(&tmp, Some(&source_dir));
+        let ws = workspace_record(&tmp);
+        let runner = CapturingRunner::new();
+
+        run_setup_engine(&store, &runner, &ws, &one_step_config(), 0).unwrap();
+
+        let invocations = runner.into_invocations();
+        assert_eq!(invocations.len(), 1);
+        let env: std::collections::HashMap<_, _> = invocations[0].env.iter().cloned().collect();
+        assert_eq!(
+            env.get("CUBE_BASE_REPO").map(String::as_str),
+            Some(source_dir.display().to_string()).as_deref()
+        );
+        assert!(env.contains_key("CUBE_WORKSPACE"));
+    }
+
+    #[test]
+    fn setup_engine_expands_cube_base_repo_in_command() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create a source directory with a file that should be copied.
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("config.toml"), b"secret").unwrap();
+
+        let store = make_store_with_repo(&tmp, Some(&source_dir));
+        let ws = workspace_record(&tmp);
+
+        // Command references $CUBE_BASE_REPO — must be expanded by the shell.
+        let config: SetupConfig = serde_yaml::from_str(
+            r#"version: 1
+steps:
+  - id: copy-config
+    command: 'cp "$CUBE_BASE_REPO/config.toml" config.toml'
+    run_when: always
+"#,
+        )
+        .unwrap();
+
+        let runner = RealCommandRunner;
+        run_setup_engine(&store, &runner, &ws, &config, 0).unwrap();
+
+        // Assert the file was actually copied, proving $CUBE_BASE_REPO expanded.
+        let dest = ws.workspace_path.join("config.toml");
+        assert!(
+            dest.exists(),
+            "config.toml should have been copied from $CUBE_BASE_REPO"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"secret");
     }
 }
