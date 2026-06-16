@@ -17,6 +17,7 @@ checkleft-check-sdk = { path = "../sdk" }
 checkleft-file-forbidden-path = { path = "../checks/file/forbidden-path" }
 checkleft-file-ifchange = { path = "../checks/file/ifchange" }
 checkleft-file-size = { path = "../checks/file/size" }
+checkleft-md-link-integrity = { path = "../checks/md/link-integrity" }
 checkleft-rust-giant-structs = { path = "../checks/rust/giant-structs" }
 checkleft-rust-giant-structs-create = { path = "../checks/rust/giant-structs-create" }
 wit-bindgen = "0.51"

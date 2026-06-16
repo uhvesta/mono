@@ -24,6 +24,7 @@ rust_shared_library(
         "//tools/checkleft/checks/file/forbidden-path:file_forbidden_path_check",
         "//tools/checkleft/checks/file/ifchange:ifchange_check",
         "//tools/checkleft/checks/file/size:file_size_check",
+        "//tools/checkleft/checks/md/link-integrity:md_link_integrity_check",
         "//tools/checkleft/checks/rust/giant-structs:rust_giant_structs_use_builder",
         "//tools/checkleft/checks/rust/giant-structs-create:rust_giant_structs_create",
         "//tools/checkleft/sdk:checkleft_check_sdk",

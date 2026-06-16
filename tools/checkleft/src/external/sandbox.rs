@@ -710,10 +710,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlink_pointing_outside_ceiling_is_rejected() {
+    fn symlink_pointing_outside_ceiling_is_silently_skipped() {
         use std::os::unix::fs as unix_fs;
 
         // Create a disk tree with a symlink pointing outside the tree root.
+        // This simulates the `bazel-bin` / `bazel-out` symlinks that Bazel
+        // creates in the workspace root — they escape the source tree and must
+        // not appear in a whole-repo sandbox (they are not real repo files).
         let inside = tempdir().expect("create inside dir");
         let outside = tempdir().expect("create outside dir");
 
@@ -729,15 +732,25 @@ mod tests {
 
         let tree = crate::source_tree::LocalSourceTree::new(inside.path()).expect("create tree");
 
-        // WholeRepo would include link.txt via glob; the sandbox must reject it
-        // because LocalSourceTree.read_file rejects escaping symlinks.
+        // WholeRepo glob now skips symlinks that escape the tree root, so
+        // sandbox creation must succeed. The sandbox contains only real repo
+        // files; the escaping symlink does NOT appear in it.
         let cs = ChangeSet::new(vec![]);
-        let err = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(inside.path())).unwrap_err();
+        let result = create_sandbox(&cs, AccessScope::WholeRepo, &tree, &HostCeiling::new(inside.path()))
+            .expect("sandbox creation must succeed; escaping symlinks are skipped by glob");
 
-        let full_err = format!("{:#}", err);
+        assert_eq!(
+            result.allowed_paths,
+            vec![PathBuf::from("normal.rs")],
+            "only the real file must be in the sandbox; escaping symlink must be absent"
+        );
         assert!(
-            full_err.contains("symlink") || full_err.contains("escapes"),
-            "expected symlink-escape error, got: {full_err}"
+            !result.root.path().join("link.txt").exists(),
+            "escaping symlink must not be materialized into the sandbox"
+        );
+        assert!(
+            result.root.path().join("normal.rs").exists(),
+            "real file must be in the sandbox"
         );
     }
 

@@ -76,7 +76,7 @@ What each check actually does (the cost centers that matter for this commit, whi
 | `rust-test-rule-coverage` | built-in Rust | none (scans BUILD files on disk) | Yes, cheap |
 | `file/size` + bundled rust checks | WASM component | none (in-process wasmtime) | First-run `.cwasm` JIT compile, then cached |
 | `format/bazel`, `lint/bazel` | declarative | `buildifier` | No-op (no BUILD/`.bazel` files changed) |
-| `docs-link-integrity`, `no-generated-artifacts` (forbidden-paths), `todo-expiry`, `repo-visibility` | built-in Rust | none | Cheap, pure file/string work |
+| `md/link-integrity` (formerly `docs-link-integrity`), `no-generated-artifacts` (forbidden-paths), `todo-expiry`, `repo-visibility` | built-in Rust / WASM | none | Cheap, pure file/string work |
 
 > Aside on "11": `CHECKS.yaml` enables 10 checks explicitly; the 11th reported is a bundled rust check (`file/size` ships in a multiplexed WASM component alongside a `rust/*` check that auto-applies to changed `.rs` files). The exact identity doesn't affect the timing story.
 

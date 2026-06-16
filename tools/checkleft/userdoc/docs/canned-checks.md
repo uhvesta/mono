@@ -219,7 +219,7 @@ Notes:
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 
-## `docs-link-integrity`
+## `md/link-integrity`
 
 Purpose:
 
@@ -232,7 +232,9 @@ Config keys:
 Notes:
 
 - External URLs (`http`, `https`, `mailto`, `tel`) and same-page anchors are ignored.
+- Image links (`![alt](target)`) are skipped.
 - Severity is `warning`.
+- Runs as an embedded WASM check with `whole_repo` access so it can verify targets anywhere in the repo.
 
 ## `file/size`
 

@@ -1,0 +1,15 @@
+[package]
+name = "checkleft-md-link-integrity"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check (md/link-integrity): validate internal markdown links in changed markdown files"
+
+# An ordinary rlib. The component ABI is wired once in the aggregating
+# `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
+# the single multiplexed preinstalled component. No `wit-bindgen` dependency is
+# needed here because this crate no longer calls `export_checks!`.
+[dependencies]
+checkleft-check-sdk = { path = "../../../sdk" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

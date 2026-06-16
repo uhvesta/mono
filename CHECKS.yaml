@@ -4,7 +4,7 @@ check_definitions:
   allow_override_bundled: true
 
 checks:
-  - id: docs-link-integrity
+  - id: md/link-integrity
     policy:
       severity: warning
 

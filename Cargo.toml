@@ -25,6 +25,7 @@ members = [
   "tools/checkleft/checks/file/forbidden-path",
   "tools/checkleft/checks/file/ifchange",
   "tools/checkleft/checks/file/size",
+  "tools/checkleft/checks/md/link-integrity",
   "tools/checkleft/checks/rust/giant-structs",
   "tools/checkleft/checks/rust/giant-structs-common",
   "tools/checkleft/checks/rust/giant-structs-create",

@@ -131,6 +131,7 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             "file/forbidden-path",
             "file/size",
             "file/ifchange",
+            "md/link-integrity",
             // Deprecated alias of file/ifchange, kept for the migration window.
             // Dispatches to the same multiplexed component; the guest exports a
             // descriptor for each name.
@@ -277,6 +278,7 @@ mod tests {
 
         let file_size = resolve_component("file/size");
         let file_ifchange = resolve_component("file/ifchange");
+        let md_link_integrity = resolve_component("md/link-integrity");
         let api_breaking = resolve_component("api-breaking-surface");
         let giant_structs = resolve_component("rust/giant-structs");
 
@@ -289,6 +291,7 @@ mod tests {
         for (name, comp) in [
             ("file/ifchange", &file_ifchange),
             ("api-breaking-surface", &api_breaking),
+            ("md/link-integrity", &md_link_integrity),
         ] {
             assert_eq!(
                 file_size.artifact_bytes.map(<[u8]>::as_ptr),
@@ -304,6 +307,7 @@ mod tests {
         // the component's list-checks / run-check exports.
         assert_eq!(file_size.check_name, "file/size");
         assert_eq!(file_ifchange.check_name, "file/ifchange");
+        assert_eq!(md_link_integrity.check_name, "md/link-integrity");
         assert_eq!(api_breaking.check_name, "api-breaking-surface");
         assert_eq!(giant_structs.check_name, "rust/giant-structs");
     }

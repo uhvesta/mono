@@ -176,6 +176,21 @@ impl SourceTree for LocalSourceTree {
                 continue;
             }
 
+            // Skip symlinks whose targets escape the source tree root or resolve
+            // to a directory. Escaping symlinks are untracked artefacts (e.g.
+            // `bazel-bin` in a Bazel workspace) that would cause sandbox
+            // materialisation to fail. Directory symlinks (e.g. pnpm package
+            // symlinks inside node_modules) cannot be read as files and must
+            // not appear in a whole-repo scan.
+            if entry.file_type().is_symlink() {
+                let Ok(resolved) = entry.path().canonicalize() else {
+                    continue;
+                };
+                if !resolved.starts_with(&self.root) || resolved.is_dir() {
+                    continue;
+                }
+            }
+
             let relative_path = self.path_relative_to_root(entry.path())?;
             if glob_set.is_match(&relative_path) {
                 matches.push(relative_path);

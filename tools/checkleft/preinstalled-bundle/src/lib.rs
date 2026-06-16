@@ -44,6 +44,7 @@ use checkleft_check_sdk::export_checks;
 use checkleft_file_forbidden_path::__CHECKLEFT_ENTRY_forbidden_path_check;
 use checkleft_file_ifchange::{__CHECKLEFT_ENTRY_api_breaking_surface_check, __CHECKLEFT_ENTRY_file_ifchange_check};
 use checkleft_file_size::__CHECKLEFT_ENTRY_file_size_check;
+use checkleft_md_link_integrity::__CHECKLEFT_ENTRY_md_link_integrity_check;
 use checkleft_rust_giant_structs_create::{
     __CHECKLEFT_ENTRY_giant_structs_create_check, giant_structs_create_declared_exclusions,
     giant_structs_create_evaluate_exclusion,
@@ -56,6 +57,7 @@ export_checks!(
     forbidden_path_check,
     file_size_check,
     file_ifchange_check,
+    md_link_integrity_check,
     // Deprecated alias of file/ifchange, kept for the migration window so existing
     // `api-breaking-surface` configs keep resolving.
     api_breaking_surface_check,

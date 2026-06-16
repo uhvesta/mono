@@ -664,6 +664,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkleft-md-link-integrity"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "tempfile",
+]
+
+[[package]]
 name = "checkleft-package"
 version = "0.1.0"
 dependencies = [
@@ -684,6 +692,7 @@ dependencies = [
  "checkleft-file-forbidden-path",
  "checkleft-file-ifchange",
  "checkleft-file-size",
+ "checkleft-md-link-integrity",
  "checkleft-rust-giant-structs",
  "checkleft-rust-giant-structs-create",
  "wit-bindgen 0.51.0",
