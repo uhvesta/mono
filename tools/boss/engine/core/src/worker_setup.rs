@@ -208,7 +208,7 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.\n\
          \n\
-         - `jj git fetch` to sync; `jj new main` for a fresh task;\n\
+         - `jj git fetch` to sync; `jj new main@origin` for a fresh task;\n\
            `jj edit <bookmark>` to resume.\n\
          - `jj describe -m '...'` to set commit messages;\n\
            `jj git push -b <bookmark>` to publish.\n\

@@ -1166,7 +1166,7 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
              jj edit {prior_branch}@origin   # resumes prior commits if branch was pushed\n\
              ```\n\
              If that command fails (branch not found on remote — prior worker hadn't pushed \
-             yet), fall back to `jj new main` instead.\n\
+             yet), fall back to `jj new main@origin` instead.\n\
              \n\
              If you successfully resumed the prior branch, continue from those commits and \
              push using the new expected branch name `{expected_branch_new}` (see the \

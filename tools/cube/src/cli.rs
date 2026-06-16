@@ -95,7 +95,7 @@ pub enum WorkspaceCommand {
         /// intact*, for recovery of stranded in-flight work. The normal
         /// lease path skips a dirty workspace and provisions a fresh one;
         /// with this flag cube claims the named workspace as-is and
-        /// suppresses the `jj git fetch && jj new main` reset so the
+        /// suppresses the `jj git fetch && jj new main@origin` reset so the
         /// uncommitted tree is handed to the new lease-holder. Requires
         /// `--prefer`. Unlike the best-effort `--prefer`, this never
         /// falls back: if the named workspace is missing, leased, or has
@@ -131,7 +131,7 @@ pub enum WorkspaceCommand {
         /// Recorded in the workspaces row's `last_release_reason`.
         #[arg(long)]
         reason: Option<String>,
-        /// Skip the `jj git fetch && jj new main` reset on release.
+        /// Skip the `jj git fetch && jj new main@origin` reset on release.
         /// The slot is freed in cube's registry but the workspace's
         /// working copy is left as-is for forensics. Pair with
         /// `--reason crash` for crash recovery.
