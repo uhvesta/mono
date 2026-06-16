@@ -173,10 +173,7 @@ mod tests {
 
     #[test]
     fn maps_check_id_to_expected_bypass_name() {
-        assert_eq!(
-            bypass_name_for_check_id("api-breaking-surface"),
-            "BYPASS_API_BREAKING_SURFACE"
-        );
+        assert_eq!(bypass_name_for_check_id("file/ifchange"), "BYPASS_FILE_IFCHANGE");
         assert_eq!(
             bypass_name_for_check_id("frontend-no-legacy-api"),
             "BYPASS_FRONTEND_NO_LEGACY_API"

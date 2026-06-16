@@ -2,13 +2,6 @@
 
 This page documents the built-in check implementations currently registered in the checks binary.
 
-## `api-breaking-surface` (deprecated alias)
-
-Deprecated alias of [`file/ifchange`](#fileifchange). It
-dispatches to the same implementation with the same `trigger_globs` / `required_globs` /
-`message` / `remediation` config. New configuration should reference
-`file/ifchange`; this alias is kept for one migration window.
-
 ## `bazel-policies`
 
 Purpose:
@@ -356,7 +349,6 @@ Notes:
 - Severity defaults to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass` (see
   [Bypass mechanism](bypass.md)).
-- Deprecated alias `api-breaking-surface` dispatches to this same check during the migration window.
 
 ## `rust-test-rule-coverage`
 

@@ -8,7 +8,7 @@ This page describes bypass support for checks that opt into bypass.
 - By default, checks do not allow bypass.
 - In the current default config, bypass is enabled for:
   - `file/size`
-  - `file/ifchange` (and its deprecated alias `api-breaking-surface`)
+  - `file/ifchange`
   - `no-usfa-typo` (directive name: `BYPASS_NO_USFA_TYPO`)
 
 ```toml
@@ -53,9 +53,7 @@ The bypass name is derived from the check id by uppercasing and replacing all no
 | `rust/giant-structs` | `BYPASS_RUST_GIANT_STRUCTS` |
 | `file/ifchange` | `BYPASS_FILE_IFCHANGE` |
 
-For `file/ifchange` (the bypass name follows the policy `id:`, so an
-instance kept under the deprecated `id: api-breaking-surface` still uses
-`BYPASS_API_BREAKING_SURFACE`):
+For `file/ifchange`:
 
 ```text
 BYPASS_FILE_IFCHANGE=No public API behavior changed; docs update would be misleading.

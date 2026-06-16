@@ -132,10 +132,6 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
             "file/size",
             "file/ifchange",
             "md/link-integrity",
-            // Deprecated alias of file/ifchange, kept for the migration window.
-            // Dispatches to the same multiplexed component; the guest exports a
-            // descriptor for each name.
-            "api-breaking-surface",
             "rust/giant-structs",
             "rust/giant-structs-create",
         ],
@@ -279,7 +275,6 @@ mod tests {
         let file_size = resolve_component("file/size");
         let file_ifchange = resolve_component("file/ifchange");
         let md_link_integrity = resolve_component("md/link-integrity");
-        let api_breaking = resolve_component("api-breaking-surface");
         let giant_structs = resolve_component("rust/giant-structs");
 
         // Same underlying component bytes (pointer-identical static + equal sha).
@@ -288,18 +283,18 @@ mod tests {
             giant_structs.artifact_bytes.map(<[u8]>::as_ptr),
             "preinstalled wasm checks must point at the same consolidated component",
         );
-        for (name, comp) in [
-            ("file/ifchange", &file_ifchange),
-            ("api-breaking-surface", &api_breaking),
-            ("md/link-integrity", &md_link_integrity),
-        ] {
-            assert_eq!(
-                file_size.artifact_bytes.map(<[u8]>::as_ptr),
-                comp.artifact_bytes.map(<[u8]>::as_ptr),
-                "{name} must point at the same consolidated component",
-            );
-            assert_eq!(file_size.artifact_sha256, comp.artifact_sha256);
-        }
+        assert_eq!(
+            file_size.artifact_bytes.map(<[u8]>::as_ptr),
+            file_ifchange.artifact_bytes.map(<[u8]>::as_ptr),
+            "file/ifchange must point at the same consolidated component",
+        );
+        assert_eq!(file_size.artifact_sha256, file_ifchange.artifact_sha256);
+        assert_eq!(
+            file_size.artifact_bytes.map(<[u8]>::as_ptr),
+            md_link_integrity.artifact_bytes.map(<[u8]>::as_ptr),
+            "md/link-integrity must point at the same consolidated component",
+        );
+        assert_eq!(file_size.artifact_sha256, md_link_integrity.artifact_sha256);
         assert_eq!(file_size.artifact_sha256, giant_structs.artifact_sha256);
         assert!(!file_size.artifact_sha256.is_empty(), "sha256 must be computed");
 
@@ -308,7 +303,6 @@ mod tests {
         assert_eq!(file_size.check_name, "file/size");
         assert_eq!(file_ifchange.check_name, "file/ifchange");
         assert_eq!(md_link_integrity.check_name, "md/link-integrity");
-        assert_eq!(api_breaking.check_name, "api-breaking-surface");
         assert_eq!(giant_structs.check_name, "rust/giant-structs");
     }
 

@@ -24,12 +24,6 @@
 //! The two mechanisms are independent and additive: a single instance can rely
 //! on markers, on glob couplings, or on both.
 //!
-//! ## Deprecated aliases
-//!
-//! For a migration window this check is also exported under its historical id
-//! `api-breaking-surface`, which dispatches to the same implementation.
-//! New configuration should reference `file/ifchange`.
-//!
 //! ## Supported comment styles (markers)
 //!
 //! The `LINT.IfChange` / `LINT.ThenChange` directives are recognized when preceded
@@ -60,15 +54,7 @@ use checkleft_check_sdk::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
-// ── Check entry points ─────────────────────────────────────────────────────────
-//
-// The canonical check runs both mechanisms. The deprecated alias runs only its
-// historical mechanism so that existing configs are not accidentally extended
-// (e.g. `api-breaking-surface` must not start enforcing LINT markers that the
-// deleted native check never enforced) and to avoid double-reporting when a repo
-// enables both an alias and the canonical check during the migration window.
-
-/// Canonical check: require a companion change when a coupled surface changes.
+/// Require a companion change when a coupled surface changes.
 #[check(
     name = "file/ifchange",
     description = "requires a companion change (marked region/file or glob-matched surface) to change together",
@@ -77,19 +63,6 @@ use serde::Deserialize;
 )]
 pub fn file_ifchange_check(input: CheckInput) -> Vec<Finding> {
     run(&input)
-}
-
-/// Deprecated alias of `file/ifchange` (glob-coupling history).
-/// Runs only the trigger_globs/required_globs mechanism — not LINT markers —
-/// to faithfully reproduce the original `api-breaking-surface` behavior.
-#[check(
-    name = "api-breaking-surface",
-    description = "deprecated alias of file/ifchange (trigger_globs / required_globs)",
-    severity = error,
-    access_scope = whole_repo
-)]
-pub fn api_breaking_surface_check(input: CheckInput) -> Vec<Finding> {
-    glob_findings(&input)
 }
 
 /// Runs both coupling mechanisms and concatenates their findings.
@@ -1776,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn aliases_dispatch_to_historical_mechanism_only() {
+    fn file_ifchange_check_runs_marker_mechanism() {
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let old_cwd = std::env::current_dir().unwrap();
@@ -1789,43 +1762,14 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("b.txt"), "unchanged\n").unwrap();
-        fs::create_dir_all(dir.path().join("backend/blob/src/v3")).unwrap();
-        fs::write(dir.path().join("backend/blob/src/v3/auth.rs"), "fn f() {}\n").unwrap();
 
-        // file/ifchange alias: runs marker mechanism only; marker is unsatisfied → 1 finding.
-        // No glob config is present so glob mode would be a no-op in any case.
         let cs = make_changeset(
             vec![("a.txt", ChangeKind::Modified)],
             vec![("a.txt", vec![hunk_new(2, 1)])],
         );
         let ifchange_findings = file_ifchange_check(CheckInput::__from_parts(cs, "{}".to_owned()));
-        assert_eq!(ifchange_findings.len(), 1, "file/ifchange alias must run marker mode");
-
-        // api-breaking-surface alias: runs glob mechanism only.
-        // The changeset touches a.txt (unsatisfied marker) AND a backend file.
-        // The alias must NOT report a marker finding — only the glob finding.
-        let glob_config = r#"{"trigger_globs": ["backend/blob/src/v3/**"], "required_globs": ["docs/backend.md"]}"#;
-        let cs2 = make_changeset(
-            vec![
-                ("a.txt", ChangeKind::Modified),
-                ("backend/blob/src/v3/auth.rs", ChangeKind::Modified),
-            ],
-            vec![("a.txt", vec![hunk_new(2, 1)])],
-        );
-        let abs_findings = api_breaking_surface_check(CheckInput::__from_parts(cs2, glob_config.to_owned()));
         std::env::set_current_dir(old_cwd).unwrap();
-        assert_eq!(
-            abs_findings.len(),
-            1,
-            "api-breaking-surface alias must run glob mode only (no marker findings); got {abs_findings:?}"
-        );
-        assert!(
-            abs_findings[0]
-                .location
-                .as_ref()
-                .map_or(false, |l| l.path.contains("auth.rs")),
-            "the single finding should be the glob finding for auth.rs, not a marker finding; got {abs_findings:?}"
-        );
+        assert_eq!(ifchange_findings.len(), 1, "file/ifchange must run marker mode");
     }
 
     #[test]
