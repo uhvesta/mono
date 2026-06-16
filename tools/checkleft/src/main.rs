@@ -904,7 +904,17 @@ struct OutputStyle {
 impl OutputStyle {
     fn detect_for_stdout() -> Self {
         let no_color = std::env::var_os("NO_COLOR").is_some();
-        if !std::io::stdout().is_terminal() || no_color {
+        if no_color {
+            return Self {
+                level: ColorLevel::None,
+            };
+        }
+
+        let clicolor_force = std::env::var("CLICOLOR_FORCE")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+
+        if !std::io::stdout().is_terminal() && !clicolor_force {
             return Self {
                 level: ColorLevel::None,
             };

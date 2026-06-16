@@ -13,4 +13,4 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [checks] running checks"
-bin/checkleft run
+CLICOLOR_FORCE=1 bin/checkleft run
