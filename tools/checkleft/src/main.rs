@@ -443,7 +443,7 @@ async fn dispatch_run(
 
 async fn build_runner(
     root: &Path,
-    _vcs: &Vcs,
+    vcs: &Vcs,
     base_revision: Option<BaseRevision>,
     external_checks_file: Option<String>,
     external_checks_url: Option<String>,
@@ -463,7 +463,17 @@ async fn build_runner(
         .await?,
     );
     info!("initializing source tree");
-    let source_tree = Arc::new(LocalSourceTree::with_base_revision(root, base_revision)?);
+    // Collect the VCS-tracked file set so that glob() can include files that
+    // are committed but match a .gitignore pattern (tracked before the rule was
+    // added), while still skipping untracked ignored build artifacts and deps.
+    let tracked_paths = vcs
+        .all_files_changeset()
+        .unwrap_or_default()
+        .changed_files
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    let source_tree = Arc::new(LocalSourceTree::with_tracked_paths(root, base_revision, tracked_paths)?);
     info!("initializing external package provider");
     let external_provider = build_external_package_provider(root)?;
     info!("initializing external executor");

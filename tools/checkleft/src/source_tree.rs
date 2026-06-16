@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -6,7 +7,6 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSetBuilder};
 use tracing::debug;
-use walkdir::WalkDir;
 
 use crate::input::{SourceTree, TreeVersion};
 use crate::path::validate_relative_path;
@@ -15,6 +15,10 @@ use crate::vcs::BaseRevision;
 pub struct LocalSourceTree {
     root: PathBuf,
     base_revision: Option<BaseRevision>,
+    /// VCS-tracked paths relative to `root`. When present, glob() overlays
+    /// these on top of the ignore-respecting walk so that files committed
+    /// before a matching .gitignore rule was added are still returned.
+    tracked_paths: Option<HashSet<PathBuf>>,
 }
 
 impl LocalSourceTree {
@@ -36,7 +40,21 @@ impl LocalSourceTree {
         Ok(Self {
             root,
             base_revision: base_revision.into(),
+            tracked_paths: None,
         })
+    }
+
+    /// Like [`with_base_revision`] but also supplies the set of VCS-tracked
+    /// paths (relative to `root`) so that [`glob`] can include files that are
+    /// tracked but happen to match a `.gitignore` pattern.
+    pub fn with_tracked_paths(
+        root: impl Into<PathBuf>,
+        base_revision: impl Into<Option<BaseRevision>>,
+        tracked_paths: HashSet<PathBuf>,
+    ) -> Result<Self> {
+        let mut tree = Self::with_base_revision(root, base_revision)?;
+        tree.tracked_paths = Some(tracked_paths);
+        Ok(tree)
     }
 
     pub fn root(&self) -> &Path {
@@ -156,27 +174,37 @@ impl SourceTree for LocalSourceTree {
         let glob_set = glob_builder.build().context("failed to build glob set")?;
 
         let walk_start = Instant::now();
-        let mut matches = Vec::new();
+        let mut matches: HashSet<PathBuf> = HashSet::new();
         let mut skipped_symlinks = 0usize;
-        for entry in WalkDir::new(&self.root)
+
+        // Walk the source tree respecting .gitignore/.ignore rules so that
+        // untracked ignored paths (cargo target/, node_modules/, .cache/, etc.)
+        // are not materialised into every whole-repo sandbox. The ignore crate
+        // reads .gitignore, .ignore, .git/info/exclude, and the global gitignore.
+        for result in ignore::WalkBuilder::new(&self.root)
             .follow_links(false)
-            .into_iter()
+            // Include hidden files (e.g. .github/, .cargo/) — we want to check
+            // them; the gitignore rules handle what should actually be excluded.
+            .hidden(false)
+            // Prevent descending into VCS internal directories: their contents
+            // are not check inputs and can disappear mid-walk.
             .filter_entry(|e| {
-                // Never descend into VCS internal directories — their contents
-                // are not check inputs and can disappear mid-walk (e.g.
-                // .jj/working_copy/working_copy.lock).
-                if e.file_type().is_dir() {
+                if e.file_type().is_some_and(|t| t.is_dir()) {
                     let name = e.file_name();
                     name != ".jj" && name != ".git"
                 } else {
                     true
                 }
             })
+            .build()
         {
             let entry =
-                entry.with_context(|| format!("failed to walk source tree rooted at {}", self.root.display()))?;
+                result.with_context(|| format!("failed to walk source tree rooted at {}", self.root.display()))?;
 
-            if entry.file_type().is_dir() {
+            let Some(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_dir() {
                 continue;
             }
 
@@ -186,7 +214,7 @@ impl SourceTree for LocalSourceTree {
             // materialisation to fail. Directory symlinks (e.g. pnpm package
             // symlinks inside node_modules) cannot be read as files and must
             // not appear in a whole-repo scan.
-            if entry.file_type().is_symlink() {
+            if ft.is_symlink() {
                 let Ok(resolved) = entry.path().canonicalize() else {
                     debug!(path = %entry.path().display(), reason = "unresolvable symlink", "skipped glob entry");
                     skipped_symlinks += 1;
@@ -201,19 +229,36 @@ impl SourceTree for LocalSourceTree {
 
             let relative_path = self.path_relative_to_root(entry.path())?;
             if glob_set.is_match(&relative_path) {
-                matches.push(relative_path);
+                matches.insert(relative_path);
             }
         }
 
-        matches.sort();
+        // A file that is VCS-tracked but happens to match a .gitignore rule
+        // (added after the file was committed) must still be included: checks
+        // operate on tracked content. The ignore walk above skipped it, so
+        // overlay the tracked set: include any tracked path not already found
+        // that matches the glob and still exists on the filesystem.
+        if let Some(tracked) = &self.tracked_paths {
+            for tracked_path in tracked {
+                if !matches.contains(tracked_path) && glob_set.is_match(tracked_path) {
+                    let abs_path = self.root.join(tracked_path);
+                    if abs_path.is_file() {
+                        matches.insert(tracked_path.clone());
+                    }
+                }
+            }
+        }
+
+        let mut result: Vec<PathBuf> = matches.into_iter().collect();
+        result.sort();
         debug!(
             pattern,
-            matched = matches.len(),
+            matched = result.len(),
             skipped_symlinks,
             elapsed_ms = walk_start.elapsed().as_millis(),
             "glob walk complete"
         );
-        Ok(matches)
+        Ok(result)
     }
 }
 
@@ -234,8 +279,9 @@ fn run_bytes_command(root: &Path, binary: &str, args: &[&str]) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use tempfile::tempdir;
@@ -407,6 +453,102 @@ mod tests {
 
         assert_eq!(current, b"after\n");
         assert_eq!(base, b"before\n");
+    }
+
+    /// Untracked ignored files (e.g. cargo target/) must NOT appear in glob
+    /// results. Only files ignored by .gitignore AND not in the tracked set
+    /// should be excluded.
+    #[test]
+    fn glob_excludes_gitignored_untracked_files() {
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        run_git(temp.path(), &["config", "user.name", "Test"]);
+
+        // Commit a source file.
+        fs::write(temp.path().join("src.rs"), b"fn main() {}").expect("write source");
+        run_git(temp.path(), &["add", "src.rs"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        // Add a .gitignore that ignores target/.
+        fs::write(temp.path().join(".gitignore"), b"/target\n").expect("write gitignore");
+
+        // Create an untracked ignored directory (simulating cargo's target/).
+        fs::create_dir_all(temp.path().join("target/debug")).expect("create target dir");
+        fs::write(temp.path().join("target/debug/app"), b"binary").expect("write binary");
+
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let matches = tree.glob("**").expect("glob all");
+
+        for p in &matches {
+            assert!(
+                !p.starts_with("target"),
+                "ignored untracked target/ must not appear: {}",
+                p.display()
+            );
+        }
+        assert!(
+            matches.contains(&Path::new("src.rs").to_path_buf()),
+            "committed source file must appear"
+        );
+    }
+
+    /// A file that is committed (tracked) but whose path later matches a
+    /// .gitignore rule MUST still appear in glob results. Checks operate on
+    /// tracked content and must not silently miss such files.
+    #[test]
+    fn glob_includes_tracked_but_gitignored_files() {
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        run_git(temp.path(), &["config", "user.name", "Test"]);
+
+        // Commit a file that we will later gitignore.
+        fs::write(temp.path().join("generated.rs"), b"// generated").expect("write file");
+        run_git(temp.path(), &["add", "generated.rs"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        // Now add a gitignore rule that would exclude the already-committed file.
+        fs::write(temp.path().join(".gitignore"), b"generated.rs\n").expect("write gitignore");
+
+        // Build the tracked set (as the runner would) from VCS.
+        let tracked_paths: HashSet<PathBuf> = vec![PathBuf::from("generated.rs")].into_iter().collect();
+
+        let tree =
+            LocalSourceTree::with_tracked_paths(temp.path(), None::<BaseRevision>, tracked_paths).expect("create tree");
+        let matches = tree.glob("**").expect("glob all");
+
+        assert!(
+            matches.contains(&Path::new("generated.rs").to_path_buf()),
+            "tracked-but-gitignored file must appear in glob results; got: {matches:?}"
+        );
+    }
+
+    /// Without the tracked_paths overlay, a tracked-but-gitignored file is
+    /// absent from glob results (this is the "pure gitignore" behavior that the
+    /// task description says would over-exclude; it is the baseline to show the
+    /// overlay is doing work).
+    #[test]
+    fn glob_excludes_gitignored_file_without_tracked_overlay() {
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "test@example.com"]);
+        run_git(temp.path(), &["config", "user.name", "Test"]);
+
+        fs::write(temp.path().join("generated.rs"), b"// generated").expect("write file");
+        run_git(temp.path(), &["add", "generated.rs"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        fs::write(temp.path().join(".gitignore"), b"generated.rs\n").expect("write gitignore");
+
+        // No tracked_paths overlay.
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let matches = tree.glob("**").expect("glob all");
+
+        assert!(
+            !matches.contains(&Path::new("generated.rs").to_path_buf()),
+            "without tracked overlay, gitignored file must not appear"
+        );
     }
 
     fn run_git(root: &Path, args: &[&str]) {
