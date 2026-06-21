@@ -151,6 +151,26 @@ impl Vcs {
         }
     }
 
+    /// Return the concatenated commit descriptions for all commits in the range
+    /// `base_sha..HEAD` (git) / `base_sha..@` (jj).  A BYPASS directive in any
+    /// commit in the pushed range is therefore visible to the caller.
+    pub fn commit_descriptions_since(&self, base_sha: &str) -> Result<String> {
+        match self.kind {
+            VcsKind::Jujutsu => {
+                let revset = format!("{base_sha}..@");
+                run_command(
+                    &self.root,
+                    "jj",
+                    &["log", "-r", &revset, "--no-graph", "-T", "description"],
+                )
+            }
+            VcsKind::Git => {
+                let range = format!("{base_sha}..HEAD");
+                run_command(&self.root, "git", &["log", "--pretty=%B", &range])
+            }
+        }
+    }
+
     pub fn remote_repo_slug(&self) -> Option<String> {
         if let Ok(output) = run_command(&self.root, "git", &["remote", "get-url", "origin"])
             && let Some(slug) = parse_repo_slug_from_remote_url(output.trim())
@@ -865,6 +885,83 @@ R docs/old.md => docs/new.md
         assert!(
             paths.contains(&std::path::Path::new("text.rs")),
             "text file should be in changeset; got: {paths:?}"
+        );
+    }
+
+    /// Regression test for the jj/push-with-empty-tip-commit scenario:
+    /// BYPASS_FILE_SIZE is placed in a parent (content) commit while the tip commit
+    /// has an empty description.  `commit_descriptions_since` must still surface it.
+    #[test]
+    fn commit_descriptions_since_finds_bypass_in_parent_commit_with_empty_tip() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn git_output(root: &std::path::Path, args: &[&str]) -> String {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).expect("utf-8").trim().to_owned()
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init", "-b", "main"]);
+        run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
+        run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
+
+        // Base commit on main.
+        fs::write(temp.path().join("base.txt"), "base\n").expect("write base");
+        run_git(temp.path(), &["add", "base.txt"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+        let base_sha = git_output(temp.path(), &["rev-parse", "HEAD"]);
+
+        run_git(temp.path(), &["checkout", "-b", "pr-branch"]);
+
+        // Content commit: has the BYPASS directive in its message.
+        fs::write(temp.path().join("large.txt"), "x".repeat(5000)).expect("write large");
+        run_git(temp.path(), &["add", "large.txt"]);
+        run_git(
+            temp.path(),
+            &[
+                "commit",
+                "-m",
+                "feat: add large file\n\nBYPASS_FILE_SIZE=File is intentionally large; one-off exception approved by infra.",
+            ],
+        );
+
+        // Empty-content tip commit with no BYPASS directive — simulates jj's
+        // pre-positioned working-copy commit (@) which sits on top of the real
+        // content commits but carries no description of its own.
+        run_git(
+            temp.path(),
+            &["commit", "--allow-empty", "-m", "wip: pre-push working-copy commit"],
+        );
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        let descriptions = vcs
+            .commit_descriptions_since(&base_sha)
+            .expect("commit_descriptions_since must not error");
+
+        assert!(
+            descriptions.contains("BYPASS_FILE_SIZE="),
+            "BYPASS_FILE_SIZE directive must be found in the range even when tip commit is empty; got: {descriptions:?}"
         );
     }
 }

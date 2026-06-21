@@ -409,7 +409,7 @@ async fn dispatch_run(
     )
     .await?;
     info!("resolving changeset for run");
-    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env).await;
+    let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
     info!(
         changed_files = changeset.changed_files.len(),
         "resolved changeset for run"
@@ -566,9 +566,23 @@ fn parse_external_provider_mode(raw: Option<String>) -> Result<ExternalProviderM
     }
 }
 
-async fn attach_description_context(changeset: ChangeSet, vcs: &Vcs, env: &CiEnvironment) -> ChangeSet {
+async fn attach_description_context(
+    changeset: ChangeSet,
+    vcs: &Vcs,
+    env: &CiEnvironment,
+    plan: &ChangePlan,
+) -> ChangeSet {
     info!("attaching commit and PR metadata");
-    let commit_description = normalize_optional_description(vcs.current_commit_description().ok());
+    // When we know the base revision, read ALL commit descriptions in the pushed
+    // range so that a BYPASS directive placed in any content commit (including
+    // when @ is an empty working-copy commit on top of the real content) is seen.
+    let commit_description = match plan {
+        ChangePlan::Scoped { base_sha, .. } => {
+            normalize_optional_description(vcs.commit_descriptions_since(base_sha).ok())
+                .or_else(|| normalize_optional_description(vcs.current_commit_description().ok()))
+        }
+        _ => normalize_optional_description(vcs.current_commit_description().ok()),
+    };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
     let pr_description = normalize_optional_description(
