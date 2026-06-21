@@ -1134,11 +1134,11 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
              After leasing your workspace:\n\
              ```\n\
              jj git fetch\n\
-             GIT_DIR=.jj/repo/store/git gh pr checkout {pr_number}   # lands you on the PR branch\n\
+             cube workspace goto --pr {pr_number}   # lands you on the PR branch\n\
              ```\n\
              Then make your changes on that branch and push:\n\
              ```\n\
-             jj git push --bookmark <branch-name>   # or: GIT_DIR=.jj/repo/store/git git push\n\
+             cube pr update --branch <branch-name>\n\
              ```\n\
              \n\
              If the branch cannot be resumed (deleted upstream, conflict you cannot resolve, etc.),\n\
@@ -1314,17 +1314,17 @@ fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> String {
                 .unwrap_or_else(|| "?".into());
             prompt.push_str(&format!(
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-                 - Push your commits to the existing PR branch (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
-                 - Confirm the PR is updated with `GIT_DIR=.jj/repo/store/git gh pr view {pr_number}`.\n\
+                 - Push your commits to the existing PR branch with `cube pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
+                 - Confirm the PR is updated with `gh pr view {pr_number}` (pass `-R owner/repo` since bare gh calls need it in a jj workspace — use `jj git remote` to find the slug, or check the PR URL above).\n\
                  - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
         } else {
             prompt.push_str(&format!(
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
-                 - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark and pushing — do NOT invent a different name.\n\
-                 - Push your branch (`jj bookmark create {expected_branch} -r @ && jj git push -b {expected_branch} --allow-new`) and open a PR with `gh pr create --head {expected_branch} --base main` if one does not already exist.\n\
-                 - Alternatively, use `cube pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It errors if a PR already exists — use `cube pr update --branch {expected_branch}` in that case.\n\
+                 - Use the engine-supplied branch name from the `expected branch name` line above (`{expected_branch}`) when creating your bookmark — do NOT invent a different name.\n\
+                 - Push your branch (`jj bookmark create {expected_branch} -r @`) and open a PR with `cube pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It errors if a PR already exists — use `cube pr update --branch {expected_branch}` in that case.\n\
+                 - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `cube pr create` or `cube pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
                  - Print the PR URL on its own line as the final thing in your final response so the engine can pick it up automatically.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
@@ -1912,7 +1912,7 @@ fn compose_revision_directive(
     out.push_str("   jj bookmark set <parent-branch-name> -r @\n");
     out.push_str("   ```\n");
     out.push_str(
-        "4. `jj git push -b <parent-branch-name>`   # NO --allow-new; NO GIT_DIR prefix; the branch already exists.\n",
+        "4. `cube pr update --branch <parent-branch-name>`   # pushes to the existing PR; no GIT_DIR or --allow-new needed.\n",
     );
     out.push_str("5. **Update the PR description** — this is a required step, not optional:\n");
     out.push_str(&format!(

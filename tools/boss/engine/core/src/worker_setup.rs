@@ -164,8 +164,7 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
         "\n## PR creation mode\n\
          \n\
          Default PR creation mode: pass `--draft` to `cube pr create`\n\
-         (or `gh pr create`) unless the chore description explicitly says\n\
-         to create a non-draft PR.\n"
+         unless the chore description explicitly says to create a non-draft PR.\n"
     } else {
         ""
     };
@@ -211,7 +210,11 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          - `jj git fetch` to sync; `jj new main@origin` for a fresh task;\n\
            `jj edit <bookmark>` to resume.\n\
          - `jj describe -m '...'` to set commit messages;\n\
-           `jj git push -b <bookmark>` to publish.\n\
+           `jj bookmark create <name> -r @` to name a commit.\n\
+         - **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,\n\
+           `git push`, `gh pr create`). A PreToolUse hook blocks these. Use:\n\
+           - `cube pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)\n\
+           - `cube pr update --branch <name>` — existing PR (pushes new commits to it)\n\
          - Never `jj git push --deleted` or `git push --delete`\n\
            without explicit user approval.\n\
          - `.claude/` is gitignored by the engine. Do not force-track\n\
@@ -251,9 +254,8 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          ```\n\
          \n\
          `cube pr create` errors if an open PR already exists for the branch\n\
-         (use `cube pr update` for that — see below). **Rule: `jj git push -b\n\
-         <bookmark>` requires `--allow-new` the first time when calling jj\n\
-         directly; `cube pr create` handles this for you.**\n\
+         (use `cube pr update` for that — see below). `cube pr create` handles\n\
+         the push and `--allow-new` automatically; never call `jj git push` directly.\n\
          \n\
          To update an existing PR (push new commits to it):\n\
          \n\
@@ -265,13 +267,13 @@ pub fn render_claude_md(input: &WorkerSetupInput) -> String {
          \n\
          Every cube workspace is a **secondary jj workspace** that SHARES one\n\
          object store with its siblings — there is no per-workspace clone. That\n\
-         store has a single `origin` remote pointing at the real GitHub\n\
-         upstream, so `jj git push -b my-feature` reaches GitHub directly.\n\
+         store has a single `origin` remote pointing at the real GitHub upstream.\n\
          \n\
-         - Prefer `cube pr create` / `cube pr update` for all pushes: they push to the\n\
-           github.com remote by URL and verify the result against GitHub, and\n\
-           — because the workspace has no top-level `.git` — it resolves\n\
-           `-R <owner/repo>` for `gh` so PR creation Just Works.\n\
+         - **Only use `cube pr create` / `cube pr update` for pushes and PR operations**:\n\
+           they push to GitHub by URL and resolve `-R <owner/repo>` for `gh`\n\
+           automatically, so PR creation Just Works without `.git/` at the root.\n\
+           Direct `jj git push`, `git push`, or `gh pr create` calls are blocked\n\
+           by a PreToolUse hook in every worker session.\n\
          - Because the store is shared, a `jj git fetch` in ANY workspace\n\
            advances the remote-tracking bookmarks (e.g. `main@origin`) seen by\n\
            ALL of them. Don't be alarmed if refs move without you fetching.\n\
@@ -333,6 +335,72 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
     let value = settings_value(input, EngineDataDirSandbox::Enabled);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
+
+/// Inline Python decision hook that blocks ALL standard workers from pushing
+/// branches or opening PRs via bare VCS commands (`gh pr create`, `jj git push`,
+/// `git push`). Workers must use `cube pr create` (new PR) or `cube pr update`
+/// (existing PR) instead, which are jj-aware and resolve the GitHub repo without
+/// a GIT_DIR override.
+///
+/// Uses `shlex.split()` so push/PR-creation phrases inside quoted arguments
+/// (commit messages, `--body` strings) do NOT trigger the block — only the
+/// actual invoked program + verb/subcommand tokens are inspected.
+///
+/// Applies to ALL `WorkerKind::Standard` workers (local and remote). The
+/// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
+/// revision workers and adds additional blocks (`cube pr create`, `cube pr
+/// ensure`) with revision-specific messaging.
+///
+/// Known limitation: the guard inspects only the top-level program token of
+/// each delimiter-split group. Invocations that wrap the blocked command in
+/// another program (`sh -c 'jj git push ...'`, `bash -lc '...'`, `xargs git
+/// push`, etc.) will not match and are approved. Workers are not adversarial
+/// and this edge case is covered by the checkleft gate and deny rules as
+/// defense-in-depth, so the limitation is acceptable.
+const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
+    "python3 -c \"\n",
+    "import json,os,sys,re,shlex\n",
+    "inp=json.load(sys.stdin)\n",
+    "cmd=inp.get('tool_input',{}).get('command','')\n",
+    "DELIMS={'&&','||',';','|','&'}\n",
+    "try:\n",
+    "    toks=shlex.split(cmd,posix=True)\n",
+    "except Exception:\n",
+    "    toks=cmd.split()\n",
+    "groups=[]\n",
+    "cur=[]\n",
+    "for t in toks:\n",
+    "    if t in DELIMS:\n",
+    "        if cur:\n",
+    "            groups.append(cur[:])\n",
+    "        cur=[]\n",
+    "    else:\n",
+    "        cur.append(t)\n",
+    "if cur:\n",
+    "    groups.append(cur)\n",
+    "matched=None\n",
+    "for g in groups:\n",
+    "    i=0\n",
+    "    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n",
+    "        i+=1\n",
+    "    rest=g[i:]\n",
+    "    prog=os.path.basename(rest[0]) if rest else ''\n",
+    "    if len(rest)>=3 and prog=='gh' and rest[1]=='pr' and rest[2]=='create':\n",
+    "        matched='gh pr create'\n",
+    "        break\n",
+    "    if len(rest)>=3 and prog=='jj' and rest[1]=='git' and rest[2]=='push':\n",
+    "        matched='jj git push'\n",
+    "        break\n",
+    "    if len(rest)>=2 and prog=='git' and rest[1]=='push':\n",
+    "        matched='git push'\n",
+    "        break\n",
+    "if matched:\n",
+    "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: cube pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or cube pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
+    "    print(json.dumps({'decision':'block','reason':msg}))\n",
+    "else:\n",
+    "    print(json.dumps({'decision':'approve'}))\n",
+    "\""
+);
 
 /// Inline Python decision hook that guards revision tasks from opening new
 /// PRs. Uses `shlex.split()` to tokenise the Bash command string so that
@@ -555,13 +623,43 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
         ],
     }));
 
-    // Deterministic pre-push checkleft gate (standard implementation
-    // workers only). Matches Bash commands that push (`jj git push` /
-    // `git push`) and blocks the push when the repo's checkleft reports
-    // errors, echoing the findings + bypass guidance. The whole worker
-    // fleet pushes with jj, whose native `jj git push` does not run git's
-    // pre-push hook — so this restores the gate at the harness layer (the
-    // same mechanism as the path guard above).
+    // PR redirect guard (all standard workers, local AND remote). Blocks
+    // bare-VCS PR creation and branch-push attempts (`gh pr create`,
+    // `jj git push`, `git push`) and redirects to cube pr create / cube pr
+    // update. This is the primary guardrail that makes correct PR-creation
+    // behaviour deterministic across ALL worker execution kinds (chore,
+    // task, design, investigation, revision) regardless of prompt drift.
+    //
+    // Revision workers receive this guard PLUS the revision-specific guard
+    // below — the revision guard stacks on top and adds additional blocks
+    // (`cube pr create`, `cube pr ensure`) with revision-specific messaging.
+    //
+    // Reviewer and triage workers do not get this guard because their deny
+    // rules already block all push operations; the guard is redundant and
+    // would add noise without benefit.
+    if input.worker_kind == WorkerKind::Standard {
+        pre_tool_use_hooks.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": PR_REDIRECT_GUARD_COMMAND,
+                }
+            ],
+        }));
+    }
+
+    // Deterministic pre-push checkleft gate (local standard workers only).
+    // Matches Bash commands that push (`jj git push` / `git push`) and
+    // blocks the push when the repo's checkleft reports errors, echoing the
+    // findings + bypass guidance. The whole worker fleet pushes with jj,
+    // whose native `jj git push` does not run git's pre-push hook — so this
+    // restores the gate at the harness layer (the same mechanism as the path
+    // guard above).
+    //
+    // In practice the PR redirect guard above blocks direct `jj git push` /
+    // `git push` first, but this guard provides defense-in-depth and still
+    // fires if the PR redirect guard ever misses an edge case.
     //
     // Scoped to local standard workers:
     //   • Reviewer / triage workers cannot push (their deny rules block

@@ -4517,8 +4517,10 @@ pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
 /// will simply push and open one, but a worker that's blocked has an
 /// out to explain itself rather than churning.
 pub const PROBE_NO_PR: &str = "You stopped without producing a PR for this work. \
-If the work is complete, push your branch and open the PR with `gh pr create`. \
-If you're blocked, explain what you need.";
+If the work is complete, open the PR with `cube pr create --branch <bookmark>` (pushes the \
+branch and opens the PR in one step, jj-aware, no GIT_DIR needed). If a PR already exists \
+for this branch, push any new commits with `cube pr update --branch <bookmark>` instead — \
+do not open a duplicate. If you're blocked, explain what you need.";
 
 /// Extract the set of required-check names a `ci_remediations` attempt
 /// was opened to fix, parsed from its `failed_checks` JSON snapshot
@@ -4591,8 +4593,8 @@ fn ci_attempt_signal_cleared(attempt_failed_checks: &str, ci: &OpenPrCiStatus) -
 pub fn probe_push_to_existing_pr(pr_url: &str) -> String {
     format!(
         "A PR already exists for this work: {pr_url}. Do NOT open a new PR. If you have local \
-commits, push them to the existing PR's branch (`jj git push -b <bookmark>`). If your changes \
-are already pushed or there is nothing left to do, say so — explain your status instead of \
+commits, push them to the existing PR's branch with `cube pr update --branch <bookmark>`. If your \
+changes are already pushed or there is nothing left to do, say so — explain your status instead of \
 re-running."
     )
 }
@@ -4600,7 +4602,7 @@ re-running."
 /// Probe text dispatched when a PR exists but the worker has local
 /// commits that haven't been pushed yet — the PR is stale.
 pub const PROBE_STALE_PR: &str = "A PR exists for this branch, but your local commits \
-are ahead of the PR's head. Push the new commits (`jj git push -b <bookmark>`) \
+are ahead of the PR's head. Push the new commits with `cube pr update --branch <bookmark>` \
 so the PR reflects your latest work, or explain why the local commits should not \
 be pushed.";
 

@@ -1203,57 +1203,70 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
-    // Must have 5 entries: the shim, the deterministic path guard, the
-    // always-on boss-launch guard, the checkleft push guard (standard
-    // worker), and the revision-only gh-pr-create guard.
+    // Must have 6 entries: the shim, the deterministic path guard, the
+    // always-on boss-launch guard, the PR redirect guard (all standard workers),
+    // the checkleft push guard (local standard worker), and the revision-only
+    // gh-pr-create guard.
     assert_eq!(
         pre.len(),
-        5,
-        "revision_implementation PreToolUse must have shim + path guard + boss-launch guard + checkleft push guard + pr guard, got {pre:?}",
+        6,
+        "revision_implementation PreToolUse must have shim + path guard + boss-launch guard + PR redirect guard + checkleft push guard + revision pr guard, got {pre:?}",
     );
-    // The revision pr-guard is the Bash-matcher entry whose command
-    // inspects `gh pr create`; the boss-launch guard is also Bash-matched,
-    // so disambiguate by content.
-    let pr_guard = pre
+    // The revision pr-guard is the Bash-matcher entry whose command inspects
+    // `cube pr ensure`; both the PR redirect guard and the boss-launch guard are
+    // also Bash-matched, so disambiguate by the `ensure` token.
+    let revision_pr_guard = pre
         .iter()
-        .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("create"))
-        .expect("revision PreToolUse must include a gh-pr-create guard");
-    // Guard command must reference the deny decision and block PR *creation*
-    // (gh pr create, cube pr create, deprecated cube pr ensure) while pointing
-    // workers at the allowed `cube pr update` for advancing the existing PR.
-    let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
+        .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("ensure"))
+        .expect("revision PreToolUse must include the revision-specific gh-pr-create guard");
+    // Revision guard command must block PR *creation* (gh pr create, cube pr create,
+    // deprecated cube pr ensure) while pointing workers at cube pr update.
+    let guard_cmd = revision_pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
     assert!(
         guard_cmd.contains("gh") && guard_cmd.contains("pr") && guard_cmd.contains("create"),
-        "guard command must inspect gh pr create / cube pr create: {guard_cmd}",
+        "revision guard must inspect gh pr create / cube pr create: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("cube") && guard_cmd.contains("ensure"),
-        "guard command must also block the deprecated cube pr ensure: {guard_cmd}",
+        "revision guard must also block the deprecated cube pr ensure: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("cube pr update"),
-        "guard block message must point workers at `cube pr update`: {guard_cmd}",
+        "revision guard block message must point workers at `cube pr update`: {guard_cmd}",
     );
     assert!(
         guard_cmd.contains("block"),
-        "guard command must produce a block decision: {guard_cmd}",
+        "revision guard must produce a block decision: {guard_cmd}",
+    );
+    // The PR redirect guard must also be present (all standard workers).
+    let pr_redirect_guard = pre
+        .iter()
+        .find(|e| {
+            let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
+            cmd.contains("jj git push") && cmd.contains("cube pr create") && !cmd.contains("ensure")
+        })
+        .expect("revision PreToolUse must include the PR redirect guard (all standard workers)");
+    let redirect_cmd = pr_redirect_guard["hooks"][0]["command"].as_str().unwrap_or("");
+    assert!(
+        redirect_cmd.contains("cube pr update"),
+        "PR redirect guard block message must mention cube pr update: {redirect_cmd}",
     );
 }
 
 #[test]
-fn chore_implementation_has_shim_and_path_guard_but_no_revision_guard() {
+fn chore_implementation_has_pr_redirect_guard_but_no_revision_guard() {
     let input = sample_input(); // execution_kind: "chore_implementation"
     let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
-    // chore: [boss-event shim, deterministic path guard, boss-launch
-    // guard, checkleft push guard]. The revision-only `gh pr create`
-    // guard must NOT be present.
+    // chore: [boss-event shim, deterministic path guard, boss-launch guard,
+    // PR redirect guard (all standard workers), checkleft push guard].
+    // The revision-only `gh pr create` guard (which blocks `cube pr ensure`) must NOT be present.
     assert_eq!(
         pre.len(),
-        4,
-        "chore_implementation PreToolUse must have shim + path guard + boss-launch guard + checkleft push guard, got {pre:?}",
+        5,
+        "chore_implementation PreToolUse must have shim + path guard + boss-launch guard + PR redirect guard + checkleft push guard, got {pre:?}",
     );
     assert_eq!(
         pre[0]["matcher"],
@@ -1265,12 +1278,53 @@ fn chore_implementation_has_shim_and_path_guard_but_no_revision_guard() {
         path_guard.contains("BOSS_DATA_DIR=") && path_guard.contains(PATH_GUARD_SCRIPT_NAME),
         "second PreToolUse hook must be the path guard, got {path_guard}",
     );
-    // No revision guard: nothing inspects `cube ... ensure`.
+    // The PR redirect guard must be present for chore workers.
+    let has_pr_redirect_guard = pre.iter().any(|e| {
+        let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
+        cmd.contains("jj git push") && cmd.contains("cube pr create")
+    });
+    assert!(has_pr_redirect_guard, "chore must carry the PR redirect guard: {pre:?}",);
+    // No revision-specific guard: nothing inspects `cube ... ensure`.
     for entry in pre {
         let cmd = entry["hooks"][0]["command"].as_str().unwrap_or("");
         assert!(
             !cmd.contains("ensure"),
-            "chore must not carry the revision gh-pr-create guard: {cmd}",
+            "chore must not carry the revision-specific gh-pr-create guard: {cmd}",
+        );
+    }
+}
+
+/// Design and investigation workers are also `WorkerKind::Standard` and must
+/// carry the PR redirect guard. The original root cause (T686) was a DESIGN
+/// worker's prelude diverging from chore/task preludes — pin that cross-prelude
+/// invariant here so future drift is caught immediately.
+#[test]
+fn design_and_investigation_workers_carry_pr_redirect_guard() {
+    for execution_kind in ["project_design", "investigation_implementation"] {
+        let mut input = sample_input();
+        input.execution_kind = execution_kind.into();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let pre = parsed["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{execution_kind}: PreToolUse must be an array"));
+        // Must carry the PR redirect guard: the Bash-matcher hook whose
+        // command inspects `jj git push` and `cube pr create` (but not
+        // `ensure`, which is the revision-only guard).
+        let has_pr_redirect_guard = pre.iter().any(|e| {
+            let cmd = e["hooks"][0]["command"].as_str().unwrap_or("");
+            cmd.contains("jj git push") && cmd.contains("cube pr create") && !cmd.contains("ensure")
+        });
+        assert!(
+            has_pr_redirect_guard,
+            "{execution_kind} worker must carry the PR redirect guard: {pre:?}",
+        );
+        // Must NOT carry the revision-specific guard (which blocks `cube pr ensure`).
+        let has_revision_guard = pre
+            .iter()
+            .any(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("ensure"));
+        assert!(
+            !has_revision_guard,
+            "{execution_kind} worker must not carry the revision-specific guard: {pre:?}",
         );
     }
 }
@@ -1340,19 +1394,24 @@ fn revision_task_kind_adds_gh_pr_create_guard_even_with_wrong_execution_kind() {
         .as_array()
         .expect("PreToolUse must be an array");
 
+    // shim + path guard + boss-launch guard + PR redirect guard (all standard)
+    // + checkleft push guard + revision-specific pr guard = 6 total
     assert_eq!(
         pre.len(),
-        5,
-        "revision task_kind must add the pr guard (shim + path guard + boss-launch guard + checkleft push guard + pr guard) even when execution_kind is wrong, got {pre:?}",
+        6,
+        "revision task_kind must add the revision pr guard on top of the PR redirect guard \
+         (shim + path guard + boss-launch guard + PR redirect guard + checkleft push guard + \
+         revision pr guard) even when execution_kind is wrong, got {pre:?}",
     );
-    let pr_guard = pre
+    // The revision-specific guard blocks `cube pr ensure` — find it by that token.
+    let revision_pr_guard = pre
         .iter()
-        .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("create"))
-        .expect("revision task_kind must include a gh-pr-create guard");
-    let guard_cmd = pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
+        .find(|e| e["hooks"][0]["command"].as_str().unwrap_or("").contains("ensure"))
+        .expect("revision task_kind must include the revision-specific gh-pr-create guard");
+    let guard_cmd = revision_pr_guard["hooks"][0]["command"].as_str().unwrap_or("");
     assert!(
         guard_cmd.contains("block"),
-        "guard must produce a block decision: {guard_cmd}",
+        "revision guard must produce a block decision: {guard_cmd}",
     );
 }
 
@@ -2015,4 +2074,139 @@ fn guard_block_message_reuses_head_branch_from_gh_pr_create() {
         reason.contains("cube pr update --branch boss/exec_abc123_01"),
         "block reason must reuse the --head branch in the update suggestion, got: {reason}",
     );
+}
+
+// ── PR_REDIRECT_GUARD_COMMAND execution tests ─────────────────────────
+//
+// These tests actually run the PR redirect guard script (via `sh -c`) to
+// verify that it blocks direct VCS push commands and GH PR creation while
+// allowing cube pr create/update.
+
+/// Run the PR redirect guard against a simulated Bash tool_input payload
+/// and return the `decision` field from its JSON output.
+fn run_pr_redirect_guard(bash_command: &str) -> String {
+    use std::io::Write as _;
+    let stdin_payload = serde_json::json!({
+        "tool_input": {"command": bash_command}
+    })
+    .to_string();
+
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(PR_REDIRECT_GUARD_COMMAND)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sh must be available");
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_payload.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "PR redirect guard produced invalid JSON for command {:?}: {e}\nstdout={stdout}\nstderr={}",
+            bash_command,
+            String::from_utf8_lossy(&out.stderr),
+        )
+    });
+    parsed["decision"].as_str().unwrap_or("missing").to_owned()
+}
+
+// --- PR redirect guard: must BLOCK ---
+
+#[test]
+fn pr_redirect_blocks_gh_pr_create() {
+    let decision = run_pr_redirect_guard("gh pr create --title 'My PR' --body 'content'");
+    assert_eq!(decision, "block", "guard must block gh pr create");
+}
+
+#[test]
+fn pr_redirect_blocks_gh_pr_create_with_git_dir_prefix() {
+    let decision = run_pr_redirect_guard("GIT_DIR=.jj/repo/store/git gh pr create --title 'x'");
+    assert_eq!(
+        decision, "block",
+        "guard must block gh pr create even with a GIT_DIR= env prefix"
+    );
+}
+
+#[test]
+fn pr_redirect_blocks_jj_git_push_with_allow_new() {
+    let decision = run_pr_redirect_guard("jj git push -b boss/exec_abc --allow-new");
+    assert_eq!(decision, "block", "guard must block jj git push --allow-new");
+}
+
+#[test]
+fn pr_redirect_blocks_jj_git_push_without_allow_new() {
+    let decision = run_pr_redirect_guard("jj git push -b boss/exec_abc");
+    assert_eq!(
+        decision, "block",
+        "guard must block jj git push even without --allow-new"
+    );
+}
+
+#[test]
+fn pr_redirect_blocks_git_push() {
+    let decision = run_pr_redirect_guard("git push origin boss/exec_abc");
+    assert_eq!(decision, "block", "guard must block bare git push");
+}
+
+#[test]
+fn pr_redirect_blocks_gh_pr_create_in_compound_command() {
+    let decision = run_pr_redirect_guard(r#"jj describe -m "my change" && gh pr create --title 'x'"#);
+    assert_eq!(decision, "block", "guard must block gh pr create in a compound command");
+}
+
+#[test]
+fn pr_redirect_blocks_jj_git_push_in_compound_command() {
+    let decision = run_pr_redirect_guard(r#"jj describe -m "my change" && jj git push -b boss/exec_abc --allow-new"#);
+    assert_eq!(decision, "block", "guard must block jj git push in a compound command");
+}
+
+// --- PR redirect guard: must APPROVE ---
+
+#[test]
+fn pr_redirect_approves_cube_pr_create() {
+    let decision = run_pr_redirect_guard("cube pr create --branch boss/exec_abc --title 'x'");
+    assert_eq!(decision, "approve", "guard must allow cube pr create");
+}
+
+#[test]
+fn pr_redirect_approves_cube_pr_update() {
+    let decision = run_pr_redirect_guard("cube pr update --branch boss/exec_abc");
+    assert_eq!(decision, "approve", "guard must allow cube pr update");
+}
+
+#[test]
+fn pr_redirect_approves_jj_git_fetch() {
+    let decision = run_pr_redirect_guard("jj git fetch");
+    assert_eq!(decision, "approve", "guard must allow jj git fetch");
+}
+
+#[test]
+fn pr_redirect_approves_jj_describe_with_jj_git_push_in_message() {
+    let decision = run_pr_redirect_guard(r#"jj describe -m "fix: stop using jj git push for PRs""#);
+    assert_eq!(
+        decision, "approve",
+        "guard must NOT block jj describe when the phrase is in the commit message",
+    );
+}
+
+#[test]
+fn pr_redirect_approves_jj_bookmark_create() {
+    let decision = run_pr_redirect_guard("jj bookmark create boss/exec_abc -r @");
+    assert_eq!(decision, "approve", "guard must allow jj bookmark create");
+}
+
+#[test]
+fn pr_redirect_approves_echo_with_jj_git_push_phrase() {
+    let decision = run_pr_redirect_guard(r#"echo "jj git push is now blocked""#);
+    assert_eq!(decision, "approve", "echo with jj git push phrase must not be blocked");
 }
