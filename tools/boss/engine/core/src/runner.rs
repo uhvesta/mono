@@ -2050,7 +2050,36 @@ fn compose_conflict_resolution_fragment(attempt: &ConflictResolution) -> String 
          form and agents reliably get them wrong.\n\n",
     );
     out.push_str(
-        "### How to resolve jj conflicts (structural edit — NOT line-range surgery)\n\n\
+        "### How to resolve jj conflicts (first-class conflicts — stacked branches)\n\n\
+         **jj records conflicts IN each commit independently.** `jj git push` refuses to push \
+         ANY commit that still contains a conflict, including ancestors. Resolving only the \
+         working-copy tip does NOT clear conflicts baked into parent commits — this is the most \
+         common failure mode on stacked branches.\n\n\
+         **Step A — List every conflicted commit on the branch:**\n\
+         ```\n\
+         jj log -r '::<branch>' -T 'change_id ++ \" \" ++ description.first_line() ++ \" conflicts=\" ++ conflict ++ \"\\n\"'\n\
+         ```\n\
+         Note every commit with `conflicts=true`.\n\n\
+         **Step B — Resolve from the BASE upward:**\n\
+         ```\n\
+         jj edit <lowest-conflicted-change-id>\n\
+         ```\n\
+         Fix the conflicted files in that commit (see structural-edit instructions below) so it \
+         is conflict-free; descendants auto-rebase. Re-run the log from Step A and resolve the \
+         next-lowest still-conflicted commit. Repeat until **no commit** in `::<branch>` has \
+         `conflicts=true`.\n\n\
+         **Step C — Verify before pushing:**\n\
+         ```\n\
+         jj log -r '::<branch>' -T 'conflict ++ \"\\n\"'\n\
+         ```\n\
+         Output must contain no `true`. Only then run `cube pr update --branch <branch>`.\n\n\
+         **Do NOT** squash or resolve only at the working-copy tip — it cannot clear an \
+         ancestor's conflict.\n\n\
+         **Non-interactive env:** ALWAYS pass `-m \"…\"` to `jj describe`, `jj squash`, \
+         `jj commit`, and `jj new`. The worker environment has no usable editor \
+         (`EDITOR=false`); any jj command that opens an editor hard-fails with \
+         \"Editor 'false' exited\". Never rely on the interactive editor.\n\n\
+         **Structural edit — NOT line-range surgery:**\n\n\
          jj materializes each conflict as annotated regions directly in the file. \
          Resolve by **editing those regions in place**:\n\n\
          - Open the conflicted file and find the `<<<<<<<` / `>>>>>>>` marker blocks.\n\
@@ -2236,6 +2265,22 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 attempt.head_branch.as_str()
             },
         ));
+        out.push_str(
+            "**If the rebase produces conflicts on a stacked branch:** jj records conflicts \
+             IN each commit independently — `jj git push` refuses to push ANY commit that \
+             still contains a conflict, including ancestors. Resolving only the tip does NOT \
+             clear ancestor conflicts. List conflicted commits and resolve from the base upward:\n\
+             ```\n\
+             # list conflicted commits\n\
+             jj log -r '::<branch>' -T 'change_id ++ \" \" ++ description.first_line() ++ \" conflicts=\" ++ conflict ++ \"\\n\"'\n\
+             # edit the lowest conflicted commit, fix it, repeat upward\n\
+             jj edit <lowest-conflicted-change-id>\n\
+             # verify: output must contain no 'true'\n\
+             jj log -r '::<branch>' -T 'conflict ++ \"\\n\"'\n\
+             ```\n\
+             Always pass `-m \"…\"` to `jj describe`/`jj squash`/`jj commit`/`jj new` — \
+             `EDITOR=false` in this environment; any command that opens an editor hard-fails.\n\n",
+        );
         if is_rebounce {
             out.push_str(
                 "Wait for the re-run's required checks to settle (`gh pr checks --watch`). Then:\n\n\
@@ -3619,6 +3664,23 @@ mod compose_prompt_tests {
         assert!(
             prompt.contains("boss engine conflicts mark-failed"),
             "conflict fragment must include the mark-failed stop condition:\n{prompt}",
+        );
+        // Must contain the jj first-class conflict / stacked-branch recipe.
+        assert!(
+            prompt.contains("jj records conflicts IN each commit independently"),
+            "conflict fragment must explain jj first-class conflict model:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Resolve from the BASE upward"),
+            "conflict fragment must instruct base-up resolution for stacked branches:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("conflicts=true"),
+            "conflict fragment must reference the conflicts=true log template:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("EDITOR=false"),
+            "conflict fragment must warn about non-interactive editor env:\n{prompt}",
         );
         // Must still contain the base revision directive spine.
         assert!(
