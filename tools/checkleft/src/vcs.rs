@@ -74,14 +74,14 @@ impl Vcs {
             VcsKind::Jujutsu => {
                 let summary = run_command(&self.root, "jj", &["diff", "--summary"])?;
                 let mut changeset = parse_jj_diff_summary(&summary)?;
-                let patch = run_command(&self.root, "jj", &["diff", "--git"])?;
+                let patch = run_command_lossy(&self.root, "jj", &["diff", "--git"])?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
             VcsKind::Git => {
                 let summary = run_command(&self.root, "git", &["diff", "--name-status", "HEAD"])?;
                 let mut changeset = parse_git_name_status(&summary)?;
-                let patch = run_command(&self.root, "git", &["diff", "--patch", "HEAD"])?;
+                let patch = run_command_lossy(&self.root, "git", &["diff", "--patch", "HEAD"])?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
@@ -97,7 +97,7 @@ impl Vcs {
                     &["diff", "--summary", "--from", base_ref, "--to", "@"],
                 )?;
                 let mut changeset = parse_jj_diff_summary(&summary)?;
-                let patch = run_command(&self.root, "jj", &["diff", "--git", "--from", base_ref, "--to", "@"])?;
+                let patch = run_command_lossy(&self.root, "jj", &["diff", "--git", "--from", base_ref, "--to", "@"])?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
@@ -106,7 +106,7 @@ impl Vcs {
                 info!(base_ref, merge_base, "resolved merge-base for changeset");
                 let summary = run_command(&self.root, "git", &["diff", "--name-status", &merge_base, "HEAD"])?;
                 let mut changeset = parse_git_name_status(&summary)?;
-                let patch = run_command(&self.root, "git", &["diff", "--patch", &merge_base, "HEAD"])?;
+                let patch = run_command_lossy(&self.root, "git", &["diff", "--patch", &merge_base, "HEAD"])?;
                 attach_line_deltas(&mut changeset, &patch);
                 Ok(changeset)
             }
@@ -281,6 +281,31 @@ fn run_command(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
 
     String::from_utf8(output.stdout)
         .with_context(|| format!("command `{binary} {}` returned invalid utf-8", args.join(" ")))
+}
+
+/// Like `run_command` but decodes stdout lossily, replacing invalid UTF-8
+/// sequences with U+FFFD. Use for diff/patch commands whose output may contain
+/// binary file content — the hunk headers are always ASCII and still parse
+/// correctly; binary hunks simply produce no parseable lines.
+fn run_command_lossy(root: &Path, binary: &str, args: &[&str]) -> Result<String> {
+    info!(
+        root = %root.display(),
+        binary,
+        args = args.join(" "),
+        "running command"
+    );
+    let output = Command::new(binary)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("failed to execute `{binary} {}`", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("command `{binary} {}` failed: {}", args.join(" "), stderr.trim());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn detect_jj_root(start: &Path) -> Result<Option<PathBuf>> {
@@ -782,6 +807,64 @@ R docs/old.md => docs/new.md
             changed_paths,
             vec![std::path::Path::new("pr_file.txt")],
             "expected only pr_file.txt; drift.txt must be excluded. Got: {changed_paths:?}"
+        );
+    }
+
+    /// A changeset whose diff contains binary (non-UTF-8) content must not
+    /// error. The binary hunk is simply skipped; text files in the same
+    /// changeset are still included in the result.
+    #[test]
+    fn git_changeset_since_handles_binary_file() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        fn run_git(root: &std::path::Path, args: &[&str]) {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let temp = tempdir().expect("create temp dir");
+        run_git(temp.path(), &["init", "-b", "main"]);
+        run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
+        run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
+
+        // Base commit on main
+        fs::write(temp.path().join("base.txt"), "base\n").expect("write base");
+        run_git(temp.path(), &["add", "base.txt"]);
+        run_git(temp.path(), &["commit", "-m", "initial"]);
+
+        // Create a PR branch and add a binary file (non-UTF-8 bytes) plus a text file.
+        run_git(temp.path(), &["checkout", "-b", "pr-branch"]);
+        let binary_content: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x80, 0xFF];
+        fs::write(temp.path().join("data.bin"), &binary_content).expect("write binary file");
+        fs::write(temp.path().join("text.rs"), "fn main() {}\n").expect("write text file");
+        run_git(temp.path(), &["add", "data.bin", "text.rs"]);
+        run_git(temp.path(), &["commit", "-m", "add binary and text"]);
+
+        let vcs = super::Vcs::detect(temp.path()).expect("detect vcs");
+        // Must not error even though the diff contains non-UTF-8 bytes.
+        let changeset = vcs
+            .changeset_since("main")
+            .expect("changeset with binary file must not error");
+
+        let paths: Vec<_> = changeset.changed_files.iter().map(|f| f.path.as_path()).collect();
+        assert!(
+            paths.contains(&std::path::Path::new("data.bin")),
+            "binary file should be in changeset; got: {paths:?}"
+        );
+        assert!(
+            paths.contains(&std::path::Path::new("text.rs")),
+            "text file should be in changeset; got: {paths:?}"
         );
     }
 }

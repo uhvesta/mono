@@ -208,6 +208,39 @@ index 0000000..1111111
     }
 
     #[test]
+    fn binary_file_hunk_is_skipped_text_hunks_still_parsed() {
+        // A patch with a binary file followed by a text file: the binary entry
+        // produces no line-delta (no @@ headers), and the text file is still parsed.
+        let diffs = parse_file_diffs_from_git_patch(
+            r#"
+diff --git a/data.bin b/data.bin
+new file mode 100644
+index 0000000..1234567
+Binary files /dev/null and b/data.bin differ
+diff --git a/src/lib.rs b/src/lib.rs
+index 0000000..1111111 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1 +1,2 @@
+ existing
++new line
+"#,
+        );
+
+        assert!(
+            diffs.get(&PathBuf::from("data.bin")).is_none()
+                || diffs
+                    .get(&PathBuf::from("data.bin"))
+                    .is_some_and(|d| d.line_delta.added_lines == 0 && d.file_diff.hunks.is_empty()),
+            "binary file should have no line-delta or no hunks"
+        );
+
+        let text_diff = diffs.get(&PathBuf::from("src/lib.rs")).expect("text file diff");
+        assert_eq!(text_diff.line_delta.added_lines, 1);
+        assert_eq!(text_diff.line_delta.removed_lines, 0);
+    }
+
+    #[test]
     fn parses_deleted_file_patch_under_old_path() {
         let diffs = parse_file_diffs_from_git_patch(
             r#"
