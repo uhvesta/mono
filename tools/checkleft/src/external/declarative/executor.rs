@@ -212,9 +212,32 @@ fn run_tool_invocation(
 
     match tool.mode {
         InvocationMode::Batch => {
-            let args = with_prefix(expand_batch_args(repo_root, &tool.args, files));
-            let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
-            classify_and_project(invocation, &output, None, Some(&needs_invocations))
+            // Compute the fixed argv cost (program + prefix args + non-{{files}} args)
+            // to size file chunks. Files are split into chunks that keep the total
+            // argv byte cost under ARG_BYTE_SAFE_THRESHOLD to avoid ARG_MAX errors
+            // on large changesets.
+            let fixed_cost = argv_byte_cost_of_path(&binary.program)
+                + argv_byte_cost(&binary.prefix_args)
+                + tool
+                    .args
+                    .iter()
+                    .filter(|a| *a != "{{files}}")
+                    .map(|a| a.replace("{{repo_root}}", &repo_root.to_string_lossy()))
+                    .map(|a| a.len() + 1)
+                    .sum::<usize>();
+            let chunks = split_files_into_chunks(fixed_cost, files);
+            let mut findings = Vec::new();
+            for chunk in chunks {
+                let args = with_prefix(expand_batch_args(repo_root, &tool.args, chunk));
+                let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
+                findings.extend(classify_and_project(
+                    invocation,
+                    &output,
+                    None,
+                    Some(&needs_invocations),
+                )?);
+            }
+            Ok(findings)
         }
         InvocationMode::PerFile => {
             let mut findings = Vec::new();
@@ -420,6 +443,49 @@ fn describe_exit(code: Option<i32>) -> String {
         Some(code) => code.to_string(),
         None => "signal".to_owned(),
     }
+}
+
+/// Safe upper bound on argv byte cost per invocation, well below the OS ARG_MAX.
+/// Linux's ARG_MAX is 2 MiB; macOS allows ~1 MiB but shrinks with large environments.
+/// 128 KiB gives generous headroom on every platform.
+pub(crate) const ARG_BYTE_SAFE_THRESHOLD: usize = 128 * 1024;
+
+/// Approximate argv byte cost of a slice of argument strings.
+/// Each argument contributes its byte length plus one byte for its null terminator.
+fn argv_byte_cost(args: &[String]) -> usize {
+    args.iter().map(|a| a.len() + 1).sum()
+}
+
+/// Approximate argv byte cost of a path (used for the program argument).
+fn argv_byte_cost_of_path(path: &Path) -> usize {
+    path.to_string_lossy().len() + 1
+}
+
+/// Split `files` into the smallest number of contiguous slices such that each
+/// slice, when added to `fixed_cost`, keeps the total argv byte cost under
+/// [`ARG_BYTE_SAFE_THRESHOLD`]. When a single file alone would exceed the
+/// threshold there is no smaller unit to split at, so it is placed in its own
+/// chunk and the invocation proceeds (the OS may still succeed).
+pub(crate) fn split_files_into_chunks(fixed_cost: usize, files: &[String]) -> Vec<&[String]> {
+    if files.is_empty() {
+        return vec![files];
+    }
+    let available = ARG_BYTE_SAFE_THRESHOLD.saturating_sub(fixed_cost);
+    let mut chunks: Vec<&[String]> = Vec::new();
+    let mut start = 0;
+    let mut chunk_cost: usize = 0;
+
+    for (i, file) in files.iter().enumerate() {
+        let file_cost = file.len() + 1;
+        if chunk_cost + file_cost > available && i > start {
+            chunks.push(&files[start..i]);
+            start = i;
+            chunk_cost = 0;
+        }
+        chunk_cost += file_cost;
+    }
+    chunks.push(&files[start..]);
+    chunks
 }
 
 /// In batch mode the standalone `{{files}}` arg expands to N file args.
