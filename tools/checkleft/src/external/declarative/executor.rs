@@ -45,7 +45,7 @@ pub fn run_declarative_check(
         .transpose()
         .context("invalid `applies_to` config override")?;
     let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
-    let files = select_files(changeset, applies_to)?;
+    let files = select_files(repo_root, changeset, applies_to, package.skip_symlinks)?;
     if files.is_empty() {
         return Ok(CheckResult {
             check_id: package_id.to_owned(),
@@ -129,8 +129,14 @@ fn normalize_finding_paths(findings: &mut [Finding], repo_root: &Path) {
 }
 
 /// Select non-deleted changed files matching any `applies_to` glob, sorted for
-/// determinism.
-fn select_files(changeset: &ChangeSet, applies_to: &[String]) -> Result<Vec<String>> {
+/// determinism. When `skip_symlinks` is true, paths that are symlinks (resolved
+/// against `repo_root`) are excluded without following the link.
+fn select_files(
+    repo_root: &Path,
+    changeset: &ChangeSet,
+    applies_to: &[String],
+    skip_symlinks: bool,
+) -> Result<Vec<String>> {
     let mut builder = GlobSetBuilder::new();
     for pattern in applies_to {
         builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
@@ -142,6 +148,15 @@ fn select_files(changeset: &ChangeSet, applies_to: &[String]) -> Result<Vec<Stri
         .iter()
         .filter(|file| !matches!(file.kind, ChangeKind::Deleted))
         .filter(|file| globset.is_match(&file.path))
+        .filter(|file| {
+            if !skip_symlinks {
+                return true;
+            }
+            let abs = repo_root.join(&file.path);
+            !std::fs::symlink_metadata(&abs)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        })
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect();
     files.sort();

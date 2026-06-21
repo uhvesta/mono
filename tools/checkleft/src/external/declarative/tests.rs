@@ -2032,3 +2032,210 @@ fn prettier_linelist_remediation_renders_overridden_version() {
         "remediation must NOT contain the old hardcoded 3.8.4 when version is overridden to 3.9.0; got: {remediation}"
     );
 }
+
+// ── skip_symlinks flag ─────────────────────────────────────────────────────────
+
+#[test]
+fn prettier_manifest_has_skip_symlinks_true() {
+    let package = parse_prettier_package();
+    assert!(
+        package.skip_symlinks,
+        "format/prettier must set skip_symlinks: true so symlinks (e.g. CLAUDE.md -> AGENTS.md) \
+         are not passed to prettier, which exits 2 on symlink paths"
+    );
+}
+
+/// Build a minimal per_file declarative manifest wired to a fake script, with
+/// skip_symlinks controlled by the caller. The script always exits 2 (which maps
+/// to `default → error`) when invoked, so the test can tell whether the file was
+/// selected (error propagated) or skipped (empty result returned early).
+#[cfg(unix)]
+fn skip_symlinks_package(script: &Path, skip_symlinks: bool) -> ExternalCheckDeclarativePackage {
+    let manifest = format!(
+        r#"
+id = "test-skip-symlinks"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.md"]
+skip_symlinks = {skip_symlinks}
+
+[needs.tool.default]
+path = "{script}"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "per_file"
+args = ["{{{{file}}}}"]
+exit = {{ "0" = "ok", default = "error" }}
+
+[invocations.transform]
+kind = "linelist"
+message = "hit"
+"#,
+        script = script.display(),
+    );
+    let package = parse_external_check_package_manifest(&manifest).expect("test manifest must parse");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        other => panic!("expected declarative, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_symlinks_true_excludes_symlinked_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+
+    // Real file.
+    std::fs::write(repo_root.path().join("AGENTS.md"), "# Agents\n").expect("write real file");
+    // Symlink pointing at the real file (like CLAUDE.md -> AGENTS.md in mono).
+    std::os::unix::fs::symlink("AGENTS.md", repo_root.path().join("CLAUDE.md")).expect("create symlink");
+
+    // Script that logs each invocation's file arg, then exits 0 (ok).
+    // Verifying CLAUDE.md is absent from the log confirms it was filtered out.
+    let script_path2 = repo_root.path().join("count.sh");
+    std::fs::write(&script_path2, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\nexit 0\n").expect("write count script");
+    let mut perms2 = std::fs::metadata(&script_path2).expect("metadata").permissions();
+    perms2.set_mode(0o755);
+    std::fs::set_permissions(&script_path2, perms2).expect("chmod");
+
+    let package = skip_symlinks_package(&script_path2, true);
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: std::path::PathBuf::from("AGENTS.md"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::PathBuf::from("CLAUDE.md"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+    let result = super::run_declarative_check(
+        repo_root.path(),
+        "test-skip-symlinks",
+        &package,
+        &changeset,
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect("run with skip_symlinks=true must succeed");
+
+    // No findings expected (script exits 0).
+    assert!(
+        result.findings.is_empty(),
+        "skip_symlinks=true with exit-0 script must produce no findings; got: {:#?}",
+        result.findings
+    );
+
+    // Verify CLAUDE.md was NOT passed to the script by reading the log.
+    let log_path = repo_root.path().join("count.sh.log");
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        !log.contains("CLAUDE.md"),
+        "CLAUDE.md is a symlink and must be skipped with skip_symlinks=true; log: {log}"
+    );
+    assert!(
+        log.contains("AGENTS.md"),
+        "AGENTS.md is a real file and must still be checked; log: {log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_symlinks_false_includes_symlinked_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+    std::fs::write(repo_root.path().join("AGENTS.md"), "# Agents\n").expect("write real file");
+    std::os::unix::fs::symlink("AGENTS.md", repo_root.path().join("CLAUDE.md")).expect("create symlink");
+
+    let script_path = repo_root.path().join("count.sh");
+    std::fs::write(&script_path, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\nexit 0\n").expect("write count script");
+    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+    let package = skip_symlinks_package(&script_path, false);
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: std::path::PathBuf::from("AGENTS.md"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::PathBuf::from("CLAUDE.md"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    let result = super::run_declarative_check(
+        repo_root.path(),
+        "test-skip-symlinks",
+        &package,
+        &changeset,
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect("run with skip_symlinks=false must succeed");
+
+    assert!(
+        result.findings.is_empty(),
+        "exit-0 script must produce no findings; got: {:#?}",
+        result.findings
+    );
+
+    let log = std::fs::read_to_string(repo_root.path().join("count.sh.log")).unwrap_or_default();
+    assert!(
+        log.contains("CLAUDE.md"),
+        "with skip_symlinks=false, CLAUDE.md (symlink) must still be passed to the tool; log: {log}"
+    );
+    assert!(
+        log.contains("AGENTS.md"),
+        "AGENTS.md must be passed to the tool; log: {log}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_non_symlink_file_always_included_regardless_of_flag() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+    std::fs::write(repo_root.path().join("README.md"), "# Hello\n").expect("write file");
+
+    let script_path = repo_root.path().join("count.sh");
+    std::fs::write(&script_path, "#!/bin/sh\necho \"$1\" >> \"$0.log\"\nexit 0\n").expect("write count script");
+    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+    let package = skip_symlinks_package(&script_path, true);
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: std::path::PathBuf::from("README.md"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    super::run_declarative_check(
+        repo_root.path(),
+        "test-skip-symlinks",
+        &package,
+        &changeset,
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect("run must succeed");
+
+    let log = std::fs::read_to_string(repo_root.path().join("count.sh.log")).unwrap_or_default();
+    assert!(
+        log.contains("README.md"),
+        "README.md is a real file and must be included even with skip_symlinks=true; log: {log}"
+    );
+}

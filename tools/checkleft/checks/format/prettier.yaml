@@ -4,6 +4,7 @@ runtime: declarative-v1
 api_version: v1
 applies_to:
   - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,css,scss,less,html,vue,md,markdown,yaml,yml,graphql,gql}"
+skip_symlinks: true
 
 # Binary resolution + version pinning:
 #   - default: the `npm` binding provisions Prettier via `npx --yes prettier@<version>`,

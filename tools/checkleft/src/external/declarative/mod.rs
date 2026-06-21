@@ -63,6 +63,11 @@ pub struct ExternalCheckDeclarativePackage {
     /// Ordered, self-contained invocation specs. Findings from all invocations
     /// concatenate in order.
     pub invocations: Vec<Invocation>,
+    /// When true, paths that are symlinks are excluded from the file list before
+    /// any invocation runs. Detected via `symlink_metadata` (does NOT follow the
+    /// link). Default: false. Use for tools that refuse symlinks (e.g. prettier
+    /// exits 2 on a symlink path).
+    pub skip_symlinks: bool,
 }
 
 /// A declared binary requirement with a default binding.
@@ -206,13 +211,14 @@ pub(super) struct RawDeclarativeFields {
     pub applies_to: Vec<String>,
     pub needs: BTreeMap<String, RawBinaryRequirement>,
     pub invocations: Vec<RawInvocation>,
+    pub skip_symlinks: bool,
 }
 
 impl RawDeclarativeFields {
     /// True when none of the declarative-only fields are set — used by the parent
     /// module to reject them in artifact/exec modes.
     pub(super) fn is_empty(&self) -> bool {
-        self.applies_to.is_empty() && self.needs.is_empty() && self.invocations.is_empty()
+        self.applies_to.is_empty() && self.needs.is_empty() && self.invocations.is_empty() && !self.skip_symlinks
     }
 }
 
@@ -343,6 +349,7 @@ pub(super) fn validate_declarative_implementation(
         needs,
         applies_to: raw.applies_to,
         invocations,
+        skip_symlinks: raw.skip_symlinks,
     })
 }
 

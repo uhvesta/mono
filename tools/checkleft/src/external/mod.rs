@@ -231,6 +231,8 @@ struct RawDeclarativeCheckManifest {
     needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
     #[serde(default)]
     invocations: Vec<declarative::RawInvocation>,
+    #[serde(default)]
+    skip_symlinks: bool,
 }
 
 impl RawDeclarativeCheckManifest {
@@ -253,6 +255,7 @@ impl RawDeclarativeCheckManifest {
             applies_to: self.applies_to,
             needs: self.needs,
             invocations: self.invocations,
+            skip_symlinks: self.skip_symlinks,
         };
 
         Ok(ExternalCheckPackage {
@@ -301,6 +304,8 @@ struct RawExternalCheckPackage {
     needs: std::collections::BTreeMap<String, declarative::RawBinaryRequirement>,
     #[serde(default)]
     invocations: Vec<declarative::RawInvocation>,
+    #[serde(default)]
+    skip_symlinks: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -327,11 +332,13 @@ impl RawExternalCheckPackage {
             applies_to,
             needs,
             invocations,
+            skip_symlinks,
         } = self;
         let declarative = declarative::RawDeclarativeFields {
             applies_to,
             needs,
             invocations,
+            skip_symlinks,
         };
 
         let id = required_non_empty("id", id)?;
