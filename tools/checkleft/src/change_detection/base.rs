@@ -289,8 +289,20 @@ fn select_base_push_to_default(prober: &dyn HeadProber) -> BaseSelection {
 /// Row 8 (fallback): if no merge-base exists (detached HEAD, unrelated histories),
 /// try `HEAD^1` as a best-effort base. If HEAD has no parent either (root commit
 /// on a detached HEAD), return `Empty { DetachedHeadNoParent }`.
+///
+/// Prefer `origin/<default_branch>` when available so jj/cube worker workspaces
+/// (where the local bookmark is stale/at-HEAD and only `origin/main` is
+/// authoritative) compute the real merge-base instead of collapsing to HEAD.
+/// Mirrors the same pattern already used by Rows 1 and 5, and matches the P844
+/// design spec ("Probe origin/main then origin/master, then local main/master").
 fn select_base_local(prober: &dyn HeadProber, default_branch: &str) -> BaseSelection {
-    match prober.merge_base(default_branch) {
+    let remote_ref = format!("origin/{default_branch}");
+    let base_ref = if prober.resolve(&remote_ref).is_some() {
+        remote_ref
+    } else {
+        default_branch.to_owned()
+    };
+    match prober.merge_base(&base_ref) {
         Some(sha) => BaseSelection::WorkingTree { base_sha: sha },
         None => {
             // Row 8: no common ancestor with the default branch.
@@ -577,6 +589,39 @@ mod tests {
     fn row6_local_uses_working_tree_on_merge_base() {
         let scenario = Scenario::Local;
         let env = CiEnvironment::default();
+        // No origin/main present → falls back to bare "main".
+        let prober = Stub::default().base(DEFAULT, MERGE_BASE_SHA);
+        assert_eq!(
+            select_base(&scenario, &env, &prober, DEFAULT),
+            BaseSelection::WorkingTree {
+                base_sha: MERGE_BASE_SHA.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn row6_local_prefers_origin_ref_over_stale_local() {
+        let scenario = Scenario::Local;
+        let env = CiEnvironment::default();
+        // origin/main is present and fresher; local "main" is stale (at-HEAD in
+        // a jj/cube worker workspace). select_base_local must use origin/main.
+        let prober = Stub::default()
+            .rev("origin/main", "some_origin_sha") // origin/main resolves
+            .base("origin/main", MERGE_BASE_SHA)
+            .base(DEFAULT, "stale_local_sha");
+        assert_eq!(
+            select_base(&scenario, &env, &prober, DEFAULT),
+            BaseSelection::WorkingTree {
+                base_sha: MERGE_BASE_SHA.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn row6_local_falls_back_to_local_when_origin_absent() {
+        let scenario = Scenario::Local;
+        let env = CiEnvironment::default();
+        // origin/main does not resolve → fall through to bare "main".
         let prober = Stub::default().base(DEFAULT, MERGE_BASE_SHA);
         assert_eq!(
             select_base(&scenario, &env, &prober, DEFAULT),

@@ -494,6 +494,93 @@ fn local_prepush_scopes_against_merge_base() {
     assert_eq!(scoped_paths(&vcs, &plan), vec!["feature.rs"]);
 }
 
+// ══ Row 6b — Local / pre-push with stale local default bookmark ════════════════
+
+/// Row 6 regression — cube/jj worker workspace with a stale local `main`.
+///
+/// In a jj secondary workspace (cube worker), the local `main` bookmark is not
+/// advanced by jj — only `origin/main` tracks the real GitHub default branch.
+/// If the worker was leased and a commit was created, local `main` may be at
+/// the same commit as HEAD (or otherwise stale), causing
+/// `merge-base(local main, HEAD)` to collapse to HEAD → empty diff → the
+/// pre-push gate silently passes even for a violating commit.
+///
+/// This test models that topology with git: after an explicit fetch that
+/// creates `origin/main` at the real fork point, local `main` is
+/// force-advanced to the current HEAD, while `origin/main` still points to
+/// the real fork point.
+///
+/// After the fix, `select_base_local` prefers `origin/main` when available,
+/// so `merge-base(origin/main, HEAD)` correctly resolves the fork point.
+#[test]
+fn local_prepush_stale_local_main_uses_origin_main() {
+    // Remote: main -> A (base.txt), feature/thing -> P (feature.rs).
+    // Leave remote HEAD on `main` so that `git fetch origin` sees it as the
+    // default and reliably creates the `origin/main` tracking ref.
+    let remote_dir = init_repo("main");
+    let remote = remote_dir.path().to_owned();
+    let fork = commit(&remote, "base.txt", "base\n", "A: base");
+    git(&remote, &["checkout", "-b", "feature/thing"]);
+    commit(&remote, "feature.rs", "fn feature() {}\n", "P: feature");
+    git(&remote, &["checkout", "main"]); // remote HEAD back to main
+
+    // Clone: use explicit refspecs to guarantee origin/main and
+    // origin/feature/thing tracking refs exist regardless of git version.
+    let clone_dir = tempdir().expect("tempdir");
+    let clone = clone_dir.path().to_owned();
+    git(&clone, &["init", "-b", "main"]);
+    git(&clone, &["config", "user.email", "test@checkleft.example"]);
+    git(&clone, &["config", "user.name", "Checkleft Test"]);
+    git(&clone, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(
+        &clone,
+        &[
+            "fetch",
+            "origin",
+            "+refs/heads/main:refs/remotes/origin/main",
+            "+refs/heads/feature/thing:refs/remotes/origin/feature/thing",
+        ],
+    );
+    // Switch to the feature branch (HEAD = P).
+    git(
+        &clone,
+        &["checkout", "-b", "feature/thing", "refs/remotes/origin/feature/thing"],
+    );
+
+    // Simulate the jj/cube worker condition: force local `main` to the current
+    // HEAD (the feature branch tip P), so merge-base(local main, HEAD) == P
+    // (empty diff). Only `origin/main` still points to the real fork point A.
+    git(&clone, &["branch", "-f", "main", "HEAD"]);
+
+    let vcs = detect(&clone);
+    let env = CiEnvironment::default(); // no CI signal → Local
+
+    let plan = resolve(&env, &vcs, auto());
+
+    assert!(
+        matches!(
+            plan,
+            ChangePlan::Scoped {
+                scenario: Scenario::Local,
+                ..
+            }
+        ),
+        "expected Scoped Local, got {plan:?}"
+    );
+    assert_eq!(
+        base_sha(&plan),
+        Some(fork.as_str()),
+        "must use origin/main (real fork point A), not stale local main (= P = HEAD)"
+    );
+    assert_eq!(
+        scoped_paths(&vcs, &plan),
+        vec!["feature.rs"],
+        "feature.rs must be detected; empty changeset would be the pre-fix regression"
+    );
+
+    drop(remote_dir);
+}
+
 // ══ Row 7 — First commit / no merge-base ═══════════════════════════════════════
 
 /// Row 7. When `HEAD` shares no history with the base branch (unrelated
