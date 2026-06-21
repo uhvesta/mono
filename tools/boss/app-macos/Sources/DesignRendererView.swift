@@ -110,11 +110,20 @@ struct DesignRendererView: View {
     let content: DesignRendererContent
 
     @EnvironmentObject private var model: ChatViewModel
+    @Environment(\.colorScheme) private var colorScheme
     @State private var source: String = ""
     @State private var loadError: String?
 
     private var questionGroups: [AttentionGroup] {
         model.openQuestionGroupsForDocPath(content.filePath)
+    }
+
+    private var viewerBackground: Color {
+        colorScheme == .dark ? Color(white: 0.06) : .white
+    }
+
+    private var viewerForeground: Color {
+        colorScheme == .dark ? .white : .black
     }
 
     var body: some View {
@@ -131,6 +140,8 @@ struct DesignRendererView: View {
                 .frame(maxWidth: .infinity)
             }
             .textSelection(.enabled)
+            .background(viewerBackground)
+            .foregroundStyle(viewerForeground)
             .task(id: content.filePath) {
                 await load()
             }
