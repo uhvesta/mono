@@ -34,8 +34,11 @@ enum GitHubContentFetcher {
         case ghLaunchFailed(underlying: Error)
         /// `gh` ran but exited non-zero. Carries stderr so the user
         /// sees the actual reason (auth required, repo not found,
-        /// etc.) rather than a stock message.
-        case ghExitFailure(status: Int32, stderr: String)
+        /// etc.) rather than a stock message. `endpoint` names the
+        /// `/repos/<owner>/<repo>/contents/<path>?ref=<branch>` path
+        /// attempted so a "Not Found" failure shows exactly what was
+        /// missing rather than a bare 404.
+        case ghExitFailure(status: Int32, stderr: String, endpoint: String?)
         case nonUTF8Response
 
         var errorDescription: String? {
@@ -46,9 +49,13 @@ enum GitHubContentFetcher {
                 return "Malformed raw-content URL: \(url.absoluteString)"
             case .ghLaunchFailed(let err):
                 return "Failed to launch gh: \(err.localizedDescription)"
-            case .ghExitFailure(_, let stderr):
+            case .ghExitFailure(_, let stderr, let endpoint):
                 let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                return trimmed.isEmpty ? "gh api failed" : "gh api failed: \(trimmed)"
+                var msg = trimmed.isEmpty ? "gh api failed" : "gh api failed: \(trimmed)"
+                if let ep = endpoint {
+                    msg += " (tried \(ep))"
+                }
+                return msg
             case .nonUTF8Response:
                 return "gh returned non-UTF8 content"
             }
@@ -130,6 +137,11 @@ enum GitHubContentFetcher {
     /// produces in `raw_content_url` for any GitHub-hosted design
     /// doc. Throws on any failure so the markdown viewer surfaces
     /// the error rather than rendering a stub `404: Not Found` body.
+    ///
+    /// On a `gh` exit-failure the thrown error includes the full
+    /// `/repos/<owner>/<repo>/contents/<path>?ref=<branch>` endpoint
+    /// that was attempted so a "Not Found (HTTP 404)" message tells
+    /// the user exactly which path or ref was wrong.
     static func fetch(_ url: URL) async throws -> String {
         guard let host = url.host?.lowercased() else {
             throw FetchError.unsupportedHost(url)
@@ -140,11 +152,16 @@ enum GitHubContentFetcher {
         guard let ref = parseRawContentURL(url) else {
             throw FetchError.malformedRawURL(url)
         }
-        return try await runGH(arguments: [
-            "api",
-            "-H", "Accept: application/vnd.github.raw",
-            contentsAPIEndpoint(for: ref),
-        ])
+        let endpoint = contentsAPIEndpoint(for: ref)
+        do {
+            return try await runGH(arguments: [
+                "api",
+                "-H", "Accept: application/vnd.github.raw",
+                endpoint,
+            ])
+        } catch FetchError.ghExitFailure(let status, let stderr, _) {
+            throw FetchError.ghExitFailure(status: status, stderr: stderr, endpoint: endpoint)
+        }
     }
 
     private static func runGH(arguments: [String]) async throws -> String {
@@ -173,7 +190,8 @@ enum GitHubContentFetcher {
                     let stderrText = String(data: stderrData, encoding: .utf8) ?? "(non-utf8 stderr)"
                     continuation.resume(throwing: FetchError.ghExitFailure(
                         status: proc.terminationStatus,
-                        stderr: stderrText
+                        stderr: stderrText,
+                        endpoint: nil
                     ))
                     return
                 }

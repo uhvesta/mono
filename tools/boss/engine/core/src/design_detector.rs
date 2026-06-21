@@ -61,6 +61,47 @@ pub async fn on_design_pr_detected(work_db: &WorkDb, task_id: &str, product_id: 
         None => return,
     };
     let Some(path) = scan.doc_path else {
+        // doc_path could not be determined (zero or ambiguous matches in the PR).
+        // Still update design_doc_branch to the PR head branch so the in-app
+        // viewer fetches from the live PR branch while it is open — provided
+        // the project already has a path set. set_project_design_doc with
+        // design_doc_path=None is a branch-only update and leaves an existing
+        // NULL path as NULL, so it is safe to call unconditionally here.
+        if let Some(head_branch) = scan.head_ref_name {
+            let input = SetProjectDesignDocInput {
+                project_id: project_id.to_owned(),
+                design_doc_path: None,
+                design_doc_branch: Some(head_branch.clone()),
+                design_doc_repo_remote_url: None,
+                unset: false,
+            };
+            match work_db.set_project_design_doc(input) {
+                Ok(_) => tracing::debug!(
+                    task_id,
+                    project_id,
+                    pr_url,
+                    branch = head_branch,
+                    "design detector: doc path not determined from PR; \
+                     updated design_doc_branch to PR head (in_review)"
+                ),
+                Err(err) => tracing::warn!(
+                    task_id,
+                    project_id,
+                    pr_url,
+                    ?err,
+                    "design detector: doc path not determined from PR; \
+                     failed to update design_doc_branch to PR head"
+                ),
+            }
+        } else {
+            tracing::debug!(
+                task_id,
+                project_id,
+                pr_url,
+                "design detector: doc path not determined from PR and head ref unknown; \
+                 skipping (in_review)"
+            );
+        }
         return;
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
@@ -306,6 +347,36 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
         None => return,
     };
     let Some(path) = scan.doc_path else {
+        // doc_path could not be determined. Still update doc_branch to the PR
+        // head so the viewer fetches from the live branch while the PR is open.
+        if let Some(head_branch) = scan.head_ref_name {
+            match work_db.set_task_doc_pointer(task_id, None, Some(&head_branch), None) {
+                Ok(_) => tracing::debug!(
+                    task_id,
+                    product_id,
+                    pr_url,
+                    branch = head_branch,
+                    "doc detector: doc path not determined from PR; \
+                     updated doc_branch to PR head (in_review)"
+                ),
+                Err(err) => tracing::warn!(
+                    task_id,
+                    product_id,
+                    pr_url,
+                    ?err,
+                    "doc detector: doc path not determined from PR; \
+                     failed to update doc_branch to PR head"
+                ),
+            }
+        } else {
+            tracing::debug!(
+                task_id,
+                product_id,
+                pr_url,
+                "doc detector: doc path not determined from PR and head ref unknown; \
+                 skipping (in_review)"
+            );
+        }
         return;
     };
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
@@ -539,6 +610,12 @@ pub(crate) fn parse_pr_scan(root: &serde_json::Value) -> PrScanResult {
 /// warnings so the design path and the project-less (investigation) path
 /// log an accurate hint. Zero or multiple matches yield `doc_path =
 /// None`; a missing/non-array `files` key is treated as zero matches.
+///
+/// When a PR contains multiple matching files (e.g. a newly-added design
+/// doc alongside a modified `main.md` index), the ambiguity is resolved
+/// by preferring files with `changeType = "ADDED"`. If exactly one ADDED
+/// file matches, it is selected. If multiple ADDED files match, or if no
+/// ADDED file matches among the multiple candidates, `doc_path` is `None`.
 pub(crate) fn parse_pr_scan_matching(
     root: &serde_json::Value,
     matcher: impl Fn(&str) -> bool,
@@ -556,19 +633,29 @@ pub(crate) fn parse_pr_scan_matching(
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
 
-    let matches: Vec<String> = root
+    // Collect (path, is_added) pairs for every file that satisfies `matcher`.
+    // `is_added` is true when the file's `changeType` field is "ADDED"; this
+    // lets us disambiguate newly-created design docs from pre-existing files
+    // that were only incidentally modified in the same PR.
+    let matches: Vec<(String, bool)> = root
         .get("files")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|f| f.get("path").and_then(|p| p.as_str()).map(str::to_owned))
-                .filter(|p| matcher(p))
+                .filter_map(|f| {
+                    let path = f.get("path").and_then(|p| p.as_str()).map(str::to_owned)?;
+                    if !matcher(&path) {
+                        return None;
+                    }
+                    let is_added = f.get("changeType").and_then(|ct| ct.as_str()) == Some("ADDED");
+                    Some((path, is_added))
+                })
                 .collect()
         })
         .unwrap_or_default();
 
     let doc_path = match matches.len() {
-        1 => Some(matches.into_iter().next().unwrap()),
+        1 => Some(matches.into_iter().next().unwrap().0),
         0 => {
             tracing::warn!(
                 doc_label,
@@ -578,12 +665,36 @@ pub(crate) fn parse_pr_scan_matching(
             None
         }
         n => {
-            tracing::warn!(
-                count = n,
-                doc_label,
-                "doc detector: multiple matching doc files in PR; skipping auto-populate"
-            );
-            None
+            // Multiple matches. Try to resolve the ambiguity by preferring the
+            // single file with changeType="ADDED": in a typical design PR the
+            // new design doc is the ADDED file, while any other matching .md
+            // (e.g. a main.md index updated to link to it) is MODIFIED.
+            let mut added: Vec<String> = matches
+                .into_iter()
+                .filter_map(|(p, is_added)| if is_added { Some(p) } else { None })
+                .collect();
+            match added.len() {
+                1 => {
+                    let path = added.remove(0);
+                    tracing::info!(
+                        doc_label,
+                        path,
+                        total_matches = n,
+                        "doc detector: multiple matching doc files in PR; \
+                         disambiguated by changeType=ADDED"
+                    );
+                    Some(path)
+                }
+                _ => {
+                    tracing::warn!(
+                        count = n,
+                        doc_label,
+                        "doc detector: multiple matching doc files in PR; \
+                         skipping auto-populate"
+                    );
+                    None
+                }
+            }
         }
     };
 
@@ -723,6 +834,59 @@ mod tests {
         });
         let scan = parse_pr_scan(&root);
         assert_eq!(scan.doc_path, None);
+    }
+
+    /// T1897 regression: a design PR that adds a new doc AND modifies an
+    /// existing main.md index. The ADDED file is the new design doc; the
+    /// MODIFIED file is just the index being updated. Before this fix the
+    /// scanner found two matches and returned None, preventing the pointer
+    /// from being populated. With the fix, the single ADDED file wins.
+    #[test]
+    fn parse_pr_scan_prefers_added_file_over_modified_when_ambiguous() {
+        let root = serde_json::json!({
+            "files": [
+                {"path": "tools/checkleft/docs/designs/checkleft-extensibility.attentions.json", "changeType": "ADDED"},
+                {"path": "tools/checkleft/docs/designs/checkleft-extensibility.md", "changeType": "ADDED"},
+                {"path": "tools/checkleft/docs/designs/main.md", "changeType": "MODIFIED"},
+            ],
+            "headRefName": "boss/exec_18b98cf64218f0a0_20e",
+            "baseRefName": "main",
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(
+            scan.doc_path.as_deref(),
+            Some("tools/checkleft/docs/designs/checkleft-extensibility.md"),
+            "should pick the single ADDED .md, not the MODIFIED main.md"
+        );
+        assert_eq!(scan.head_ref_name.as_deref(), Some("boss/exec_18b98cf64218f0a0_20e"));
+    }
+
+    /// Two ADDED design docs: still ambiguous even with changeType
+    /// disambiguation — returns None so auto-populate is skipped.
+    #[test]
+    fn parse_pr_scan_two_added_design_docs_remain_ambiguous() {
+        let root = serde_json::json!({
+            "files": [
+                {"path": "tools/boss/docs/designs/feature-a.md", "changeType": "ADDED"},
+                {"path": "tools/boss/docs/designs/feature-b.md", "changeType": "ADDED"},
+            ],
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path, None, "two ADDED docs → still ambiguous");
+    }
+
+    /// One ADDED and one MODIFIED without changeType (pre-API shape):
+    /// no changeType key → treated as non-ADDED → picks the file with ADDED.
+    #[test]
+    fn parse_pr_scan_added_plus_untyped_picks_added() {
+        let root = serde_json::json!({
+            "files": [
+                {"path": "tools/boss/docs/designs/new-feature.md", "changeType": "ADDED"},
+                {"path": "tools/boss/docs/designs/main.md"},
+            ],
+        });
+        let scan = parse_pr_scan(&root);
+        assert_eq!(scan.doc_path.as_deref(), Some("tools/boss/docs/designs/new-feature.md"));
     }
 
     #[test]
