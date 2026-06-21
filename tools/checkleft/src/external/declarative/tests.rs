@@ -2061,12 +2061,15 @@ fn prettier_skips_files_outside_applies_to() {
 
 #[cfg(unix)]
 #[test]
-fn prettier_exit_two_with_no_output_surfaces_as_error() {
-    // prettier exit 2 (e.g. a syntax error) is `default → error` in the manifest, so
-    // run_declarative_check aborts rather than silently reporting clean.
+fn prettier_exit_two_with_no_output_surfaces_as_error_finding() {
+    // prettier exit 2 (e.g. a syntax error) is `default → error` in the manifest.
+    // In per_file mode, a file-level error is isolated: it produces an error-severity
+    // finding scoped to the file rather than aborting the whole check (which would
+    // suppress every other file's results). The check still fails — an error-severity
+    // finding is surfaced — but other files are not masked.
     let repo_root = tempfile::tempdir().expect("temp repo root");
     let script_path = repo_root.path().join("fake_prettier.sh");
-    write_executable(&script_path, "#!/bin/sh\nexit 2\n");
+    write_executable(&script_path, "#!/bin/sh\necho 'tool error' >&2\nexit 2\n");
     let manifest = prettier_manifest_with_path_default(&script_path);
     let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
     let declarative = match package.implementation {
@@ -2078,7 +2081,7 @@ fn prettier_exit_two_with_no_output_surfaces_as_error() {
         kind: ChangeKind::Modified,
         old_path: None,
     }]);
-    let err = super::run_declarative_check(
+    let result = super::run_declarative_check(
         repo_root.path(),
         "format/prettier",
         &declarative,
@@ -2086,10 +2089,29 @@ fn prettier_exit_two_with_no_output_surfaces_as_error() {
         &toml::Value::Table(Default::default()),
         None,
     )
-    .expect_err("exit 2 must surface as a check error");
+    .expect("per_file error mode returns Ok with an error-severity finding, not Err");
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "one file → one error finding; got: {:#?}",
+        result.findings
+    );
+    let f = &result.findings[0];
+    assert_eq!(
+        f.severity,
+        Severity::Error,
+        "exit-2 file must produce an error-severity finding"
+    );
     assert!(
-        format!("{err:#}").contains("exit") || format!("{err:#}").contains("error"),
-        "error must explain the failure; got: {err:#}"
+        f.message.contains("exit") || f.message.contains("2"),
+        "error finding must explain the failure (exit code); got: {}",
+        f.message
+    );
+    let loc = f.location.as_ref().expect("error finding must name the file");
+    assert_eq!(
+        loc.path,
+        Path::new("src/app.ts"),
+        "error finding must be scoped to the failing file"
     );
 }
 
@@ -2394,5 +2416,206 @@ fn real_non_symlink_file_always_included_regardless_of_flag() {
     assert!(
         log.contains("README.md"),
         "README.md is a real file and must be included even with skip_symlinks=true; log: {log}"
+    );
+}
+
+// ── per_file error isolation ────────────────────────────────────────────────────
+//
+// These tests verify that a single per_file invocation error does NOT suppress
+// other files' findings. One file erroring (default → error) must produce an
+// error-severity finding for THAT file and let the loop continue.
+
+/// Build a per_file declarative manifest backed by a fake script, with linelist
+/// transform and exit semantics: 0=ok, 1=findings, default=error (so exit 2 = error).
+#[cfg(unix)]
+fn per_file_error_package(script: &Path) -> ExternalCheckDeclarativePackage {
+    let manifest = format!(
+        r#"
+id = "test/per-file-error"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**"]
+
+[needs.tool.default]
+path = "{script}"
+
+[[invocations]]
+id = "check"
+run = "tool"
+mode = "per_file"
+args = ["{{{{file}}}}"]
+exit = {{ "0" = "ok", "1" = "findings", default = "error" }}
+
+[invocations.transform]
+kind = "linelist"
+message = "needs formatting"
+"#,
+        script = script.display(),
+    );
+    let package = parse_external_check_package_manifest(&manifest).expect("per_file error test manifest must parse");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        other => panic!("expected declarative, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn per_file_error_isolates_to_file_does_not_abort_check() {
+    // Three files: A errors (exit 2), B has findings (exit 1 + stdout), C is clean
+    // (exit 0). The error on A must NOT suppress B's findings or C's clean result.
+    // After the fix: result contains A's error finding AND B's formatting finding.
+
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+    // Script: file_a → exit 2 (error); file_b → print filename + exit 1 (finding);
+    // file_c → exit 0 (clean).
+    let script_path = repo_root.path().join("per_file_tool.sh");
+    write_executable(
+        &script_path,
+        "#!/bin/sh\ncase \"$1\" in\n  *file_a*) exit 2 ;;\n  *file_b*) echo \"$1\"; exit 1 ;;\n  *) exit 0 ;;\nesac\n",
+    );
+
+    let package = per_file_error_package(&script_path);
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: std::path::PathBuf::from("file_a.ts"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::PathBuf::from("file_b.ts"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::PathBuf::from("file_c.ts"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    let result = super::run_declarative_check(
+        repo_root.path(),
+        "test/per-file-error",
+        &package,
+        &changeset,
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect("per_file error must return Ok with findings, not abort");
+
+    // Expect exactly two findings: an error finding for file_a and a warning finding for file_b.
+    assert_eq!(
+        result.findings.len(),
+        2,
+        "expected error finding for file_a + formatting finding for file_b; got: {:#?}",
+        result.findings
+    );
+
+    let error_findings: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .collect();
+    assert_eq!(
+        error_findings.len(),
+        1,
+        "exactly one error finding (for file_a); got: {:#?}",
+        error_findings
+    );
+    let ef = &error_findings[0];
+    assert_eq!(
+        ef.location.as_ref().map(|l| l.path.as_path()),
+        Some(Path::new("file_a.ts")),
+        "error finding must be scoped to file_a"
+    );
+    assert!(
+        ef.message.contains("exit") || ef.message.contains("2"),
+        "error finding must mention exit code; got: {}",
+        ef.message
+    );
+
+    let warning_findings: Vec<_> = result
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Warning)
+        .collect();
+    assert_eq!(
+        warning_findings.len(),
+        1,
+        "exactly one warning finding (for file_b); got: {:#?}",
+        warning_findings
+    );
+    assert_eq!(
+        warning_findings[0].location.as_ref().map(|l| l.path.as_path()),
+        Some(Path::new("file_b.ts")),
+        "warning finding must be for file_b"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn per_file_single_exit2_does_not_hide_other_files_findings() {
+    // Regression for the prettier+symlink case: a single file that exits 2 must not
+    // mask the findings from other files. Two files: the first exits 2 (error), the
+    // second exits 1 with stdout output (finding). The result must contain the
+    // formatting finding from the second file.
+    let repo_root = tempfile::tempdir().expect("temp repo root");
+    let script_path = repo_root.path().join("tool.sh");
+    // First arg that contains "first" → exit 2; anything else → echo filename + exit 1.
+    write_executable(
+        &script_path,
+        "#!/bin/sh\ncase \"$1\" in\n  *first*) exit 2 ;;\n  *) echo \"$1\"; exit 1 ;;\nesac\n",
+    );
+
+    let package = per_file_error_package(&script_path);
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: std::path::PathBuf::from("first.ts"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: std::path::PathBuf::from("second.ts"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    let result = super::run_declarative_check(
+        repo_root.path(),
+        "test/per-file-error",
+        &package,
+        &changeset,
+        &toml::Value::Table(Default::default()),
+        None,
+    )
+    .expect("per_file error must not abort the check");
+
+    // Both findings must be present: error for first.ts, warning for second.ts.
+    assert_eq!(
+        result.findings.len(),
+        2,
+        "exit-2 on first.ts must not mask second.ts's finding; got: {:#?}",
+        result.findings
+    );
+
+    let has_error_for_first = result.findings.iter().any(|f| {
+        f.severity == Severity::Error && f.location.as_ref().map(|l| l.path.as_path()) == Some(Path::new("first.ts"))
+    });
+    assert!(
+        has_error_for_first,
+        "error finding for first.ts must be present; got: {:#?}",
+        result.findings
+    );
+
+    let has_warning_for_second = result.findings.iter().any(|f| {
+        f.severity == Severity::Warning && f.location.as_ref().map(|l| l.path.as_path()) == Some(Path::new("second.ts"))
+    });
+    assert!(
+        has_warning_for_second,
+        "formatting finding for second.ts must NOT be suppressed by first.ts's error; got: {:#?}",
+        result.findings
     );
 }

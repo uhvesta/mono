@@ -4,10 +4,21 @@
 //! invocation (batch or per-file) → apply exit semantics → project stdout into
 //! findings → concatenate. The framework owns every step; the check is data.
 //!
-//! Exit semantics are load-bearing. A nonzero/`default → error` outcome aborts the
-//! whole check with an error (surfaced by the runner as a check error), so a tool
-//! that crashes never masquerades as "clean". `findings` runs the transform (which
-//! naturally yields zero findings for clean output); `ok` short-circuits to none.
+//! Exit semantics are load-bearing and differ by invocation mode:
+//!
+//! - **Batch** (single invocation over all files): a `default → error` outcome aborts
+//!   the whole check. The invocation has no per-file scope, so there is nowhere to
+//!   attach a file-scoped error finding — the whole check is the unit of failure.
+//! - **Per-file** (one invocation per file): a `default → error` outcome for one file
+//!   is **isolated** — it becomes an error-severity finding scoped to that file, and
+//!   the loop continues to the next file. This prevents a single bad file (e.g. a
+//!   symlink that the tool refuses) from masking every other file's findings.
+//!
+//! In both modes, an `ok` exit short-circuits to no findings; a `findings` exit runs
+//! the transform (which naturally yields zero findings for clean output). The
+//! "never masquerade as clean" invariant is preserved in per_file mode: an errored
+//! file surfaces as an error-severity finding, so the check still fails — it just
+//! no longer suppresses the other files' results.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +28,7 @@ use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobSetBuilder};
 
 use crate::input::{ChangeKind, ChangeSet};
-use crate::output::{CheckResult, Finding, Severity};
+use crate::output::{CheckResult, Finding, Location, Severity};
 
 use super::{
     ArtifactFormat, BazelAspectInvocation, ExitOutcome, ExternalCheckDeclarativePackage, Invocation, InvocationKind,
@@ -240,16 +251,58 @@ fn run_tool_invocation(
             Ok(findings)
         }
         InvocationMode::PerFile => {
+            // Per-file errors are isolated: one file's error becomes an error-severity
+            // finding scoped to that file, and the loop continues to the next file.
+            // See module-level doc for the batch vs per_file asymmetry.
             let mut findings = Vec::new();
             for file in files {
                 let args = with_prefix(expand_per_file_args(repo_root, &tool.args, file));
                 let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
-                findings.extend(classify_and_project(
-                    invocation,
-                    &output,
-                    Some(file),
-                    Some(&needs_invocations),
-                )?);
+                match invocation.exit.classify(output.exit_code) {
+                    ExitOutcome::Ok => {}
+                    ExitOutcome::Findings => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        findings.extend(
+                            invocation
+                                .transform
+                                .apply(&output.stdout, output.exit_code, Some(file), Some(&needs_invocations))
+                                .with_context(|| {
+                                    let stderr_trimmed = stderr.trim();
+                                    if stderr_trimmed.is_empty() {
+                                        format!("transform for invocation `{}` (file: {file}) failed", invocation.id)
+                                    } else {
+                                        format!(
+                                            "transform for invocation `{}` (file: {file}) failed; tool stderr:\n{stderr_trimmed}",
+                                            invocation.id
+                                        )
+                                    }
+                                })?,
+                        );
+                    }
+                    ExitOutcome::Error => {
+                        // Record an error finding for this file and continue.
+                        // The check still fails (error-severity finding), but other
+                        // files' findings are not suppressed.
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        findings.push(Finding {
+                            severity: Severity::Error,
+                            message: format!(
+                                "declarative invocation `{}` failed for `{}` (exit {}): {}",
+                                invocation.id,
+                                file,
+                                describe_exit(output.exit_code),
+                                stderr.trim()
+                            ),
+                            location: Some(Location {
+                                path: PathBuf::from(file),
+                                line: None,
+                                column: None,
+                            }),
+                            remediations: Vec::new(),
+                            suggested_fix: None,
+                        });
+                    }
+                }
             }
             Ok(findings)
         }
