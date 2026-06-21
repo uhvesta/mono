@@ -550,6 +550,55 @@ pub async fn serve(
         }
     }
 
+    // Backfill design_doc_branch / doc_branch for in-review tasks whose PR
+    // was detected before engine v1.0.135 (PR #1590). The fix in #1590 made
+    // the design detector set the branch when first detecting a PR; tasks
+    // already in in_review before that release still have a NULL branch,
+    // causing the in-app viewer to fetch the doc from main (404 while the
+    // PR is open). Fire-and-forget: spawned as a background task so it
+    // never blocks startup; errors are logged and skipped per candidate.
+    {
+        let work_db_for_backfill = server_state.work_db.clone();
+        tokio::spawn(async move {
+            let candidates = match work_db_for_backfill.list_in_review_tasks_for_doc_branch_backfill() {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(?err, "doc-branch backfill: failed to query candidates; skipping");
+                    return;
+                }
+            };
+            if candidates.is_empty() {
+                tracing::debug!("doc-branch backfill: no in-review tasks with null doc branch");
+                return;
+            }
+            tracing::info!(
+                count = candidates.len(),
+                "doc-branch backfill: scanning in-review tasks with null doc branch",
+            );
+            for candidate in candidates {
+                if let Some(ref project_id) = candidate.project_id {
+                    crate::design_detector::on_design_pr_detected(
+                        &work_db_for_backfill,
+                        &candidate.task_id,
+                        &candidate.product_id,
+                        project_id,
+                        &candidate.pr_url,
+                    )
+                    .await;
+                } else {
+                    crate::design_detector::on_task_doc_pr_detected(
+                        &work_db_for_backfill,
+                        &candidate.task_id,
+                        &candidate.product_id,
+                        &candidate.pr_url,
+                    )
+                    .await;
+                }
+            }
+            tracing::info!("doc-branch backfill: sweep complete");
+        });
+    }
+
     // Spawn the database backup loop. Fires immediately on boot (startup
     // snapshot) and then every `backup_interval` (default: 1 hour).
     // Uses SQLite's VACUUM INTO for a crash-safe, WAL-compatible copy.

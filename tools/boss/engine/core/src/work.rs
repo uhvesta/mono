@@ -137,6 +137,24 @@ pub struct HealedGhostActive {
     pub product_id: String,
 }
 
+/// A task returned by
+/// [`WorkDb::list_in_review_tasks_for_doc_branch_backfill`] — an
+/// `in_review` task whose doc-branch pointer is `NULL` and that has a
+/// `pr_url` the design detector can scan.
+///
+/// - `project_id = Some(id)` → project-design path; call
+///   [`crate::design_detector::on_design_pr_detected`].
+/// - `project_id = None` → per-task-doc path (investigation or
+///   project-less design); call
+///   [`crate::design_detector::on_task_doc_pr_detected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocBranchBackfillCandidate {
+    pub task_id: String,
+    pub product_id: String,
+    pub project_id: Option<String>,
+    pub pr_url: String,
+}
+
 use crate::work_dependencies::{self as deps, EdgeInsertOutcome, RELATION_BLOCKS};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);

@@ -565,6 +565,60 @@ impl WorkDb {
             .flatten();
         Ok(path)
     }
+
+    /// List `in_review` tasks whose doc-branch pointer is `NULL` and whose
+    /// PR is still open (unmerged), so a startup sweep can backfill the
+    /// branch without waiting for the next PR event.
+    ///
+    /// Two candidate shapes are returned:
+    ///
+    /// - **Project-design tasks** (`kind='design'`, `project_id IS NOT NULL`):
+    ///   the associated project's `design_doc_branch` is `NULL`. The caller
+    ///   should invoke [`crate::design_detector::on_design_pr_detected`] with
+    ///   `project_id = Some(...)`.
+    ///
+    /// - **Per-task-doc tasks** (`kind='investigation'`, or `kind='design'`
+    ///   with `project_id IS NULL`): the task's own `doc_branch` is `NULL`.
+    ///   The caller should invoke
+    ///   [`crate::design_detector::on_task_doc_pr_detected`] with
+    ///   `project_id = None`.
+    ///
+    /// Only tasks with a non-null `pr_url` and `deleted_at IS NULL` are
+    /// returned; tasks without a PR cannot be scanned.
+    pub fn list_in_review_tasks_for_doc_branch_backfill(&self) -> Result<Vec<DocBranchBackfillCandidate>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            // Project-design tasks: join to the project to check design_doc_branch.
+            "SELECT t.id, t.product_id, t.project_id, t.pr_url
+             FROM tasks t
+             JOIN projects p ON t.project_id = p.id
+             WHERE t.kind = 'design'
+               AND t.status = 'in_review'
+               AND t.project_id IS NOT NULL
+               AND t.pr_url IS NOT NULL
+               AND t.deleted_at IS NULL
+               AND p.design_doc_branch IS NULL
+             UNION ALL
+             -- Per-task-doc tasks: tasks.doc_branch is the relevant pointer.
+             SELECT t.id, t.product_id, NULL, t.pr_url
+             FROM tasks t
+             WHERE (t.kind = 'investigation'
+                    OR (t.kind = 'design' AND t.project_id IS NULL))
+               AND t.status = 'in_review'
+               AND t.pr_url IS NOT NULL
+               AND t.deleted_at IS NULL
+               AND t.doc_branch IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DocBranchBackfillCandidate {
+                task_id: row.get(0)?,
+                product_id: row.get(1)?,
+                project_id: row.get(2)?,
+                pr_url: row.get(3)?,
+            })
+        })?;
+        collect_rows(rows)
+    }
 }
 
 /// Resolve a task's per-task doc pointer (`doc_*` columns) into a
