@@ -1,0 +1,12 @@
+# Bazel output symlinks
+bazel-*
+
+# Cargo/Rust build output
+target/
+
+# Lockfiles
+Cargo.lock
+MODULE.bazel.lock
+
+# Node dependencies
+node_modules/

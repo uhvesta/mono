@@ -71,6 +71,10 @@ checks:
     policy:
       severity: warning
 
+  - id: format/prettier
+    policy:
+      severity: error
+
   - id: format/rust
     policy:
       severity: error
