@@ -16,6 +16,7 @@
 //! `apply(stdout, exit_code, input_file) → Vec<Finding>` signature. Computed
 //! transforms that need real logic are where the wasm pure-function tier begins.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -46,12 +47,21 @@ pub enum Transform {
 
 impl Transform {
     /// Project an invocation's output into findings. `input_file` is the file the
-    /// invocation ran on (per-file mode) or `None` (batch mode).
-    pub fn apply(&self, stdout: &[u8], exit_code: Option<i32>, input_file: Option<&str>) -> Result<Vec<Finding>> {
+    /// invocation ran on (per-file mode) or `None` (batch mode). `needs_invocations`
+    /// maps binary names to their human-readable invocation strings for template
+    /// rendering (e.g. `"prettier"` → `"npx --yes prettier@3.8.4"`); pass `None`
+    /// when not available (e.g. in unit tests that bypass the executor).
+    pub fn apply(
+        &self,
+        stdout: &[u8],
+        exit_code: Option<i32>,
+        input_file: Option<&str>,
+        needs_invocations: Option<&BTreeMap<String, String>>,
+    ) -> Result<Vec<Finding>> {
         match self {
-            Transform::Json(json) => json.apply(stdout, exit_code, input_file),
+            Transform::Json(json) => json.apply(stdout, exit_code, input_file, needs_invocations),
             Transform::Passthrough => passthrough(stdout),
-            Transform::LineList(ll) => ll.apply(stdout, exit_code, input_file),
+            Transform::LineList(ll) => ll.apply(stdout, exit_code, input_file, needs_invocations),
         }
     }
 }
@@ -87,14 +97,24 @@ pub struct JsonTransform {
 }
 
 impl JsonTransform {
-    fn apply(&self, stdout: &[u8], exit_code: Option<i32>, input_file: Option<&str>) -> Result<Vec<Finding>> {
+    fn apply(
+        &self,
+        stdout: &[u8],
+        exit_code: Option<i32>,
+        input_file: Option<&str>,
+        needs_invocations: Option<&BTreeMap<String, String>>,
+    ) -> Result<Vec<Finding>> {
         let root: Value = serde_json::from_slice(stdout).with_context(|| {
             format!(
                 "declarative json transform could not parse tool stdout as JSON; raw stdout: {:?}",
                 String::from_utf8_lossy(stdout)
             )
         })?;
-        let context = RenderContext { input_file, exit_code };
+        let context = RenderContext {
+            input_file,
+            exit_code,
+            needs_invocations,
+        };
         let mut findings = Vec::new();
         for item in self.selector.select(&root)? {
             findings.push(self.finding.render(&item, context)?);
@@ -173,7 +193,13 @@ pub struct LineListTransform {
 }
 
 impl LineListTransform {
-    fn apply(&self, stdout: &[u8], exit_code: Option<i32>, input_file: Option<&str>) -> Result<Vec<Finding>> {
+    fn apply(
+        &self,
+        stdout: &[u8],
+        exit_code: Option<i32>,
+        input_file: Option<&str>,
+        needs_invocations: Option<&BTreeMap<String, String>>,
+    ) -> Result<Vec<Finding>> {
         let text = std::str::from_utf8(stdout).context("linelist transform: stdout is not valid UTF-8")?;
         let paths: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
         if paths.is_empty() && exit_code != Some(0) {
@@ -188,7 +214,11 @@ impl LineListTransform {
                  operational error (e.g. parse failure), not a clean result"
             );
         }
-        let context = RenderContext { input_file, exit_code };
+        let context = RenderContext {
+            input_file,
+            exit_code,
+            needs_invocations,
+        };
         let message = self.message.render(NO_JSON_ITEM, context)?;
         let remediations = self
             .remediations

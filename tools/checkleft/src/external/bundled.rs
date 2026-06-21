@@ -103,6 +103,14 @@ static BUNDLED_CHECK_DEFS: &[BundledCheckDef] = &[
         limits: None,
     },
     BundledCheckDef {
+        check_names: &["format/prettier"],
+        kind: BundledCheckDefKind::Declarative {
+            extension: "yaml",
+            contents: include_str!("../../checks/format/prettier.yaml"),
+        },
+        limits: None,
+    },
+    BundledCheckDef {
         check_names: &["lint/rust"],
         kind: BundledCheckDefKind::Declarative {
             extension: "yaml",

@@ -17,6 +17,7 @@ rust_library(
     # inside bazel's sandbox during proc-macro / macro expansion.
     compile_data = [
         "checks/format/bazel.yaml",
+        "checks/format/prettier.yaml",
         "checks/format/rust.yaml",
         "checks/lint/bazel.yaml",
         "checks/lint/rust.yaml",
@@ -122,6 +123,7 @@ rust_test(
     # compile time in component_bindings.rs. All are embedded/read at compile time.
     compile_data = [
         "checks/format/bazel.yaml",
+        "checks/format/prettier.yaml",
         "checks/format/rust.yaml",
         "checks/lint/bazel.yaml",
         "checks/lint/rust.yaml",

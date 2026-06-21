@@ -106,8 +106,34 @@ Not allowed in `component` mode:
 binaries, runs declared invocations, and applies declared transforms. Required:
 
 1. `applies_to` — non-empty list of file globs the check applies to.
-2. `needs` — at least one declared binary, each with a `default` binding
-   (`{ bazel = "<label>" }` or `{ path = "<path-or-name>" }`).
+2. `needs` — at least one declared binary, each with a `default` binding and an
+   optional `fallback` binding. A binding sets **exactly one** of:
+    - `bazel: "<label>"` — a Bazel label, built and resolved to its executable
+      (requires a Bazel workspace).
+    - `path: "<path-or-name>"` — a direct path or `PATH` name, used as-is.
+    - `npm: { package: "<pkg>", version: "<x.y.z>" }` — a **version-pinned npm
+      package**, resolved to `npx --yes <package>@<version>`. The pinned version is
+      part of the package spec, so npx runs exactly that release regardless of any
+      globally-installed copy (requires `npx`/Node on `PATH`). This is how a check
+      pins a tool version without standing up a parallel Bazel JS toolchain.
+
+   A `fallback` is only meaningful when the `default` is `bazel` or `npm` (a `path`
+   default always resolves). When the primary binding fails to resolve, the
+   framework uses the fallback and warns loudly on stderr. A CHECKS-config override
+   at `needs.<name>.{bazel|path|npm}` substitutes a binding per repo; an `npm`
+   override may set only the field it wants to change (e.g. just `version`) and
+   inherits the rest from the default `npm` binding, so re-pinning a version is a
+   one-line override:
+
+   ```yaml
+   checks:
+     - id: format/prettier
+       config:
+         needs:
+           prettier:
+             npm:
+               version: "3.9.0"   # package inherited from the default binding
+   ```
 3. `invocations` — at least one invocation, each with `id`, `run` (a declared
    binary), `mode` (`batch` | `per_file`), templated `args`, an `exit` map
    (codes → `ok` | `findings` | `error`, plus a required `default`), and a

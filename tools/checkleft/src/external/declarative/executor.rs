@@ -151,7 +151,7 @@ fn select_files(changeset: &ChangeSet, applies_to: &[String]) -> Result<Vec<Stri
 
 fn run_invocation(
     repo_root: &Path,
-    binaries: &BTreeMap<String, PathBuf>,
+    binaries: &BTreeMap<String, resolve::ResolvedBinary>,
     invocation: &Invocation,
     files: &[String],
     effective_severity: Option<Severity>,
@@ -172,7 +172,7 @@ fn run_invocation(
 
 fn run_tool_invocation(
     repo_root: &Path,
-    binaries: &BTreeMap<String, PathBuf>,
+    binaries: &BTreeMap<String, resolve::ResolvedBinary>,
     invocation: &Invocation,
     tool: &ToolInvocation,
     files: &[String],
@@ -181,18 +181,37 @@ fn run_tool_invocation(
         .get(&tool.run)
         .ok_or_else(|| anyhow::anyhow!("invocation `{}` binary `{}` was not resolved", invocation.id, tool.run))?;
 
+    // Resolved prefix args (e.g. `npx --yes prettier@3.8.4`) precede the
+    // invocation's own templated args.
+    let with_prefix = |args: Vec<String>| -> Vec<String> {
+        let mut all = binary.prefix_args.clone();
+        all.extend(args);
+        all
+    };
+
+    // Build the human-readable invocation map for {{needs.<name>.invocation}} templates.
+    let needs_invocations: BTreeMap<String, String> = binaries
+        .iter()
+        .map(|(name, bin)| (name.clone(), bin.display_invocation.clone()))
+        .collect();
+
     match tool.mode {
         InvocationMode::Batch => {
-            let args = expand_batch_args(repo_root, &tool.args, files);
-            let output = spawn(repo_root, binary, &args, &invocation.id)?;
-            classify_and_project(invocation, &output, None)
+            let args = with_prefix(expand_batch_args(repo_root, &tool.args, files));
+            let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
+            classify_and_project(invocation, &output, None, Some(&needs_invocations))
         }
         InvocationMode::PerFile => {
             let mut findings = Vec::new();
             for file in files {
-                let args = expand_per_file_args(repo_root, &tool.args, file);
-                let output = spawn(repo_root, binary, &args, &invocation.id)?;
-                findings.extend(classify_and_project(invocation, &output, Some(file))?);
+                let args = with_prefix(expand_per_file_args(repo_root, &tool.args, file));
+                let output = spawn(repo_root, &binary.program, &args, &invocation.id)?;
+                findings.extend(classify_and_project(
+                    invocation,
+                    &output,
+                    Some(file),
+                    Some(&needs_invocations),
+                )?);
             }
             Ok(findings)
         }
@@ -319,7 +338,9 @@ fn run_bazel_aspect_invocation(
     }
 
     // 4. Read each artifact and project it through the transform. Empty artifacts
-    //    are clean results (e.g. a crate with no clippy diagnostics).
+    //    are clean results (e.g. a crate with no clippy diagnostics). bazel_aspect
+    //    invocations delegate to bazel and declare no binaries, so there are no
+    //    needs_invocations to thread through here.
     let mut findings = Vec::new();
     for artifact in String::from_utf8_lossy(&cquery_output.stdout).lines() {
         let artifact = artifact.trim();
@@ -347,12 +368,17 @@ fn run_bazel_aspect_invocation(
                 )
             })?,
         };
-        findings.extend(invocation.transform.apply(&document, Some(0), None).with_context(|| {
-            format!(
-                "transform for invocation `{}` failed on artifact `{}`",
-                invocation.id, artifact
-            )
-        })?);
+        findings.extend(
+            invocation
+                .transform
+                .apply(&document, Some(0), None, None)
+                .with_context(|| {
+                    format!(
+                        "transform for invocation `{}` failed on artifact `{}`",
+                        invocation.id, artifact
+                    )
+                })?,
+        );
     }
     Ok(findings)
 }
@@ -433,6 +459,7 @@ fn classify_and_project(
     invocation: &Invocation,
     output: &InvocationOutput,
     input_file: Option<&str>,
+    needs_invocations: Option<&BTreeMap<String, String>>,
 ) -> Result<Vec<Finding>> {
     match invocation.exit.classify(output.exit_code) {
         ExitOutcome::Ok => Ok(Vec::new()),
@@ -440,7 +467,7 @@ fn classify_and_project(
             let stderr = String::from_utf8_lossy(&output.stderr);
             invocation
                 .transform
-                .apply(&output.stdout, output.exit_code, input_file)
+                .apply(&output.stdout, output.exit_code, input_file, needs_invocations)
                 .with_context(|| {
                     let file_note = input_file.map(|f| format!(" (file: {f})")).unwrap_or_default();
                     let stderr_trimmed = stderr.trim();

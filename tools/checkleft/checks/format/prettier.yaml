@@ -1,0 +1,69 @@
+id: format/prettier
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to:
+  - "**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts,json,css,scss,less,html,vue,md,markdown,yaml,yml,graphql,gql}"
+
+# Binary resolution + version pinning:
+#   - default: the `npm` binding provisions Prettier via `npx --yes prettier@<version>`,
+#     pinned here to 3.8.4. The version is part of the package spec, so npx fetches
+#     and runs exactly that release regardless of any globally-installed copy — a
+#     reproducible tool without standing up a parallel Bazel JS toolchain (mono has
+#     no rules_js/node Bazel integration today; Node arrives on PATH via the planned
+#     CI bootstrap). Re-pin per-repo via CHECKS config, setting only the version
+#     (package is inherited from this default `npm` binding):
+#
+#       checks:
+#         - id: format/prettier
+#           config:
+#             needs:
+#               prettier:
+#                 npm:
+#                   version: "3.9.0"
+#
+#   - fallback: when `npx` is not on PATH (some local/non-CI environments), the
+#     framework uses `prettier` from PATH and warns loudly on stderr so you know the
+#     pinned toolchain was skipped. A repo that later adopts a hermetic Bazel JS
+#     toolchain can point `needs.prettier.bazel` at its prettier target via CHECKS
+#     config with no change to this definition.
+#   - Prettier discovers the REPO's own config (.prettierrc / prettier.config.*) and
+#     .prettierignore relative to the repo root (invocations run with cwd = repo
+#     root). checkleft imposes no formatting options of its own.
+needs:
+  prettier:
+    default:
+      npm:
+        package: "prettier"
+        version: "3.8.4"
+    fallback:
+      path: "prettier"
+
+invocations:
+  - id: format
+    run: prettier
+    mode: per_file
+    args:
+      # --list-different: print the path of each file that is NOT already formatted
+      # (one per line) and exit 1; exit 0 when the file is formatted. The linelist
+      # transform turns each printed path into one file-level finding and treats
+      # "exit 1 with no output" as an operational error (e.g. a syntax error) rather
+      # than a clean result — mirroring rustfmt --check -l.
+      - "--list-different"
+      # --ignore-unknown: silently skip a file Prettier has no parser for instead of
+      # erroring (exit 2), so an applies_to match Prettier can't handle is a no-op
+      # rather than a check error.
+      - "--ignore-unknown"
+      - "{{file}}"
+    # exit 0 = already formatted (ok); exit 1 = needs formatting (path on stdout via
+    # --list-different) OR an operational error (no stdout — handled by the linelist
+    # transform); any other code = error.
+    exit:
+      "0": ok
+      "1": findings
+      default: error
+    transform:
+      kind: linelist
+      message: "file needs prettier formatting"
+      remediations:
+        - "Run `{{needs.prettier.invocation}} --write {{input.file}}` to auto-format."

@@ -69,10 +69,11 @@ pub struct ExternalCheckDeclarativePackage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryRequirement {
     pub default: BinaryBinding,
-    /// Optional fallback when the default (bazel) binding fails to resolve.
-    /// When set and bazel resolution fails, the framework uses the fallback and
-    /// emits a loud warning to stderr so the operator knows hermetic resolution
-    /// was skipped.
+    /// Optional fallback for when the default binding fails to resolve. Only
+    /// meaningful when `default` is `bazel` or `npm` (a `path` default always
+    /// resolves). When the primary resolution fails, the framework uses the
+    /// fallback and emits a loud warning to stderr so the operator knows the
+    /// pinned/hermetic toolchain was skipped.
     pub fallback: Option<BinaryBinding>,
 }
 
@@ -85,6 +86,13 @@ pub enum BinaryBinding {
     Bazel(String),
     /// A direct path or PATH name — the portable fallback (no Bazel involved).
     Path(String),
+    /// A version-pinned npm package, provisioned via `npx --yes <package>@<version>`
+    /// (environment-conditional: requires `npx`/Node on PATH). The version pin is
+    /// part of the package spec, so npx fetches and runs exactly that release
+    /// regardless of any globally-installed copy — a reproducible tool without
+    /// standing up a parallel Bazel JS toolchain. Pair with a `fallback.path` for
+    /// environments that have the tool on PATH but no npx.
+    Npm { package: String, version: String },
 }
 
 /// One self-contained invocation of a declarative check.
@@ -223,6 +231,20 @@ struct RawBinaryBinding {
     bazel: Option<String>,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    npm: Option<RawNpmBinding>,
+}
+
+/// A version-pinned npm package binding. In a `default`/`fallback` binding both
+/// fields are required; a CHECKS-config override may set only the field it wants to
+/// change (the other is inherited from the default binding — see `resolve`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNpmBinding {
+    #[serde(default)]
+    package: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,30 +349,48 @@ pub(super) fn validate_declarative_implementation(
 fn validate_requirement(name: &str, raw: RawBinaryRequirement) -> Result<BinaryRequirement> {
     let default = parse_binding(name, "default", raw.default)?;
     let fallback = raw.fallback.map(|f| parse_binding(name, "fallback", f)).transpose()?;
-    if fallback.is_some() && !matches!(default, BinaryBinding::Bazel(_)) {
+    if fallback.is_some() && matches!(default, BinaryBinding::Path(_)) {
         bail!(
-            "binary `{name}` declares a `fallback` but `default` is not a `bazel` binding; \
-             fallback is only meaningful when the primary binding is `bazel`"
+            "binary `{name}` declares a `fallback` but `default` is a `path` binding; \
+             a `path` default always resolves, so the fallback is unreachable — \
+             fallback is only meaningful when `default` is `bazel` or `npm`"
         );
     }
     Ok(BinaryRequirement { default, fallback })
 }
 
 fn parse_binding(name: &str, field: &str, raw: RawBinaryBinding) -> Result<BinaryBinding> {
-    match (raw.bazel, raw.path) {
-        (Some(_), Some(_)) => {
-            bail!("binary `{name}` {field} binding must set exactly one of `bazel` or `path`, not both")
-        }
-        (Some(bazel), None) => Ok(BinaryBinding::Bazel(non_empty(
+    let set_count = raw.bazel.is_some() as u8 + raw.path.is_some() as u8 + raw.npm.is_some() as u8;
+    if set_count == 0 {
+        bail!("binary `{name}` {field} binding must set one of `bazel`, `path`, or `npm`");
+    }
+    if set_count > 1 {
+        bail!("binary `{name}` {field} binding must set exactly one of `bazel`, `path`, or `npm`");
+    }
+    if let Some(bazel) = raw.bazel {
+        return Ok(BinaryBinding::Bazel(non_empty(
             &format!("needs.{name}.{field}.bazel"),
             bazel,
-        )?)),
-        (None, Some(path)) => Ok(BinaryBinding::Path(non_empty(
+        )?));
+    }
+    if let Some(path) = raw.path {
+        return Ok(BinaryBinding::Path(non_empty(
             &format!("needs.{name}.{field}.path"),
             path,
-        )?)),
-        (None, None) => bail!("binary `{name}` {field} binding must set one of `bazel` or `path`"),
+        )?));
     }
+    let npm = raw.npm.expect("exactly one binding field set");
+    let package = non_empty(
+        &format!("needs.{name}.{field}.npm.package"),
+        npm.package
+            .ok_or_else(|| anyhow::anyhow!("binary `{name}` {field} `npm` binding must set `package`"))?,
+    )?;
+    let version = non_empty(
+        &format!("needs.{name}.{field}.npm.version"),
+        npm.version
+            .ok_or_else(|| anyhow::anyhow!("binary `{name}` {field} `npm` binding must set `version`"))?,
+    )?;
+    Ok(BinaryBinding::Npm { package, version })
 }
 
 fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvocation) -> Result<Invocation> {

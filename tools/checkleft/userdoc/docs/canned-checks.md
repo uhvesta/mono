@@ -212,6 +212,43 @@ Notes:
 - Findings default to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 
+## `format/prettier`
+
+Purpose:
+
+- Flags changed web/config files that are not [Prettier](https://prettier.io)-formatted (`*.js`, `*.jsx`, `*.mjs`, `*.cjs`, `*.ts`, `*.tsx`, `*.mts`, `*.cts`, `*.json`, `*.css`, `*.scss`, `*.less`, `*.html`, `*.vue`, `*.md`, `*.markdown`, `*.yaml`, `*.yml`, `*.graphql`, `*.gql`).
+
+Implementation:
+
+- This is a declarative check (`runtime: declarative-v1`), not built-in Rust code. It runs `prettier --list-different --ignore-unknown <file>` per changed file and emits one finding per file that needs reformatting.
+- Prettier discovers the **repo's own** configuration (`.prettierrc` / `prettier.config.*`) and `.prettierignore` relative to the repo root — checkleft imposes no formatting options of its own.
+
+Tool provisioning and version pinning:
+
+- By default Prettier is provisioned via `npx --yes prettier@<version>`, pinned to **3.8.4**. The version is part of the npm package spec, so npx runs exactly that release regardless of any globally-installed copy — a reproducible tool without a separate Bazel JS toolchain.
+- Re-pin the version per repo through the `needs` binding (the package name is inherited from the default `npm` binding):
+
+```yaml
+checks:
+  - id: format/prettier
+    policy:
+      severity: error
+    config:
+      needs:
+        prettier:
+          npm:
+            version: "3.9.0"
+```
+
+- When `npx` is not on `PATH`, the check falls back to a `prettier` binary on `PATH` and warns loudly on stderr that the pinned toolchain was skipped. A repo with a hermetic Bazel JS toolchain can instead point the binding at a Bazel target with `needs.prettier.bazel: "<label>"`, or at an explicit path with `needs.prettier.path: "<path>"` — no change to the bundled definition required.
+
+Notes:
+
+- Each finding's remediation is ``Run `prettier --write <file>` to auto-format.``
+- A file Prettier has no parser for is skipped (`--ignore-unknown`) rather than reported as an error.
+- Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
+- See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
+
 ## `md/link-integrity`
 
 Purpose:
