@@ -1269,3 +1269,222 @@ invocations:
         "got: {err:#}"
     );
 }
+
+// ── per-repo applies_to override via CHECKS.yaml config blob ──────────────────
+
+/// Build a minimal declarative package that matches only `**/*.bzl` files,
+/// wired to a shell script that immediately fails (so we can observe whether
+/// `run_declarative_check` selected the file at all — if it short-circuits with
+/// an empty result it means the file was NOT selected).
+#[cfg(unix)]
+fn applies_to_test_package(script_path: &str) -> ExternalCheckDeclarativePackage {
+    let manifest = format!(
+        r#"
+id = "test-check"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = ["**/*.bzl"]
+
+[needs.tool.default]
+path = "{script_path}"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "findings", default = "error" }}
+
+[invocations.transform]
+kind = "passthrough"
+"#
+    );
+    let package = parse_external_check_package_manifest(&manifest).expect("test manifest must parse");
+    match package.implementation {
+        ExternalCheckPackageImplementation::Declarative(d) => d,
+        other => panic!("expected declarative, got {other:?}"),
+    }
+}
+
+/// A changeset with one file of each type so we can verify glob selection.
+fn changeset_with_files(paths: &[&str]) -> crate::input::ChangeSet {
+    crate::input::ChangeSet::new(
+        paths
+            .iter()
+            .map(|p| ChangedFile {
+                path: std::path::PathBuf::from(p),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn applies_to_override_replaces_definition_glob() {
+    // The package applies_to is ["**/*.bzl"]. The config override sets ["**/*.rs"].
+    // A changeset with a .rs file should now be selected, while a .bzl file should not.
+    let config: toml::Value = toml::from_str(r#"applies_to = ["**/*.rs"]"#).unwrap();
+    let globs = super::resolve::override_applies_to(&config)
+        .expect("override must be present")
+        .expect("override must be valid");
+    assert_eq!(globs, vec!["**/*.rs"]);
+}
+
+#[test]
+fn applies_to_override_absent_falls_back_to_definition() {
+    // No `applies_to` key in config → override_applies_to returns None.
+    let config: toml::Value = toml::from_str(r#"needs.tool.path = "x""#).unwrap();
+    let result = super::resolve::override_applies_to(&config);
+    assert!(result.is_none(), "absent override must return None");
+}
+
+#[test]
+fn applies_to_override_empty_list_is_rejected() {
+    let config: toml::Value = toml::from_str("applies_to = []").unwrap();
+    let err = super::resolve::override_applies_to(&config)
+        .expect("override present")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must not be empty"),
+        "empty list must be rejected; got: {err:#}"
+    );
+}
+
+#[test]
+fn applies_to_override_non_list_is_rejected() {
+    let config: toml::Value = toml::from_str(r#"applies_to = "**/*.rs""#).unwrap();
+    let err = super::resolve::override_applies_to(&config)
+        .expect("override present")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must be a list"),
+        "scalar value must be rejected; got: {err:#}"
+    );
+}
+
+#[test]
+fn applies_to_override_empty_string_entry_is_rejected() {
+    let config: toml::Value = toml::from_str(r#"applies_to = [""]"#).unwrap();
+    let err = super::resolve::override_applies_to(&config)
+        .expect("override present")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("must not be empty"),
+        "empty string entry must be rejected; got: {err:#}"
+    );
+}
+
+/// End-to-end test: config applies_to override restricts file selection so only
+/// matching files are checked. The package definition matches `**/*.bzl`; the
+/// config override changes it to `**/*.rs`. A .rs file should produce findings;
+/// the .bzl file should be skipped (→ empty result, no invocation attempted).
+#[test]
+#[cfg(unix)]
+fn applies_to_override_end_to_end_restricts_selection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    // Script that emits one finding for any file passed to it.
+    let script_path = temp.path().join("emit_one.sh");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf '%s' '{\"findings\":[{\"severity\":\"warning\",\"message\":\"selected\",\"location\":null,\"remediations\":[],\"suggested_fix\":null}]}'\n",
+    )
+    .expect("write script");
+    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+    let package = applies_to_test_package(&script_path.to_string_lossy());
+
+    // Config override: only match .rs files, not .bzl.
+    let config: toml::Value = toml::from_str(r#"applies_to = ["**/*.rs"]"#).unwrap();
+
+    // Changeset has one .rs file and one .bzl file.
+    let changeset = changeset_with_files(&["src/main.rs", "BUILD.bzl"]);
+
+    let result = super::run_declarative_check(temp.path(), "test-check", &package, &changeset, &config, None)
+        .expect("run succeeds");
+
+    // The .rs file was selected (→ one finding). The .bzl file was excluded by the override.
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "override applies_to must select only .rs file; got: {:#?}",
+        result.findings
+    );
+    assert_eq!(result.findings[0].message, "selected");
+}
+
+#[test]
+#[cfg(unix)]
+fn applies_to_no_override_uses_definition_glob() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    // Script that emits one finding for any file.
+    let script_path = temp.path().join("emit_one.sh");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf '%s' '{\"findings\":[{\"severity\":\"warning\",\"message\":\"selected\",\"location\":null,\"remediations\":[],\"suggested_fix\":null}]}'\n",
+    )
+    .expect("write script");
+    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+    let package = applies_to_test_package(&script_path.to_string_lossy());
+
+    // No applies_to override — definition's ["**/*.bzl"] applies.
+    let config: toml::Value = toml::Value::Table(Default::default());
+    let changeset = changeset_with_files(&["src/main.rs", "a/b/BUILD.bzl"]);
+
+    let result = super::run_declarative_check(temp.path(), "test-check", &package, &changeset, &config, None)
+        .expect("run succeeds");
+
+    // Only the .bzl file matches; .rs is skipped.
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "without override, definition applies_to selects only .bzl; got: {:#?}",
+        result.findings
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn applies_to_override_all_files_skipped_returns_empty() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+
+    // Script emits one finding.
+    let script_path = temp.path().join("emit_one.sh");
+    std::fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf '%s' '{\"findings\":[{\"severity\":\"warning\",\"message\":\"selected\",\"location\":null,\"remediations\":[],\"suggested_fix\":null}]}'\n",
+    )
+    .expect("write script");
+    let mut perms = std::fs::metadata(&script_path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script_path, perms).expect("chmod");
+
+    let package = applies_to_test_package(&script_path.to_string_lossy());
+
+    // Override: only frontend/**. Changeset has no frontend files → nothing selected.
+    let config: toml::Value = toml::from_str(r#"applies_to = ["frontend/**"]"#).unwrap();
+    let changeset = changeset_with_files(&["src/main.rs", "backend/lib.rs"]);
+
+    let result = super::run_declarative_check(temp.path(), "test-check", &package, &changeset, &config, None)
+        .expect("run succeeds");
+
+    assert!(
+        result.findings.is_empty(),
+        "no files match override glob → no findings; got: {:#?}",
+        result.findings
+    );
+}

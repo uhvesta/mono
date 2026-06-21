@@ -98,6 +98,35 @@ Supported keys:
 - `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
 
+## Overriding `applies_to` for declarative checks
+
+Declarative checks (format/bazel, format/rust, format/prettier, lint/js, lint/rust, etc.) declare which files they run on via an `applies_to` glob list in their check definition. A consuming repo can restrict or retarget that file set from its CHECKS.yaml without forking the definition — by setting `applies_to` inside the per-check `config` block.
+
+**Semantics:** the repo's `applies_to` list **replaces** the definition's list entirely (it does not merge or extend). This is the simplest model and matches the word "override": whatever the definition declared, the repo wins. There is one `applies_to` vocabulary (positive globs) used in both the definition and the override.
+
+```yaml
+checks:
+  # Run format/prettier only on frontend source, not on the whole repo.
+  - id: format/prettier
+    config:
+      applies_to:
+        - "frontend/**"
+
+  # Run format/rust only under the tools/ subtree.
+  - id: format/rust
+    config:
+      applies_to:
+        - "tools/**/*.rs"
+        - "lib/**/*.rs"
+```
+
+Rules:
+
+- The override must be a non-empty list of glob strings. An empty list is rejected — use `enabled: false` to disable the check entirely.
+- Each glob uses the same syntax as the check definition's `applies_to` (globset patterns; `**` matches across directory boundaries).
+- When no `applies_to` key appears in `config`, the definition's own list is used unchanged.
+- The override applies to all declarative checks uniformly — it is a framework feature, not specific to any one check.
+
 ## Pattern: First-party (bundled) check — zero install
 
 First-party checks whose definitions ship inside the `checkleft` binary resolve automatically from `id` (or `check`). No `implementation:` line needed:

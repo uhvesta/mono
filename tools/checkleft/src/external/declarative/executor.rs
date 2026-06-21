@@ -39,7 +39,13 @@ pub fn run_declarative_check(
     config: &toml::Value,
     effective_severity: Option<Severity>,
 ) -> Result<CheckResult> {
-    let files = select_files(changeset, &package.applies_to)?;
+    // A per-repo `applies_to` override in the CHECKS.yaml config blob replaces the
+    // definition's applies_to list entirely (same glob vocabulary, replace semantics).
+    let applies_to_override = resolve::override_applies_to(config)
+        .transpose()
+        .context("invalid `applies_to` config override")?;
+    let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
+    let files = select_files(changeset, applies_to)?;
     if files.is_empty() {
         return Ok(CheckResult {
             check_id: package_id.to_owned(),
