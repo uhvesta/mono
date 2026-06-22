@@ -6,9 +6,10 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 use checkleft::change_detection::environment::CiEnvironment;
 
 use super::{
-    ColorLevel, ExternalProviderMode, OutputStyle, ci_from_env, github_auth_unavailable_warning,
-    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer,
-    render_human_results, resolve_github_token_from_sources, should_show_progress, sort_results_for_output,
+    ColorLevel, ExternalProviderMode, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES, TRUNCATE_MAX_TOTAL_CHARS,
+    ci_from_env, github_auth_unavailable_warning, normalize_optional_description, parse_external_provider_mode,
+    parse_github_ref_pr_number, render_human_footer, render_human_results, resolve_github_token_from_sources,
+    should_show_progress, sort_results_for_output, truncate_tool_output,
 };
 
 #[test]
@@ -715,4 +716,135 @@ fn github_auth_unavailable_warning_names_all_env_vars_and_gh_cli() {
     assert!(msg.contains("gh auth token"), "must mention gh auth token");
     assert!(msg.contains("gh auth login"), "must tell user how to fix it");
     assert!(msg.contains("example/repo"), "must name the repository");
+}
+
+// --- truncate_tool_output ---
+
+#[test]
+fn truncate_tool_output_short_message_passes_through_unchanged() {
+    let short = "SyntaxError: unexpected token at (1:5)";
+    let result = truncate_tool_output(short);
+    // Short messages are returned as Borrowed — no allocation and no modification.
+    assert_eq!(&*result, short);
+    assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+}
+
+#[test]
+fn truncate_tool_output_clips_excess_lines_and_appends_marker() {
+    // Build a message with more lines than TRUNCATE_MAX_LINES.
+    let line_count = TRUNCATE_MAX_LINES + 15;
+    let input: String = (1..=line_count)
+        .map(|i| format!("error output line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = truncate_tool_output(&input);
+    let output_lines: Vec<&str> = result.lines().collect();
+
+    // TRUNCATE_MAX_LINES content lines + 1 truncation marker.
+    assert_eq!(
+        output_lines.len(),
+        TRUNCATE_MAX_LINES + 1,
+        "expected {TRUNCATE_MAX_LINES} content lines plus marker"
+    );
+
+    // First and last content lines are preserved in order.
+    assert!(
+        output_lines[0].contains("error output line 1"),
+        "first line must be preserved"
+    );
+    assert!(output_lines[TRUNCATE_MAX_LINES - 1].contains(&format!("error output line {TRUNCATE_MAX_LINES}")));
+
+    // Marker names elided lines and chars.
+    let marker = output_lines[TRUNCATE_MAX_LINES];
+    assert!(marker.contains("truncated"), "marker must say 'truncated'");
+    assert!(marker.contains("15 more line(s)"), "marker must report 15 elided lines");
+}
+
+#[test]
+fn truncate_tool_output_clips_oversized_single_line_and_appends_marker() {
+    // A single line far exceeding TRUNCATE_MAX_LINE_LEN (like prettier's full-file echo).
+    let huge_line = "x".repeat(TRUNCATE_MAX_LINE_LEN * 10);
+    let result = truncate_tool_output(&huge_line);
+    let output_lines: Vec<&str> = result.lines().collect();
+
+    // 1 clipped content line + 1 truncation marker.
+    assert_eq!(output_lines.len(), 2, "expect clipped content line and marker");
+
+    // Content line ends with the ellipsis character and is within the char cap (+1 for '…').
+    assert!(output_lines[0].ends_with('\u{2026}'), "clipped line must end with '…'");
+    assert!(
+        output_lines[0].chars().count() <= TRUNCATE_MAX_LINE_LEN + 1,
+        "clipped line must not exceed TRUNCATE_MAX_LINE_LEN + 1 char for '…'"
+    );
+
+    // Marker reports more chars were elided.
+    assert!(output_lines[1].contains("truncated"), "marker must say 'truncated'");
+    assert!(
+        output_lines[1].contains("more char(s)"),
+        "marker must report elided char count"
+    );
+}
+
+#[test]
+fn truncate_tool_output_total_char_cap_across_lines() {
+    // Each line is just under TRUNCATE_MAX_LINE_LEN but there are enough to
+    // exhaust TRUNCATE_MAX_TOTAL_CHARS before TRUNCATE_MAX_LINES is reached.
+    let line = "a".repeat(TRUNCATE_MAX_LINE_LEN - 1); // 199 chars per line
+    let lines_to_exhaust = TRUNCATE_MAX_TOTAL_CHARS / (TRUNCATE_MAX_LINE_LEN - 1) + 2;
+    let input: String = std::iter::repeat(line.as_str())
+        .take(lines_to_exhaust)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let result = truncate_tool_output(&input);
+    let output_lines: Vec<&str> = result.lines().collect();
+
+    // Must be bounded: content lines + marker ≤ TRUNCATE_MAX_LINES + 1.
+    assert!(
+        output_lines.len() <= TRUNCATE_MAX_LINES + 1,
+        "total output must be bounded by TRUNCATE_MAX_LINES + marker"
+    );
+
+    // Last line must be the truncation marker.
+    let marker = output_lines[output_lines.len() - 1];
+    assert!(marker.contains("truncated"), "last line must be truncation marker");
+}
+
+#[test]
+fn truncate_tool_output_does_not_affect_json_serialization() {
+    // JSON output uses CheckResult directly (serde), never render_finding.
+    // Verify the full message survives serde round-trip regardless of size.
+    let huge_message = "x".repeat(TRUNCATE_MAX_TOTAL_CHARS * 5);
+    let results = vec![CheckResult {
+        check_id: "fmt".to_owned(),
+        findings: vec![Finding {
+            severity: Severity::Error,
+            message: huge_message.clone(),
+            location: None,
+            remediations: vec![],
+            suggested_fix: None,
+        }],
+    }];
+    let json = serde_json::to_string(&results).expect("serialize to JSON");
+    assert!(
+        json.contains(&huge_message),
+        "JSON output must contain the full untruncated message"
+    );
+
+    // Verify the human render of the same result IS truncated.
+    let human = render_human_results(
+        &results,
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+    assert!(
+        !human.contains(&huge_message),
+        "human output must NOT contain the full huge message"
+    );
+    assert!(
+        human.contains("truncated"),
+        "human output must contain the truncation marker"
+    );
 }
