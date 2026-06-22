@@ -14,3 +14,20 @@
 pub mod safety;
 
 pub use safety::{CopyBackReport, WritableSandbox};
+
+/// The outcome of invoking a WASM/component check's `fix-check` entry point and
+/// routing its edits through the [`safety`] copy-back core.
+///
+/// This is the host-side companion to the guest's `fix-error` WIT result: a real
+/// fixer failure (or an edit that targets a file outside the fixable set) surfaces
+/// as an `Err` from the runtime, while `not-fixable` — the ordinary outcome for a
+/// check with no declared fix — is the non-error [`ComponentFixOutcome::NotFixable`].
+#[derive(Debug)]
+pub enum ComponentFixOutcome {
+    /// The check produced edits that were applied through the copy-back core. The
+    /// [`CopyBackReport`] names exactly the files written to the real tree (a
+    /// subset of the fixable set that actually changed) and any copy-back error.
+    Applied(CopyBackReport),
+    /// The check declares no fix entry point. A no-op for `fix`, not an error.
+    NotFixable,
+}

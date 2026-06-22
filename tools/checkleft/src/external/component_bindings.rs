@@ -56,6 +56,35 @@ mod tests {
     }
 
     #[test]
+    fn fix_error_variants_are_generated() {
+        // Proves the host bindgen picked up the new `fix-error` variant from the
+        // WIT (which it must, for `call_fix_check` to be callable).
+        let unknown = types::FixError::UnknownCheck("no-such-check".to_owned());
+        let failed = types::FixError::Failed("fixer blew up".to_owned());
+        let not_fixable = types::FixError::NotFixable;
+        match unknown {
+            types::FixError::UnknownCheck(name) => assert_eq!(name, "no-such-check"),
+            _ => panic!("unexpected variant"),
+        }
+        match failed {
+            types::FixError::Failed(msg) => assert_eq!(msg, "fixer blew up"),
+            _ => panic!("unexpected variant"),
+        }
+        assert!(matches!(not_fixable, types::FixError::NotFixable));
+    }
+
+    #[test]
+    fn file_edit_can_be_constructed() {
+        let edit = types::FileEdit {
+            path: "src/lib.rs".to_owned(),
+            old_text: "foo".to_owned(),
+            new_text: "bar".to_owned(),
+        };
+        assert_eq!(edit.path, "src/lib.rs");
+        assert_eq!(edit.new_text, "bar");
+    }
+
+    #[test]
     fn finding_can_be_constructed() {
         let finding = types::Finding {
             severity: types::Severity::Error,

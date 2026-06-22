@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +12,10 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
+use crate::fix::{ComponentFixOutcome, CopyBackReport, WritableSandbox};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
+use crate::path::validate_relative_path;
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
@@ -430,6 +432,65 @@ impl DefaultExternalCheckExecutor {
                 source_tree,
                 config,
                 config_dir,
+            },
+        )
+    }
+
+    /// Apply the WASM/component check's `fix-check` entry point over `fixable`,
+    /// routing any edits the guest returns through the [`crate::fix`] copy-back
+    /// core.
+    ///
+    /// W1 model: the fixable set is staged into a writable sandbox preopened
+    /// **read-only** for the guest (so the guest needs no write capability). The
+    /// guest returns `file-edit`s; the host validates each edit targets a staged
+    /// file, applies them to the staged copies, and atomically copies back only
+    /// the files that actually changed. A fixer error — or an edit outside the
+    /// fixable set — aborts the fix and leaves the real tree untouched.
+    ///
+    /// `dest_root` is the real working-tree root the changed files are written
+    /// back to (normally the runtime root). Returns
+    /// [`ComponentFixOutcome::NotFixable`] when the check declares no fix.
+    ///
+    /// Note (v1 constraint): the guest reads only the staged fixable set, not its
+    /// full declared `access-scope`. This suits the typed-edit fixer that rewrites
+    /// the files it flags; a fixer needing broader read context is out of scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fix_component_check(
+        &self,
+        package: &ExternalCheckPackage,
+        component: &ExternalCheckComponentPackage,
+        changeset: &ChangeSet,
+        source_tree: &dyn SourceTree,
+        config: &toml::Value,
+        config_dir: &Path,
+        fixable: &[PathBuf],
+        dest_root: &Path,
+    ) -> Result<ComponentFixOutcome> {
+        if !self.ticker.is_alive() {
+            anyhow::bail!(
+                "epoch ticker thread has died; cannot enforce execution timeout for fix of check `{}`",
+                package.id
+            );
+        }
+
+        // Reuse the audit loader: it reads + sha-verifies + AOT-loads the bytes
+        // and memoizes the result per run, exactly the lifecycle a fix needs.
+        let wasm_component = self.load_component_for_audit(package, component)?;
+
+        run_component_fix(
+            &self.engine,
+            &self.root,
+            FixRun {
+                package,
+                check_name: &component.check_name,
+                component: &wasm_component,
+                limits: component.limits.as_ref(),
+                changeset,
+                source_tree,
+                config,
+                config_dir,
+                fixable,
+                dest_root,
             },
         )
     }
@@ -987,6 +1048,153 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     };
     apply_struct_exclusions(&mut result, config, config_dir);
     Ok(result)
+}
+
+/// Inputs for one component `fix-check` invocation over a fixable set.
+///
+/// Mirrors [`ComponentRun`] but adds the fixable set `F` and the copy-back
+/// destination. All fields are references so the struct is cheap to build.
+struct FixRun<'a> {
+    package: &'a ExternalCheckPackage,
+    check_name: &'a str,
+    component: &'a Component,
+    limits: Option<&'a ExternalCheckComponentLimits>,
+    changeset: &'a ChangeSet,
+    source_tree: &'a dyn SourceTree,
+    config: &'a toml::Value,
+    /// Repo-root-relative directory of the CHECKS file that configures this check.
+    config_dir: &'a Path,
+    /// Repo-relative fixable set `F`: the files this check is permitted to fix.
+    fixable: &'a [PathBuf],
+    /// Real working-tree root that changed files are copied back to.
+    dest_root: &'a Path,
+}
+
+/// Invoke a component's `fix-check` export over the fixable set and route the
+/// returned edits through the safety copy-back core (W1: host-applied edits,
+/// read-only guest sandbox).
+fn run_component_fix(engine: &Engine, root: &Path, run: FixRun) -> Result<ComponentFixOutcome> {
+    let (timeout_ticks, max_memory_bytes) = resolve_component_limits(run.limits, run.fixable.len());
+
+    // Stage EXACTLY the fixable set into a writable sandbox (force-copied, never
+    // hardlinked). This single sandbox is both the guest's read surface (preopened
+    // read-only below — W1 needs no guest write capability) and the host's apply
+    // target; the staged set is the airlock domain that copy-back enforces.
+    let ceiling = HostCeiling::new(root);
+    let sandbox = WritableSandbox::stage(run.fixable, run.source_tree, &ceiling)
+        .with_context(|| format!("failed to stage writable fix sandbox for check `{}`", run.package.id))?;
+
+    // Once paths absent from the tree are dropped, an empty staged set is a clean
+    // no-op: there is nothing to read, fix, or copy back.
+    if sandbox.staged_paths().is_empty() {
+        return Ok(ComponentFixOutcome::Applied(CopyBackReport::default()));
+    }
+
+    let linker = build_component_v1_linker(engine)?;
+    let host_state = HostState::with_sandbox_root(sandbox.root_path(), max_memory_bytes)
+        .with_context(|| format!("failed to configure WASI context for fix of check `{}`", run.package.id))?;
+    let mut store = Store::new(engine, host_state);
+    store.limiter(|state| &mut state.limiter);
+    store.set_epoch_deadline(timeout_ticks);
+    let instance = wasmtime(linker.instantiate(&mut store, run.component))
+        .with_context(|| format!("failed to instantiate component for fix of `{}`", run.package.id))?;
+    let bindings = wasmtime(WitCheck::new(&mut store, &instance))
+        .with_context(|| format!("failed to bind component exports for fix of `{}`", run.package.id))?;
+
+    let input = lower_check_input(run.changeset, run.source_tree, run.config, run.config_dir)?;
+    let file_list = format_file_list(run.changeset);
+    let fix_result = wasmtime(bindings.call_fix_check(&mut store, run.check_name, &input)).map_err(|err| {
+        if is_interrupt_error(&err) {
+            anyhow::anyhow!(
+                "check `{}` in component `{}` exceeded its {} ms wall-clock limit while fixing: {}",
+                run.check_name,
+                run.package.id,
+                timeout_ticks,
+                file_list,
+            )
+        } else {
+            err.context(format!(
+                "`fix-check` call failed for check `{}` in component `{}` while fixing: {}",
+                run.check_name, run.package.id, file_list,
+            ))
+        }
+    })?;
+
+    let edits = match fix_result {
+        Ok(edits) => edits,
+        // `not-fixable` is the ordinary outcome for a check with no declared fix:
+        // a no-op, not an error. The sandbox is dropped untouched on return.
+        Err(wit_types::FixError::NotFixable) => return Ok(ComponentFixOutcome::NotFixable),
+        Err(wit_types::FixError::UnknownCheck(name)) => bail!(
+            "component `{}` does not know check `{}` for fix (list-checks/run-check dispatch passed)",
+            run.package.id,
+            name,
+        ),
+        Err(wit_types::FixError::Failed(msg)) => bail!(
+            "fix for check `{}` in component `{}` failed: {}",
+            run.check_name,
+            run.package.id,
+            msg,
+        ),
+    };
+
+    // Apply the guest's edits to the staged copies. An edit outside the fixable
+    // set, or one that does not apply, aborts here — the sandbox is dropped and
+    // the real tree is left untouched (no copy-back ran).
+    apply_edits_to_sandbox(&sandbox, edits)
+        .with_context(|| format!("failed to apply fix edits for check `{}`", run.package.id))?;
+
+    let changed = sandbox
+        .detect_changes()
+        .with_context(|| format!("failed to detect fixed files for check `{}`", run.package.id))?;
+    let report = sandbox.copy_back(&changed, run.dest_root);
+    Ok(ComponentFixOutcome::Applied(report))
+}
+
+/// Apply guest-returned `file-edit`s to the staged sandbox copies, in order.
+///
+/// Each edit must target a path in the staged fixable set `F`; an edit elsewhere
+/// is an airlock violation and aborts the whole fix. The edit's `old-text` must
+/// occur in the current file content — a non-applying (e.g. stale) edit is a hard
+/// error so the fix aborts rather than silently dropping the change. Multiple
+/// edits to one file apply sequentially against the running content.
+fn apply_edits_to_sandbox(sandbox: &WritableSandbox, edits: Vec<wit_types::FileEdit>) -> Result<()> {
+    let staged: BTreeSet<PathBuf> = sandbox.staged_paths().into_iter().collect();
+
+    for edit in edits {
+        let rel = PathBuf::from(&edit.path);
+        validate_relative_path(&rel).with_context(|| format!("fix edit targets invalid path `{}`", edit.path))?;
+        if !staged.contains(&rel) {
+            bail!(
+                "airlock violation: fix edit targets `{}`, which is not in the fixable set",
+                edit.path
+            );
+        }
+
+        let target = sandbox.root_path().join(&rel);
+        let content = fs::read_to_string(&target)
+            .with_context(|| format!("failed to read staged file for fix edit: {}", target.display()))?;
+        let updated =
+            apply_file_edit(&content, &edit).with_context(|| format!("fix edit for `{}` does not apply", edit.path))?;
+        fs::write(&target, updated)
+            .with_context(|| format!("failed to write fix edit to staged file: {}", target.display()))?;
+    }
+    Ok(())
+}
+
+/// Apply a single `file-edit` to `content`, replacing the first occurrence of
+/// `old-text` with `new-text`.
+///
+/// Errors when `old-text` is empty (insert-only edits are unsupported in v1) or
+/// is not present in `content` (the edit is stale and does not apply).
+fn apply_file_edit(content: &str, edit: &wit_types::FileEdit) -> Result<String> {
+    if edit.old_text.is_empty() {
+        bail!("fix edit has empty old-text; insert-only edits are not supported");
+    }
+    if !content.contains(&edit.old_text) {
+        bail!("old-text not found in file (the edit is stale or does not apply)");
+    }
+    Ok(content.replacen(&edit.old_text, &edit.new_text, 1))
 }
 
 /// Suppress findings host-side for the framework-level `exclude_structs`

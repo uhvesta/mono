@@ -182,6 +182,54 @@ pub struct SuggestedFix {
     pub edits: Vec<FileEdit>,
 }
 
+/// The result of a check's fix entry point.
+///
+/// Returned (after conversion via [`IntoFixOutcome`]) by the `fix = fn`
+/// function declared on a `#[check]`. The host maps each variant onto the
+/// `fix-check` WIT result:
+///
+/// * [`FixOutcome::Edits`] → `ok(list<file-edit>)`: the edits the host should
+///   apply. An empty list is valid (the check found nothing to change).
+/// * [`FixOutcome::Failed`] → `err(failed(msg))`: the fixer ran but errored; the
+///   host aborts and leaves the tree untouched.
+/// * [`FixOutcome::NotFixable`] → `err(not-fixable)`: the check has no fix. This
+///   is the default for any check that does not declare `fix = fn`.
+#[derive(Debug, Clone)]
+pub enum FixOutcome {
+    /// Edits to apply (possibly empty).
+    Edits(Vec<FileEdit>),
+    /// The fixer failed with a human-readable reason.
+    Failed(String),
+    /// The check declares no fix entry point.
+    NotFixable,
+}
+
+/// Conversion from a fixer function's return type into a [`FixOutcome`].
+///
+/// A `fix = fn` function may return either `Vec<FileEdit>` (it cannot fail) or
+/// `Result<Vec<FileEdit>, String>` (it may fail with a message). This trait lets
+/// the `#[check]` macro accept both shapes without the author wrapping the
+/// result by hand.
+pub trait IntoFixOutcome {
+    /// Convert `self` into the canonical [`FixOutcome`].
+    fn into_fix_outcome(self) -> FixOutcome;
+}
+
+impl IntoFixOutcome for Vec<FileEdit> {
+    fn into_fix_outcome(self) -> FixOutcome {
+        FixOutcome::Edits(self)
+    }
+}
+
+impl IntoFixOutcome for Result<Vec<FileEdit>, String> {
+    fn into_fix_outcome(self) -> FixOutcome {
+        match self {
+            Ok(edits) => FixOutcome::Edits(edits),
+            Err(message) => FixOutcome::Failed(message),
+        }
+    }
+}
+
 /// One diagnostic produced by a check.
 #[derive(Debug, Clone)]
 pub struct Finding {
@@ -315,6 +363,16 @@ pub mod __private {
         fn descriptor(&self) -> crate::CheckDescriptor;
         fn run(&self, input: crate::CheckInput) -> Vec<crate::Finding>;
 
+        /// Compute the fix for this check, returning the edits the host should
+        /// apply.
+        ///
+        /// Populated when the `#[check]` attribute is annotated with
+        /// `fix = fn_name`. Defaults to [`crate::FixOutcome::NotFixable`], so a
+        /// check without a declared fix is a no-op for `checkleft fix`.
+        fn fix(&self, _input: crate::CheckInput) -> crate::FixOutcome {
+            crate::FixOutcome::NotFixable
+        }
+
         /// Return the auditable exclusion entries for this check.
         ///
         /// Populated when the `#[check]` attribute is annotated with
@@ -421,6 +479,37 @@ mod tests {
         let input = empty_input();
         let cfg: Cfg = input.config().unwrap();
         assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn into_fix_outcome_from_vec_is_edits() {
+        let edits = vec![FileEdit {
+            path: "src/lib.rs".to_owned(),
+            old_text: "a".to_owned(),
+            new_text: "b".to_owned(),
+        }];
+        match edits.into_fix_outcome() {
+            FixOutcome::Edits(e) => assert_eq!(e.len(), 1),
+            other => panic!("expected Edits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_fix_outcome_from_ok_result_is_edits() {
+        let result: Result<Vec<FileEdit>, String> = Ok(vec![]);
+        match result.into_fix_outcome() {
+            FixOutcome::Edits(e) => assert!(e.is_empty()),
+            other => panic!("expected empty Edits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_fix_outcome_from_err_result_is_failed() {
+        let result: Result<Vec<FileEdit>, String> = Err("boom".to_owned());
+        match result.into_fix_outcome() {
+            FixOutcome::Failed(msg) => assert_eq!(msg, "boom"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]

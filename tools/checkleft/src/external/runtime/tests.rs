@@ -13,9 +13,9 @@ use crate::source_tree::LocalSourceTree;
 
 use super::{
     BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
-    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_struct_exclusions, build_wasmtime_engine,
-    call_declared_exclusions, call_evaluate_exclusion, compile_component, is_interrupt_error, lower_changeset,
-    lower_check_input, resolve_component_limits,
+    MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_edits_to_sandbox, apply_file_edit, apply_struct_exclusions,
+    build_wasmtime_engine, call_declared_exclusions, call_evaluate_exclusion, compile_component, is_interrupt_error,
+    lower_changeset, lower_check_input, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -1327,4 +1327,136 @@ fn call_declared_exclusions_timeout_error_names_check_and_budget() {
         full.contains("declared-exclusions") || msg.contains("exceeded"),
         "error must mention declared-exclusions or exceeded; got: {full}"
     );
+}
+
+// --- WASM/external fix entry point: host-side apply + copy-back (T9) ---
+//
+// These exercise the host's half of `fix-check` — the `file-edit` apply and the
+// route through the T2 `WritableSandbox` copy-back — directly, with mock guest
+// edits, so the safety-critical "apply only inside the fixable set" logic is
+// covered without compiling a fix-enabled wasm guest at test time. The guest-side
+// `fix = fn` path is proven to compile to a real component by the trivial-check
+// example's `bazel test` smoke target.
+
+use crate::external::component_bindings::checkleft::check::types as fix_wit;
+use crate::external::sandbox::HostCeiling;
+use crate::fix::WritableSandbox;
+
+/// Build a real on-disk tree and a `LocalSourceTree` over it; the same dir is the
+/// copy-back destination, mirroring production where the ceiling, source tree, and
+/// working tree are one directory.
+fn fix_disk_tree(entries: &[(&str, &str)]) -> (tempfile::TempDir, LocalSourceTree) {
+    let dir = tempdir().expect("temp dir");
+    for (path, content) in entries {
+        let full = dir.path().join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("create dirs");
+        }
+        fs::write(&full, content).expect("write file");
+    }
+    let tree = LocalSourceTree::new(dir.path()).expect("source tree");
+    (dir, tree)
+}
+
+fn wit_edit(path: &str, old_text: &str, new_text: &str) -> fix_wit::FileEdit {
+    fix_wit::FileEdit {
+        path: path.to_owned(),
+        old_text: old_text.to_owned(),
+        new_text: new_text.to_owned(),
+    }
+}
+
+#[test]
+fn apply_file_edit_replaces_first_occurrence_only() {
+    let out = apply_file_edit("foo bar foo", &wit_edit("x", "foo", "baz")).expect("apply");
+    assert_eq!(out, "baz bar foo");
+}
+
+#[test]
+fn apply_file_edit_errors_when_old_text_absent() {
+    let err = apply_file_edit("hello", &wit_edit("x", "world", "earth")).unwrap_err();
+    assert!(err.to_string().contains("not found"), "got: {err}");
+}
+
+#[test]
+fn apply_file_edit_errors_on_empty_old_text() {
+    let err = apply_file_edit("hello", &wit_edit("x", "", "earth")).unwrap_err();
+    assert!(err.to_string().contains("empty old-text"), "got: {err}");
+}
+
+#[test]
+fn fix_apply_writes_only_changed_files_through_copy_back() {
+    let (dir, tree) = fix_disk_tree(&[("a.txt", "hello world"), ("b.txt", "untouched")]);
+    let fixable = vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")];
+    let sandbox = WritableSandbox::stage(&fixable, &tree, &HostCeiling::new(dir.path())).expect("stage");
+
+    // The "guest" returns one edit, for a.txt only.
+    apply_edits_to_sandbox(&sandbox, vec![wit_edit("a.txt", "hello", "goodbye")]).expect("apply edits");
+
+    let changed = sandbox.detect_changes().expect("detect");
+    assert_eq!(changed, vec![PathBuf::from("a.txt")], "only a.txt changed");
+
+    let report = sandbox.copy_back(&changed, dir.path());
+    assert!(report.is_ok());
+    assert_eq!(report.applied, vec![PathBuf::from("a.txt")]);
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "goodbye world");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "untouched",
+        "an unedited fixable file is left alone"
+    );
+}
+
+#[test]
+fn fix_apply_rejects_edit_outside_fixable_set() {
+    // The airlock: an edit naming a file that was never staged must be refused
+    // before any write, leaving the real tree untouched.
+    let (dir, tree) = fix_disk_tree(&[("a.txt", "aaa"), ("secret.txt", "do not touch")]);
+    let sandbox =
+        WritableSandbox::stage(&[PathBuf::from("a.txt")], &tree, &HostCeiling::new(dir.path())).expect("stage");
+
+    let err = apply_edits_to_sandbox(&sandbox, vec![wit_edit("secret.txt", "do not touch", "TOUCHED")]).unwrap_err();
+    assert!(err.to_string().contains("airlock"), "got: {err}");
+
+    // Nothing was copied back (we aborted before detect/copy_back); the real file
+    // is byte-identical.
+    assert_eq!(
+        fs::read_to_string(dir.path().join("secret.txt")).unwrap(),
+        "do not touch",
+        "a file outside the fixable set must never be written"
+    );
+}
+
+#[test]
+fn fix_apply_aborts_and_leaves_tree_untouched_when_edit_does_not_apply() {
+    // A stale edit (old-text not present) aborts the whole fix; dropping the
+    // sandbox without copy-back leaves the original bytes in place.
+    let (dir, tree) = fix_disk_tree(&[("a.txt", "current content")]);
+    let sandbox =
+        WritableSandbox::stage(&[PathBuf::from("a.txt")], &tree, &HostCeiling::new(dir.path())).expect("stage");
+
+    let err = apply_edits_to_sandbox(&sandbox, vec![wit_edit("a.txt", "stale text", "new")]).unwrap_err();
+    assert!(format!("{err:#}").contains("does not apply"), "got: {err:#}");
+
+    drop(sandbox);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "current content",
+        "a failed fix must leave the original file untouched"
+    );
+}
+
+#[test]
+fn fix_apply_no_edits_is_a_no_op() {
+    // Idempotency: a guest that returns no edits writes nothing.
+    let (dir, tree) = fix_disk_tree(&[("a.txt", "stable")]);
+    let sandbox =
+        WritableSandbox::stage(&[PathBuf::from("a.txt")], &tree, &HostCeiling::new(dir.path())).expect("stage");
+
+    apply_edits_to_sandbox(&sandbox, vec![]).expect("apply no edits");
+    let changed = sandbox.detect_changes().expect("detect");
+    assert!(changed.is_empty());
+    let report = sandbox.copy_back(&changed, dir.path());
+    assert!(report.is_ok() && report.applied.is_empty());
+    assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "stable");
 }

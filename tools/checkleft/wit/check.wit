@@ -221,6 +221,23 @@ interface types {
         failed(string),
     }
 
+    /// Error variants returned by `fix-check`.
+    ///
+    /// `not-fixable` is the ordinary outcome for a check that declares no fix
+    /// entry point — the host treats it as a no-op for `fix`, never a failure.
+    /// `failed` means a declared fixer ran and errored; the host aborts that
+    /// fix and leaves the working tree untouched.
+    variant fix-error {
+        /// No check with the given name is exported by this component.
+        unknown-check(string),
+        /// The fixer ran but encountered a fatal error. The host discards any
+        /// staged work and leaves the real tree untouched.
+        failed(string),
+        /// The named check exists but declares no fix. A no-op for `fix`, not an
+        /// error: the host reports the check's files as "no fix available".
+        not-fixable,
+    }
+
     /// An exclusion entry declared by a check for stale-exclusion auditing.
     ///
     /// Returned by `declared-exclusions`. The host re-evaluates the exclusion
@@ -256,7 +273,7 @@ interface types {
 /// guests read files with `std::fs` and see only the files the host allows.
 /// No checkleft-specific file import exists in this world.
 world check {
-    use types.{change-set, check-input, finding, check-descriptor, check-error, declared-exclusion, exclusion-status};
+    use types.{change-set, check-input, finding, file-edit, check-descriptor, check-error, fix-error, declared-exclusion, exclusion-status};
 
     /// Return a descriptor for every check exported by this component.
     /// Called once by the host after instantiation.
@@ -267,6 +284,25 @@ world check {
         name: string,
         input: check-input,
     ) -> result<list<finding>, check-error>;
+
+    /// Compute the fixes for the named check and return the edits to apply.
+    ///
+    /// This is the write-side companion to `run-check`, used by `checkleft fix`.
+    /// The W1 model is host-applied edits: the guest reads its (read-only)
+    /// sandbox and returns `file-edit` records describing the changes it wants;
+    /// it never writes the filesystem itself. The host validates that every
+    /// returned `file-edit.path` is in the fixable set, applies the edits to a
+    /// staged copy of those files, and atomically copies back only the files that
+    /// actually changed — so "touch nothing outside the fixable set" is enforced
+    /// host-side, not trusted to the guest.
+    ///
+    /// Returns `not-fixable` when the named check declares no fix (the common
+    /// case), `unknown-check` when no such check is exported, or `failed` when a
+    /// declared fixer errored.
+    export fix-check: func(
+        name: string,
+        input: check-input,
+    ) -> result<list<file-edit>, fix-error>;
 
     /// Declare the exact set of additional files required by the named check
     /// for the given changeset invocation.

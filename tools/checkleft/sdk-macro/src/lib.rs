@@ -32,6 +32,8 @@ struct CheckArgs {
     evaluate_exclusion: Option<Ident>,
     /// Optional function to call for `declare_required_files` dispatch.
     required_files: Option<Ident>,
+    /// Optional function to call for `fix-check` dispatch.
+    fix: Option<Ident>,
 }
 
 #[derive(Default)]
@@ -60,6 +62,7 @@ impl Parse for CheckArgs {
         let mut declared_exclusions: Option<Ident> = None;
         let mut evaluate_exclusion: Option<Ident> = None;
         let mut required_files: Option<Ident> = None;
+        let mut fix: Option<Ident> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -103,6 +106,10 @@ impl Parse for CheckArgs {
                     let ident: Ident = input.parse()?;
                     required_files = Some(ident);
                 }
+                "fix" => {
+                    let ident: Ident = input.parse()?;
+                    fix = Some(ident);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
@@ -131,6 +138,7 @@ impl Parse for CheckArgs {
             declared_exclusions,
             evaluate_exclusion,
             required_files,
+            fix,
         })
     }
 }
@@ -185,6 +193,12 @@ fn parse_access_scope(input: ParseStream<'_>) -> syn::Result<AccessScopeArg> {
 /// - `required_files = fn` (optional): Function to declare the extra files needed by the
 ///   check beyond the changeset. Use with `access_scope = declared_files`.
 ///   The function must have the signature `fn(&ChangeSet, &str) -> Vec<String>`.
+/// - `fix = fn` (optional): Function that computes this check's automatic fix for
+///   `checkleft fix`. The function takes the same `CheckInput` as the check and
+///   returns either `Vec<FileEdit>` (cannot fail) or `Result<Vec<FileEdit>, String>`
+///   (may fail with a message). The host validates that every returned edit targets
+///   a file in the fixable set and applies the edits itself — the guest never writes
+///   the filesystem. Absent ⇒ the check has no fix (a no-op for `checkleft fix`).
 ///
 /// After annotating all check functions, call `export_checks!(path::to::fn, ...)` once at
 /// the crate root to wire up the component exports.
@@ -277,6 +291,22 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
         quote! {}
     };
 
+    // Optional fix trait method impl. The fixer may return `Vec<FileEdit>` or
+    // `Result<Vec<FileEdit>, String>`; `IntoFixOutcome` normalizes both shapes,
+    // so this expansion does not depend on which one the author chose.
+    let fix_impl = if let Some(hook_fn) = &args.fix {
+        quote! {
+            fn fix(
+                &self,
+                input: ::checkleft_check_sdk::CheckInput,
+            ) -> ::checkleft_check_sdk::FixOutcome {
+                ::checkleft_check_sdk::IntoFixOutcome::into_fix_outcome(#hook_fn(input))
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         #func
 
@@ -311,6 +341,7 @@ fn expand_check(args: CheckArgs, func: ItemFn) -> syn::Result<TokenStream2> {
             #declared_exclusions_impl
             #evaluate_exclusion_impl
             #required_files_impl
+            #fix_impl
         }
 
         // `pub` so both the same-crate `export_checks!` (via `super::`) and an
@@ -453,6 +484,27 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
         })
         .collect();
 
+    // fix_check: match-arm dispatch, mirroring run_check. Each arm maps the
+    // check's `FixOutcome` onto the `fix-check` WIT result.
+    let fix_dispatch_arms: Vec<TokenStream2> = entry_paths
+        .iter()
+        .map(|entry| {
+            quote! {
+                n if n == #entry.name() => {
+                    match #entry.fix(sdk_input) {
+                        ::checkleft_check_sdk::FixOutcome::Edits(edits) => ::core::result::Result::Ok(
+                            edits.into_iter().map(to_wit_file_edit).collect()
+                        ),
+                        ::checkleft_check_sdk::FixOutcome::Failed(message) =>
+                            ::core::result::Result::Err(W::FixError::Failed(message)),
+                        ::checkleft_check_sdk::FixOutcome::NotFixable =>
+                            ::core::result::Result::Err(W::FixError::NotFixable),
+                    }
+                }
+            }
+        })
+        .collect();
+
     // declared_exclusions: if-chain dispatch (hooks travel with the check entry)
     let decl_excl_arms: Vec<TokenStream2> = entry_paths
         .iter()
@@ -542,6 +594,20 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     match name.as_str() {
                         #( #dispatch_arms )*
                         _ => ::core::result::Result::Err(W::CheckError::UnknownCheck(name)),
+                    }
+                }
+
+                fn fix_check(
+                    name: ::std::string::String,
+                    input: W::CheckInput,
+                ) -> ::core::result::Result<
+                    ::std::vec::Vec<W::FileEdit>,
+                    W::FixError,
+                > {
+                    let sdk_input = from_wit_input(input);
+                    match name.as_str() {
+                        #( #fix_dispatch_arms )*
+                        _ => ::core::result::Result::Err(W::FixError::UnknownCheck(name)),
                     }
                 }
 
@@ -639,12 +705,16 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                     remediations: f.remediations,
                     suggested_fix: f.suggested_fix.map(|sf| W::SuggestedFix {
                         description: sf.description,
-                        edits: sf.edits.into_iter().map(|e| W::FileEdit {
-                            path: e.path,
-                            old_text: e.old_text,
-                            new_text: e.new_text,
-                        }).collect(),
+                        edits: sf.edits.into_iter().map(to_wit_file_edit).collect(),
                     }),
+                }
+            }
+
+            fn to_wit_file_edit(e: ::checkleft_check_sdk::FileEdit) -> W::FileEdit {
+                W::FileEdit {
+                    path: e.path,
+                    old_text: e.old_text,
+                    new_text: e.new_text,
                 }
             }
 
