@@ -1,9 +1,11 @@
 "use strict";
 
 // Minimal ESLint flat config (CJS — no package.json in this Bazel-only repo).
-// Rules are the full @eslint/js recommended set, inlined to avoid the @eslint/js
-// package dependency. All rules below are core ESLint built-ins, so no import
-// is needed. When the repo later adds a JS package infrastructure, switch to:
+// Rules are the full @eslint/js recommended set for ESLint 10.5.0, inlined to
+// avoid the @eslint/js package dependency. All rules below are core ESLint
+// built-ins, so no import is needed. To programmatically source the recommended
+// set, add @eslint/js as a separate dependency (it is not bundled with eslint)
+// and switch to:
 //   const js = require("@eslint/js");
 //   module.exports = [js.configs.recommended, { ignores: [...] }];
 
@@ -18,10 +20,16 @@ module.exports = [
     ],
   },
   {
+    // Scope commonjs sourceType to .js/.cjs files so future .mjs files
+    // default to ESLint's per-extension sourceType (module) instead of
+    // getting a fatal parse error on import/export syntax.
+    files: ["**/*.js", "**/*.cjs"],
     languageOptions: {
       sourceType: "commonjs",
     },
-    // ESLint recommended rules (equivalent to @eslint/js js.configs.recommended)
+  },
+  {
+    // ESLint 10.5.0 recommended rules (full set: 64 rules)
     rules: {
       "constructor-super": "error",
       "for-direction": "error",
@@ -68,6 +76,7 @@ module.exports = [
       "no-shadow-restricted-names": "error",
       "no-sparse-arrays": "error",
       "no-this-before-super": "error",
+      "no-unassigned-vars": "error",
       "no-undef": "error",
       "no-unexpected-multiline": "error",
       "no-unreachable": "error",
@@ -77,10 +86,12 @@ module.exports = [
       "no-unused-labels": "error",
       "no-unused-private-class-members": "error",
       "no-unused-vars": "error",
+      "no-useless-assignment": "error",
       "no-useless-backreference": "error",
       "no-useless-catch": "error",
       "no-useless-escape": "error",
       "no-with": "error",
+      "preserve-caught-error": "error",
       "require-yield": "error",
       "use-isnan": "error",
       "valid-typeof": "error",
