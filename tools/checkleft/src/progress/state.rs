@@ -22,6 +22,8 @@ pub enum IconKind {
     Passed,
     /// Red x — the check finished with at least one error/warning finding.
     Failed,
+    /// Neutral circle — the check had zero eligible files and was skipped.
+    Skipped,
 }
 
 /// One rendered status line: the semantic icon plus its text. The renderer maps
@@ -157,6 +159,8 @@ impl ProgressState {
                 Lifecycle::Done { files_failed, elapsed } => {
                     let (icon, text) = if files_failed > 0 {
                         (IconKind::Failed, done_failed_text(entry, files_failed, elapsed))
+                    } else if entry.total_files == 0 {
+                        (IconKind::Skipped, done_skipped_text(entry, elapsed))
                     } else {
                         (IconKind::Passed, done_passed_text(entry, elapsed))
                     };
@@ -198,6 +202,14 @@ fn done_passed_text(entry: &Entry, elapsed: Duration) -> String {
         "{}: {} passed [{}]",
         entry.id,
         pluralize_files(entry.total_files),
+        format_elapsed(elapsed)
+    )
+}
+
+fn done_skipped_text(entry: &Entry, elapsed: Duration) -> String {
+    format!(
+        "{}: skipped — no applicable files [{}]",
+        entry.id,
         format_elapsed(elapsed)
     )
 }
@@ -340,6 +352,45 @@ mod tests {
         let lines = state.visible_lines(now);
         let ids: Vec<&str> = text_of(&lines).iter().map(|t| t.split(':').next().unwrap()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn zero_eligible_files_renders_as_skipped() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        state.register("format/bazel", 0);
+        state.start("format/bazel", Instant::now());
+        state.finish("format/bazel", 0, Duration::from_millis(3));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].icon, IconKind::Skipped);
+        assert_eq!(lines[0].text, "format/bazel: skipped — no applicable files [3ms]");
+    }
+
+    #[test]
+    fn nonzero_eligible_all_passing_renders_as_passed() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        state.register("lint", 5);
+        state.start("lint", Instant::now());
+        state.finish("lint", 0, Duration::from_millis(42));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].icon, IconKind::Passed);
+        assert_eq!(lines[0].text, "lint: 5 files passed [42ms]");
+    }
+
+    #[test]
+    fn failing_check_still_renders_as_failed() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        state.register("typo", 4);
+        state.start("typo", Instant::now());
+        state.finish("typo", 2, Duration::from_millis(10));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].icon, IconKind::Failed);
+        assert_eq!(lines[0].text, "typo: 2 files failed [10ms]");
     }
 
     #[test]

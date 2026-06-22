@@ -57,6 +57,7 @@ fn icon_glyph(icon: IconKind, tick: usize) -> String {
         }
         IconKind::Passed => "\u{1b}[32m✔\u{1b}[0m".to_owned(), // green
         IconKind::Failed => "\u{1b}[31m✖\u{1b}[0m".to_owned(), // red
+        IconKind::Skipped => "\u{1b}[2m○\u{1b}[0m".to_owned(), // dim
     }
 }
 
