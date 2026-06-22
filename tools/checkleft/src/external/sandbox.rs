@@ -73,6 +73,23 @@ fn sweep_stale_sandboxes(base: &Path) {
     }
 }
 
+/// Controls how a file's bytes are placed into the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CopyMode {
+    /// Prefer a zero-copy `fs::hard_link` from the ceiling, falling back to a
+    /// `SourceTree`-materialized copy. This is the default and is only safe for
+    /// **read-only** consumers (the WASM check runtime): a hardlink shares the
+    /// inode with the real file, so an in-place truncating write inside the
+    /// sandbox would silently mutate the real file outside any copy-back.
+    #[default]
+    PreferHardlink,
+    /// Always copy file contents; **never** hardlink. Required for any
+    /// **writable** sandbox (the `fix` path): the staged file must be a distinct
+    /// inode so a fixer's in-place write stays contained in the sandbox and can
+    /// only reach the real tree through the controlled copy-back step.
+    ForceCopy,
+}
+
 /// Declares how much of the repository a check needs to read.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AccessScope {
@@ -140,6 +157,11 @@ pub struct SandboxResult {
 /// the entire call. Symlink entries are always materialized via the SourceTree
 /// rather than hardlinked, so the SourceTree's containment checks apply.
 ///
+/// This is the read-only entry point: it uses [`CopyMode::PreferHardlink`]. A
+/// caller that intends to **write** inside the sandbox (the `fix` path) must use
+/// [`create_sandbox_with_mode`] with [`CopyMode::ForceCopy`] so staged files are
+/// distinct inodes from the real tree.
+///
 /// **Invariant:** `ceiling.path` must equal the root of `source_tree`; see
 /// [`HostCeiling`] for details.
 pub fn create_sandbox(
@@ -147,6 +169,24 @@ pub fn create_sandbox(
     scope: AccessScope,
     source_tree: &dyn SourceTree,
     ceiling: &HostCeiling,
+) -> Result<SandboxResult> {
+    create_sandbox_with_mode(changeset, scope, source_tree, ceiling, CopyMode::PreferHardlink)
+}
+
+/// Create a sandbox with an explicit [`CopyMode`].
+///
+/// Identical to [`create_sandbox`] except the caller chooses whether files may be
+/// hardlinked ([`CopyMode::PreferHardlink`], read-only consumers) or must always
+/// be copied ([`CopyMode::ForceCopy`], writable consumers such as `fix`). Under
+/// `ForceCopy` the hardlink fast path is never attempted, so every staged file is
+/// a fresh inode and an in-place write inside the sandbox cannot escape to the
+/// real tree.
+pub fn create_sandbox_with_mode(
+    changeset: &ChangeSet,
+    scope: AccessScope,
+    source_tree: &dyn SourceTree,
+    ceiling: &HostCeiling,
+    copy_mode: CopyMode,
 ) -> Result<SandboxResult> {
     let scope_str = match &scope {
         AccessScope::ModifiedOnly => "modified-only",
@@ -180,7 +220,7 @@ pub fn create_sandbox(
     let results: Vec<Result<Option<(PathBuf, bool)>>> = allowlist
         .par_iter()
         .map(
-            |path| match populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree) {
+            |path| match populate_sandbox_file(sandbox_root.path(), path, &ceiling.path, source_tree, copy_mode) {
                 Ok(hardlinked) => Ok(Some((path.clone(), hardlinked))),
                 Err(e) if source_file_not_found(&e) => Ok(None),
                 Err(e) => Err(e).with_context(|| format!("failed to populate sandbox file {}", path.display())),
@@ -315,11 +355,16 @@ fn source_file_not_found(err: &anyhow::Error) -> bool {
 /// via a hardlink (zero-copy, fast path) or `false` when it was materialised
 /// from the SourceTree (copy path). Returns `Err` on any I/O failure other than
 /// ENOENT (handled by the caller as a benign mid-walk disappearance).
+///
+/// Under [`CopyMode::ForceCopy`] the hardlink fast path is skipped entirely, so
+/// the staged file is always a fresh inode — a write inside the sandbox cannot
+/// reach the real tree.
 fn populate_sandbox_file(
     sandbox_root: &Path,
     relative_path: &Path,
     ceiling: &Path,
     source_tree: &dyn SourceTree,
+    copy_mode: CopyMode,
 ) -> Result<bool> {
     let dest = sandbox_root.join(relative_path);
 
@@ -333,14 +378,19 @@ fn populate_sandbox_file(
     // reference rather than its target, which could point outside the ceiling and
     // be followed by a check tool at runtime.  Routing symlinks through the
     // SourceTree ensures its containment checks (resolve_checked_path) are applied.
-    let source = ceiling.join(relative_path);
-    let source_is_symlink = fs::symlink_metadata(&source)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false);
+    //
+    // ForceCopy skips this block outright: a hardlink would share the real file's
+    // inode, which is exactly what a writable (fix) sandbox must not do.
+    if copy_mode == CopyMode::PreferHardlink {
+        let source = ceiling.join(relative_path);
+        let source_is_symlink = fs::symlink_metadata(&source)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
 
-    if !source_is_symlink && fs::hard_link(&source, &dest).is_ok() {
-        debug!(path = %relative_path.display(), method = "hardlink", "populated sandbox file");
-        return Ok(true);
+        if !source_is_symlink && fs::hard_link(&source, &dest).is_ok() {
+            debug!(path = %relative_path.display(), method = "hardlink", "populated sandbox file");
+            return Ok(true);
+        }
     }
 
     // Fall back to materializing from the SourceTree. This handles virtual or
@@ -369,7 +419,7 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::{AccessScope, HostCeiling, create_sandbox};
+    use super::{AccessScope, CopyMode, HostCeiling, create_sandbox, create_sandbox_with_mode};
     use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 
     /// An in-memory SourceTree for unit tests.
@@ -816,6 +866,95 @@ mod tests {
 
         let content = fs::read(result.root.path().join("src/real.rs")).expect("read hardlinked file");
         assert_eq!(content, b"fn real() {}");
+    }
+
+    // --- Force-copy mode (writable sandbox) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn force_copy_does_not_hardlink_local_source_tree() {
+        use std::os::unix::fs::MetadataExt;
+
+        // PreferHardlink shares the inode; ForceCopy must produce a distinct inode
+        // so a write inside the sandbox cannot escape to the real file.
+        //
+        // Create the source tree in the same location where sandbox_base_dir() will
+        // place the sandbox (XDG cache dir or system tmp fallback). In CI (Bazel),
+        // TEST_TMPDIR (used by tempfile::tempdir()) and HOME (used by
+        // directories::ProjectDirs) can reside on different filesystems. If source
+        // and sandbox end up on different devices, fs::hard_link fails with EXDEV
+        // and PreferHardlink silently copies, making the inode assertion spurious.
+        let source_parent = super::sandbox_base_dir().unwrap_or_else(std::env::temp_dir);
+        let dir = tempfile::Builder::new()
+            .prefix("checkleft-test-src")
+            .tempdir_in(&source_parent)
+            .expect("create source temp dir");
+        let src_file = dir.path().join("src/real.rs");
+        fs::create_dir_all(src_file.parent().unwrap()).expect("create dirs");
+        fs::write(&src_file, b"fn real() {}").expect("write source file");
+        let tree = crate::source_tree::LocalSourceTree::new(dir.path()).expect("create tree");
+
+        let cs = changeset(&["src/real.rs"]);
+        let real_ino = fs::metadata(dir.path().join("src/real.rs")).unwrap().ino();
+
+        let linked = create_sandbox_with_mode(
+            &cs,
+            AccessScope::ModifiedOnly,
+            &tree,
+            &HostCeiling::new(dir.path()),
+            CopyMode::PreferHardlink,
+        )
+        .expect("hardlink sandbox");
+        assert_eq!(
+            fs::metadata(linked.root.path().join("src/real.rs")).unwrap().ino(),
+            real_ino,
+            "PreferHardlink must share the inode with the real file"
+        );
+
+        let copied = create_sandbox_with_mode(
+            &cs,
+            AccessScope::ModifiedOnly,
+            &tree,
+            &HostCeiling::new(dir.path()),
+            CopyMode::ForceCopy,
+        )
+        .expect("force-copy sandbox");
+        assert_ne!(
+            fs::metadata(copied.root.path().join("src/real.rs")).unwrap().ino(),
+            real_ino,
+            "ForceCopy must NOT share the inode with the real file"
+        );
+        assert_eq!(
+            fs::read(copied.root.path().join("src/real.rs")).expect("read copied file"),
+            b"fn real() {}",
+            "force-copied content must match the source"
+        );
+    }
+
+    #[test]
+    fn force_copy_write_does_not_mutate_real_file() {
+        // The load-bearing safety property: rewriting the staged copy in place
+        // must leave the real on-disk file byte-identical.
+        let (dir, tree) = disk_source_tree(&[("a.txt", b"original")]);
+        let cs = changeset(&["a.txt"]);
+
+        let sandbox = create_sandbox_with_mode(
+            &cs,
+            AccessScope::ModifiedOnly,
+            &tree,
+            &HostCeiling::new(dir.path()),
+            CopyMode::ForceCopy,
+        )
+        .expect("force-copy sandbox");
+
+        // Truncating, in-place rewrite of the sandbox copy.
+        fs::write(sandbox.root.path().join("a.txt"), b"REWRITTEN-IN-SANDBOX").expect("write sandbox copy");
+
+        assert_eq!(
+            fs::read(dir.path().join("a.txt")).expect("read real file"),
+            b"original",
+            "real file must be untouched by a write to the force-copied sandbox file"
+        );
     }
 
     // --- Sandbox location ---

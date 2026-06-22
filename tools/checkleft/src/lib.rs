@@ -10,6 +10,7 @@ pub mod checks;
 pub mod config;
 pub mod exclusion;
 pub mod external;
+pub mod fix;
 pub mod input;
 pub mod install;
 pub mod output;

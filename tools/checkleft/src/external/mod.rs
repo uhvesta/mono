@@ -176,7 +176,7 @@ pub use runtime::{
     precompile_into_cache_dir,
 };
 pub mod sandbox;
-pub use sandbox::{AccessScope, HostCeiling, SandboxResult, create_sandbox};
+pub use sandbox::{AccessScope, CopyMode, HostCeiling, SandboxResult, create_sandbox, create_sandbox_with_mode};
 
 /// Test-only helpers shared across the component-runtime test modules
 /// (`runtime::tests`, `runner::tests`). Gated on `#[cfg(test)]` so the
