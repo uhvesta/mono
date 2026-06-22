@@ -1,0 +1,31 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "WASM/external fix shape: how should a wasm check apply its fix? W1 = guest returns file-edits and the host applies them (guest FS stays read-only; smaller trust surface; reuses the existing file-edit WIT record). W2 = host gives the guest a writable sandbox preopen and the guest writes files itself (matches the contract's 'capability to write the sandboxed files'). The design recommends W1 as default with W2 as an opt-in.",
+    "choices": [
+      "W1 default, W2 opt-in (recommended)",
+      "W1 only (drop W2 entirely for v1)",
+      "W2 only (guest writes the sandbox, matching the contract literally)"
+    ],
+    "anchor": "d-wasmexternal-fix-entry-point"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Convergence default when a file is fixed by multiple checks (e.g. lint --fix then format --write): how many fix passes by default?",
+    "choices": [
+      "Single ordered pass (--max_passes 1) — stable for all bundled checks, cheapest",
+      "Converge to fixpoint (default 2+ passes, stop when no change) — safer against pathological fixers"
+    ],
+    "anchor": "g-ordering-convergence-concurrency-verification"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Exit code: should `checkleft fix` exit 1 when an Error-severity finding still remains after fixing + re-verify (consistent with `run`)? Answer No if you'd prefer fix to exit 0 whenever it successfully applied any fixes, regardless of residual unfixable errors (friendlier for an auto-fix bot).",
+    "anchor": "a-cli-surface-and-relationship-to-run"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "lint/js is being replaced by lint/oxc (#1619). Should we still wire an `eslint --fix` block for lint/js in v1, or drop lint/js from the fix coverage table entirely? Answer Yes to keep eslint --fix; No to drop lint/js.",
+    "anchor": "h-per-check-fix-coverage"
+  }
+]
