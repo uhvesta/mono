@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use tempfile::tempdir;
 
@@ -549,4 +550,58 @@ class Foo {
     .await;
 
     assert!(findings.is_empty());
+}
+
+#[tokio::test]
+async fn applicable_file_count_matches_ticks_when_changeset_mixes_java_and_non_java() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("src")).expect("create src dir");
+    fs::write(temp.path().join("src/Foo.java"), "class Foo {}\n").expect("write java");
+    fs::write(temp.path().join("src/README.txt"), "docs\n").expect("write txt");
+
+    let config = &toml::Value::Table(toml::toml! {
+        lang = "java"
+        rules = [{ nocall = "java.util.concurrent.Future#get()" }]
+    });
+    let check = CodePatternsCheck;
+    let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+    let configured = check.configure(config).expect("configure");
+
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: Path::new("src/Foo.java").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: Path::new("src/README.txt").to_path_buf(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+
+    let total = configured.applicable_file_count(&changeset);
+    assert_eq!(total, 1, "only the .java file is eligible");
+
+    let ticks: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let ticks_clone = Arc::clone(&ticks);
+    let on_file_processed: Arc<dyn Fn(usize) + Send + Sync> = Arc::new(move |n| {
+        ticks_clone.lock().unwrap().push(n);
+    });
+
+    configured
+        .run_with_progress(&changeset, &tree, on_file_processed)
+        .await
+        .expect("run_with_progress must succeed");
+
+    let ticks = ticks.lock().unwrap().clone();
+    assert_eq!(
+        ticks,
+        vec![1],
+        "must emit exactly one tick for the one eligible .java file; got {ticks:?}"
+    );
+    assert!(
+        ticks.iter().all(|&n| n <= total),
+        "numerator must never exceed denominator ({total}); got {ticks:?}"
+    );
 }

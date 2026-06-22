@@ -30,6 +30,14 @@ impl Check for WorkflowActionVersionCheck {
 
 #[async_trait]
 impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
+    fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        changeset
+            .changed_files
+            .iter()
+            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && is_github_workflow_file(&f.path))
+            .count()
+    }
+
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
     }

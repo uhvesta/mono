@@ -30,6 +30,14 @@ impl Check for BazelversionPoliciesCheck {
 
 #[async_trait]
 impl ConfiguredCheck for CompiledBazelversionPoliciesConfig {
+    fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        changeset
+            .changed_files
+            .iter()
+            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && f.path == Path::new(".bazelversion"))
+            .count()
+    }
+
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
     }

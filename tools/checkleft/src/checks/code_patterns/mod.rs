@@ -34,6 +34,14 @@ impl Check for CodePatternsCheck {
 
 #[async_trait]
 impl ConfiguredCheck for config::CompiledCodePatternsConfig {
+    fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        changeset
+            .changed_files
+            .iter()
+            .filter(|f| !matches!(f.kind, ChangeKind::Deleted) && matches_language_path(&f.path, self.language))
+            .count()
+    }
+
     async fn run(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         self.run_with_progress(changeset, tree, Arc::new(|_| {})).await
     }
