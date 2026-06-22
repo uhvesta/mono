@@ -82,3 +82,9 @@ checks:
   - id: lint/rust
     policy:
       severity: error
+
+  - id: lint/js
+    policy:
+      severity: error
+    config:
+      config_file: "eslint.config.js"
