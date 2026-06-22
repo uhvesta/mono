@@ -13,4 +13,5 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/ci-env.sh"
 
 echo "--- [checks] running checks"
-CLICOLOR_FORCE=1 bin/checkleft run
+# --show-progress=true: render the interactive progress UI (Buildkite renders it cleanly).
+CLICOLOR_FORCE=1 bin/checkleft run --show-progress=true
