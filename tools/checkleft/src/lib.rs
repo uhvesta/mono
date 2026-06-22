@@ -14,6 +14,7 @@ pub mod input;
 pub mod install;
 pub mod output;
 pub mod path;
+pub mod progress;
 pub mod runner;
 pub mod source_tree;
 pub mod vcs;

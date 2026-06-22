@@ -44,6 +44,7 @@ required-features = ["benchmarking"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+console = { workspace = true }
 directories = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 globset = { workspace = true }

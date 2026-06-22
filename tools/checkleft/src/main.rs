@@ -23,6 +23,8 @@ use checkleft::install::{
     InstallOutcome, UninstallOutcome, install_pre_push_hook, pre_push_path, uninstall_pre_push_hook,
 };
 use checkleft::output::{CheckResult, Finding, Location, Severity, SuggestedFix};
+use checkleft::progress::render::TermRenderer;
+use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
 use checkleft::runner::Runner;
 use checkleft::source_tree::LocalSourceTree;
 use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
@@ -42,6 +44,14 @@ struct RunArgs {
     default_branch: Option<String>,
     #[arg(long, default_value = "human")]
     format: OutputFormat,
+    /// Show the interactive progress UI (per-check status lines + findings that
+    /// stream into a scrolling log). Auto-detected by default: on for an
+    /// interactive, color-capable terminal; off for pipes, CI, `NO_COLOR`, and
+    /// non-human `--format`. `--show-progress=false` forces it off and yields
+    /// output byte-identical to the non-interactive path; `--show-progress`
+    /// (or `=true`) forces it on.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    show_progress: Option<bool>,
 }
 
 /// Explicit log-level override (higher precedence than -v count and RUST_LOG).
@@ -387,6 +397,7 @@ async fn dispatch_run(
         base_ref,
         default_branch,
         format,
+        show_progress,
     }: RunArgs,
     root: &Path,
     vcs: &Vcs,
@@ -414,8 +425,26 @@ async fn dispatch_run(
         changed_files = changeset.changed_files.len(),
         "resolved changeset for run"
     );
+
+    // The progress UI is purely additive on the interactive path. When it is
+    // disabled the reporter is a no-op and output is byte-identical to before.
+    let style = OutputStyle::detect_for_stdout();
+    let progress_enabled = matches!(format, OutputFormat::Human)
+        && should_show_progress(
+            show_progress,
+            style.level,
+            std::io::stdout().is_terminal(),
+            stderr().is_terminal(),
+            detect_ci(),
+        );
+    let mut live = progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE));
+    let reporter: Arc<dyn ProgressReporter> = match &live {
+        Some(progress) => progress.reporter(make_render_findings(style)),
+        None => Arc::new(NoopProgressReporter),
+    };
+
     let run_started_at = Instant::now();
-    let mut results = runner.run_changeset(&changeset).await?;
+    let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
     let elapsed = run_started_at.elapsed();
     sort_results_for_output(&mut results);
     let total_findings: usize = results.iter().map(|r| r.findings.len()).sum();
@@ -427,7 +456,17 @@ async fn dispatch_run(
     );
 
     match format {
-        OutputFormat::Human => print_human_results(&results, elapsed),
+        OutputFormat::Human => {
+            if let Some(mut progress) = live.take() {
+                // Stop the render loop, leaving the final per-check status block on
+                // screen; the findings already streamed into the log area above it,
+                // so only the summary footer remains to print.
+                progress.finalize();
+                print!("{}", render_human_footer(&results, style, elapsed));
+            } else {
+                print_human_results(&results, elapsed);
+            }
+        }
         OutputFormat::Json => print_json_results(&results)?,
     }
 
@@ -883,6 +922,84 @@ fn severity_sort_key(severity: Severity) -> u8 {
         Severity::Warning => 1,
         Severity::Info => 2,
     }
+}
+
+/// Decide whether to show the interactive progress UI.
+///
+/// An explicit `--show-progress=<bool>` always wins. Otherwise (auto) it is on
+/// only for an interactive, color-capable terminal on both stdout and stderr and
+/// outside CI — matching checkleft's existing color gating (`NO_COLOR`,
+/// `is_terminal`) so the UI is never drawn into a pipe, a log, or CI output.
+fn should_show_progress(flag: Option<bool>, color: ColorLevel, stdout_tty: bool, stderr_tty: bool, ci: bool) -> bool {
+    match flag {
+        Some(value) => value,
+        None => color != ColorLevel::None && stdout_tty && stderr_tty && !ci,
+    }
+}
+
+/// Whether we appear to be running under CI (where the progress UI is off by
+/// default even if a pseudo-tty is allocated).
+fn detect_ci() -> bool {
+    ci_from_env(std::env::var("CI").ok().as_deref())
+}
+
+/// Pure core of [`detect_ci`]: a `CI` env value counts as CI when it is present
+/// and not an explicit falsey value. Split out so it is testable without
+/// mutating process environment.
+fn ci_from_env(raw: Option<&str>) -> bool {
+    matches!(raw, Some(value) if !value.is_empty() && value != "0" && value != "false")
+}
+
+/// Build the closure the progress reporter uses to render a check's findings
+/// into the scrolling log area, in the same form as the non-interactive output.
+fn make_render_findings(style: OutputStyle) -> RenderFindings {
+    Arc::new(move |result: &CheckResult| {
+        let mut findings = result.findings.clone();
+        findings.sort_by_key(|finding| severity_sort_key(finding.severity));
+        let mut out = String::new();
+        for finding in &findings {
+            out.push_str(&render_finding(result, finding, style));
+        }
+        out
+    })
+}
+
+/// The trailing summary the interactive path prints after finalizing the status
+/// block. The per-finding bodies already streamed into the log area, so for the
+/// has-findings case this is only the summary line; the no-findings and
+/// no-checks cases match [`render_human_results`] exactly.
+fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Duration) -> String {
+    if results.is_empty() {
+        return "No checks ran.\n".to_owned();
+    }
+
+    let total_findings: usize = results.iter().map(|result| result.findings.len()).sum();
+    if total_findings == 0 {
+        return format!(
+            "{}: no findings ({} checks ran in {}s)\n",
+            style.paint_info("checks"),
+            results.len(),
+            elapsed.as_secs()
+        );
+    }
+
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    for result in results {
+        for finding in &result.findings {
+            match finding.severity {
+                Severity::Error => errors += 1,
+                Severity::Warning => warnings += 1,
+                Severity::Info => infos += 1,
+            }
+        }
+    }
+
+    format!(
+        "{}: {errors} error(s), {warnings} warning(s), {infos} info finding(s)\n",
+        style.paint_bold("summary")
+    )
 }
 
 fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Duration) -> String {

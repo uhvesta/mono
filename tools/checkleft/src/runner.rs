@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use tokio::task::JoinSet;
+
+use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
 
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
@@ -121,6 +124,24 @@ impl Runner {
     }
 
     pub async fn run_changeset(&self, changeset: &ChangeSet) -> Result<Vec<CheckResult>> {
+        // The non-interactive path: a no-op reporter, so behavior and output are
+        // identical to a build without the progress UI.
+        self.run_changeset_with_progress(changeset, Arc::new(NoopProgressReporter))
+            .await
+    }
+
+    /// Like [`Self::run_changeset`] but emits per-check lifecycle events to
+    /// `reporter` for the interactive progress UI. The reporter is
+    /// presentation-only: it never affects scheduling, findings, or ordering of
+    /// the returned results. Each executing check registers up front, then emits
+    /// `start` / `finish` from its own task (checks run concurrently, hence the
+    /// thread-safe `Arc<dyn ProgressReporter>`); findings stream into the log
+    /// area as each check completes.
+    pub async fn run_changeset_with_progress(
+        &self,
+        changeset: &ChangeSet,
+        reporter: Arc<dyn ProgressReporter>,
+    ) -> Result<Vec<CheckResult>> {
         let scheduled = self.schedule_runs(changeset)?;
         info!(
             scheduled_runs = scheduled.runs.len(),
@@ -129,6 +150,11 @@ impl Runner {
         );
 
         let mut results = scheduled.diagnostics;
+        // Config diagnostics are produced synchronously (no run); stream them so
+        // they appear in the log area alongside the checks that did run.
+        for result in &results {
+            reporter.stream_findings(result);
+        }
         let mut join_set = JoinSet::new();
         for run in scheduled.runs {
             match run.execution {
@@ -144,32 +170,39 @@ impl Runner {
                         file_count,
                         "running built-in check"
                     );
+                    reporter.register(&configured_check_id, file_count);
+                    let reporter = Arc::clone(&reporter);
 
                     join_set.spawn(async move {
-                        let check_start = std::time::Instant::now();
-                        check
-                            .run(&run_changeset, source_tree.as_ref())
-                            .await
-                            .map(|mut result| {
-                                let elapsed_ms = check_start.elapsed().as_millis();
+                        reporter.start(&configured_check_id);
+                        let check_start = Instant::now();
+                        match check.run(&run_changeset, source_tree.as_ref()).await {
+                            Ok(mut result) => {
+                                let elapsed = check_start.elapsed();
                                 // Report findings under the configured instance id.
                                 result.check_id = configured_check_id.clone();
                                 let result = apply_policy_to_result(result, &run_policy, &run_changeset);
                                 info!(
                                     check_id = %configured_check_id,
-                                    elapsed_ms,
+                                    elapsed_ms = elapsed.as_millis(),
                                     findings = result.findings.len(),
                                     "built-in check complete"
                                 );
-                                result
-                            })
-                            .map_err(|err| (configured_check_id, source_path, err))
+                                reporter.stream_findings(&result);
+                                reporter.finish(&configured_check_id, files_failed_count(&result), elapsed);
+                                Ok(result)
+                            }
+                            Err(err) => {
+                                reporter.finish(&configured_check_id, 1, check_start.elapsed());
+                                Err((configured_check_id, source_path, err))
+                            }
+                        }
                     });
                 }
                 ScheduledExecution::BuiltInMissing {
                     implementation_check_id,
                 } => {
-                    results.push(CheckResult {
+                    let result = CheckResult {
                         check_id: run.configured_check_id,
                         findings: vec![Finding {
                             severity: Severity::Error,
@@ -187,7 +220,9 @@ impl Runner {
                             ],
                             suggested_fix: None,
                         }],
-                    });
+                    };
+                    reporter.stream_findings(&result);
+                    results.push(result);
                 }
                 ScheduledExecution::ExternalResolved { package } => {
                     let external_executor = Arc::clone(&self.external_executor);
@@ -208,45 +243,57 @@ impl Runner {
                         file_count,
                         "running external check"
                     );
+                    reporter.register(&configured_check_id, file_count);
+                    let reporter = Arc::clone(&reporter);
 
                     join_set.spawn(async move {
+                        reporter.start(&configured_check_id);
                         // The executor is synchronous but wasmtime-wasi internally calls
                         // block_on, which panics if a Tokio runtime is already active on
                         // the thread.  spawn_blocking moves execution onto a thread-pool
                         // thread where no runtime is running.
                         let check_id_clone = configured_check_id.clone();
                         let source_path_clone = source_path.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let check_start = std::time::Instant::now();
-                            external_executor
-                                .execute(
-                                    &package,
-                                    &run_changeset,
-                                    source_tree.as_ref(),
-                                    &run_config,
-                                    &run_config_dir,
-                                    run_policy.severity_override,
-                                )
-                                .map(|mut result| {
-                                    let elapsed_ms = check_start.elapsed().as_millis();
+                        let task_reporter = Arc::clone(&reporter);
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            let check_start = Instant::now();
+                            match external_executor.execute(
+                                &package,
+                                &run_changeset,
+                                source_tree.as_ref(),
+                                &run_config,
+                                &run_config_dir,
+                                run_policy.severity_override,
+                            ) {
+                                Ok(mut result) => {
+                                    let elapsed = check_start.elapsed();
                                     result.check_id = configured_check_id.clone();
                                     let result = apply_policy_to_result(result, &run_policy, &run_changeset);
                                     info!(
                                         check_id = %configured_check_id,
-                                        elapsed_ms,
+                                        elapsed_ms = elapsed.as_millis(),
                                         findings = result.findings.len(),
                                         "external check complete"
                                     );
-                                    result
-                                })
-                                .map_err(|err| (configured_check_id, source_path, err))
+                                    task_reporter.stream_findings(&result);
+                                    task_reporter.finish(&configured_check_id, files_failed_count(&result), elapsed);
+                                    Ok(result)
+                                }
+                                Err(err) => {
+                                    task_reporter.finish(&configured_check_id, 1, check_start.elapsed());
+                                    Err((configured_check_id, source_path, err))
+                                }
+                            }
                         })
-                        .await
-                        .unwrap_or_else(|e| Err((check_id_clone, source_path_clone, anyhow!("executor panicked: {e}"))))
+                        .await;
+                        outcome.unwrap_or_else(|e| {
+                            reporter.finish(&check_id_clone, 1, Duration::ZERO);
+                            Err((check_id_clone, source_path_clone, anyhow!("executor panicked: {e}")))
+                        })
                     });
                 }
                 ScheduledExecution::Invalid { message, remediation } => {
-                    results.push(CheckResult {
+                    let result = CheckResult {
                         check_id: run.configured_check_id,
                         findings: vec![Finding {
                             severity: Severity::Error,
@@ -259,7 +306,9 @@ impl Runner {
                             remediations: remediation.into_iter().collect(),
                             suggested_fix: None,
                         }],
-                    });
+                    };
+                    reporter.stream_findings(&result);
+                    results.push(result);
                 }
             }
         }
@@ -268,7 +317,7 @@ impl Runner {
             match join_result {
                 Ok(Ok(result)) => results.push(result),
                 Ok(Err((check_id, source_path, err))) => {
-                    results.push(CheckResult {
+                    let result = CheckResult {
                         check_id,
                         findings: vec![Finding {
                             severity: Severity::Error,
@@ -281,7 +330,11 @@ impl Runner {
                             remediations: vec![],
                             suggested_fix: None,
                         }],
-                    });
+                    };
+                    // The status line was already marked failed from the task; stream
+                    // the rendered execution-failure finding into the log area.
+                    reporter.stream_findings(&result);
+                    results.push(result);
                 }
                 Err(join_err) => {
                     return Err(anyhow!("runner task failed to execute: {join_err}"));
@@ -289,7 +342,11 @@ impl Runner {
             }
         }
 
-        results.extend(self.audit_stale_exclusions(changeset).await?);
+        let audit = self.audit_stale_exclusions(changeset).await?;
+        for result in &audit {
+            reporter.stream_findings(result);
+        }
+        results.extend(audit);
 
         results.sort_by(|left, right| left.check_id.cmp(&right.check_id));
         Ok(results)

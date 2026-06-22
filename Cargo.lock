@@ -586,6 +586,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "console",
  "directories",
  "filetime",
  "globset",

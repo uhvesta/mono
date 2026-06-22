@@ -6,9 +6,9 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 use checkleft::change_detection::environment::CiEnvironment;
 
 use super::{
-    ColorLevel, ExternalProviderMode, OutputStyle, github_auth_unavailable_warning, normalize_optional_description,
-    parse_external_provider_mode, parse_github_ref_pr_number, render_human_results, resolve_github_token_from_sources,
-    sort_results_for_output,
+    ColorLevel, ExternalProviderMode, OutputStyle, ci_from_env, github_auth_unavailable_warning,
+    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer,
+    render_human_results, resolve_github_token_from_sources, should_show_progress, sort_results_for_output,
 };
 
 #[test]
@@ -578,6 +578,130 @@ fn resolve_github_token_trims_whitespace_from_token() {
     // gh auth token output may include a trailing newline.
     let token = resolve_github_token_from_sources(None, None, None, Some("  gh-cli-token\n  "));
     assert_eq!(token.as_deref(), Some("gh-cli-token"));
+}
+
+// --- progress auto-detection (should_show_progress / detect_ci) ---
+
+#[test]
+fn progress_auto_on_for_interactive_color_terminal() {
+    // tty stdout + tty stderr + color + not CI → on.
+    assert!(should_show_progress(None, ColorLevel::Basic, true, true, false));
+    assert!(should_show_progress(None, ColorLevel::TrueColor, true, true, false));
+}
+
+#[test]
+fn progress_auto_off_without_color() {
+    // NO_COLOR / non-color terminal collapses ColorLevel to None → off.
+    assert!(!should_show_progress(None, ColorLevel::None, true, true, false));
+}
+
+#[test]
+fn progress_auto_off_when_piped() {
+    // stdout not a terminal (piped) → off, even with color forced.
+    assert!(!should_show_progress(None, ColorLevel::Basic, false, true, false));
+    // stderr not a terminal → off.
+    assert!(!should_show_progress(None, ColorLevel::Basic, true, false, false));
+}
+
+#[test]
+fn progress_auto_off_in_ci() {
+    assert!(!should_show_progress(None, ColorLevel::Basic, true, true, true));
+}
+
+#[test]
+fn progress_flag_forces_regardless_of_environment() {
+    // --show-progress=false forces off even on a perfect interactive terminal.
+    assert!(!should_show_progress(
+        Some(false),
+        ColorLevel::TrueColor,
+        true,
+        true,
+        false
+    ));
+    // --show-progress=true forces on even when piped / no-color / CI.
+    assert!(should_show_progress(Some(true), ColorLevel::None, false, false, true));
+}
+
+#[test]
+fn ci_from_env_recognizes_truthy_and_falsey_values() {
+    assert!(ci_from_env(Some("true")));
+    assert!(ci_from_env(Some("1")));
+    assert!(!ci_from_env(Some("false")), "literal `false` must not count as CI");
+    assert!(!ci_from_env(Some("0")), "literal `0` must not count as CI");
+    assert!(!ci_from_env(Some("")), "empty CI must not count as CI");
+    assert!(!ci_from_env(None), "unset CI must not count as CI");
+}
+
+// --- byte-identical disabled output (snapshot) ---
+
+fn snapshot_results() -> Vec<CheckResult> {
+    vec![CheckResult {
+        check_id: "typo".to_owned(),
+        findings: vec![Finding {
+            severity: Severity::Error,
+            message: "Found typo.".to_owned(),
+            location: Some(Location {
+                path: PathBuf::from("a.rs"),
+                line: Some(3),
+                column: Some(5),
+            }),
+            remediations: vec!["Fix it.".to_owned()],
+            suggested_fix: None,
+        }],
+    }]
+}
+
+#[test]
+fn disabled_path_output_is_byte_identical_snapshot() {
+    // Pins the exact bytes of the non-interactive human output. The interactive
+    // path must never change this; `--show-progress=false` routes here verbatim.
+    let output = render_human_results(
+        &snapshot_results(),
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+    assert_eq!(
+        output,
+        "error[typo]: Found typo.\n  --> a.rs:3:5\n   = to resolve: Fix it.\n\nsummary: 1 error(s), 0 warning(s), 0 info finding(s)\n"
+    );
+}
+
+#[test]
+fn footer_only_emits_summary_line_for_has_findings() {
+    // On the interactive path the finding bodies stream live, so the trailing
+    // footer is just the summary line — identical to the last line of the
+    // non-interactive output.
+    let footer = render_human_footer(
+        &snapshot_results(),
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+    assert_eq!(footer, "summary: 1 error(s), 0 warning(s), 0 info finding(s)\n");
+}
+
+#[test]
+fn footer_matches_disabled_output_for_no_findings_and_no_checks() {
+    let style = OutputStyle {
+        level: ColorLevel::None,
+    };
+    // No findings: footer is identical to the disabled path's whole output.
+    let no_findings = vec![CheckResult {
+        check_id: "example".to_owned(),
+        findings: vec![],
+    }];
+    assert_eq!(
+        render_human_footer(&no_findings, style, Duration::from_secs(12)),
+        render_human_results(&no_findings, style, Duration::from_secs(12)),
+    );
+    // No checks at all.
+    assert_eq!(
+        render_human_footer(&[], style, Duration::from_secs(0)),
+        render_human_results(&[], style, Duration::from_secs(0)),
+    );
 }
 
 // --- github_auth_unavailable_warning ---
