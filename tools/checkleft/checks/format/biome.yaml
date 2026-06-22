@@ -85,3 +85,15 @@ invocations:
         severity: warning
         remediations:
           - "Run `{{needs.biome.invocation}} format --write {{item.path}}` to auto-format."
+    fix:
+      # biome format --write rewrites each file in place and exits 0 on success.
+      # --files-ignore-unknown=true carried over so stray files are skipped silently.
+      # No --reporter flag: we don't need to parse output in fix mode.
+      args:
+        - "format"
+        - "--files-ignore-unknown=true"
+        - "--write"
+        - "{{files}}"
+      exit:
+        "0": ok
+        default: error

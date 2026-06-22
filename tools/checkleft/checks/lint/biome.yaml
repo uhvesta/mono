@@ -93,3 +93,17 @@ invocations:
         severity: "{{item.sev}}"
         remediations:
           - "Fix the Biome lint violation, or suppress it with a justified `// biome-ignore lint: <reason>` comment."
+    fix:
+      # --write applies safe auto-fixes in place. Exit 1 means unfixable diagnostics
+      # remain — that is not a fix error; the post-verify pass will report the residue.
+      # --files-ignore-unknown=true carried over so stray files are skipped silently.
+      # No --reporter flag: we don't need to parse output in fix mode.
+      args:
+        - "lint"
+        - "--files-ignore-unknown=true"
+        - "--write"
+        - "{{files}}"
+      exit:
+        "0": ok
+        "1": ok
+        default: error

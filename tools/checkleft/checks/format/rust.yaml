@@ -54,3 +54,13 @@ invocations:
       message: "file needs rustfmt formatting"
       remediations:
         - "Run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{input.file}}`."
+    fix:
+      # Drop --check and -l; rustfmt writes the file in place and exits 0 on success.
+      # --config-path pin is kept so the repo's rustfmt.toml governs the rewrite.
+      # Mode inherits per_file from the parent invocation — one process per file.
+      args:
+        - "--config-path={{repo_root}}"
+        - "{{file}}"
+      exit:
+        "0": ok
+        default: error

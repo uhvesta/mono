@@ -72,3 +72,14 @@ invocations:
       message: "file needs prettier formatting"
       remediations:
         - "Run `{{needs.prettier.invocation}} --write {{input.file}}` to auto-format."
+    fix:
+      # prettier --write rewrites each file in place and exits 0 on success.
+      # Exit 2 (parse error) is a genuine failure — abort copy-back.
+      # --ignore-unknown carried over so stray files are skipped rather than erroring.
+      args:
+        - "--write"
+        - "--ignore-unknown"
+        - "{{files}}"
+      exit:
+        "0": ok
+        default: error

@@ -36,3 +36,11 @@ invocations:
         severity: warning
         remediations:
           - "Run `buildifier {{item.filename}}` to auto-format."
+    fix:
+      # -mode=fix rewrites each file in place; exits 0 on success.
+      args:
+        - "-mode=fix"
+        - "{{files}}"
+      exit:
+        "0": ok
+        default: error

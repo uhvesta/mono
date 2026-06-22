@@ -39,3 +39,14 @@ invocations:
         severity: warning
         remediations:
           - "Run `buildifier --lint=fix {{input.file}}` to auto-fix, or resolve manually."
+    fix:
+      # -lint=fix -mode=fix applies lint fixes and rewrites files in place (batch).
+      # Override mode to batch: one process covers all files, unlike the per_file check.
+      mode: batch
+      args:
+        - "-lint=fix"
+        - "-mode=fix"
+        - "{{files}}"
+      exit:
+        "0": ok
+        default: error

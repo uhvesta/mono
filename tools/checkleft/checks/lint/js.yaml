@@ -90,3 +90,19 @@ invocations:
         severity: "{{item.sev}}"
         remediations:
           - "Fix the ESLint violation, or suppress with a justified `// eslint-disable-next-line` comment."
+    fix:
+      # --fix applies auto-fixable violations in place. Exit 1 means unfixable errors
+      # remain — that is not a fix error; the post-verify pass will report the residue.
+      # Exit 2 is a config/internal error — abort copy-back.
+      # --no-config-lookup and --config carried over to enforce the required config_file.
+      # No --format flag: we don't need to parse output in fix mode.
+      args:
+        - "--no-config-lookup"
+        - "--config"
+        - "{{config.config_file}}"
+        - "--fix"
+        - "{{files}}"
+      exit:
+        "0": ok
+        "1": ok
+        default: error

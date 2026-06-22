@@ -4,7 +4,32 @@ use crate::external::{ExternalCheckPackageImplementation, parse_declarative_chec
 
 use super::{FixExitOutcome, InvocationMode};
 
-const RUSTFMT_MANIFEST: &str = include_str!("../../../checks/format/rust.yaml");
+/// A minimal manifest with NO fix block — used to assert fix == None.
+const NO_FIX_MANIFEST: &str = r#"
+id: format/no-fix
+mode: declarative
+runtime: declarative-v1
+api_version: v1
+applies_to: ["**/*.txt"]
+
+needs:
+  mytool:
+    default:
+      path: mytool
+
+invocations:
+  - id: check
+    run: mytool
+    mode: batch
+    args: ["--check", "{{files}}"]
+    exit:
+      "0": ok
+      "1": findings
+      default: error
+    transform:
+      kind: linelist
+      message: "file needs mytool formatting"
+"#;
 
 /// A minimal YAML manifest with a `fix` block on a batch invocation.
 const FIX_BLOCK_MANIFEST: &str = r#"
@@ -67,7 +92,7 @@ fn fix_block_parses_with_inherited_run_and_mode() {
 #[test]
 fn fix_block_absent_means_no_fix() {
     // An invocation without a fix block must have fix == None.
-    let package = parse_declarative_check_manifest(RUSTFMT_MANIFEST).expect("rustfmt manifest must parse");
+    let package = parse_declarative_check_manifest(NO_FIX_MANIFEST).expect("no-fix manifest must parse");
     let declarative = match package.implementation {
         ExternalCheckPackageImplementation::Declarative(d) => d,
         other => panic!("expected declarative, got {other:?}"),

@@ -94,3 +94,12 @@ invocations:
       message: "file needs oxfmt formatting"
       remediations:
         - "Run `{{needs.oxfmt.invocation}} --write {{input.file}}` to auto-format."
+    fix:
+      # oxfmt --write rewrites each file in place and exits 0 on success.
+      # Exit 2 (parse/syntax error) is a genuine failure — abort copy-back.
+      args:
+        - "--write"
+        - "{{files}}"
+      exit:
+        "0": ok
+        default: error

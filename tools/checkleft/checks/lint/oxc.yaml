@@ -110,3 +110,17 @@ invocations:
         severity: "{{item.sev}}"
         remediations:
           - "Fix the oxlint violation, or suppress it with a justified `// oxlint-disable-next-line <rule>` comment."
+    fix:
+      # --fix applies auto-fixable violations in place. Exit 1 means unfixable
+      # diagnostics remain — that is not a fix error (the fixable ones were applied);
+      # the post-verify pass will report the residue.
+      # --no-error-on-unmatched-pattern carried over so an all-ignored set is a no-op.
+      # No --format flag: we don't need to parse output in fix mode.
+      args:
+        - "--fix"
+        - "--no-error-on-unmatched-pattern"
+        - "{{files}}"
+      exit:
+        "0": ok
+        "1": ok
+        default: error
