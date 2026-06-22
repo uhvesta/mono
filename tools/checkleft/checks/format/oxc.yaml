@@ -68,25 +68,26 @@ needs:
 invocations:
   - id: format
     run: oxfmt
-    mode: per_file
+    mode: batch
     args:
-      # --list-different: print the path of each file that is NOT already
-      # formatted (one per line) and exit 1; exit 0 when the file is formatted.
-      # This is CHECK mode — it never writes the file. The linelist transform
-      # turns each printed path into one file-level finding. (We use per_file so
-      # the remediation can name `{{input.file}}`, mirroring format/prettier.)
+      # --list-different: print the path of each file NOT already formatted (one
+      # per line) and exit non-zero. Batch mode runs one process over all files,
+      # paying npx startup once. The linelist transform maps each printed path to
+      # a per-file finding. This is CHECK mode — it never writes files.
       - "--list-different"
-      - "{{file}}"
-    # oxfmt 0.55.0 exit codes (cleaner than prettier, which conflates 1):
-    #   0 = already formatted (ok)
-    #   1 = needs formatting (path printed on stdout via --list-different)
-    #   2 = operational error, e.g. a parse/syntax error (message on stderr, no
-    #       stdout file list) — surfaced as a per-file error finding, not "clean".
-    # In per_file mode a `default → error` outcome is isolated to that one file
-    # and the loop continues, so one unparseable file never masks the rest.
+      - "{{files}}"
+    # oxfmt 0.55.0 exit codes in batch mode:
+    #   0 = all files already formatted (ok)
+    #   1 = at least one file needs formatting (unformatted paths on stdout)
+    #   2 = at least one parse/syntax error (message on stderr); oxfmt continues
+    #       past the bad file and still reports unformatted paths on stdout.
+    #       Mapped to `findings` so the linelist transform runs: files with
+    #       unformatted output become findings; an all-error batch (empty stdout)
+    #       causes the linelist to bail as an operational error.
     exit:
       "0": ok
       "1": findings
+      "2": findings
       default: error
     transform:
       kind: linelist

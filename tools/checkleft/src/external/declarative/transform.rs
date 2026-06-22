@@ -226,7 +226,7 @@ impl LineListTransform {
         &self,
         stdout: &[u8],
         exit_code: Option<i32>,
-        input_file: Option<&str>,
+        _input_file: Option<&str>,
         needs_invocations: Option<&BTreeMap<String, String>>,
     ) -> Result<Vec<Finding>> {
         let text = std::str::from_utf8(stdout).context("linelist transform: stdout is not valid UTF-8")?;
@@ -243,30 +243,36 @@ impl LineListTransform {
                  operational error (e.g. parse failure), not a clean result"
             );
         }
-        let context = RenderContext {
-            input_file,
-            exit_code,
-            needs_invocations,
-        };
-        let message = self.message.render(NO_JSON_ITEM, context)?;
-        let remediations = self
-            .remediations
-            .iter()
-            .map(|r| r.render(NO_JSON_ITEM, context))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(paths
+        // Render message and remediations per-path, using each stdout path as
+        // `input.file`. This lets `{{input.file}}` work in both per_file and batch
+        // mode: in per_file mode the stdout path is the file being checked; in batch
+        // mode it is the specific unformatted file for that finding.
+        paths
             .into_iter()
-            .map(|path| Finding {
-                severity: self.severity,
-                message: message.clone(),
-                location: Some(Location {
-                    path: PathBuf::from(path),
-                    line: None,
-                    column: None,
-                }),
-                remediations: remediations.clone(),
-                suggested_fix: None,
+            .map(|path| {
+                let context = RenderContext {
+                    input_file: Some(path),
+                    exit_code,
+                    needs_invocations,
+                };
+                let message = self.message.render(NO_JSON_ITEM, context)?;
+                let remediations = self
+                    .remediations
+                    .iter()
+                    .map(|r| r.render(NO_JSON_ITEM, context))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Finding {
+                    severity: self.severity,
+                    message,
+                    location: Some(Location {
+                        path: PathBuf::from(path),
+                        line: None,
+                        column: None,
+                    }),
+                    remediations,
+                    suggested_fix: None,
+                })
             })
-            .collect())
+            .collect()
     }
 }

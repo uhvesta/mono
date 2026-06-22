@@ -1666,8 +1666,8 @@ fn prettier_manifest_parses_correctly() {
     let package = parse_prettier_package();
     assert_eq!(package.invocations.len(), 1);
     assert_eq!(package.invocations[0].id, "format");
-    // per_file so the linelist remediation can name `{{input.file}}`, mirroring rustfmt.
-    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::PerFile);
+    // batch: one Prettier process over all files, paying npx startup once.
+    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::Batch);
     let args = &tool(&package.invocations[0]).args;
     assert!(
         args.iter().any(|a| a == "--list-different"),
@@ -1677,11 +1677,16 @@ fn prettier_manifest_parses_correctly() {
         args.iter().any(|a| a == "--ignore-unknown"),
         "expected --ignore-unknown so unsupported files are skipped, not errors; got: {args:?}"
     );
-    // exit 0 = formatted (ok); exit 1 = needs formatting (findings) or operational
-    // error (handled by linelist); anything else = error.
+    assert!(
+        args.iter().any(|a| a == "{{files}}"),
+        "expected {{{{files}}}} for batch mode; got: {args:?}"
+    );
+    // exit 0 = all formatted (ok); exit 1 = some need formatting (findings);
+    // exit 2 = parse/syntax error but Prettier continues and reports other files
+    // (findings); anything else = error so a crash never reads as clean.
     assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Ok);
     assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Findings);
-    assert_eq!(package.invocations[0].exit.classify(Some(2)), ExitOutcome::Error);
+    assert_eq!(package.invocations[0].exit.classify(Some(2)), ExitOutcome::Findings);
     assert_eq!(package.invocations[0].exit.classify(None), ExitOutcome::Error);
 }
 
@@ -2061,16 +2066,18 @@ fn prettier_skips_files_outside_applies_to() {
 
 #[cfg(unix)]
 #[test]
-fn prettier_exit_two_with_no_output_surfaces_as_error_finding() {
-    // prettier exit 2 (e.g. a syntax error) is `default → error` in the manifest.
-    // In per_file mode, a file-level error is isolated: it produces an error-severity
-    // finding scoped to the file rather than aborting the whole check (which would
-    // suppress every other file's results). The check still fails — an error-severity
-    // finding is surfaced — but other files are not masked.
+fn prettier_exit_two_with_no_output_causes_check_error() {
+    // In batch mode, prettier exit 2 maps to `findings` and the linelist runs.
+    // With empty stdout (all files errored), the linelist bails as an operational
+    // error — the check returns Err rather than a spurious "zero findings" result.
     let repo_root = tempfile::tempdir().expect("temp repo root");
     let script_path = repo_root.path().join("fake_prettier.sh");
     write_executable(&script_path, "#!/bin/sh\necho 'tool error' >&2\nexit 2\n");
     let manifest = prettier_manifest_with_path_default(&script_path);
+    assert_ne!(
+        manifest, PRETTIER_MANIFEST,
+        "path-default replacement did not match the manifest"
+    );
     let package = parse_declarative_check_manifest(&manifest).expect("manifest parses");
     let declarative = match package.implementation {
         ExternalCheckPackageImplementation::Declarative(d) => d,
@@ -2081,7 +2088,7 @@ fn prettier_exit_two_with_no_output_surfaces_as_error_finding() {
         kind: ChangeKind::Modified,
         old_path: None,
     }]);
-    let result = super::run_declarative_check(
+    let err = super::run_declarative_check(
         repo_root.path(),
         "format/prettier",
         &declarative,
@@ -2089,29 +2096,11 @@ fn prettier_exit_two_with_no_output_surfaces_as_error_finding() {
         &toml::Value::Table(Default::default()),
         None,
     )
-    .expect("per_file error mode returns Ok with an error-severity finding, not Err");
-    assert_eq!(
-        result.findings.len(),
-        1,
-        "one file → one error finding; got: {:#?}",
-        result.findings
-    );
-    let f = &result.findings[0];
-    assert_eq!(
-        f.severity,
-        Severity::Error,
-        "exit-2 file must produce an error-severity finding"
-    );
+    .expect_err("batch mode: exit 2 + empty stdout must return Err (operational error)");
+    let msg = format!("{err:#}");
     assert!(
-        f.message.contains("exit") || f.message.contains("2"),
-        "error finding must explain the failure (exit code); got: {}",
-        f.message
-    );
-    let loc = f.location.as_ref().expect("error finding must name the file");
-    assert_eq!(
-        loc.path,
-        Path::new("src/app.ts"),
-        "error finding must be scoped to the failing file"
+        msg.contains("operational error") || msg.contains("exit") || msg.contains("no output"),
+        "error must explain the cause; got: {msg}"
     );
 }
 
@@ -2168,9 +2157,10 @@ fn prettier_linelist_remediation_renders_default_invocation() {
     let mut needs_invocations = BTreeMap::new();
     needs_invocations.insert("prettier".to_owned(), "npx --yes prettier@3.8.4".to_owned());
 
-    // Simulate prettier --list-different printing "src/app.ts" and exiting 1.
+    // Simulate prettier --list-different (batch) printing "src/app.ts" and exiting 1.
+    // input_file is None in batch mode; the linelist uses the stdout path per-finding.
     let findings = transform
-        .apply(b"src/app.ts\n", Some(1), Some("src/app.ts"), Some(&needs_invocations))
+        .apply(b"src/app.ts\n", Some(1), None, Some(&needs_invocations))
         .expect("linelist transform with needs_invocations");
 
     assert_eq!(findings.len(), 1);
@@ -2196,8 +2186,9 @@ fn prettier_linelist_remediation_renders_overridden_version() {
     let mut needs_invocations = BTreeMap::new();
     needs_invocations.insert("prettier".to_owned(), "npx --yes prettier@3.9.0".to_owned());
 
+    // input_file is None in batch mode; the linelist uses the stdout path per-finding.
     let findings = transform
-        .apply(b"src/app.ts\n", Some(1), Some("src/app.ts"), Some(&needs_invocations))
+        .apply(b"src/app.ts\n", Some(1), None, Some(&needs_invocations))
         .expect("linelist transform with version override");
 
     assert_eq!(findings.len(), 1);

@@ -44,14 +44,14 @@ fn format_oxc_manifest_parses_correctly() {
     );
     assert_eq!(package.invocations.len(), 1);
     assert_eq!(package.invocations[0].id, "format");
-    // per_file so the linelist remediation can name `{{input.file}}`, mirroring prettier.
-    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::PerFile);
-    // oxfmt exit codes: 0 = formatted (ok); 1 = needs formatting (path on stdout via
-    // --list-different → findings); 2 = parse/operational error (no file list) →
-    // error; anything else also error so a crash never reads as clean.
+    // batch: one oxfmt process over all files, paying npx startup once.
+    assert_eq!(tool(&package.invocations[0]).mode, InvocationMode::Batch);
+    // oxfmt exit codes: 0 = all formatted (ok); 1 = some need formatting (findings);
+    // 2 = parse/syntax error but oxfmt continues and reports other files (findings);
+    // anything else = error so a crash never reads as clean.
     assert_eq!(package.invocations[0].exit.classify(Some(0)), ExitOutcome::Ok);
     assert_eq!(package.invocations[0].exit.classify(Some(1)), ExitOutcome::Findings);
-    assert_eq!(package.invocations[0].exit.classify(Some(2)), ExitOutcome::Error);
+    assert_eq!(package.invocations[0].exit.classify(Some(2)), ExitOutcome::Findings);
     assert_eq!(package.invocations[0].exit.classify(None), ExitOutcome::Error);
 }
 
@@ -64,8 +64,8 @@ fn format_oxc_args_use_list_different_and_never_write() {
         "format/oxc must pass --list-different so violated paths appear on stdout; got: {args:?}"
     );
     assert!(
-        args.iter().any(|a| a == "{{file}}"),
-        "format/oxc must pass the per-file path; got: {args:?}"
+        args.iter().any(|a| a == "{{files}}"),
+        "format/oxc must pass the batch file set via {{{{files}}}}; got: {args:?}"
     );
     // Format-CHECK mode only: must NOT mutate files in the check invocation.
     assert!(
@@ -190,12 +190,13 @@ fn format_oxc_npm_version_override_repins() {
 fn format_oxc_transform_emits_one_file_level_finding_with_dynamic_remediation() {
     let package = parse_format_oxc_package();
     let needs = oxfmt_needs();
-    // per_file mode: oxfmt --list-different prints the unformatted file's path and
-    // exits 1. The linelist transform turns that path into one file-level finding;
-    // the remediation renders the resolved invocation + the per-file `{{input.file}}`.
+    // batch mode: oxfmt --list-different prints the unformatted file's path and
+    // exits 1. The linelist transform turns each printed path into one file-level
+    // finding; the remediation renders the resolved invocation + the path from
+    // stdout as `{{input.file}}`.
     let findings = package.invocations[0]
         .transform
-        .apply(b"src/a.ts\n", Some(1), Some("src/a.ts"), Some(&needs))
+        .apply(b"src/a.ts\n", Some(1), None, Some(&needs))
         .expect("format/oxc transform");
     assert_eq!(findings.len(), 1, "one finding expected; got: {findings:?}");
     let f = &findings[0];
@@ -242,7 +243,7 @@ fn write_executable_script(path: &Path, body: &str) {
 }
 
 #[cfg(unix)]
-fn run_format_oxc(script_body: &str, file: &str) -> CheckResult {
+fn run_format_oxc_result(script_body: &str, files: &[&str]) -> anyhow::Result<CheckResult> {
     let temp = tempfile::tempdir().expect("temp dir");
     let script_path = temp.path().join("fake_oxfmt.sh");
     write_executable_script(&script_path, script_body);
@@ -253,14 +254,23 @@ fn run_format_oxc(script_body: &str, file: &str) -> CheckResult {
         ExternalCheckPackageImplementation::Declarative(d) => d,
         other => panic!("expected declarative, got {other:?}"),
     };
-    let changeset = ChangeSet::new(vec![ChangedFile {
-        path: std::path::PathBuf::from(file),
-        kind: ChangeKind::Modified,
-        old_path: None,
-    }]);
+    let changeset = ChangeSet::new(
+        files
+            .iter()
+            .map(|f| ChangedFile {
+                path: std::path::PathBuf::from(f),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            })
+            .collect(),
+    );
     let config = toml::Value::Table(Default::default());
     super::run_declarative_check(temp.path(), "format/oxc", &declarative, &changeset, &config, None)
-        .expect("run succeeds")
+}
+
+#[cfg(unix)]
+fn run_format_oxc(script_body: &str, file: &str) -> CheckResult {
+    run_format_oxc_result(script_body, &[file]).expect("run succeeds")
 }
 
 #[cfg(unix)]
@@ -301,21 +311,80 @@ fn format_oxc_end_to_end_clean_file_produces_no_findings() {
 
 #[cfg(unix)]
 #[test]
-fn format_oxc_end_to_end_parse_error_is_a_per_file_error_not_clean() {
-    // oxfmt exits 2 on a parse error (no file list). per_file mode must record an
-    // error-severity finding scoped to that file rather than masquerade as clean.
-    let result = run_format_oxc("#!/bin/sh\necho 'x Unexpected token' 1>&2\nexit 2\n", "src/broken.ts");
+fn format_oxc_end_to_end_all_parse_errors_causes_check_error() {
+    // oxfmt exits 2 on a parse error. In batch mode, exit 2 maps to `findings`
+    // and the linelist transform runs. With empty stdout (all files errored, none
+    // unformatted), the linelist bails as an operational error — the check returns
+    // Err rather than a spurious "zero findings" result.
+    let err = run_format_oxc_result(
+        "#!/bin/sh\necho 'x Unexpected token' 1>&2\nexit 2\n",
+        &["src/broken.ts"],
+    )
+    .expect_err("all-parse-error batch must return Err, not Ok");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("operational error") || msg.contains("exit") || msg.contains("no output"),
+        "error must explain the cause; got: {msg}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn format_oxc_end_to_end_batch_reports_multiple_unformatted_files() {
+    // Batch mode: fake oxfmt prints all file args that need formatting (all of
+    // them here) and exits 1. The linelist transform must produce one finding per
+    // path, not just one for the "last" file.
+    let result = run_format_oxc_result(
+        // Print every argument except the leading --list-different flag
+        "#!/bin/sh\nshift\nfor f in \"$@\"; do printf '%s\\n' \"$f\"; done\nexit 1\n",
+        &["src/a.ts", "src/b.ts"],
+    )
+    .expect("batch run succeeds");
+    assert_eq!(
+        result.findings.len(),
+        2,
+        "two unformatted files must produce two findings; got: {:#?}",
+        result.findings
+    );
+    let paths: Vec<&Path> = result
+        .findings
+        .iter()
+        .map(|f| f.location.as_ref().expect("location").path.as_path())
+        .collect();
+    assert!(paths.contains(&Path::new("src/a.ts")));
+    assert!(paths.contains(&Path::new("src/b.ts")));
+    // Each finding's remediation must name its own specific file.
+    for f in &result.findings {
+        let file_path = f.location.as_ref().unwrap().path.to_string_lossy();
+        assert!(
+            f.remediations.iter().any(|r| r.contains(file_path.as_ref())),
+            "remediation for {file_path} must reference that file; got: {:?}",
+            f.remediations
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn format_oxc_end_to_end_batch_parse_error_in_mixed_batch_continues() {
+    // When a batch contains a bad (unparseable) file alongside an unformatted one,
+    // oxfmt exits 2 but still prints the unformatted file on stdout. The check must
+    // produce a finding for the unformatted file even though one file had an error.
+    let result = run_format_oxc_result(
+        // Simulate oxfmt: print the last arg (unformatted file) to stdout and exit 2
+        // (as if the second arg caused a parse error).
+        "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s\\n' \"$last\"\nexit 2\n",
+        &["src/broken.ts", "src/unformatted.ts"],
+    )
+    .expect("mixed-error batch still returns Ok (linelist gets a non-empty stdout)");
     assert_eq!(
         result.findings.len(),
         1,
-        "expected one error finding; got: {:#?}",
+        "mixed batch: only the unformatted file should produce a finding; got: {:#?}",
         result.findings
     );
-    let f = &result.findings[0];
     assert_eq!(
-        f.severity,
-        Severity::Error,
-        "an exit-2 parse error must be an error finding"
+        result.findings[0].location.as_ref().expect("location").path,
+        Path::new("src/unformatted.ts")
     );
-    assert_eq!(f.location.as_ref().expect("location").path, Path::new("src/broken.ts"));
 }

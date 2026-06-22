@@ -43,25 +43,29 @@ needs:
 invocations:
   - id: format
     run: prettier
-    mode: per_file
+    mode: batch
     args:
-      # --list-different: print the path of each file that is NOT already formatted
-      # (one per line) and exit 1; exit 0 when the file is formatted. The linelist
-      # transform turns each printed path into one file-level finding and treats
-      # "exit 1 with no output" as an operational error (e.g. a syntax error) rather
-      # than a clean result — mirroring rustfmt --check -l.
+      # --list-different: print the path of each file NOT already formatted (one
+      # per line) and exit non-zero. Batch mode runs one process over all files,
+      # paying npx startup once. The linelist transform maps each printed path to
+      # a per-file finding. This is CHECK mode — it never writes files.
       - "--list-different"
-      # --ignore-unknown: silently skip a file Prettier has no parser for instead of
-      # erroring (exit 2), so an applies_to match Prettier can't handle is a no-op
-      # rather than a check error.
+      # --ignore-unknown: silently skip a file Prettier has no parser for instead
+      # of erroring, so an applies_to match Prettier can't handle is a no-op.
       - "--ignore-unknown"
-      - "{{file}}"
-    # exit 0 = already formatted (ok); exit 1 = needs formatting (path on stdout via
-    # --list-different) OR an operational error (no stdout — handled by the linelist
-    # transform); any other code = error.
+      - "{{files}}"
+    # Prettier exit codes in batch mode:
+    #   0 = all files already formatted (ok)
+    #   1 = at least one file needs formatting (unformatted paths on stdout)
+    #   2 = at least one parse/syntax error (message on stderr); Prettier continues
+    #       past the bad file and still reports unformatted paths on stdout.
+    #       Mapped to `findings` so the linelist transform runs: files with
+    #       unformatted output become findings; an all-error batch (empty stdout)
+    #       causes the linelist to bail as an operational error.
     exit:
       "0": ok
       "1": findings
+      "2": findings
       default: error
     transform:
       kind: linelist
