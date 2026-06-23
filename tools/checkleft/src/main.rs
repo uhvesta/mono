@@ -13,6 +13,7 @@ use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_fro
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
+use checkleft::external::FixInvocationOutcome;
 use checkleft::external::{
     BundledExternalCheckPackageProvider, CompositeExternalCheckPackageProvider, ConfiguredExternalCheckPackageProvider,
     DefaultExternalCheckExecutor, ExternalCheckExecutor, ExternalCheckPackageProvider,
@@ -583,13 +584,24 @@ fn compute_fix_plan(results: &[CheckResult], paths: &[PathBuf], dirty_paths: &Ha
     FixPlan { checks }
 }
 
-fn print_fix_dry_plan(plan: &FixPlan, style: OutputStyle, elapsed: Duration) {
-    let total_files: usize = plan.checks.iter().map(|c| c.failing_files.len()).sum();
-    let total_dirty_skipped: usize = plan.checks.iter().map(|c| c.dirty_skipped.len()).sum();
+/// Outcome bucket for one check in the fix output.
+enum FixCheckOutcome<'a> {
+    /// Declarative fix was executed: each element is one invocation's outcome.
+    Executed(&'a Vec<FixInvocationOutcome>),
+    /// No fix block is declared for this check (no declarative `fix:` on any
+    /// invocation, built-in, or WASM component).
+    NoFixAvailable,
+}
 
+fn print_fix_results(
+    plan: &FixPlan,
+    outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
+    style: OutputStyle,
+    elapsed: Duration,
+) {
     if plan.checks.is_empty() {
         println!(
-            "{}: no fixable files found ({} checks ran in {}s)\n",
+            "{}: no failing files found ({} checks ran in {}s)\n",
             style.paint_info("fix"),
             0,
             elapsed.as_secs()
@@ -597,15 +609,52 @@ fn print_fix_dry_plan(plan: &FixPlan, style: OutputStyle, elapsed: Duration) {
         return;
     }
 
-    println!(
-        "{}: DRY RUN — showing failing-file sets (no files written)\n",
-        style.paint_info("fix")
-    );
+    let mut total_applied = 0usize;
+    let mut total_errors = 0usize;
+    let mut total_no_fix = 0usize;
+    let total_dirty_skipped: usize = plan.checks.iter().map(|c| c.dirty_skipped.len()).sum();
 
     for check_plan in &plan.checks {
+        let bucket = match outcomes.get(&check_plan.check_id) {
+            Some(inv_outcomes) if !inv_outcomes.is_empty() => FixCheckOutcome::Executed(inv_outcomes),
+            // Present but empty vec = no fix blocks declared (or non-declarative check).
+            _ => FixCheckOutcome::NoFixAvailable,
+        };
+
         println!("  {}:", style.paint_check_id(&check_plan.check_id));
-        for file in &check_plan.failing_files {
-            println!("    {}", file.display());
+        match bucket {
+            FixCheckOutcome::NoFixAvailable => {
+                println!("    {}", style.paint_help_body("no fix available"));
+                total_no_fix += 1;
+            }
+            FixCheckOutcome::Executed(inv_outcomes) => {
+                for inv in inv_outcomes {
+                    // Print applied files and per-file errors unconditionally —
+                    // a partial copy-back I/O error leaves `applied` non-empty
+                    // (those files were already written) even when `error` is set.
+                    for file in &inv.applied {
+                        println!("    {} {}", style.paint_info("fixed"), file.display());
+                        total_applied += 1;
+                    }
+                    for (file, msg) in &inv.per_file_errors {
+                        println!("    {} {}: {msg}", style.paint_error("error"), file.display());
+                        total_errors += 1;
+                    }
+                    if let Some(ref err) = inv.error {
+                        println!(
+                            "    {}: {}",
+                            style.paint_error("fix error"),
+                            style.paint_message(&format!("[{}] {err:#}", inv.invocation_id))
+                        );
+                        total_errors += 1;
+                    } else if inv.applied.is_empty() && inv.per_file_errors.is_empty() {
+                        println!(
+                            "    {}",
+                            style.paint_help_body("nothing to fix (already clean or no matching files)")
+                        );
+                    }
+                }
+            }
         }
         for file in &check_plan.dirty_skipped {
             println!("    {} (skipped: uncommitted changes)", file.display());
@@ -619,24 +668,49 @@ fn print_fix_dry_plan(plan: &FixPlan, style: OutputStyle, elapsed: Duration) {
         String::new()
     };
     println!(
-        "{}: {} check(s) with failing files, {} total file(s){} in {}s\n",
+        "{}: {} file(s) fixed, {} error(s), {} check(s) with no fix available{} (in {}s)\n",
         style.paint_bold("summary"),
-        plan.checks.len(),
-        total_files,
+        total_applied,
+        total_errors,
+        total_no_fix,
         dirty_note,
         elapsed.as_secs()
     );
 }
 
-fn print_fix_dry_plan_json(plan: &FixPlan) -> Result<()> {
+fn print_fix_results_json(
+    plan: &FixPlan,
+    outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
+) -> Result<()> {
     let output: Vec<serde_json::Value> = plan
         .checks
         .iter()
         .map(|c| {
+            let inv_outcomes = outcomes.get(&c.check_id);
+            let status = match inv_outcomes {
+                Some(v) if !v.is_empty() => "executed",
+                _ => "no_fix_available",
+            };
+            let invocations: Vec<serde_json::Value> = inv_outcomes
+                .map(|v| {
+                    v.iter()
+                        .map(|inv| {
+                            serde_json::json!({
+                                "invocation_id": inv.invocation_id,
+                                "applied": inv.applied.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                                "per_file_errors": inv.per_file_errors.iter().map(|(p, m)| serde_json::json!({"file": p.display().to_string(), "error": m})).collect::<Vec<_>>(),
+                                "error": inv.error.as_ref().map(|e| format!("{e:#}")),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             serde_json::json!({
                 "check_id": c.check_id,
                 "failing_files": c.failing_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dirty_skipped": c.dirty_skipped.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                "fix_status": status,
+                "invocations": invocations,
             })
         })
         .collect();
@@ -721,9 +795,20 @@ async fn dispatch_fix(
 
     let fix_plan = compute_fix_plan(&results, &paths, &dirty_paths);
 
+    // Build the per-check fix plan as a map for the runner.
+    let fix_plan_map: std::collections::BTreeMap<String, Vec<PathBuf>> = fix_plan
+        .checks
+        .iter()
+        .map(|c| (c.check_id.clone(), c.failing_files.clone()))
+        .collect();
+
+    // Execute declarative fix blocks inside T2 sandboxes; non-declarative checks
+    // produce empty outcome vecs (no fix available).
+    let fix_outcomes = runner.run_declarative_fixes(&changeset, &fix_plan_map, root)?;
+
     match format {
-        OutputFormat::Human => print_fix_dry_plan(&fix_plan, style, elapsed),
-        OutputFormat::Json => print_fix_dry_plan_json(&fix_plan)?,
+        OutputFormat::Human => print_fix_results(&fix_plan, &fix_outcomes, style, elapsed),
+        OutputFormat::Json => print_fix_results_json(&fix_plan, &fix_outcomes)?,
     }
 
     let has_error = results

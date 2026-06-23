@@ -22,7 +22,9 @@ pub const BUNDLED_IMPLEMENTATION_PREFIX: &str = "bundled:";
 
 pub mod declarative;
 
-pub use declarative::{ExternalCheckDeclarativePackage, run_declarative_check};
+pub use declarative::{
+    ExternalCheckDeclarativePackage, FixInvocationOutcome, run_declarative_check, run_declarative_fix,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalCheckImplementationRef {

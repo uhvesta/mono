@@ -606,6 +606,56 @@ impl Runner {
         locate_entry_line(contents, entry)
     }
 
+    /// Execute declared `fix` blocks for every declarative check whose ID appears
+    /// in `fix_plan`. Checks not in `fix_plan` are skipped entirely.
+    ///
+    /// Returns a map from configured check ID to per-invocation outcomes. A check
+    /// that is not a declarative external check (built-in, WASM component) maps to
+    /// an empty `Vec` (no declarative fix available). A declarative check with no
+    /// `fix` blocks on any invocation likewise maps to an empty `Vec`.
+    pub fn run_declarative_fixes(
+        &self,
+        changeset: &ChangeSet,
+        fix_plan: &BTreeMap<String, Vec<PathBuf>>,
+        repo_root: &Path,
+    ) -> Result<BTreeMap<String, Vec<crate::external::FixInvocationOutcome>>> {
+        let scheduled = self.schedule_runs(changeset)?;
+        let mut outcomes: BTreeMap<String, Vec<crate::external::FixInvocationOutcome>> = BTreeMap::new();
+
+        for run in scheduled.runs {
+            let check_id = run.configured_check_id.clone();
+            let Some(failing_files) = fix_plan.get(&check_id) else {
+                continue;
+            };
+
+            let declarative = match &run.execution {
+                ScheduledExecution::ExternalResolved { package } => match &package.implementation {
+                    ExternalCheckPackageImplementation::Declarative(d) => Some(d.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            match declarative {
+                None => {
+                    outcomes.entry(check_id).or_default();
+                }
+                Some(d) => {
+                    let invocation_outcomes = crate::external::run_declarative_fix(
+                        repo_root,
+                        &d,
+                        failing_files,
+                        self.source_tree.as_ref(),
+                        &run.config,
+                    );
+                    outcomes.insert(check_id, invocation_outcomes);
+                }
+            }
+        }
+
+        Ok(outcomes)
+    }
+
     pub fn list_configured_checks(&self, changeset: &ChangeSet) -> Result<Vec<String>> {
         info!(
             changed_files = changeset.changed_files.len(),
