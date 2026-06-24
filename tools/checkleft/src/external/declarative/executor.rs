@@ -836,12 +836,17 @@ pub struct FixInvocationOutcome {
 ///
 /// Invocations without a `fix` block are silently skipped. `bazel_aspect`
 /// invocations likewise (they cannot declare a fix block by schema).
+///
+/// `on_file_processed` is called after each file is processed (per-file mode)
+/// or after each batch invocation completes, with the running count of files
+/// processed so far across all invocations.
 pub fn run_declarative_fix(
     repo_root: &Path,
     package: &ExternalCheckDeclarativePackage,
     fixable_files: &[PathBuf],
     source_tree: &dyn SourceTree,
     config: &toml::Value,
+    on_file_processed: impl Fn(usize),
 ) -> Vec<FixInvocationOutcome> {
     let binaries = match resolve::resolve_all(repo_root, &package.needs, config) {
         Ok(b) => b,
@@ -866,6 +871,7 @@ pub fn run_declarative_fix(
     let config_values = extract_config_string_values(config);
     let ceiling = HostCeiling::new(repo_root);
     let mut outcomes = Vec::new();
+    let mut total_processed = 0usize;
 
     for invocation in &package.invocations {
         let Some(fix) = &invocation.fix else { continue };
@@ -961,6 +967,8 @@ pub fn run_declarative_fix(
         }
         let staged_strings: Vec<String> = staged.iter().map(|p| p.to_string_lossy().into_owned()).collect();
 
+        let inv_file_count = staged_strings.len();
+        let base_processed = total_processed;
         let outcome = match fix.mode {
             InvocationMode::Batch => execute_fix_batch(
                 sandbox.root_path(),
@@ -972,6 +980,10 @@ pub fn run_declarative_fix(
                 &config_values,
                 &invocation.id,
                 &sandbox,
+                &mut || {
+                    total_processed = base_processed + inv_file_count;
+                    on_file_processed(total_processed);
+                },
             ),
             InvocationMode::PerFile => execute_fix_per_file(
                 sandbox.root_path(),
@@ -983,6 +995,10 @@ pub fn run_declarative_fix(
                 &config_values,
                 &invocation.id,
                 &sandbox,
+                &mut || {
+                    total_processed += 1;
+                    on_file_processed(total_processed);
+                },
             ),
         };
 
@@ -1020,6 +1036,7 @@ fn execute_fix_batch(
     config_values: &BTreeMap<String, String>,
     invocation_id: &str,
     sandbox: &WritableSandbox,
+    on_done: &mut dyn FnMut(),
 ) -> Result<FixInvocationOutcome> {
     let fixed_cost = argv_byte_cost_of_path(program)
         + argv_byte_cost(prefix_args)
@@ -1054,6 +1071,7 @@ fn execute_fix_batch(
     }
 
     // All chunks succeeded — detect which staged files changed and copy them back.
+    on_done();
     let changed = sandbox
         .detect_changes()
         .context("failed to detect changes in fix sandbox")?;
@@ -1090,6 +1108,7 @@ fn execute_fix_per_file(
     config_values: &BTreeMap<String, String>,
     invocation_id: &str,
     sandbox: &WritableSandbox,
+    on_file_done: &mut dyn FnMut(),
 ) -> Result<FixInvocationOutcome> {
     let mut ok_files: HashSet<PathBuf> = HashSet::new();
     let mut per_file_errors: Vec<(PathBuf, String)> = Vec::new();
@@ -1119,6 +1138,7 @@ fn execute_fix_per_file(
                 per_file_errors.push((PathBuf::from(file), err.to_string()));
             }
         }
+        on_file_done();
     }
 
     // Detect which staged files changed, then copy back only those where the
@@ -1274,6 +1294,7 @@ case "$1" in *b.txt) exit 1 ;; *) exit 0 ;; esac"#,
             &BTreeMap::new(),
             "inv",
             &sandbox,
+            &mut || {},
         )
         .expect("execute");
 
@@ -1332,6 +1353,7 @@ exit 1"#,
             &BTreeMap::new(),
             "inv",
             &sandbox,
+            &mut || {},
         )
         .expect("execute");
 
@@ -1378,6 +1400,7 @@ exit 1"#,
             &BTreeMap::new(),
             "inv",
             &sandbox,
+            &mut || {},
         )
         .expect("execute returns Ok(outcome) with error field set");
 

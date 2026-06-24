@@ -880,12 +880,10 @@ async fn dispatch_fix(
     };
 
     let run_started_at = Instant::now();
-    let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
+    let mut results = runner
+        .run_changeset_with_progress(&changeset, Arc::clone(&reporter))
+        .await?;
     sort_results_for_output(&mut results);
-
-    if let Some(mut progress) = live.take() {
-        progress.finalize();
-    }
 
     // When --allow_dirty=false, subtract files with uncommitted working-tree
     // changes from the fixable set so in-flight edits are never clobbered.
@@ -905,8 +903,11 @@ async fn dispatch_fix(
         .collect();
 
     // Execute declarative fix blocks inside T2 sandboxes; non-declarative checks
-    // produce empty outcome vecs (no fix available).
-    let fix_outcomes = runner.run_declarative_fixes(&changeset, &fix_plan_map, root, max_passes.unwrap_or(1))?;
+    // produce empty outcome vecs (no fix available). The same reporter is reused
+    // for the apply phase so the LiveProgress instance covers both phases before
+    // finalization.
+    let fix_outcomes =
+        runner.run_declarative_fixes(&changeset, &fix_plan_map, root, max_passes.unwrap_or(1), reporter)?;
 
     // Collect the files that were atomically copied back to the real working tree.
     let applied_files: std::collections::BTreeSet<PathBuf> = fix_outcomes
@@ -939,6 +940,13 @@ async fn dispatch_fix(
     } else {
         None
     };
+
+    // Finalize the progress UI now that both the discovery and apply phases are
+    // complete. Any verify re-run above used NoopProgressReporter so the live
+    // display did not overlap with the verify pass.
+    if let Some(mut progress) = live.take() {
+        progress.finalize();
+    }
 
     let elapsed = run_started_at.elapsed();
 

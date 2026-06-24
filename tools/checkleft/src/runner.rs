@@ -617,13 +617,19 @@ impl Runner {
     ///
     /// Returns a map from configured check ID to per-invocation outcomes across
     /// all passes. A check that is not a declarative external check (built-in,
-    /// WASM) maps to an empty `Vec` (no declarative fix available).
+    /// WASM) maps to an empty `Vec` (no declarative fix available). A declarative
+    /// check with no `fix` blocks on any invocation likewise maps to an empty `Vec`.
+    ///
+    /// `reporter` receives lifecycle events for the apply phase (register/start/
+    /// record_progress/finish per check), identical in shape to the run phase so
+    /// the same `LiveProgress` instance can be reused across both phases.
     pub fn run_declarative_fixes(
         &self,
         changeset: &ChangeSet,
         fix_plan: &BTreeMap<String, Vec<PathBuf>>,
         repo_root: &Path,
         max_passes: u32,
+        reporter: Arc<dyn ProgressReporter>,
     ) -> Result<BTreeMap<String, Vec<crate::external::FixInvocationOutcome>>> {
         use rayon::prelude::*;
 
@@ -661,6 +667,12 @@ impl Runner {
         let mut accumulated: BTreeMap<String, Vec<crate::external::FixInvocationOutcome>> =
             fix_plan.keys().map(|k| (k.clone(), Vec::new())).collect();
 
+        // Register all checks with the reporter up front so the apply-phase
+        // status lines appear before any invocations begin.
+        for (check_id, files) in fix_plan {
+            reporter.register(check_id, files.len());
+        }
+
         let source_tree = Arc::clone(&self.source_tree);
         let max = max_passes.max(1);
 
@@ -671,11 +683,16 @@ impl Runner {
                 .par_iter()
                 .map(|group| {
                     let source_tree = Arc::clone(&source_tree);
+                    let reporter = Arc::clone(&reporter);
                     let mut group_results: Vec<(String, Vec<crate::external::FixInvocationOutcome>)> = Vec::new();
 
                     // Apply checks serially in category order so each check
                     // sandboxes the latest bytes written by its predecessor.
                     for check_id in &group.ordered_checks {
+                        let fix_start = Instant::now();
+                        reporter.start(check_id);
+                        let reporter_clone = Arc::clone(&reporter);
+                        let check_id_for_progress = check_id.clone();
                         let invocation_outcomes = match declarative_info.get(check_id) {
                             Some(Some((package, config))) => crate::external::run_declarative_fix(
                                 repo_root,
@@ -683,9 +700,15 @@ impl Runner {
                                 &fix_plan[check_id],
                                 source_tree.as_ref(),
                                 config,
+                                move |n| reporter_clone.record_progress(&check_id_for_progress, n),
                             ),
                             _ => Vec::new(), // non-declarative or missing → no fix
                         };
+                        let error_count: usize = invocation_outcomes
+                            .iter()
+                            .map(|inv| inv.per_file_errors.len() + if inv.error.is_some() { 1 } else { 0 })
+                            .sum();
+                        reporter.finish(check_id, error_count, fix_start.elapsed());
                         group_results.push((check_id.clone(), invocation_outcomes));
                     }
 
