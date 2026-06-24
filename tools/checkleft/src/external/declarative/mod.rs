@@ -40,6 +40,9 @@ pub mod transform;
 mod tests;
 
 #[cfg(test)]
+mod tests_bazel_aspect;
+
+#[cfg(test)]
 mod tests_lint_js;
 
 #[cfg(test)]
@@ -173,6 +176,11 @@ pub struct BazelAspectInvocation {
     pub build_flags: Vec<String>,
     /// How each artifact file's contents are shaped before the transform.
     pub artifact_format: ArtifactFormat,
+    /// Bazel rule kinds whose same-package direct rdeps of the found lib/binary
+    /// targets should also receive the aspect. Absent/empty means no test-rdep
+    /// extension. Multiple kinds are joined with `|` in a bazel `kind()` regex.
+    /// Example: `["rust_test"]` covers `#[cfg(test)]` modules for Rust checks.
+    pub test_rdeps_kinds: Vec<String>,
 }
 
 /// The on-disk shape of an output-group artifact.
@@ -361,6 +369,9 @@ pub(super) struct RawInvocation {
     /// bazel_aspect: `json` (default) or `jsonl`.
     #[serde(default)]
     artifact_format: Option<String>,
+    /// bazel_aspect: rule kinds to extend the target set with via same-package rdeps.
+    #[serde(default)]
+    test_rdeps_kinds: Vec<String>,
     exit: BTreeMap<String, String>,
     transform: RawTransform,
     /// Optional fix invocation. Only valid on `tool` invocations; rejected on
@@ -520,6 +531,7 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
                 ("output_groups", !raw.output_groups.is_empty()),
                 ("build_flags", !raw.build_flags.is_empty()),
                 ("artifact_format", raw.artifact_format.is_some()),
+                ("test_rdeps_kinds", !raw.test_rdeps_kinds.is_empty()),
             ] {
                 if set {
                     bail!("tool invocation `{id}` must not set `{field}` (bazel_aspect-only field)");
@@ -588,6 +600,7 @@ fn validate_invocation(needs: &BTreeMap<String, BinaryRequirement>, raw: RawInvo
                     output_groups: raw.output_groups,
                     build_flags: raw.build_flags,
                     artifact_format,
+                    test_rdeps_kinds: raw.test_rdeps_kinds,
                 }),
                 None,
             )

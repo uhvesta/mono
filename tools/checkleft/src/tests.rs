@@ -795,8 +795,7 @@ fn truncate_tool_output_total_char_cap_across_lines() {
     // exhaust TRUNCATE_MAX_TOTAL_CHARS before TRUNCATE_MAX_LINES is reached.
     let line = "a".repeat(TRUNCATE_MAX_LINE_LEN - 1); // 199 chars per line
     let lines_to_exhaust = TRUNCATE_MAX_TOTAL_CHARS / (TRUNCATE_MAX_LINE_LEN - 1) + 2;
-    let input: String = std::iter::repeat(line.as_str())
-        .take(lines_to_exhaust)
+    let input: String = std::iter::repeat_n(line.as_str(), lines_to_exhaust)
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -1121,7 +1120,7 @@ fn still_failing_from_verify_info_only_check_excluded() {
 fn make_fix_outcome(invocation_id: &str, applied: &[&str]) -> FixInvocationOutcome {
     FixInvocationOutcome {
         invocation_id: invocation_id.to_owned(),
-        applied: applied.iter().map(|p| PathBuf::from(p)).collect(),
+        applied: applied.iter().map(PathBuf::from).collect(),
         per_file_errors: Vec::new(),
         error: None,
     }

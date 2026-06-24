@@ -37,6 +37,9 @@ invocations:
       - "--@rules_rust//rust/settings:clippy_error_format=json"
       - "--@rules_rust//rust/settings:clippy_flags={{severity_deny_flag}}"
     artifact_format: jsonl
+    # Apply the aspect to rust_test targets as well as lib/binary targets, so
+    # #[cfg(test)] modules — compiled only in the test build — are covered.
+    test_rdeps_kinds: ["rust_test"]
     # Exit semantics classify the `bazel build` step. With capture_clippy_output
     # the build succeeds even when clippy reports violations, so 0 → findings
     # (read the artifacts); any other exit is a build/operational error.

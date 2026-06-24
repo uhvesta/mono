@@ -228,7 +228,7 @@ index 0000000..1111111 100644
         );
 
         assert!(
-            diffs.get(&PathBuf::from("data.bin")).is_none()
+            !diffs.contains_key(&PathBuf::from("data.bin"))
                 || diffs
                     .get(&PathBuf::from("data.bin"))
                     .is_some_and(|d| d.line_delta.added_lines == 0 && d.file_diff.hunks.is_empty()),

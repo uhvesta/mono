@@ -5,16 +5,15 @@
 // failing" bug). The fix changed the default to unwrap_or(DEFAULT_FIX_PASSES).
 
 /// Guard that DEFAULT_FIX_PASSES is large enough to converge a 2-pass
-/// formatter. Fails if the constant is reverted to 1.
-#[test]
-fn default_fix_passes_is_at_least_two() {
+/// formatter. Fails at compile time if the constant is reverted to 1.
+const _: () = {
     use super::DEFAULT_FIX_PASSES;
     assert!(
         DEFAULT_FIX_PASSES >= 2,
-        "DEFAULT_FIX_PASSES must be ≥ 2 so that a 2-pass formatter \
+        "DEFAULT_FIX_PASSES must be >= 2 so that a 2-pass formatter \
          converges when --max-passes is omitted from dispatch_fix"
     );
-}
+};
 
 #[cfg(unix)]
 #[test]
