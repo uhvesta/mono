@@ -834,7 +834,7 @@ async fn dispatch_fix(
             },
         allow_dirty,
         verify,
-        max_passes: _, // TODO(T7): multi-pass convergence
+        max_passes,
         paths,
     }: FixArgs,
     root: &Path,
@@ -906,7 +906,7 @@ async fn dispatch_fix(
 
     // Execute declarative fix blocks inside T2 sandboxes; non-declarative checks
     // produce empty outcome vecs (no fix available).
-    let fix_outcomes = runner.run_declarative_fixes(&changeset, &fix_plan_map, root)?;
+    let fix_outcomes = runner.run_declarative_fixes(&changeset, &fix_plan_map, root, max_passes.unwrap_or(1))?;
 
     // Collect the files that were atomically copied back to the real working tree.
     let applied_files: std::collections::BTreeSet<PathBuf> = fix_outcomes

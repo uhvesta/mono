@@ -12,8 +12,10 @@
 //! later tasks and all funnel through [`safety::WritableSandbox`].
 
 pub mod safety;
+pub mod scheduler;
 
 pub use safety::{CopyBackReport, WritableSandbox};
+pub use scheduler::{FixGroup, build_fix_schedule};
 
 /// The outcome of invoking a WASM/component check's `fix-check` entry point and
 /// routing its edits through the [`safety`] copy-back core.

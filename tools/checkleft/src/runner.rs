@@ -609,51 +609,108 @@ impl Runner {
     /// Execute declared `fix` blocks for every declarative check whose ID appears
     /// in `fix_plan`. Checks not in `fix_plan` are skipped entirely.
     ///
-    /// Returns a map from configured check ID to per-invocation outcomes. A check
-    /// that is not a declarative external check (built-in, WASM component) maps to
-    /// an empty `Vec` (no declarative fix available). A declarative check with no
-    /// `fix` blocks on any invocation likewise maps to an empty `Vec`.
+    /// Disjoint check groups (checks whose fixable-file sets do not overlap) run
+    /// concurrently via rayon. Checks within a group are applied serially in
+    /// category order (lint before format) so each check sees the latest bytes
+    /// written by its predecessor. The pipeline repeats until convergence or
+    /// `max_passes` is hit; a pass with no files written terminates early.
+    ///
+    /// Returns a map from configured check ID to per-invocation outcomes across
+    /// all passes. A check that is not a declarative external check (built-in,
+    /// WASM) maps to an empty `Vec` (no declarative fix available).
     pub fn run_declarative_fixes(
         &self,
         changeset: &ChangeSet,
         fix_plan: &BTreeMap<String, Vec<PathBuf>>,
         repo_root: &Path,
+        max_passes: u32,
     ) -> Result<BTreeMap<String, Vec<crate::external::FixInvocationOutcome>>> {
-        let scheduled = self.schedule_runs(changeset)?;
-        let mut outcomes: BTreeMap<String, Vec<crate::external::FixInvocationOutcome>> = BTreeMap::new();
+        use rayon::prelude::*;
 
+        let scheduled = self.schedule_runs(changeset)?;
+
+        // Collect the declarative package + per-check config for each check in
+        // the fix plan. Non-declarative checks (built-in, WASM) map to None.
+        let mut declarative_info: BTreeMap<
+            String,
+            Option<(crate::external::ExternalCheckDeclarativePackage, toml::Value)>,
+        > = BTreeMap::new();
         for run in scheduled.runs {
             let check_id = run.configured_check_id.clone();
-            let Some(failing_files) = fix_plan.get(&check_id) else {
+            if !fix_plan.contains_key(&check_id) {
                 continue;
-            };
-
-            let declarative = match &run.execution {
-                ScheduledExecution::ExternalResolved { package } => match &package.implementation {
-                    ExternalCheckPackageImplementation::Declarative(d) => Some(d.clone()),
+            }
+            declarative_info
+                .entry(check_id)
+                .or_insert_with(|| match &run.execution {
+                    ScheduledExecution::ExternalResolved { package } => match &package.implementation {
+                        ExternalCheckPackageImplementation::Declarative(d) => Some((d.clone(), run.config.clone())),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            };
+                });
+        }
 
-            match declarative {
-                None => {
-                    outcomes.entry(check_id).or_default();
+        // Build the fix schedule: connected components of the conflict graph
+        // become groups whose checks must run serially; groups themselves are
+        // file-disjoint and may run concurrently.
+        let groups = crate::fix::scheduler::build_fix_schedule(fix_plan);
+
+        // Ensure every check in fix_plan appears in the output map so callers
+        // can distinguish "no fix available" (empty Vec) from "not scheduled".
+        let mut accumulated: BTreeMap<String, Vec<crate::external::FixInvocationOutcome>> =
+            fix_plan.keys().map(|k| (k.clone(), Vec::new())).collect();
+
+        let source_tree = Arc::clone(&self.source_tree);
+        let max = max_passes.max(1);
+
+        for _pass in 0..max {
+            // Run groups concurrently. Groups are file-disjoint so copy-backs
+            // in different groups cannot race on any real file.
+            let pass_results: Vec<Vec<(String, Vec<crate::external::FixInvocationOutcome>)>> = groups
+                .par_iter()
+                .map(|group| {
+                    let source_tree = Arc::clone(&source_tree);
+                    let mut group_results: Vec<(String, Vec<crate::external::FixInvocationOutcome>)> = Vec::new();
+
+                    // Apply checks serially in category order so each check
+                    // sandboxes the latest bytes written by its predecessor.
+                    for check_id in &group.ordered_checks {
+                        let invocation_outcomes = match declarative_info.get(check_id) {
+                            Some(Some((package, config))) => crate::external::run_declarative_fix(
+                                repo_root,
+                                package,
+                                &fix_plan[check_id],
+                                source_tree.as_ref(),
+                                config,
+                            ),
+                            _ => Vec::new(), // non-declarative or missing → no fix
+                        };
+                        group_results.push((check_id.clone(), invocation_outcomes));
+                    }
+
+                    group_results
+                })
+                .collect();
+
+            // Merge this pass into accumulated outcomes; check for convergence.
+            let mut any_applied = false;
+            for group_results in pass_results {
+                for (check_id, inv_outcomes) in group_results {
+                    if inv_outcomes.iter().any(|inv| !inv.applied.is_empty()) {
+                        any_applied = true;
+                    }
+                    accumulated.entry(check_id).or_default().extend(inv_outcomes);
                 }
-                Some(d) => {
-                    let invocation_outcomes = crate::external::run_declarative_fix(
-                        repo_root,
-                        &d,
-                        failing_files,
-                        self.source_tree.as_ref(),
-                        &run.config,
-                    );
-                    outcomes.insert(check_id, invocation_outcomes);
-                }
+            }
+
+            // A pass that wrote no files means the pipeline has converged.
+            if !any_applied {
+                break;
             }
         }
 
-        Ok(outcomes)
+        Ok(accumulated)
     }
 
     pub fn list_configured_checks(&self, changeset: &ChangeSet) -> Result<Vec<String>> {
