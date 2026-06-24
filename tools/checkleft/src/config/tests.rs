@@ -1099,3 +1099,410 @@ id = "dual-format-check"
         ))
     );
 }
+
+// ── exclusion matcher: global and per-check excludes ──────────────────────────
+
+#[test]
+fn root_global_excludes_are_stored_in_resolved_checks() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["mobile/ios/vendor/**", "**/*.generated.*"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("src/lib.rs"))
+        .expect("resolve checks");
+
+    assert_eq!(
+        checks.global_exclude_patterns(),
+        &["mobile/ios/vendor/**", "**/*.generated.*"]
+    );
+}
+
+#[test]
+fn global_excludes_accumulate_down_hierarchy() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend")).expect("create backend dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["vendor/**"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write root config");
+
+    fs::write(
+        temp.path().join("backend/CHECKS.toml"),
+        // Authored relative to backend/: "generated/**" means "backend/generated/**"
+        // after repo-root normalization.
+        r#"
+exclude = ["generated/**"]
+
+[[checks]]
+id = "lint-rust"
+"#,
+    )
+    .expect("write backend config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve checks");
+
+    // Both root and child global excludes should be present (union).
+    // "generated/**" in backend/ normalizes to "backend/generated/**".
+    let patterns = checks.global_exclude_patterns();
+    assert!(
+        patterns.contains(&"vendor/**".to_owned()),
+        "root exclude must be present; got {patterns:?}"
+    );
+    assert!(
+        patterns.contains(&"backend/generated/**".to_owned()),
+        "child exclude must be present; got {patterns:?}"
+    );
+}
+
+#[test]
+fn global_excludes_from_child_do_not_appear_at_root_level() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend")).expect("create backend dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["vendor/**"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write root config");
+
+    fs::write(
+        temp.path().join("backend/CHECKS.toml"),
+        r#"
+exclude = ["generated/**"]
+
+[[checks]]
+id = "lint-rust"
+"#,
+    )
+    .expect("write backend config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+
+    // File at root level: should only see the root global excludes.
+    let root_checks = resolver
+        .resolve_for_file(Path::new("Cargo.toml"))
+        .expect("resolve root checks");
+    assert_eq!(root_checks.global_exclude_patterns(), &["vendor/**"]);
+}
+
+#[test]
+fn per_check_excludes_are_stored_on_check_config() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude = ["frontend/testdata/report-*.reference.html"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("frontend/src/app.ts"))
+        .expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    assert_eq!(
+        check.exclude_patterns,
+        vec!["frontend/testdata/report-*.reference.html".to_owned()]
+    );
+}
+
+#[test]
+fn per_check_excludes_are_replaced_on_upsert() {
+    // Per-check excludes follow the upsert-replace rule, not union.
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("sub")).expect("create sub dir");
+
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude = ["parent-only/**"]
+"#,
+    )
+    .expect("write root config");
+
+    fs::write(
+        temp.path().join("sub/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude = ["sub-only/**"]
+"#,
+    )
+    .expect("write child config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("sub/file.ts")).expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    // Only child's exclude should remain (parent's was replaced by upsert).
+    assert_eq!(check.exclude_patterns, vec!["sub/sub-only/**".to_owned()]);
+}
+
+#[test]
+fn per_check_excludes_from_subdirectory_are_normalized() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("frontend")).expect("create frontend dir");
+
+    fs::write(
+        temp.path().join("frontend/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude = ["testdata/**"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("frontend/src/app.ts"))
+        .expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    // Authored as "testdata/**" in frontend/CHECKS.toml → normalized to "frontend/testdata/**".
+    assert_eq!(check.exclude_patterns, vec!["frontend/testdata/**".to_owned()]);
+}
+
+#[test]
+fn legacy_config_exclude_files_is_merged_into_per_check_excludes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file/size"
+
+[checks.config]
+max_lines = 500
+exclude_files = ["**/*.md", "**/*.lock"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let check = checks.get("file/size").expect("check exists");
+    assert_eq!(
+        check.exclude_patterns,
+        vec!["**/*.md".to_owned(), "**/*.lock".to_owned()]
+    );
+}
+
+#[test]
+fn framework_level_and_legacy_excludes_are_merged() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file/size"
+exclude = ["**/*.generated.rs"]
+
+[checks.config]
+max_lines = 500
+exclude_files = ["**/*.md"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let check = checks.get("file/size").expect("check exists");
+    assert!(
+        check.exclude_patterns.contains(&"**/*.generated.rs".to_owned()),
+        "framework-level exclude must be present; got {:?}",
+        check.exclude_patterns
+    );
+    assert!(
+        check.exclude_patterns.contains(&"**/*.md".to_owned()),
+        "legacy config exclude must be present; got {:?}",
+        check.exclude_patterns
+    );
+}
+
+#[test]
+fn effective_matcher_for_combines_global_and_per_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["vendor/**"]
+
+[[checks]]
+id = "format/oxc"
+exclude = ["testdata/**"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.ts")).expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    let matcher = checks.effective_matcher_for(check).expect("build matcher");
+
+    use std::path::Path;
+    assert!(
+        matcher.is_excluded(Path::new("vendor/dep/lib.ts")),
+        "global exclude must apply"
+    );
+    assert!(
+        matcher.is_excluded(Path::new("testdata/report.ts")),
+        "per-check exclude must apply"
+    );
+    assert!(
+        !matcher.is_excluded(Path::new("src/lib.ts")),
+        "normal file must not be excluded"
+    );
+}
+
+#[test]
+fn empty_global_exclude_list_produces_diagnostic() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = []
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("must not be an empty list")),
+        "expected diagnostic about empty exclude list; got {diagnostics:?}"
+    );
+    // No patterns should have been added.
+    assert!(checks.global_exclude_patterns().is_empty());
+}
+
+#[test]
+fn empty_per_check_exclude_list_produces_diagnostic_and_skips_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude = []
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/file.ts")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("must not be an empty list")),
+        "expected diagnostic about empty per-check exclude list; got {diagnostics:?}"
+    );
+    // The check itself should be skipped (not added to resolved set).
+    assert!(
+        checks.get("format/oxc").is_none(),
+        "check with invalid exclude should be absent"
+    );
+}
+
+#[test]
+fn exclude_files_alias_works_for_global_excludes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude_files = ["Cargo.lock"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    assert_eq!(checks.global_exclude_patterns(), &["Cargo.lock".to_owned()]);
+}
+
+#[test]
+fn exclude_globs_alias_works_for_global_excludes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude_globs = ["**/*.generated.*"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    assert_eq!(checks.global_exclude_patterns(), &["**/*.generated.*".to_owned()]);
+}
+
+#[test]
+fn exclude_files_alias_works_for_per_check_excludes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+exclude_files = ["testdata/**"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/file.ts")).expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    assert_eq!(check.exclude_patterns, vec!["testdata/**".to_owned()]);
+}

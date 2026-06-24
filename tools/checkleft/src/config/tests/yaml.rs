@@ -445,3 +445,112 @@ checks:
     assert_eq!(when[0].as_str(), Some("added"));
     assert_eq!(when[1].as_str(), Some("modified"));
 }
+
+// ── exclusion: YAML format tests ──────────────────────────────────────────────
+
+#[test]
+fn yaml_global_excludes_are_parsed() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+exclude:
+  - "mobile/ios/vendor/**"
+  - "**/*.generated.*"
+checks:
+  - id: format/oxc
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/app.ts")).expect("resolve");
+
+    assert_eq!(
+        checks.global_exclude_patterns(),
+        &["mobile/ios/vendor/**", "**/*.generated.*"]
+    );
+}
+
+#[test]
+fn yaml_per_check_excludes_are_parsed() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: format/oxc
+    exclude:
+      - "frontend/testdata/report-*.reference.html"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("frontend/src/app.ts"))
+        .expect("resolve");
+
+    let check = checks.get("format/oxc").expect("check exists");
+    assert_eq!(
+        check.exclude_patterns,
+        vec!["frontend/testdata/report-*.reference.html".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn external_config_global_excludes_participate_in_union() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/external.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"
+exclude:
+  - "external-vendor/**"
+checks:
+  - id: format/oxc
+"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().expect("create temp dir");
+    let external_url = format!("{}/external.yaml", server.uri());
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+settings:
+  external_checks_url: "{external_url}"
+exclude:
+  - "local-vendor/**"
+checks:
+  - id: file-size
+"#
+        ),
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_url: None,
+            external_checks_file: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let patterns = checks.global_exclude_patterns();
+    assert!(
+        patterns.contains(&"external-vendor/**".to_owned()),
+        "external config global exclude must be present; got {patterns:?}"
+    );
+    assert!(
+        patterns.contains(&"local-vendor/**".to_owned()),
+        "local global exclude must be present; got {patterns:?}"
+    );
+}

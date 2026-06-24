@@ -9,6 +9,7 @@ pub mod check;
 pub mod checks;
 pub mod config;
 pub mod exclusion;
+pub mod exclusion_matcher;
 pub mod external;
 pub mod fix;
 pub mod input;

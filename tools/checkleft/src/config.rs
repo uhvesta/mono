@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::bypass::bypass_name_for_check_id;
+use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::{Location, Severity};
 use crate::path::validate_relative_path;
@@ -73,6 +74,13 @@ pub struct CheckConfig {
     pub enabled: bool,
     pub policy: CheckPolicyConfig,
     pub config: toml::Value,
+    /// Per-check exclude patterns, already normalized to repo-root-relative coords.
+    ///
+    /// Sourced from the framework-level `exclude` / `exclude_files` / `exclude_globs` key
+    /// on this check entry, plus the legacy `config.exclude_files` / `config.exclude_globs`
+    /// position (backward-compat). Replaced (not unioned) on upsert, consistent with how
+    /// the rest of a check entry is overridden by a child `CHECKS` file.
+    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +141,13 @@ pub struct ResolvedChecks {
     /// Accumulated check-definitions config (exec_paths + allow_override_bundled).
     /// Inherited down the config hierarchy and applied to each check's name-based resolution.
     check_definitions: ResolvedCheckDefinitions,
+    /// Accumulated global exclude patterns (repo-root-relative) from all `CHECKS` files
+    /// encountered from the repo root down to the resolved directory.
+    ///
+    /// These are unioned (accumulated) down the hierarchy: a child `CHECKS` file can only
+    /// add more global excludes, never remove ones declared by an ancestor. Each pattern
+    /// in this list is already normalized to repo-root-relative coords.
+    global_exclude_patterns: Vec<String>,
 }
 
 impl ResolvedChecks {
@@ -160,6 +175,31 @@ impl ResolvedChecks {
     /// the config hierarchy. Per-check `policy.stale_exclusion_severity` overrides it.
     pub fn stale_exclusion_mode(&self) -> StaleExclusionMode {
         self.stale_exclusion_mode
+    }
+
+    /// The accumulated global exclude patterns for this directory, repo-root-relative.
+    ///
+    /// These are the union of every ancestor `CHECKS` file's top-level `exclude` (or
+    /// `exclude_files` / `exclude_globs` alias) normalized to repo-root coords.
+    pub fn global_exclude_patterns(&self) -> &[String] {
+        &self.global_exclude_patterns
+    }
+
+    /// Build the effective [`ExclusionMatcher`] for a specific check instance.
+    ///
+    /// The effective matcher is the union of:
+    /// 1. the accumulated global exclude patterns for this directory
+    /// 2. the per-check exclude patterns on `check`
+    ///
+    /// Returns an error if any pattern is invalid globset syntax.
+    pub fn effective_matcher_for(&self, check: &CheckConfig) -> Result<ExclusionMatcher> {
+        let all: Vec<String> = self
+            .global_exclude_patterns
+            .iter()
+            .chain(check.exclude_patterns.iter())
+            .cloned()
+            .collect();
+        ExclusionMatcher::new(&all)
     }
 
     fn upsert(&mut self, check: CheckConfig) {
@@ -333,6 +373,12 @@ impl ConfigResolver {
             }
         }
 
+        // Union this file's global excludes into the accumulated set.
+        match parse_global_exclude_patterns(&checks_file.exclude, &check_config_dir, &config_relative_path) {
+            Ok(patterns) => resolved.global_exclude_patterns.extend(patterns),
+            Err(diagnostic) => resolved.push_diagnostic(diagnostic),
+        }
+
         for check in checks_file.checks {
             let configured_id = check.id;
             // check_name is the definition name (check: field, defaulting to id).
@@ -370,6 +416,19 @@ impl ConfigResolver {
                     continue;
                 }
             };
+            let exclude_patterns = match parse_per_check_exclude_patterns(
+                &configured_id,
+                &check.exclude,
+                &check.config,
+                &check_config_dir,
+                &config_relative_path,
+            ) {
+                Ok(patterns) => patterns,
+                Err(diagnostic) => {
+                    resolved.push_diagnostic(diagnostic);
+                    continue;
+                }
+            };
             resolved.upsert(CheckConfig {
                 check: check_name,
                 id: configured_id,
@@ -380,6 +439,7 @@ impl ConfigResolver {
                 enabled: check.enabled,
                 policy,
                 config: check.config,
+                exclude_patterns,
             });
         }
     }
@@ -395,6 +455,14 @@ struct ParsedChecksFile {
     check_definitions: Option<ParsedCheckDefinitions>,
     #[serde(default)]
     checks: Vec<ParsedCheckConfig>,
+    /// Top-level global excludes: paths matching these patterns are excluded from
+    /// every check. `exclude` is the canonical name; `exclude_files` and `exclude_globs`
+    /// are accepted aliases for backward compatibility.
+    ///
+    /// `None` means the key was absent (no global excludes declared here).
+    /// `Some(vec![])` means the key was present but empty — rejected as an error.
+    #[serde(default, alias = "exclude_files", alias = "exclude_globs")]
+    exclude: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -434,6 +502,13 @@ struct ParsedCheckConfig {
     policy: ParsedCheckPolicyConfig,
     #[serde(default = "empty_toml_table")]
     config: toml::Value,
+    /// Framework-level per-check excludes (sibling to `config:`, not inside it).
+    ///
+    /// `None` means absent; `Some(vec![])` is rejected as an error. The legacy
+    /// in-`config` position (`config.exclude_files` / `config.exclude_globs`) is
+    /// also read for backward compatibility and merged with this field.
+    #[serde(default, alias = "exclude_files", alias = "exclude_globs")]
+    exclude: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -454,6 +529,110 @@ struct LoadedChecksFile {
     source_label: String,
     source_path: PathBuf,
     parsed: ParsedChecksFile,
+}
+
+/// Normalize exclude patterns from the `CHECKS` file's directory to repo-root-relative.
+///
+/// Patterns are authored relative to the `CHECKS` file that declares them. This
+/// function prefixes each pattern with `config_dir` so that matching can be done
+/// against repo-root-relative changeset paths. A root config (`config_dir` empty)
+/// requires no rewriting.
+fn normalize_exclude_patterns(patterns: &[String], config_dir: &Path) -> Vec<String> {
+    if config_dir.as_os_str().is_empty() {
+        return patterns.to_vec();
+    }
+    let prefix = config_dir.to_string_lossy();
+    patterns.iter().map(|p| format!("{prefix}/{p}")).collect()
+}
+
+/// Extract the legacy per-check exclude patterns from the check's `config` blob.
+///
+/// Reads `exclude_files` and `exclude_globs` from the top-level keys of the
+/// `config` TOML table, merging both, and normalizes them to repo-root-relative
+/// using `config_dir`. Returns an empty `Vec` when neither key is present.
+///
+/// This preserves backward compatibility with the existing convention of placing
+/// exclusion config inside the check's `config:` blob rather than at the
+/// framework-level `exclude:` key.
+fn extract_legacy_config_excludes(config: &toml::Value, config_dir: &Path) -> Vec<String> {
+    let Some(table) = config.as_table() else {
+        return Vec::new();
+    };
+    let prefix = if config_dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(config_dir.to_string_lossy().into_owned())
+    };
+    let mut patterns = Vec::new();
+    for key in ["exclude_files", "exclude_globs"] {
+        if let Some(toml::Value::Array(globs)) = table.get(key) {
+            for v in globs {
+                if let Some(s) = v.as_str() {
+                    patterns.push(match &prefix {
+                        Some(p) => format!("{p}/{s}"),
+                        None => s.to_owned(),
+                    });
+                }
+            }
+        }
+    }
+    patterns
+}
+
+/// Parse and validate global exclude patterns from a parsed `CHECKS` file, returning
+/// them normalized to repo-root-relative coords. Returns a diagnostic on error.
+fn parse_global_exclude_patterns(
+    raw_exclude: &Option<Vec<String>>,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
+    let Some(patterns) = raw_exclude else {
+        return Ok(Vec::new());
+    };
+    if patterns.is_empty() {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            "top-level `exclude` must not be an empty list; omit the key to declare no global excludes".to_owned(),
+            None,
+            None,
+            Some("Add at least one glob pattern, or remove the `exclude` key entirely.".to_owned()),
+        ));
+    }
+    Ok(normalize_exclude_patterns(patterns, config_dir))
+}
+
+/// Parse and validate per-check exclude patterns from a parsed check entry, returning
+/// them normalized to repo-root-relative coords. Returns a diagnostic on error.
+///
+/// Merges the framework-level `exclude` field with the legacy `config.exclude_files` /
+/// `config.exclude_globs` position for backward compatibility.
+fn parse_per_check_exclude_patterns(
+    check_id: &str,
+    raw_exclude: &Option<Vec<String>>,
+    config: &toml::Value,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
+    if matches!(raw_exclude, Some(p) if p.is_empty()) {
+        return Err(config_file_diagnostic(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            format!(
+                "`exclude` for check `{check_id}` must not be an empty list; \
+                 omit the key to declare no per-check excludes"
+            ),
+            None,
+            None,
+            Some("Add at least one glob pattern, or remove the `exclude` key from this check entry.".to_owned()),
+        ));
+    }
+    let framework_patterns = raw_exclude
+        .as_deref()
+        .map(|p| normalize_exclude_patterns(p, config_dir))
+        .unwrap_or_default();
+    let legacy_patterns = extract_legacy_config_excludes(config, config_dir);
+    Ok([framework_patterns, legacy_patterns].concat())
 }
 
 fn parse_checks_file(path: &Path, relative_path: &Path) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
@@ -891,6 +1070,18 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
     }
     // allow_override_bundled without exec_paths is a no-op for remote configs, ignore.
 
+    // External configs always have config_dir = "" (root). Union their global excludes.
+    if let Some(patterns) = &external_checks_file.parsed.exclude {
+        if patterns.is_empty() {
+            bail!(
+                "top-level `exclude` in {} must not be an empty list; \
+                 omit the key to declare no global excludes",
+                external_checks_file.source_label
+            );
+        }
+        resolved.global_exclude_patterns.extend(patterns.iter().cloned());
+    }
+
     for check in &external_checks_file.parsed.checks {
         let configured_id = check.id.clone();
         let check_name = check.check.clone().unwrap_or_else(|| configured_id.clone());
@@ -921,6 +1112,21 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             check.enabled,
             Some(&external_checks_file.source_label),
         )?;
+        // For external configs, config_dir is always empty (root-level).
+        let exclude_patterns = if let Some(patterns) = &check.exclude {
+            if patterns.is_empty() {
+                bail!(
+                    "`exclude` for check `{configured_id}` in {} must not be an empty list; \
+                         omit the key to declare no per-check excludes",
+                    external_checks_file.source_label
+                );
+            }
+            let mut all = patterns.clone();
+            all.extend(extract_legacy_config_excludes(&check.config, Path::new("")));
+            all
+        } else {
+            extract_legacy_config_excludes(&check.config, Path::new(""))
+        };
         resolved.upsert(CheckConfig {
             check: check_name,
             id: configured_id,
@@ -931,6 +1137,7 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             enabled: check.enabled,
             policy,
             config: check.config.clone(),
+            exclude_patterns,
         });
     }
 
