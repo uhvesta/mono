@@ -610,6 +610,18 @@ fn still_failing_from_verify(verify_results: &[CheckResult]) -> std::collections
     map.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect()
 }
 
+/// Collect the distinct set of applied files across all invocation outcomes for one check.
+///
+/// When multi-pass convergence is active, the same file may appear in `applied`
+/// across several passes. This deduplicates them so the caller can report each
+/// file once and count distinct files rather than summing per-pass occurrences.
+fn distinct_applied_files(inv_outcomes: &[FixInvocationOutcome]) -> std::collections::BTreeSet<PathBuf> {
+    inv_outcomes
+        .iter()
+        .flat_map(|inv| inv.applied.iter().cloned())
+        .collect()
+}
+
 fn print_fix_results(
     plan: &FixPlan,
     outcomes: &std::collections::BTreeMap<String, Vec<FixInvocationOutcome>>,
@@ -658,23 +670,17 @@ fn print_fix_results(
                 total_no_fix += 1;
             }
             FixCheckOutcome::Executed(inv_outcomes) => {
+                // Collect errors and distinct applied files across all passes.
+                // Multi-pass convergence means the same file may appear in `applied`
+                // for several passes (e.g. an oxfmt-non-idempotent file fixed in pass 1
+                // and again in pass 2). Report each file once and suppress the
+                // terminating no-op pass's "nothing to fix" line.
+                let mut check_errors = 0usize;
                 for inv in inv_outcomes {
-                    // Print applied files, split into "fixed" vs "still failing" based on verify.
-                    for file in &inv.applied {
-                        let still_fails = check_still_failing
-                            .map(|sf: &Vec<PathBuf>| sf.contains(file))
-                            .unwrap_or(false);
-                        if still_fails {
-                            println!("    {} {}", style.paint_warning("still failing"), file.display());
-                            total_still_failing += 1;
-                        } else {
-                            println!("    {} {}", style.paint_info("fixed"), file.display());
-                            total_fixed += 1;
-                        }
-                    }
                     for (file, msg) in &inv.per_file_errors {
                         println!("    {} {}: {msg}", style.paint_error("error"), file.display());
                         total_errors += 1;
+                        check_errors += 1;
                     }
                     if let Some(ref err) = inv.error {
                         println!(
@@ -683,19 +689,40 @@ fn print_fix_results(
                             style.paint_message(&format!("[{}] {err:#}", inv.invocation_id))
                         );
                         total_errors += 1;
-                    } else if inv.applied.is_empty() && inv.per_file_errors.is_empty() {
-                        println!(
-                            "    {}",
-                            style.paint_help_body("nothing to fix (already clean or no matching files)")
-                        );
+                        check_errors += 1;
                     }
                 }
+
+                let all_applied = distinct_applied_files(inv_outcomes);
+
+                // Print applied files, split into "fixed" vs "still failing" based on verify.
+                for file in &all_applied {
+                    let still_fails = check_still_failing
+                        .map(|sf: &Vec<PathBuf>| sf.contains(file))
+                        .unwrap_or(false);
+                    if still_fails {
+                        println!("    {} {}", style.paint_warning("still failing"), file.display());
+                        total_still_failing += 1;
+                    } else {
+                        println!("    {} {}", style.paint_info("fixed"), file.display());
+                        total_fixed += 1;
+                    }
+                }
+
+                // Only print "nothing to fix" when no files were applied and no errors
+                // occurred across all passes. This suppresses the terminating no-op
+                // convergence pass that would otherwise appear as a bare stray line.
+                if all_applied.is_empty() && check_errors == 0 {
+                    println!(
+                        "    {}",
+                        style.paint_help_body("nothing to fix (already clean or no matching files)")
+                    );
+                }
+
                 // Files still failing for this check that appeared in verify but were
                 // not in any invocation's applied set (edge case: a different check
                 // on the same applied file that still fails).
                 if let Some(sf) = check_still_failing {
-                    let all_applied: std::collections::HashSet<&PathBuf> =
-                        inv_outcomes.iter().flat_map(|inv| inv.applied.iter()).collect();
                     for file in sf {
                         if !all_applied.contains(file) {
                             println!("    {} {}", style.paint_warning("still failing"), file.display());
@@ -782,12 +809,21 @@ fn print_fix_results_json(
                 .get(&c.check_id)
                 .map(|files| files.iter().map(|p| p.display().to_string()).collect())
                 .unwrap_or_default();
+            let distinct_applied: Vec<String> = inv_outcomes
+                .map(|v| {
+                    distinct_applied_files(v)
+                        .into_iter()
+                        .map(|p| p.display().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
             serde_json::json!({
                 "check_id": c.check_id,
                 "failing_files": c.failing_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "dirty_skipped": c.dirty_skipped.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "fix_status": status,
                 "invocations": invocations,
+                "distinct_applied_files": distinct_applied,
                 "still_failing_after_verify": check_still_failing,
             })
         })

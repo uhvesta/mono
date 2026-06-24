@@ -6,12 +6,14 @@ use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, Sugg
 
 use checkleft::change_detection::environment::CiEnvironment;
 
+use checkleft::external::FixInvocationOutcome;
+
 use super::{
     ColorLevel, ExternalProviderMode, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES, TRUNCATE_MAX_TOTAL_CHARS,
-    ci_from_env, compute_fix_plan, github_auth_unavailable_warning, normalize_optional_description,
-    parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer, render_human_results,
-    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, still_failing_from_verify,
-    truncate_tool_output,
+    ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
+    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_human_footer,
+    render_human_results, resolve_github_token_from_sources, should_show_progress, sort_results_for_output,
+    still_failing_from_verify, truncate_tool_output,
 };
 
 #[test]
@@ -1112,4 +1114,64 @@ fn still_failing_from_verify_info_only_check_excluded() {
     }];
     let map = still_failing_from_verify(&results);
     assert!(map.is_empty());
+}
+
+// --- distinct_applied_files: multi-pass dedup ---
+
+fn make_fix_outcome(invocation_id: &str, applied: &[&str]) -> FixInvocationOutcome {
+    FixInvocationOutcome {
+        invocation_id: invocation_id.to_owned(),
+        applied: applied.iter().map(|p| PathBuf::from(p)).collect(),
+        per_file_errors: Vec::new(),
+        error: None,
+    }
+}
+
+#[test]
+fn distinct_applied_files_deduplicates_across_passes() {
+    // Simulates a 3-pass run:
+    // Pass 1: 3 files fixed.
+    // Pass 2: 1 file fixed again (non-idempotent formatter).
+    // Pass 3: terminating no-op convergence pass (empty applied).
+    let outcomes = vec![
+        make_fix_outcome("format", &["src/a.ts", "src/b.ts", "src/c.ts"]),
+        make_fix_outcome("format", &["src/b.ts"]),
+        make_fix_outcome("format", &[]),
+    ];
+    let distinct = distinct_applied_files(&outcomes);
+    assert_eq!(
+        distinct.len(),
+        3,
+        "should count 3 distinct files, not 4 (pass1+pass2 sum)"
+    );
+    assert!(distinct.contains(&PathBuf::from("src/a.ts")));
+    assert!(distinct.contains(&PathBuf::from("src/b.ts")));
+    assert!(distinct.contains(&PathBuf::from("src/c.ts")));
+}
+
+#[test]
+fn distinct_applied_files_empty_when_all_passes_are_noop() {
+    // A fix run that never applied anything (already clean).
+    let outcomes = vec![make_fix_outcome("format", &[]), make_fix_outcome("format", &[])];
+    let distinct = distinct_applied_files(&outcomes);
+    assert!(distinct.is_empty());
+}
+
+#[test]
+fn distinct_applied_files_single_pass_unchanged() {
+    let outcomes = vec![make_fix_outcome("format", &["src/a.rs", "src/b.rs"])];
+    let distinct = distinct_applied_files(&outcomes);
+    assert_eq!(distinct.len(), 2);
+}
+
+#[test]
+fn distinct_applied_files_noop_convergence_pass_does_not_affect_count() {
+    // The terminating convergence pass has an empty `applied` list.
+    // distinct_applied_files must not add a phantom entry for it.
+    let outcomes = vec![
+        make_fix_outcome("format", &["src/foo.ts", "src/bar.ts"]),
+        make_fix_outcome("format", &[]), // convergence pass
+    ];
+    let distinct = distinct_applied_files(&outcomes);
+    assert_eq!(distinct.len(), 2, "convergence no-op pass must not inflate the count");
 }
