@@ -13,6 +13,8 @@
 
 pub mod safety;
 pub mod scheduler;
+#[cfg(test)]
+mod tests;
 
 pub use safety::{CopyBackReport, WritableSandbox};
 pub use scheduler::{FixGroup, build_fix_schedule};
