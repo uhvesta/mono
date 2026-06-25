@@ -1,8 +1,9 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//tools/checkleft/bazel:defs.bzl", "checkleft_toolchain", "starlark_check_package", "starlark_check_test")
 load("//tools/checkleft/musl:transition.bzl", "musl_binary")
 load("//tools/checkleft/wasm:defs.bzl", "precompiled_cwasm_dir")
-load("//tools/checkleft/bazel:defs.bzl", "checkleft_toolchain", "starlark_check_test")
 
 exports_files(["Cargo.toml"])
 
@@ -244,4 +245,19 @@ starlark_check_test(
     srcs = glob(["tests/fixtures/starlark_text_package/**"]),
     package_root = "tests/fixtures/starlark_text_package/checkleft",
     selector = "text/no_debug/debug_added",
+)
+
+starlark_check_package(
+    name = "starlark_text_fixture_package",
+    srcs = glob(
+        ["tests/fixtures/starlark_text_package/checkleft/**"],
+        exclude = ["tests/fixtures/starlark_text_package/checkleft/**/testdata/**"],
+    ),
+    package_root = "tests/fixtures/starlark_text_package/checkleft",
+)
+
+sh_test(
+    name = "starlark_text_fixture_package_archive_test",
+    srcs = ["tests/starlark_text_fixture_package_archive_test.sh"],
+    data = [":starlark_text_fixture_package"],
 )
