@@ -1,0 +1,110 @@
+check_meta(applies_to = ["CHECKS.yaml", "CHECKS.toml", "**/CHECKS.yaml", "**/CHECKS.toml"])
+
+PROTECTED_SOURCES = {
+    "registry://checkleft-hub/acme-baseline": "2026.06.1",
+    "registry://checkleft-hub/acme-core": "1.4.0",
+}
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        before_versions = _versions_by_source(file.before.lines if file.before else [])
+        after_versions = _versions_by_source(file.after.lines if file.after else [])
+
+        for source, minimum_version in PROTECTED_SOURCES.items():
+            before_version = before_versions.get(source)
+            after_version = after_versions.get(source)
+
+            if before_version and not after_version:
+                findings.append(fail(
+                    message = "protected checkleft package was removed: " + source,
+                    path = file.path,
+                    line = 1,
+                    column = 1,
+                ))
+                continue
+
+            if before_version and after_version and _version_lt(after_version, before_version):
+                findings.append(fail(
+                    message = "checkleft package version downgraded: " + source + " " + before_version + " -> " + after_version,
+                    path = file.path,
+                    line = 1,
+                    column = 1,
+                ))
+                continue
+
+            if after_version and _version_lt(after_version, minimum_version):
+                findings.append(fail(
+                    message = "protected checkleft package is below required version: " + source,
+                    path = file.path,
+                    line = 1,
+                    column = 1,
+                ))
+
+    return findings
+
+def _versions_by_source(lines):
+    versions = {}
+    for index, line in enumerate(lines):
+        source = _source_value(line.text)
+        if not source:
+            continue
+        version = _nearby_version(lines, index)
+        if version:
+            versions[source] = version
+    return versions
+
+def _source_value(text):
+    if "source:" in text:
+        return _clean_value(text.split("source:")[1])
+    if "source =" in text:
+        return _clean_value(text.split("source =")[1])
+    return None
+
+def _version_value(text):
+    if "version:" in text:
+        return _clean_value(text.split("version:")[1])
+    if "version =" in text:
+        return _clean_value(text.split("version =")[1])
+    return None
+
+def _nearby_version(lines, source_index):
+    start = source_index - 2
+    if start < 0:
+        start = 0
+    end = source_index + 5
+    if end > len(lines):
+        end = len(lines)
+    for index in range(start, end):
+        version = _version_value(lines[index].text)
+        if version:
+            return version
+    return None
+
+def _clean_value(value):
+    value = value.strip().strip("\"'").strip(",")
+    if " " in value:
+        value = value.split(" ")[0]
+    return value.strip().strip("\"'").strip(",")
+
+def _version_lt(left, right):
+    left_parts = _version_parts(left)
+    right_parts = _version_parts(right)
+    part_count = len(left_parts)
+    if len(right_parts) > part_count:
+        part_count = len(right_parts)
+
+    for index in range(part_count):
+        left_value = left_parts[index] if index < len(left_parts) else 0
+        right_value = right_parts[index] if index < len(right_parts) else 0
+        if left_value < right_value:
+            return True
+        if left_value > right_value:
+            return False
+    return False
+
+def _version_parts(version):
+    parts = []
+    for part in version.split("."):
+        parts.append(int(part))
+    return parts

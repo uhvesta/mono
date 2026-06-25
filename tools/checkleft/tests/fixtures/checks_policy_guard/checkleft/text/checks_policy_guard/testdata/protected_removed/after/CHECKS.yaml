@@ -1,0 +1,4 @@
+checkleft_packages:
+  packages:
+    - source: path://tools/local-checks/checkleft
+      version: 0.1.0
