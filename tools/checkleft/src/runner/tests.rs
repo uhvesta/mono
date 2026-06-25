@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
@@ -992,6 +993,98 @@ def check(ctx):
             .any(|finding| finding.message.contains("unknown implementation"))),
         "explicit Starlark selection must not also produce built-in missing diagnostics: {results:?}"
     );
+}
+
+#[tokio::test]
+async fn runner_executes_starlark_text_check_selected_by_git_package() {
+    let temp = tempdir().expect("create temp dir");
+    let package_repo = temp.path().join("git-checks");
+    fs::create_dir_all(package_repo.join("checkleft/lib")).expect("create package lib");
+    fs::create_dir_all(package_repo.join("checkleft/text/no_debug")).expect("create package check");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        package_repo.join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/git-checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        package_repo.join("checkleft/lib/messages.checkleft"),
+        r#"
+def debug_message() -> str:
+    return "debug text added from git package"
+"#,
+    )
+    .expect("write lib");
+    fs::write(
+        package_repo.join("checkleft/text/no_debug/check.checkleft"),
+        r#"
+load("//lib/messages", "debug_message")
+
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if "debug" in line.text:
+                findings.append(fail(
+                    message = debug_message(),
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    run_git(&package_repo, &["init", "-b", "main"]);
+    run_git(&package_repo, &["config", "user.email", "test@checkleft.example"]);
+    run_git(&package_repo, &["config", "user.name", "Checkleft Test"]);
+    run_git(&package_repo, &["add", "checkleft"]);
+    run_git(&package_repo, &["commit", "-m", "add checks"]);
+    run_git(&package_repo, &["tag", "0.1.0"]);
+    let package_sha256 = sha256_hex_for_test(&git_archive_checkleft_for_test(&package_repo, "0.1.0"));
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+checkleft_packages:
+  packages:
+    - source: git://{}
+      version: 0.1.0
+      sha256: {package_sha256}
+      mode: all
+"#,
+            package_repo.display()
+        ),
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_debug")
+        .expect("git-backed starlark result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "debug text added from git package");
 }
 
 #[tokio::test]
@@ -2760,4 +2853,33 @@ fn sha256_hex_for_test(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn git_archive_checkleft_for_test(root: &Path, version: &str) -> Vec<u8> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["archive", "--format=tar", version, "checkleft"])
+        .output()
+        .expect("run git archive");
+    assert!(
+        output.status.success(),
+        "git archive failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
