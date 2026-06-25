@@ -251,7 +251,7 @@ What runs on `a/b/c/service.proto`:
 
 Written in TOML. Parsed before any checks. Declares package-level metadata.
 
-Local checks are auto-discovered from the folder structure — they are **not** listed here. `package.toml` has three jobs: declare package identity, pull in external dependencies/version sets, and declare file exclusions.
+Local checks are auto-discovered from the folder structure — they are **not** listed here. `package.toml` has three jobs: declare package identity, pull in exact external package refs/version sets, and declare file exclusions.
 
 ```toml
 # checkleft/package.toml
@@ -268,11 +268,13 @@ exclude_patterns = [
 [version_sets.acme-versionset]
 source = "registry://checkleft-hub/acme-versionset"
 version = "2025.06.1"
+sha256 = "b3d1..."
 
 # Pull in an individual external check package.
 [dependencies.acme_java_checks]
 source = "git://github.com/acme/checkleft-java.git"
 version = "1.0.3"
+sha256 = "7aa9..."
 ```
 
 ### 3.1 `[package]` fields
@@ -291,6 +293,7 @@ Inspired by Amazon's Brazil build system: instead of individually pinning N chec
 [version_sets.acme-versionset]
 source = "registry://checkleft-hub/acme-versionset"
 version = "2025.06.1"   # one number, many checks
+sha256 = "b3d1..."
 ```
 
 A version set is itself a `package.toml` that re-exports other packages. The version set's manifest:
@@ -310,18 +313,22 @@ kind = "version_set"   # marks this as a version set, not a regular check packag
 [includes.proto_evolution]
 source = "registry://checkleft-hub/proto-evolution"
 version = "0.2.1"
+sha256 = "14c6..."
 
 [includes.module_json_checks]
 source = "registry://checkleft-hub/module-json"
 version = "1.3.0"
+sha256 = "f041..."
 
 [includes.java_api_compat]
 source = "registry://checkleft-hub/java-api-compat"
 version = "0.8.2"
+sha256 = "827a..."
 
 [includes.security_baseline]
 source = "registry://checkleft-hub/security-baseline"
 version = "3.1.0"
+sha256 = "e91d..."
 ```
 
 **Note on adapter overlap:** Multiple packages (from the same or different version sets) can provide checks for the same file type. For example, `proto_evolution` and `security_baseline` might both have `proto/` category checks that apply to `**/*.proto`. All applicable checks from all active packages run — there is no conflict. Each package's checks are independently auto-discovered and independently executed.
@@ -340,6 +347,7 @@ version = "0.1.0"
 [version_sets.acme-versionset]
 source = "registry://checkleft-hub/acme-versionset"
 version = "2025.06.1"
+sha256 = "b3d1..."
 # ^ This single line activates proto_evolution/wire_compat,
 #   module_json_checks/required_fields, java_api_compat/*,
 #   security_baseline/* — every public check from every included package.
@@ -349,6 +357,7 @@ version = "2025.06.1"
 [dependencies.custom_team_checks]
 source = "git://github.com/myteam/checkleft-checks.git"
 version = "0.3.0"
+sha256 = "9f20..."
 ```
 
 ### 3.3 `[version_sets.<name>]` fields (consumer side)
@@ -358,6 +367,7 @@ version = "0.3.0"
 | (table key) | `str` | yes      | Local alias for the version set.           |
 | `source`    | `str` | yes      | Source URI (same schemes as dependencies). |
 | `version`   | `str` | yes      | Exact version set version pin.             |
+| `sha256`    | `str` | yes      | SHA-256 of the published version-set package bytes. The version-set package lists exact constituent package hashes. |
 
 ### 3.4 `[includes.<name>]` fields (version set author side)
 
@@ -366,16 +376,19 @@ version = "0.3.0"
 | (table key) | `str` | yes      | Local alias for this constituent package. Consumers use this as the check ID prefix. |
 | `source`    | `str` | yes      | Source URI of the constituent package.                                               |
 | `version`   | `str` | yes      | Exact version pin. The version set author tests this version.                        |
+| `sha256`    | `str` | yes      | SHA-256 of the published constituent package bytes.                                  |
 
 ### 3.5 Version set resolution rules
 
-Resolution is intentionally simple — no complex override logic.
+Resolution is intentionally simple: there is no transitive dependency graph and no dependency solver. A consumer activates exactly the packages listed in `[dependencies]` plus the packages explicitly listed by each selected version set.
 
-1. **Multiple version sets are allowed, but overlap is a hard error.** If two version sets include the same package (by name), resolution fails immediately. Fix it by removing one of the version sets or choosing a single version set that covers both.
-2. **`[dependencies]` can only add packages not in any version set, or upgrade.** If a `[dependencies]` entry names a package that a version set already includes, its version **must** be strictly greater than the version set's pin. Pinning at the same or lower version is an error — use the version set's pin or don't.
-3. **Version sets cannot depend on other version sets.** A version set's `package.toml` may only contain `[package]` and `[includes.*]` sections. No `[version_sets.*]` nesting.
-4. **All public checks from all version-set-included packages are automatically active.** No individual activation needed.
-5. **Private checks** (under `<adapter>/private/`) in version set packages are **not** activated in consumers — they only run in the package's own repo.
+1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`.
+2. **Version sets are empty package bundles.** A version set package contains `[package]` metadata and `[includes.*]` entries. It does not export checks of its own and it cannot depend on another version set.
+3. **A version set's `sha256` covers the version-set package.** The package contains the exact ordered constituent `(source, version, sha256)` refs, so changing any included package changes the version-set package hash.
+4. **No transitive dependency closure is loaded.** A package's own `[dependencies]` are not activated when that package is consumed. Dependencies provide checks only when directly listed by the consumer or by a selected version set.
+5. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
+6. **All public checks from all selected packages are automatically active.** No individual activation needed.
+7. **Private checks** (under `<adapter>/private/`) in selected packages are **not** activated in consumers — they only run in the package's own repo.
 
 ### 3.6 `[dependencies.<name>]` fields
 
@@ -384,6 +397,7 @@ Resolution is intentionally simple — no complex override logic.
 | (table key) | `str` | yes      | Local alias used to reference this dependency's checks.          |
 | `source`    | `str` | yes      | Source URI. Schemes: `registry://`, `git://`, `path://` (local). |
 | `version`   | `str` | yes      | SemVer version or git tag. Exact pin, no ranges.                 |
+| `sha256`    | `str` | yes for fetched packages, no for `path://` | SHA-256 of the published package bytes. `path://` reads live local content for temporary monorepo iteration and is intentionally not reproducible. |
 
 ### 3.7 Auto-discovery of local checks
 
@@ -755,11 +769,11 @@ pub trait FormatAdapter: Send + Sync + 'static {
 
 Context type: `ProtoEvolutionContext`
 
-Rust side: invokes `protoc --descriptor_set_out` with `--include_source_info` at both base and current revisions. The resulting `FileDescriptorSet` is enriched with source location info (comments, line/column positions for every element). The Rust adapter parses these descriptor sets, diffs them into `SchemaDelta` values, and injects the typed models into Starlark. Starlark check authors receive a descriptor model that includes comments and source positions — not raw `.proto` text, but the full structured representation that `protoc` produces.
+Rust side: asks the repository's descriptor provider/native proto path for source-info-rich `FileDescriptorSet` values at both base and current revisions. The adapter must not directly invoke `protoc`; descriptor generation belongs to the existing native descriptor integration. The resulting `FileDescriptorSet` is enriched with source location info (comments, line/column positions for every element). The Rust adapter parses these descriptor sets, diffs them into `SchemaDelta` values, and injects the typed models into Starlark. Starlark check authors receive a descriptor model that includes comments and source positions — not raw `.proto` text, but the full structured descriptor representation.
 
 Starlark surface: `ctx.deltas`, `ctx.files`, `ctx.config`, plus all the typed descriptor types (`FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, etc.) and enum constants (`DeltaKind`, `FieldKind`, `FieldLabel`, etc.) already documented in the proto-evolution branch. Source location info is available on descriptors via `.source_location` (line, column, leading/trailing comments).
 
-**Vendored extensions:** The proto adapter bundles a set of well-known extension `.proto` files (e.g. org-wide custom options) and always includes them in the protoc invocation. Custom options defined in these vendored protos are resolved in every descriptor set automatically — no user configuration needed. Checks can inspect them via `msg.options.extensions`. If a check needs additional project-specific extensions beyond the vendored set, it can list them in `check_meta()` config via `extension_registries`.
+**Vendored extensions:** The proto adapter makes a set of well-known extension `.proto` files (e.g. org-wide custom options) available to the descriptor provider. Custom options defined in these vendored protos are resolved in every descriptor set automatically — no user configuration needed. Checks can inspect them via `msg.options.extensions`. If a check needs additional project-specific extensions beyond the vendored set, it can list them in `check_meta()` config via `extension_registries`.
 
 #### `module_json` — `module.json` file evolution
 
@@ -934,22 +948,26 @@ Every `checkleft/` directory with a `package.toml` is a distributable package. T
 
 ### 8.2 Resolution
 
-Dependencies declared in `[dependencies]` are resolved at `checkleft` startup before any checks run:
+Dependencies declared in `[dependencies]` and packages listed by selected `[version_sets]` are resolved at `checkleft` startup before any checks run:
 
-1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs of `checkleft/` directory trees. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/`.
-2. **`git://`** — cloned at the specified tag. Sparse checkout of the `checkleft/` directory only. Cached similarly.
+1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs containing `package.toml`, public `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those public checks load. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/<sha256>/`.
+2. **`git://`** — cloned at the specified tag and packed into the same package byte format. Sparse checkout of the `checkleft/` directory only. Cached similarly and verified against `sha256`.
 3. **`path://`** — local filesystem path. For monorepo cross-project dependencies. No caching; always reads live. Always relative to the repo root (e.g. `path://a/b/c/checkleft`). Relative paths (`../`) are not allowed — use the repo-root-relative path instead, similar to Bazel's `//` convention.
 
-### 8.3 Version pinning
+### 8.3 Reproducibility and hash pinning
 
 - Only exact versions are supported. No ranges, no `^`, no `~`.
-- A lockfile `checkleft/PACKAGE.lock` is generated/updated on resolution, recording SHA256 of fetched content.
-- The lockfile is checked into version control.
-- `checkleft update <dep_name> <new_version>` updates the pin and lockfile.
+- Fetched packages must declare `sha256` in `package.toml`; the resolver verifies fetched bytes before any checks are loaded.
+- Version sets are reproducible because the version-set package is itself hash-pinned, and its manifest lists exact constituent package refs and hashes.
+- There is no `PACKAGE.lock`. The manifest is already the lock because every selected external package is exact and hash-pinned.
+- `path://` dependencies are an explicit local-iteration escape hatch. They read live local content and are not reproducible until replaced by a fetched, hash-pinned ref.
+- `checkleft update <dep_name> <new_version>` updates the manifest's exact version and hash.
 
 ### 8.4 Publishing
 
-Out of scope for v1. Packages are distributed via git tags or manual registry upload. A `checkleft publish` command is a future addition.
+Publishing produces a simple `tar.gz` package. The archive contains `package.toml`, public `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those public checks load. It does not include private checks and it does not vendor package dependencies; consumers activate dependencies only when they list them directly or select a version set.
+
+The publishable tarball should be buildable by Bazel (for example with a `pkg_tar`-style target) so check authors can iterate under the same build system that schedules their package tests. A `checkleft publish` command is a future convenience layer over the same package format.
 
 ---
 
@@ -960,9 +978,9 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 ```
 1. From the changeset, walk upward from changed file paths to find ancestor checkleft/ directories.
 2. For each, parse package.toml.
-3. Resolve [dependencies] entries (fetch as needed).
-4. Auto-discover checks from folder structure in each package.
-5. Scope each check's changeset to its package's subtree.
+3. Resolve directly selected packages from [dependencies] and selected version-set includes (fetch and verify hashes as needed).
+4. Auto-discover checks from folder structure in each selected package.
+5. Scope local checks to their package subtree; consumed package checks run against their declared `applies_to` globs over the consumer repo.
 ```
 
 ### 9.2 Per-check execution
@@ -2091,16 +2109,13 @@ version = "1.0.0"
 [version_sets.acme-versionset]
 source = "registry://checkleft-hub/acme-versionset"
 version = "2025.06.1"
+sha256 = "b3d1..."
 
-# Override one package from the version set to use a newer version
-[dependencies.proto_evolution]
-source = "registry://checkleft-hub/proto-evolution"
-version = "0.3.0"   # newer than what the version set pins
-
-# Add a package not in the version set at all
+# Add a package directly alongside the version set.
 [dependencies.custom_team_checks]
 source = "git://github.com/myteam/checkleft-checks.git"
 version = "0.3.0"
+sha256 = "9f20..."
 
 # Local checks (checkleft/proto/public/evolution/, etc.) are auto-discovered.
 # package.toml is purely for external deps.
@@ -2209,7 +2224,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Shared code         | `checkleft/lib/*.checkleft`                                                                          |
 | Check-local helpers | `checkleft/<adapter>/<visibility>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`) |
 | Package manifest    | `checkleft/package.toml`                                                                             |
-| Lockfile            | `checkleft/PACKAGE.lock` (auto-generated, checked in)                                                |
+| Package integrity   | Exact `source`/`version`/`sha256` refs in `package.toml`; no `PACKAGE.lock`                          |
 | Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`) — visibility is not part of the ID                       |
 | Type annotations    | Required on all function signatures                                                                  |
 | Default sandbox     | `hermetic`                                                                                           |

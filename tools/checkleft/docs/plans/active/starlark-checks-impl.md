@@ -101,7 +101,7 @@ starlark = { version = "0.12", features = ["typing"] }
 | File | What it does |
 |---|---|
 | `starlark/discovery.rs` | Walk upward from changeset file paths to find ancestor `checkleft/` dirs. For each, scan `<adapter>/<visibility>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, visibility, path, check_meta }`. |
-| `starlark/manifest.rs` | Parse `package.toml` into `PackageManifest { package: PackageIdentity, version_sets: Vec<VersionSetRef>, dependencies: Vec<DependencyRef>, exclude_patterns: Vec<String> }`. Validate version set resolution rules (overlap = error, dep version > version set pin, no nested version sets). |
+| `starlark/manifest.rs` | Parse `package.toml` into `PackageManifest { package: PackageIdentity, version_sets: Vec<VersionSetRef>, dependencies: Vec<DependencyRef>, includes: Vec<PackageRef>, exclude_patterns: Vec<String> }`. Validate exact package refs: fetched refs require `sha256`, version sets may only contain `[package]` and `[includes.*]`, and selected duplicate package names must be byte-identical. |
 | `starlark/loader.rs` | Custom `FileLoader` impl for Starlark's `load()` statement. Resolve `//lib/foo` → `<checkleft_root>/lib/foo.checkleft`, `:types` → `<check_dir>/types.checkleft`. Enforce: no `@dep//` prefix (deps provide checks only, not importable libs). |
 
 **Integration point:** The runner calls `discovery::discover(changeset)` → gets a list of checks → for each, constructs a `StarlarkCheck` → hands them to the existing runner alongside built-in and external checks. Discovery replaces the current `CheckConfig` resolution path for Starlark checks — they are never listed in `CHECKS.yaml`.
@@ -114,11 +114,11 @@ starlark = { version = "0.12", features = ["typing"] }
 
 #### Proto adapter (`starlark/adapter/proto.rs`)
 
-- Invoke `protoc --descriptor_set_out --include_source_info` at base and current revisions
-- Parse `FileDescriptorSet` (use the `prost` or `protobuf` crate)
+- Use the existing descriptor/proto crate path for descriptor generation/parsing; do not directly invoke `protoc` from the adapter.
+- Parse `FileDescriptorSet` through the repository's native descriptor representation.
 - Build `#[derive(StarlarkValue)]` types: `ProtoEvolutionContext`, `FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, `SchemaDelta`, etc.
 - Diff logic: compare base and current descriptor sets → produce `Vec<SchemaDelta>` with `DeltaKind` variants
-- Bundle vendored extension `.proto` files and always include them in protoc invocation
+- Make vendored extension `.proto` files available through the descriptor provider
 
 This is the largest adapter. Consider splitting into submodules:
 ```
@@ -126,7 +126,7 @@ starlark/adapter/proto/
 ├── mod.rs          # ProtoAdapter impl
 ├── descriptor.rs   # Starlark value wrappers for descriptor types
 ├── diff.rs         # Descriptor set diffing → SchemaDelta
-└── invoke.rs       # protoc invocation + descriptor set parsing
+└── provider.rs     # descriptor provider integration + descriptor set parsing
 ```
 
 #### module_json adapter (`starlark/adapter/module_json.rs`)
@@ -167,8 +167,8 @@ starlark/adapter/proto/
 
 | File | What it does |
 |---|---|
-| `starlark/manifest.rs` (update) | Add resolution logic for `[dependencies]` and `[version_sets]`. |
-| `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache in `~/.cache/checkleft/packages/<name>/<version>/`. Generate/verify `PACKAGE.lock`. |
+| `starlark/manifest.rs` (update) | Add exact, hash-pinned refs for `[dependencies]`, `[version_sets]`, and version-set `[includes]`. |
+| `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. Do not generate a lockfile. |
 | `starlark/visibility.rs` | Enforce `public/` vs `private/` when activating checks from dependencies. Only `public/` checks from deps are activated. |
 
 This is the least urgent phase — local checks work without it.
