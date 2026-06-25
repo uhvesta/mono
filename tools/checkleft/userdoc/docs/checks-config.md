@@ -98,6 +98,115 @@ Supported keys:
 - `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
 
+## Excluding files from checks
+
+The `exclude` key provides a unified, framework-enforced way to tell checkleft "do not run any check (or a specific check) on these paths." It works across all check kinds — declarative, built-in Rust, and WASM component — and operates at two layers: repo-wide global and per-check.
+
+### Global excludes
+
+A top-level `exclude` key, sibling to `checks:`, `settings:`, and `check_definitions:`, declares paths that no check should ever run on. Common uses: vendored trees, generated files, lock files.
+
+```yaml
+# Root CHECKS.yaml
+exclude:
+  - "mobile/ios/vendor/**" # vendored: never check, by any check
+  - "**/*.generated.*"
+  - "Cargo.lock"
+  - "MODULE.bazel.lock"
+
+checks:
+  - id: format/oxc
+  - id: file/size
+    config:
+      max_lines: 3000
+```
+
+### Per-check excludes
+
+An `exclude` key on a check entry — sibling to `config:`, `policy:`, and `enabled:` — narrows the exclusion to that one check instance. Use this when a path should be checked by most checks but not by a specific one (for example, test-reference files that must not be reformatted but should still be flagged for size or lint violations).
+
+```yaml
+checks:
+  # Don't format these three reference files with oxc, but still check
+  # everything else about them.
+  - id: format/oxc
+    exclude:
+      - "frontend/testdata/report-*.reference.html"
+
+  - id: file/size
+    config:
+      max_lines: 3000
+```
+
+### Canonical name and aliases
+
+The canonical key name is `exclude`. The aliases `exclude_files` and `exclude_globs` are also accepted for backward compatibility, both at the top level and inside a check entry. All three names are equivalent — choose `exclude` for new configuration.
+
+Checks that historically placed their exclusion list inside the `config` block (e.g. `file/size`'s `exclude_files` key) continue to work unchanged; the framework reads from both positions and merges them into one matcher. For new configuration, prefer the framework-level position (sibling to `config:`, not inside it).
+
+```yaml
+checks:
+  # Legacy position — still honored, now framework-enforced.
+  - id: file/size
+    config:
+      max_lines: 3000
+      exclude_files:
+        - "**/*.md"
+        - "**/*.lock"
+
+  # Preferred position — equivalent, and works for all check kinds.
+  - id: file/size
+    exclude:
+      - "**/*.md"
+      - "**/*.lock"
+    config:
+      max_lines: 3000
+```
+
+### Glob syntax
+
+Each entry is a glob string using globset syntax. `**` matches across directory boundaries. Globs are authored relative to the `CHECKS.yaml` file that declares them and are normalized to repo-root paths for matching.
+
+An empty list is rejected — use `enabled: false` to disable a check entirely.
+
+### Precedence vs `applies_to`
+
+Excludes are **subtractive and always win**: they apply as a second stage after positive file selection (`applies_to` for declarative checks; the intrinsic changed-file set for other check kinds). Whatever the positive selection produces, the effective file set subtracts any excluded paths.
+
+```
+effective(check, file) = positive(check, file) AND NOT excluded(check, file)
+```
+
+Because exclusion is a separate key from `applies_to`, a per-repo `applies_to` override — which replaces the definition's positive list entirely — cannot accidentally erase the repo's excludes, and the excludes cannot be defeated by a retarget.
+
+### Inheritance through the `CHECKS` hierarchy
+
+**Global excludes accumulate (union) down the hierarchy.** The effective global exclude set for any directory is the union of every ancestor `CHECKS.yaml`'s top-level `exclude`. A child config can only add more excludes — it cannot re-enable checking of a path that a parent excluded.
+
+**Per-check excludes follow the check entry.** A per-check `exclude` is part of the check entry's identity. When a child `CHECKS.yaml` redefines a check (same `id`), the child's entry fully replaces the parent's — including its per-check excludes. This is consistent with how the rest of a check entry inherits.
+
+Remote root configs fetched via `external_checks_url` participate in the same global-exclude union, applied first, with the local root and child configs unioning on top.
+
+### Behavior guarantees
+
+The framework enforces exclusion at two points, covering all check kinds uniformly:
+
+1. **Selection-time subtraction.** Before a check runs, excluded paths are removed from the file set the check will operate on. For declarative checks, excluded files never reach the `{{files}}` argument list — so they are neither checked nor reformatted on `fix`. For programmatic and component checks, the host lowers a pre-filtered changeset into the check so the guest never sees excluded paths.
+
+2. **Finding-location post-filter.** After a check returns, any finding whose `location.path` is excluded for that check instance is dropped. This provides a uniform guarantee — "no findings on an excluded path" — regardless of check kind, including future or third-party checks that might derive paths independently.
+
+Together these guarantees mean excluded paths:
+
+- do not trigger check execution
+- are never reformatted on `fix`
+- never produce findings
+
+### Relationship to `bypass` and tool-native ignores
+
+**`exclude` vs `bypass`**: use `exclude` for permanent, path-based out-of-scope declarations (vendored trees, generated files). Use `bypass` for a one-off, logged exception on a path that is normally in scope. They can coexist on the same check instance — an excluded path is silently out of scope; a bypassed path ran, failed, and was excepted with a recorded reason.
+
+**`exclude` vs tool-native ignore files** (`.prettierignore`, `.gitignore`): the framework `exclude` is the authoritative mechanism. Because checkleft passes files explicitly to declarative check tools, whether a tool honors its own ignore file for explicitly-passed arguments is tool-specific and not guaranteed. Framework excludes work uniformly regardless of which tool a check wraps and do not depend on any ignore file on disk.
+
 ## Overriding `applies_to` for declarative checks
 
 Declarative checks (format/bazel, format/rust, format/prettier, lint/js, lint/rust, etc.) declare which files they run on via an `applies_to` glob list in their check definition. A consuming repo can restrict or retarget that file set from its CHECKS.yaml without forking the definition — by setting `applies_to` inside the per-check `config` block.

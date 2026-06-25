@@ -502,13 +502,14 @@ Purpose:
 Config keys:
 
 - `max_lines` (optional integer, default `500`)
-- `exclude_files` (optional array of glob strings; `exclude_globs` is a supported alias)
+- `exclude_files` (optional array of glob strings; `exclude_globs` is a supported alias — legacy in-`config` position, still honored)
 
 Notes:
 
 - Findings default to `warning`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`.
 - There is only one bundled check for file size. The `check: file/size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
+- For new configuration, prefer the framework-level `exclude` key (sibling to `config:`) over `exclude_files` inside `config:`. Both are equivalent and enforced by the framework; see [Excluding files from checks](checks-config.md#excluding-files-from-checks).
 
 ## `forbidden-imports-deps`
 

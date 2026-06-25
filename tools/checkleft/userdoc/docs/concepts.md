@@ -74,3 +74,7 @@ Checks are designed to operate on changes, not entire repositories.
 By default, the runner computes the current changed files (or changes since a base ref), resolves configured checks for those files, and executes checks on that scoped set. This keeps runtime proportional to change size and scales to large repositories.
 
 `--all` exists for full sweeps, but the default workflow is change-scoped presubmit feedback.
+
+## File exclusion
+
+The framework provides a unified `exclude` key for permanently removing paths from check scope — vendored trees, generated files, lock files. Exclusion is enforced by the framework before any check runs, so it applies uniformly to every check kind. See [Excluding files from checks](checks-config.md#excluding-files-from-checks) for the full schema and behavior guarantees.
