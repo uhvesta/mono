@@ -160,7 +160,7 @@ Nested packages can `load()` from ancestor `checkleft/lib/` directories (resolve
 
 **Every `checkleft/` directory with a `package.toml` is a package.** Root or nested, no distinction. The repo-root `checkleft/` is not special — it's just the top-level package. Its checks apply repo-wide because of the ancestor scoping rule (§2.4), not because of any export magic.
 
-**`public` vs `private` only matters when a package is consumed as a dependency.** Locally, within the repo, all checks run regardless of visibility. A `private/` check under `a/b/c/checkleft/` still runs on files in `a/b/c/` and its descendants. The distinction only kicks in when another package pulls in your package via `depend()`, `version_set()`, or `path://`.
+**`public` vs `private` only matters when a package is consumed as a dependency.** Locally, within the repo, all checks run regardless of visibility. A `private/` check under `a/b/c/checkleft/` still runs on files in `a/b/c/` and its descendants. The distinction only kicks in when another package pulls in your package via `[dependencies]`, `[version_sets]`, or `path://` in its `package.toml`.
 
 **Cross-package consumption — even within the same monorepo — goes through `package.toml` dependencies.** If project D wants to reuse checks from project C, it declares a `path://` dependency:
 
@@ -265,14 +265,14 @@ source = "git://github.com/acme/checkleft-java.git"
 version = "1.0.3"
 ```
 
-### 3.1 `package()` fields
+### 3.1 `[package]` fields
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | `str` | yes | Globally unique package name. Convention: `<org>/<descriptor>`. |
 | `version` | `str` | yes | SemVer. Used when this package is consumed as a dependency. |
 
-### 3.2 `version_set()` — curated check collections
+### 3.2 `[version_sets]` — curated check collections
 
 Inspired by Amazon's Brazil build system: instead of individually pinning N check packages, you depend on a single **version set** — a curated, tested-together collection that pins a coherent set of check versions. The version set author tests that all included checks work together, so consumers get a single version to track.
 
@@ -361,7 +361,7 @@ version = "0.3.0"
 Resolution is intentionally simple — no complex override logic.
 
 1. **Multiple version sets are allowed, but overlap is a hard error.** If two version sets include the same package (by name), resolution fails immediately. Fix it by removing one of the version sets or choosing a single version set that covers both.
-2. **`depend()` can only add packages not in any version set, or upgrade.** If a `depend()` names a package that a version set already includes, the `depend()` version **must** be strictly greater than the version set's pin. Pinning at the same or lower version is an error — use the version set's pin or don't.
+2. **`[dependencies]` can only add packages not in any version set, or upgrade.** If a `[dependencies]` entry names a package that a version set already includes, its version **must** be strictly greater than the version set's pin. Pinning at the same or lower version is an error — use the version set's pin or don't.
 3. **Version sets cannot depend on other version sets.** A version set's `package.toml` may only contain `[package]` and `[includes.*]` sections. No `[version_sets.*]` nesting.
 4. **All public checks from all version-set-included packages are automatically active.** No individual activation needed.
 5. **Private checks** (underscore-prefixed categories/names) in version set packages are **not** activated in consumers — they only run in the package's own repo.
@@ -383,8 +383,8 @@ Resolution is intentionally simple — no complex override logic.
 - The `applies_to` globs, `tier`, and `config` are declared **inside `check.checkleft` itself** via a `check_meta()` call at the top of the file (see §4.1).
 
 This means `package.toml` has exactly two jobs:
-1. Declare package identity (`package()`).
-2. Pull in external dependencies (`version_set()`, `depend()`).
+1. Declare package identity (`[package]`).
+2. Pull in external dependencies (`[version_sets]`, `[dependencies]`).
 
 ### 3.8 Public vs. private visibility (path semantics)
 
@@ -394,7 +394,7 @@ Visibility is determined entirely by the `public/` or `private/` directory in th
 
 | Path pattern | Visibility | Description |
 |---|---|---|
-| `checkleft/<adapter>/public/<name>/` | **Public.** | Exported when this package is consumed via `depend()` or `version_set()`. Activated in consumers. |
+| `checkleft/<adapter>/public/<name>/` | **Public.** | Exported when this package is consumed via `[dependencies]` or `[version_sets]`. Activated in consumers. |
 | `checkleft/<adapter>/private/<name>/` | **Private.** | Runs locally but not exported to consumers. |
 
 **Libraries (`lib/`):**
@@ -428,7 +428,7 @@ checkleft/
             └── check.checkleft                     # PRIVATE — local only
 ```
 
-When consumed via `depend()` or `version_set()`:
+When consumed via `[dependencies]` or `[version_sets]`:
 - `proto/evolution` — **activated** (public)
 - `module_json/required_fields` — **activated** (public)
 - `proto/team_policy` — **not activated** (private)
@@ -485,22 +485,84 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 
 Optional. Must define a `fix()` function whose signature mirrors the check but returns `list[FileEdit]`.
 
+The check and fix interact through **`fix_data`** — a strongly typed struct attached to each finding. Because the check and fix live in the same directory, they share a type definition via a local helper. The runtime validates `fix_data` against its declared type, so malformed data is caught at check evaluation time, not silently passed to the fix.
+
+**Step 1: Define a shared `fix_data` type in a check-local helper.**
+
+```python
+# checkleft/proto/public/evolution/types.checkleft
+
+# Each fix_data variant is a struct with typed fields.
+# The check constructs these; the fix pattern-matches on them.
+
+def field_not_reserved(field_number: int, field_name: str, insertion_line: int) -> FieldNotReserved:
+    return FieldNotReserved(
+        field_number = field_number,
+        field_name = field_name,
+        insertion_line = insertion_line,
+    )
+
+FieldNotReserved = struct(
+    field_number = int,
+    field_name = str,
+    insertion_line = int,
+)
+```
+
+**Step 2: The check constructs typed `fix_data`.**
+
+```python
+# checkleft/proto/public/evolution/check.checkleft
+
+load(":types", "field_not_reserved")
+
+def check(ctx: ProtoEvolutionContext) -> list[Finding]:
+    findings: list[Finding] = []
+    for delta in ctx.deltas:
+        if delta.kind == DeltaKind.field_removed:
+            findings.append(finding(
+                severity = Severity.fail,
+                message = "removed field {} must be reserved".format(delta.symbol),
+                path = delta.path,
+                fix_data = field_not_reserved(
+                    field_number = delta.before_number,
+                    field_name = delta.symbol.split(".")[-1],
+                    insertion_line = delta.line,
+                ),
+            ))
+    return findings
+```
+
+**Step 3: The fix reads typed `fix_data` — no string parsing, no dict key guessing.**
+
 ```python
 # checkleft/proto/public/evolution/fix.checkleft
+
+load(":types", "FieldNotReserved")
 
 def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     edits: list[FileEdit] = []
     for f in findings:
-        if "must be reserved" in f.message:
-            # Build the reservation line
+        if f.fix_data == None:
+            continue
+        if type(f.fix_data) == FieldNotReserved:
             edits.append(file_edit(
-                path = f.location.path,
-                old_text = "",  # insert-only
-                new_text = "  reserved {};\n".format(extract_field_number(f)),
-                after_line = f.location.line,
+                path = f.path,
+                old_text = "",
+                new_text = "  reserved {};\n  reserved \"{}\";\n".format(
+                    f.fix_data.field_number,
+                    f.fix_data.field_name,
+                ),
+                after_line = f.fix_data.insertion_line,
             ))
     return edits
 ```
+
+**Type safety guarantees:**
+- `fix_data` is typed as `struct | None` on `Finding`. The Starlark type checker validates that the check passes a struct, not an arbitrary dict.
+- The fix does `type(f.fix_data) == FieldNotReserved` for runtime dispatch — this is a real type check, not string matching.
+- Both check and fix `load()` from the same `:types` module, so they share the struct definition. A field rename or type change in the struct is caught by the type checker on both sides.
+- Findings without `fix_data` (set to `None`) are simply not auto-fixable. The fix skips them.
 
 ### 4.3 Typing requirements
 
@@ -522,7 +584,7 @@ Dialect {
 load("//lib/matchers", "glob_match", "path_prefix")
 
 # Load from a check-local helper in the same directory
-load(":utils", "extract_field_number")
+load(":types", "field_not_reserved")
 
 # Load from an external dependency
 load("@proto_evolution_checks//lib/wire", "is_wire_compatible")
@@ -538,7 +600,7 @@ load("@proto_evolution_checks//lib/wire", "is_wire_compatible")
 
 ## 5. Sandbox tiers
 
-Checks declare their required sandbox tier in `package.toml` via the `check()` call. The tier determines what host capabilities the Starlark environment exposes.
+Checks declare their required sandbox tier in `check_meta()` inside `check.checkleft`. The tier determines what host capabilities the Starlark environment exposes.
 
 ### 5.1 Tier definitions
 
@@ -551,7 +613,7 @@ Checks declare their required sandbox tier in `package.toml` via the `check()` c
 
 - Starlark code **never has filesystem access**. All data arrives as typed models injected by the Rust adapter. There is no `read_file()`, `open()`, or equivalent. The Starlark environment is a pure computation sandbox over pre-parsed data.
 - The Starlark `Globals` environment is constructed per-tier. Hermetic checks simply never see `http_get` or similar symbols — they don't exist in scope, so misuse is a compile-time name-resolution error, not a runtime denial.
-- **Tier escalation is forbidden.** A check declared `hermetic` cannot `load()` a module that was authored for `network` tier. Tier is a property of the check activation in `package.toml`, not of individual `.checkleft` files. All code reachable from a check runs at that check's tier.
+- **Tier escalation is forbidden.** A check declared `hermetic` cannot `load()` a module that was authored for `network` tier. Tier is a property of the check's `check_meta()` declaration, not of individual loaded `.checkleft` files. All code reachable from a check runs at that check's tier.
 - CI environments may **deny the `network` tier entirely** via a runner flag (`--deny-tier=network`). Checks activated at a denied tier are skipped with a warning.
 
 ### 5.3 Severity model
@@ -791,7 +853,7 @@ Line.number: int
 Line.text: str
 ```
 
-The `text` adapter is specified by setting the check category to any name that doesn't match a registered format adapter. Alternatively, checks can explicitly opt in via `adapter = "text"` in the `check()` call in `package.toml`.
+The `text` adapter is used when the check's top-level folder name doesn't match any registered format adapter. Any check whose adapter folder is not `proto`, `module_json`, `java`, or another registered adapter falls back to `text`.
 
 ### 6.4 Registering custom Rust adapters
 
@@ -853,11 +915,11 @@ This is the recommended pattern for format adapters: the Rust adapter does parsi
 
 ### 8.1 Package identity
 
-Every `checkleft/` directory with a `package.toml` is a distributable package. The `package(name, version)` call establishes identity.
+Every `checkleft/` directory with a `package.toml` is a distributable package. The `[package]` table establishes identity.
 
 ### 8.2 Resolution
 
-Dependencies declared via `depend()` are resolved at `checkleft` startup before any checks run:
+Dependencies declared in `[dependencies]` are resolved at `checkleft` startup before any checks run:
 
 1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs of `checkleft/` directory trees. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/`.
 2. **`git://`** — cloned at the specified tag. Sparse checkout of the `checkleft/` directory only. Cached similarly.
@@ -883,7 +945,7 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 ```
 1. Walk from repo root, find all checkleft/ directories.
 2. For each, parse package.toml.
-3. Resolve depend() entries (fetch/cache as needed).
+3. Resolve [dependencies] entries (fetch as needed).
 4. Collect all check() entries across all packages.
 5. Scope each check's changeset to its package's subtree.
 ```
@@ -1007,7 +1069,7 @@ Before invoking any adapter, each check's `applies_to` globs are intersected wit
 
 ## 11. Starlark dialect and type system
 
-### 10.1 Dialect settings
+### 11.1 Dialect settings
 
 ```rust
 Dialect {
@@ -1019,7 +1081,7 @@ Dialect {
 }
 ```
 
-### 10.2 Type annotations
+### 11.2 Type annotations
 
 All user-defined functions **must** have type annotations on every parameter and the return type:
 
@@ -1036,11 +1098,11 @@ def check(ctx):
     ...
 ```
 
-### 10.3 Built-in types available in all tiers
+### 11.3 Built-in types available in all tiers
 
 ```
 # Output types
-Finding(severity: Severity, message: str, path: str, line: int | None, column: int | None, remediation: str | None, suggested_fix: SuggestedFix | None)
+Finding(severity: Severity, message: str, path: str | None, line: int | None, column: int | None, remediation: str | None, suggested_fix: SuggestedFix | None, fix_data: struct | None)
 FileEdit(path: str, old_text: str, new_text: str, after_line: int | None)
 SuggestedFix(description: str, edits: list[FileEdit])
 Severity  # enum: fail, fail_but_overridable
@@ -1053,7 +1115,7 @@ str, int, float, bool, list, dict, None
 ChangeKind  # enum: added, modified, deleted, renamed
 ```
 
-### 10.4 Adapter-injected types
+### 11.4 Adapter-injected types
 
 Each adapter injects its own typed structs into the Starlark environment. These are `StarlarkValue` implementations on the Rust side, with `StarlarkAttrs` and `starlark_value` derives providing typed attribute access.
 
@@ -1108,9 +1170,28 @@ def is_internal_package(pkg: str) -> bool:
     return pkg.startswith("internal.") or ".internal." in pkg
 ```
 
+**`proto/public/evolution/types.checkleft`:**
+```python
+# Typed fix_data structs shared between check and fix.
+
+FieldNotReserved = struct(
+    field_number = int,
+    field_name = str,
+    insertion_line = int,
+)
+
+def field_not_reserved(field_number: int, field_name: str, insertion_line: int) -> FieldNotReserved:
+    return FieldNotReserved(
+        field_number = field_number,
+        field_name = field_name,
+        insertion_line = insertion_line,
+    )
+```
+
 **`proto/public/evolution/check.checkleft`:**
 ```python
 load("//lib/proto_helpers", "has_reservation", "is_internal_package")
+load(":types", "field_not_reserved")
 
 check_meta(
     applies_to: list[str] = ["**/*.proto"],
@@ -1134,6 +1215,11 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 message = "removed field {} must be reserved to prevent reuse".format(delta.symbol),
                 path = delta.path,
                 remediation = "Add a `reserved` statement for the removed field number.",
+                fix_data = field_not_reserved(
+                    field_number = delta.before_number,
+                    field_name = delta.symbol.split(".")[-1],
+                    insertion_line = delta.line,
+                ),
             ))
 
         if delta.kind == DeltaKind.field_number_changed:
@@ -1159,18 +1245,23 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 
 **`proto/public/evolution/fix.checkleft`:**
 ```python
+load(":types", "FieldNotReserved")
+
 def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     edits: list[FileEdit] = []
     for f in findings:
-        if "must be reserved" in f.message:
-            for delta in ctx.deltas:
-                if delta.kind == DeltaKind.field_removed and delta.path == f.path:
-                    edits.append(file_edit(
-                        path = f.path,
-                        old_text = "",
-                        new_text = "  reserved {};\n".format(delta.before_number),
-                        after_line = f.line,
-                    ))
+        if f.fix_data == None:
+            continue
+        if type(f.fix_data) == FieldNotReserved:
+            edits.append(file_edit(
+                path = f.path,
+                old_text = "",
+                new_text = "  reserved {};\n  reserved \"{}\";\n".format(
+                    f.fix_data.field_number,
+                    f.fix_data.field_name,
+                ),
+                after_line = f.fix_data.insertion_line,
+            ))
     return edits
 ```
 
@@ -1429,6 +1520,7 @@ Starlark checks produce `Finding` values that map 1:1 to the existing `crate::ou
 | `path` + `line` + `column` | `location: Option<Location>` |
 | `remediation` | `remediation: Option<String>` |
 | `suggested_fix` | `suggested_fix: Option<SuggestedFix>` |
+| `fix_data` | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
 
 ### 14.3 Fix compatibility
 
@@ -1442,7 +1534,7 @@ The runner reports Starlark check progress through the existing `ProgressReporte
 
 ## 15. Future extensions
 
-### 16.1 Additional sandbox tiers
+### 15.1 Additional sandbox tiers
 
 If needed later, new tiers slot in naturally:
 
@@ -1451,7 +1543,7 @@ If needed later, new tiers slot in naturally:
 | `"exec"` | Everything in `network` + subprocess execution via `exec()` built-in. |
 | `"full"` | Unrestricted. Equivalent to a Rust check. For trusted first-party checks only. |
 
-### 16.2 Additional format adapters
+### 15.2 Additional format adapters
 
 The adapter system is open for extension:
 
@@ -1462,7 +1554,7 @@ The adapter system is open for extension:
 
 Each adapter is a Rust crate implementing `FormatAdapter`. No changes to the Starlark infrastructure needed.
 
-### 16.3 Check composition
+### 15.3 Check composition
 
 A future `compose()` built-in could let checks delegate to sub-checks:
 
@@ -1476,7 +1568,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.4 Interactive fix preview
+### 15.4 Interactive fix preview
 
 A `checkleft fix --preview` mode that shows proposed edits in a TUI diff viewer before applying.
 
@@ -1578,7 +1670,7 @@ edits.append(file_edit(
 load("//lib/proto_helpers", "has_reservation", "is_internal_package")
 
 # From a check-local helper in the same check directory
-load(":utils", "extract_field_number", "format_symbol")
+load(":types", "FieldNotReserved", "field_not_reserved")
 
 # From an external versioned dependency
 load("@acme_checks//lib/wire", "is_wire_compatible", "BREAKING_KINDS")
@@ -1939,41 +2031,32 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ### 16.11 Writing a fix function
 
+The fix function receives typed `fix_data` from the check (see §4.2). No string parsing — pattern-match on the struct type.
+
 ```python
 # proto/public/evolution/fix.checkleft
 
-load(":check", "RESERVED_PATTERN")  # can load from own check file
+load(":types", "FieldNotReserved")
 
 def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     """Generate file edits to auto-fix findings where possible."""
     edits: list[FileEdit] = []
 
     for f in findings:
-        # Only fix findings we know how to handle
-        if "must be reserved" not in f.message:
+        if f.fix_data == None:
             continue
 
-        # Find the corresponding delta for context
-        for delta in ctx.deltas:
-            if delta.kind == DeltaKind.field_removed and delta.path == f.path and delta.symbol in f.message:
-                # Read the current file to find insertion point
-                for pair in ctx.files:
-                    if pair.path == f.path and pair.after != None:
-                        for msg in pair.after.messages:
-                            # Insert reserved statement after the last field
-                            last_field_line: int = 0
-                            for field in msg.fields:
-                                if field.number > 0:
-                                    last_field_line = max(last_field_line, field.number)
-                            edits.append(file_edit(
-                                path = f.path,
-                                old_text = "",
-                                new_text = "  reserved {};\n  reserved \"{}\";\n".format(
-                                    delta.before_number,
-                                    delta.symbol.split(".")[-1],
-                                ),
-                                after_line = last_field_line,
-                            ))
+        if type(f.fix_data) == FieldNotReserved:
+            edits.append(file_edit(
+                path = f.path,
+                old_text = "",
+                new_text = "  reserved {};\n  reserved \"{}\";\n".format(
+                    f.fix_data.field_number,
+                    f.fix_data.field_name,
+                ),
+                after_line = f.fix_data.insertion_line,
+            ))
+
     return edits
 ```
 
@@ -2114,4 +2197,4 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Type annotations | Required on all function signatures |
 | Default sandbox | `hermetic` |
 | Adapter linkage | `<adapter>` top-level folder name matches `FormatAdapter::kind()` |
-| Rust check override | `source: "rust://..."` in `check()` call |
+| Rust check override | `source: "rust://..."` in `check_meta()` |
