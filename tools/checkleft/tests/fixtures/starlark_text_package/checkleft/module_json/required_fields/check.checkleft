@@ -1,0 +1,33 @@
+check_meta(applies_to = ["**/module.json"])
+
+def check(ctx):
+    findings = []
+    for pair in ctx.files:
+        if pair.after == None:
+            findings.append(fail(
+                message = "module.json was deleted",
+                path = pair.path,
+            ))
+            continue
+        if pair.after.name == "":
+            findings.append(fail(
+                message = "module.json 'name' must not be empty",
+                path = pair.path,
+            ))
+        if pair.after.version == "":
+            findings.append(fail(
+                message = "module.json 'version' must not be empty",
+                path = pair.path,
+            ))
+    for delta in ctx.deltas:
+        if delta.kind == "dependency_removed":
+            findings.append(fail_but_overridable(
+                message = "dependency '" + delta.key + "' was removed",
+                path = delta.path,
+            ))
+        if delta.kind == "required_key_removed":
+            findings.append(fail(
+                message = "required key '" + delta.key + "' was removed",
+                path = delta.path,
+            ))
+    return findings
