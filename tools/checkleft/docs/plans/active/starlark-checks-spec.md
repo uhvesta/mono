@@ -9,7 +9,7 @@
 
 1. Let users define **evolution checks** (proto, JSON schema, Java API surface, etc.) in typed Starlark with minimal Rust involvement.
 2. Opinionated folder structure: one directory = one check. Shared helpers live alongside checks and are importable.
-3. Sandbox tiers tied to folder placement — hermetic by default, opt-in network access.
+3. Sandbox tiers declared in `check_meta()` — hermetic by default, opt-in network access.
 4. Versioned check distribution — pull in third-party or org-published check packages at pinned versions.
 5. Optional **fix** functions co-located with checks.
 6. Bidirectional: checks can be authored in Starlark *or* Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
@@ -80,7 +80,7 @@ No config flags, no overrides, no implicit conventions. The directory tree is th
 | `checkleft/<adapter>/public/<name>/check.checkleft` | **Public check.** Exported when this package is consumed as a dependency. |
 | `checkleft/<adapter>/private/<name>/check.checkleft` | **Private check.** Runs locally but not exported to consumers. |
 | `checkleft/<adapter>/<visibility>/<name>/fix.checkleft` | **Fix definition.** Optional. Must export a `fix()` function. |
-| `checkleft/<adapter>/<visibility>/<name>/check_test.checkleft` | **Check test.** Optional. Functional tests for the check. See §13. |
+| `checkleft/<adapter>/<visibility>/<name>/testdata/<case>/` | **Functional tests.** Fixture-based test cases. See §13. |
 | `checkleft/<adapter>/<visibility>/<name>/*.checkleft` | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
 
 The path structure is: `<adapter>/<visibility>/<name>`.
@@ -245,7 +245,7 @@ What runs on `a/b/c/service.proto`:
 
 Written in TOML. Parsed before any checks. Declares package-level metadata.
 
-Local checks are auto-discovered from the folder structure — they are **not** listed here. `package.toml` has exactly two jobs: declare package identity and pull in external dependencies/version sets.
+Local checks are auto-discovered from the folder structure — they are **not** listed here. `package.toml` has three jobs: declare package identity, pull in external dependencies/version sets, and declare file exclusions.
 
 ```toml
 # checkleft/package.toml
@@ -253,6 +253,10 @@ Local checks are auto-discovered from the folder structure — they are **not** 
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
+exclude_patterns = [
+    "third_party/**",
+    "vendor/**",
+]
 
 # Pull in a curated version set — all its public checks become active.
 [version_sets.acme-versionset]
@@ -271,6 +275,7 @@ version = "1.0.3"
 |---|---|---|---|
 | `name` | `str` | yes | Globally unique package name. Convention: `<org>/<descriptor>`. |
 | `version` | `str` | yes | SemVer. Used when this package is consumed as a dependency. |
+| `exclude_patterns` | `list[str]` | no | Glob patterns for files that should be excluded from all checks in this package. Matched relative to the package root. Common uses: `third_party/**`, `vendor/**`, `generated/**`. |
 
 ### 3.2 `[version_sets]` — curated check collections
 
@@ -454,7 +459,7 @@ check_meta(
     applies_to: list[str] = ["**/*.proto"],
     tier: str = "hermetic",
     config: dict[str, typing.Any] = {
-        "severity": "fail",
+        "extension_registries": ["proto/options.proto"],
     },
 )
 
@@ -479,7 +484,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 |---|---|---|---|---|
 | `applies_to` | `list[str]` | yes | — | Glob patterns for files this check cares about. |
 | `tier` | `str` | no | `"hermetic"` | Sandbox tier. See §5. |
-| `config` | `dict[str, typing.Any]` | no | `{}` | Default config passed to `ctx.config`. Consumers can override via `CHECKS.yaml`. |
+| `config` | `dict[str, typing.Any]` | no | `{}` | Default config passed to `ctx.config`. |
 
 ### 4.2 `fix.checkleft` — the fix file
 
@@ -625,7 +630,7 @@ Findings have exactly two severity levels. A finding always blocks merge — the
 
 There is no "informational" / "notice" severity. If something doesn't warrant blocking the build, it doesn't belong as a checkleft finding — use linter warnings or comments for that. Checkleft findings are gates.
 
-The `CHECKS.yaml` policy layer can **escalate** a check's severity (`fail_but_overridable` → `fail`) but never **relax** it. This ensures check authors set the floor and operators can only tighten.
+Severity is set per-finding by the check author. The system can only **escalate** severity (`fail_but_overridable` → `fail`), never **relax** it. This ensures check authors set the floor.
 
 Shorthand constructors match the severity names:
 
@@ -669,7 +674,7 @@ Evolution checks need **parsed representations** of files at two revisions (base
 │                    Rust host                             │
 │                                                         │
 │  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐ │
-│  │ ProtoAdapter  │   │ JsonAdapter  │   │ JavaAdapter  │ │
+│  │ ProtoAdapter  │   │ ModuleJson   │   │ JavaAdapter  │ │
 │  │              │   │              │   │              │ │
 │  │ parse(base)  │   │ parse(base)  │   │ parse(base)  │ │
 │  │ parse(cur)   │   │ parse(cur)   │   │ parse(cur)   │ │
@@ -851,7 +856,7 @@ Line.number: int
 Line.text: str
 ```
 
-The `text` adapter is used when the check's top-level folder name doesn't match any registered format adapter. Any check whose adapter folder is not `proto`, `module_json`, `java`, or another registered adapter falls back to `text`.
+`text` is a registered adapter like any other. Checks under `checkleft/text/` use the text adapter. There is no implicit fallback — an unrecognized adapter folder name is an error at discovery time (see §2.3).
 
 ### 6.4 Registering custom Rust adapters
 
@@ -941,10 +946,10 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 ### 9.1 Discovery
 
 ```
-1. Walk from repo root, find all checkleft/ directories.
+1. From the changeset, walk upward from changed file paths to find ancestor checkleft/ directories.
 2. For each, parse package.toml.
 3. Resolve [dependencies] entries (fetch as needed).
-4. Collect all check() entries across all packages.
+4. Auto-discover checks from folder structure in each package.
 5. Scope each check's changeset to its package's subtree.
 ```
 
@@ -968,7 +973,7 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
       - Apply edits via WritableSandbox.
 5. If Rust check (source: "rust://..."):
    a. Delegate to Check::configure() + ConfiguredCheck::run() as today.
-6. Collect findings, apply policy (severity override, bypass directives).
+6. Collect findings.
 ```
 
 ### 9.3 Concurrency
@@ -1486,28 +1491,7 @@ checkleft test --update proto/evolution
 
 ## 14. Integration with existing checkleft infrastructure
 
-### 14.1 CHECKS.yaml / CHECKS.toml compatibility
-
-Starlark-defined checks appear in `CHECKS.yaml` the same way external checks do today:
-
-```yaml
-checks:
-  - id: proto/evolution
-    check: starlark://checkleft/proto/public/evolution  # points at the check directory
-    policy:
-      severity: fail
-      allow_bypass: true
-    exclude_patterns:
-      - "vendor/**"
-```
-
-The `starlark://` scheme tells the runner to resolve the check from the `checkleft/` folder structure rather than from a declarative YAML or WASM component.
-
-However, `package.toml` is the **preferred** way to activate Starlark checks. `CHECKS.yaml` integration exists for repos that want to mix Starlark checks with existing declarative/WASM checks in a single config file.
-
-When both `package.toml` and `CHECKS.yaml` activate the same check ID, `CHECKS.yaml` policy fields (severity override, bypass, exclusions) take precedence — they are the operator-level override layer.
-
-### 14.2 Output compatibility
+### 14.1 Output compatibility
 
 Starlark checks produce `Finding` values that map 1:1 to the existing `crate::output::Finding`:
 
@@ -1520,11 +1504,11 @@ Starlark checks produce `Finding` values that map 1:1 to the existing `crate::ou
 | `suggested_fix` | `suggested_fix: Option<SuggestedFix>` |
 | `fix_data` | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
 
-### 14.3 Fix compatibility
+### 14.2 Fix compatibility
 
 Starlark `fix()` functions return `list[FileEdit]` which maps to the existing `Vec<FileEdit>` consumed by `WritableSandbox`. The existing fix scheduler (`src/fix/scheduler.rs`) orchestrates Starlark fixes identically to WASM component fixes.
 
-### 14.4 Progress reporting
+### 14.3 Progress reporting
 
 The runner reports Starlark check progress through the existing `ProgressReporter` trait. Each Starlark check registers its `applicable_file_count` (derived from `applies_to` glob matching) and ticks progress as files are processed by the adapter.
 
