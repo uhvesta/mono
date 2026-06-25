@@ -749,6 +749,8 @@ Rust side: invokes `protoc --descriptor_set_out` with `--include_source_info` at
 
 Starlark surface: `ctx.deltas`, `ctx.files`, `ctx.config`, plus all the typed descriptor types (`FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, etc.) and enum constants (`DeltaKind`, `FieldKind`, `FieldLabel`, etc.) already documented in the proto-evolution branch. Source location info is available on descriptors via `.source_location` (line, column, leading/trailing comments).
 
+**Vendored extensions:** The proto adapter bundles a set of well-known extension `.proto` files (e.g. org-wide custom options) and always includes them in the protoc invocation. Custom options defined in these vendored protos are resolved in every descriptor set automatically — no user configuration needed. Checks can inspect them via `msg.options.extensions`. If a check needs additional project-specific extensions beyond the vendored set, it can list them in `check_meta()` config via `extension_registries`.
+
 #### `module_json` — `module.json` file evolution
 
 Context type: `ModuleJsonEvolutionContext`
