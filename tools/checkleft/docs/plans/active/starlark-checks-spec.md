@@ -80,7 +80,7 @@ No config flags, no overrides, no implicit conventions. The directory tree is th
 | `checkleft/<adapter>/public/<name>/check.checkleft` | **Public check.** Exported when this package is consumed as a dependency. |
 | `checkleft/<adapter>/private/<name>/check.checkleft` | **Private check.** Runs locally but not exported to consumers. |
 | `checkleft/<adapter>/<visibility>/<name>/fix.checkleft` | **Fix definition.** Optional. Must export a `fix()` function. |
-| `checkleft/<adapter>/<visibility>/<name>/check_test.checkleft` | **Check test.** Optional. Functional tests for the check. See §12. |
+| `checkleft/<adapter>/<visibility>/<name>/check_test.checkleft` | **Check test.** Optional. Functional tests for the check. See §13. |
 | `checkleft/<adapter>/<visibility>/<name>/*.checkleft` | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
 
 The path structure is: `<adapter>/<visibility>/<name>`.
@@ -585,8 +585,6 @@ fail_but_overridable(message = "...", path = "...")   # Severity.fail_but_overri
 | `Severity` | `enum{fail, fail_but_overridable}` | Severity constants (see §5.3). |
 | `DeltaKind` | `enum{...}` | Format-specific delta kind constants. |
 | `print(...)` | `fn(str)` | Debug print (suppressed in CI, shown with `--verbose`). |
-| `json_decode(s)` | `fn(str) -> typing.Any` | Parse a JSON string. |
-| `json_encode(v)` | `fn(typing.Any) -> str` | Serialize to JSON. |
 | `regex_match(pattern, s)` | `fn(str, str) -> bool` | RE2 regex match. |
 | `regex_find_all(pattern, s)` | `fn(str, str) -> list[str]` | RE2 find all matches. |
 | `glob_match(pattern, path)` | `fn(str, str) -> bool` | Glob pattern match. |
@@ -931,7 +929,122 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 
 ---
 
-## 10. Starlark dialect and type system
+## 10. Horizontal scaling, incrementality, and filesystem overhead
+
+The execution model is inherently functional: every `check(ctx)` is a pure function from an immutable context to a list of findings. No shared mutable state, no side effects (hermetic tier), no ordering dependencies between checks. This makes the system trivially horizontally scalable — but only if we manage the filesystem overhead that feeds the pure functions.
+
+### 10.1 Three layers of parallelism
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ Layer 1: Check-level parallelism                                 │
+│   Every check gets its own Starlark Module + Evaluator.          │
+│   No shared mutable state. Run all checks concurrently.          │
+│   Bounded by thread pool size (default: num_cpus).               │
+├──────────────────────────────────────────────────────────────────┤
+│ Layer 2: Adapter-level parallelism                               │
+│   Different adapters (proto, java, module_json) parse            │
+│   independent file sets. Run all adapter parses concurrently.    │
+│   Within an adapter, base + current parse are independent →      │
+│   run both in parallel, then diff.                               │
+├──────────────────────────────────────────────────────────────────┤
+│ Layer 3: File-level parallelism (within an adapter)              │
+│   Adapters that parse files independently (java via tree-sitter, │
+│   text) can parse individual files in parallel.                  │
+│   Proto is constrained: protoc needs the full import graph.      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+All three layers compose. In the common case of N checks across M adapters, the execution graph is:
+
+```
+1. Discovery (sequential, fast — see §10.3)
+2. For each adapter (parallel):
+   a. parse(base)  ┐
+   b. parse(current)┘  (parallel)
+   c. diff(base, current)
+3. For each check (parallel, bounded by thread pool):
+   a. inject_globals (cheap — borrows parsed output)
+   b. evaluate check(ctx) → list[Finding]
+```
+
+Step 2 is the bottleneck (invoking protoc, running tree-sitter). Step 3 is pure Starlark evaluation — microseconds to low milliseconds per check for typical policy logic.
+
+### 10.2 Adapter output sharing (parse once, check many)
+
+Multiple checks under the same adapter folder share the same parsed output. The runner parses once per `(adapter, file_set, revision)` triple and hands the result to every check under that adapter.
+
+```
+checkleft/proto/public/evolution/       ─┐
+checkleft/proto/public/no_deletion/      ├─ all receive the SAME ProtoEvolutionContext
+checkleft/proto/private/team_policy/    ─┘
+```
+
+**Implementation:** The runner groups checks by adapter kind. For each adapter, it calls `parse()` and `diff()` once. The resulting `AdapterOutput` is `Arc`-shared across all checks in that group. `inject_globals()` borrows the shared output — it does not clone it. Starlark values are allocated in each check's own `Module` heap, but they hold references (via `StarlarkValue` wrappers) to the shared Rust-side data.
+
+This means adding a 10th proto check costs approximately zero additional parse time — only the Starlark evaluation time for that check's policy logic.
+
+### 10.3 Discovery caching and filesystem overhead
+
+Discovery walks the filesystem to find `checkleft/` directories, `package.toml` files, and `check.checkleft` files. In a large monorepo this walk is the dominant fixed cost.
+
+**Mitigations:**
+
+1. **Changeset-scoped discovery.** Don't walk the entire repo. Start from the changed file paths, walk upward to find ancestor `checkleft/` directories. For a PR touching 5 files in `a/b/c/`, discovery visits at most the path segments from `a/b/c/` to repo root — not the entire tree.
+
+2. **Discovery cache.** Cache the mapping `checkleft/ directory path → list of (check_id, adapter, visibility, applies_to globs)` in a file (`checkleft/.discovery-cache`). Invalidate on any change to `checkleft/` directory contents (stat mtime). On cache hit, skip the filesystem walk entirely.
+
+3. **Glob pre-filtering.** Before invoking any adapter, intersect each check's `applies_to` globs with the changeset. If no changed files match, the check is skipped entirely — no adapter parse, no Starlark evaluation. This is the single biggest optimization: most PRs touch files in one area, and most checks are irrelevant.
+
+4. **Dependency cache.** External dependencies (`git://`, `registry://`) are fetched once and cached in `~/.cache/checkleft/packages/<name>/<version>/`. The lockfile (`PACKAGE.lock`) records content hashes. On subsequent runs, if the lockfile entry matches, no network fetch occurs. `path://` dependencies are always read live but benefit from the discovery cache.
+
+### 10.4 Incrementality
+
+Because checks are pure functions of `(parsed_before, parsed_after, config)`, results are cacheable:
+
+```
+cache_key = hash(
+    check_id,
+    adapter_kind,
+    hash(matched_files_at_base_revision),
+    hash(matched_files_at_current_revision),
+    hash(check_source_files),     # .checkleft + loaded helpers
+    hash(config),                 # from check_meta + CHECKS.yaml overrides
+)
+```
+
+If the cache key matches a previous run, the findings are replayed from cache without invoking the adapter or Starlark. This is the same principle as Bazel's action cache — deterministic inputs produce deterministic outputs.
+
+**What invalidates the cache:**
+- Any change to a file matching `applies_to` (at either revision)
+- Any change to the `.checkleft` source files (check, fix, loaded helpers)
+- Any change to config (check_meta defaults or CHECKS.yaml overrides)
+- Adapter version change (embedded in the cache key via adapter binary hash)
+
+**What does NOT invalidate the cache:**
+- Changes to files that don't match `applies_to`
+- Changes to other checks (each check is independently cached)
+- Changes to other packages' dependencies
+
+### 10.5 Scaling strategy by repo size
+
+| Repo size | Strategy |
+|---|---|
+| Small (< 100 files) | No special treatment. Discovery + all checks complete in < 1s. |
+| Medium (100–10K files) | Changeset-scoped discovery + glob pre-filtering. Most checks skip. Typical PR: < 3s. |
+| Large monorepo (10K+ files) | All of the above + discovery cache + adapter output sharing + result cache. Typical PR: < 5s for warm cache, < 15s cold. |
+| CI at scale (many concurrent PRs) | Shared result cache (e.g. backed by remote cache like Bazel's). Each PR only computes checks for its unique changeset delta. |
+
+### 10.6 Thread pool and resource bounds
+
+- **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`. Configurable via `--parallelism=N`.
+- **Memory:** Each Starlark `Module` heap is independent. Peak memory is proportional to `(max concurrent checks) × (largest adapter output shared via Arc) + (per-check heap)`. The `Arc`-shared adapter output is the dominant term but is allocated once per adapter, not per check.
+- **Starlark evaluation timeout:** Each check has a wall-clock timeout (default: 30s, configurable via `check_meta(timeout_ms = ...)`). Runaway checks are killed and reported as failures. This prevents a single pathological check from blocking the entire pipeline.
+- **Adapter parse timeout:** Adapter `parse()` calls have their own timeout (default: 60s). Protoc invocations on large proto graphs are the primary concern here.
+
+---
+
+## 11. Starlark dialect and type system
 
 ### 10.1 Dialect settings
 
@@ -997,9 +1110,9 @@ The type checker validates these at load time.
 
 ---
 
-## 11. Dogfood examples
+## 12. Dogfood examples
 
-### 11.1 Proto evolution check
+### 12.1 Proto evolution check
 
 ```
 checkleft/
@@ -1100,7 +1213,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 11.2 `module.json` required-fields check
+### 12.2 `module.json` required-fields check
 
 ```
 checkleft/
@@ -1153,7 +1266,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 11.3 Java API stability check
+### 12.3 Java API stability check
 
 ```
 checkleft/
@@ -1208,13 +1321,13 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
 
 ---
 
-## 12. Functional testing for checks
+## 13. Functional testing for checks
 
 Check authors need to test their checks by running them against real file inputs and asserting on the outputs. Tests use **file fixtures** — actual files on disk organized into `before/` and `after/` workspaces. The test runner diffs the two workspaces, runs the adapter + check, and compares findings against expected output.
 
 This is a purely functional, black-box approach: files in, findings out. No mocking, no stubbing the adapter.
 
-### 12.1 Test directory structure
+### 13.1 Test directory structure
 
 Each test case is a directory under `testdata/` containing a `before/` workspace, an `after/` workspace, and an `expected.toml` file declaring the expected findings.
 
@@ -1242,7 +1355,7 @@ checkleft/proto/public/evolution/
         └── expected.toml
 ```
 
-### 12.2 Fixture files
+### 13.2 Fixture files
 
 **`before/`** — contains the files as they existed at the base revision. The adapter parses these as the "before" state.
 
@@ -1250,7 +1363,7 @@ checkleft/proto/public/evolution/
 
 The test runner computes the diff between the two workspaces, runs the adapter to parse both sides, and invokes the check — exactly as a real checkleft run would.
 
-### 12.3 Expected output (`expected.toml`)
+### 13.3 Expected output (`expected.toml`)
 
 ```toml
 # testdata/field_removal/expected.toml
@@ -1278,7 +1391,7 @@ path = "api/v1/user.proto"
 | `findings[].line` | `int` | no | Expected line number. |
 | `config` | `dict` | no | Override `check_meta()` config for this test case. |
 
-### 12.4 Fix testing
+### 13.4 Fix testing
 
 If a check has a `fix.checkleft`, test cases can include an `expected_fix/` directory alongside `expected.toml`. After running the check, the test runner runs the fix and asserts that the resulting files match `expected_fix/`.
 
@@ -1295,7 +1408,7 @@ testdata/field_removal/
 
 The test runner applies the fix edits to the `after/` workspace and diffs the result against `expected_fix/`. Any mismatch fails the test with a unified diff.
 
-### 12.5 Running tests
+### 13.5 Running tests
 
 ```bash
 # Run all tests for all checks in the package
@@ -1311,7 +1424,7 @@ checkleft test proto/evolution/field_removal
 checkleft test --update proto/evolution
 ```
 
-### 12.6 Test discovery and execution
+### 13.6 Test discovery and execution
 
 - Any directory under `testdata/` that contains both a `before/` (or empty) and an `expected.toml` is a test case.
 - Tests run hermetically — the adapter + check execute against the fixture files, with no access to the real repo.
@@ -1321,9 +1434,9 @@ checkleft test --update proto/evolution
 
 ---
 
-## 13. Integration with existing checkleft infrastructure
+## 14. Integration with existing checkleft infrastructure
 
-### 12.1 CHECKS.yaml / CHECKS.toml compatibility
+### 14.1 CHECKS.yaml / CHECKS.toml compatibility
 
 Starlark-defined checks appear in `CHECKS.yaml` the same way external checks do today:
 
@@ -1344,7 +1457,7 @@ However, `package.toml` is the **preferred** way to activate Starlark checks. `C
 
 When both `package.toml` and `CHECKS.yaml` activate the same check ID, `CHECKS.yaml` policy fields (severity override, bypass, exclusions) take precedence — they are the operator-level override layer.
 
-### 12.2 Output compatibility
+### 14.2 Output compatibility
 
 Starlark checks produce `Finding` values that map 1:1 to the existing `crate::output::Finding`:
 
@@ -1356,19 +1469,19 @@ Starlark checks produce `Finding` values that map 1:1 to the existing `crate::ou
 | `remediation` | `remediation: Option<String>` |
 | `suggested_fix` | `suggested_fix: Option<SuggestedFix>` |
 
-### 12.3 Fix compatibility
+### 14.3 Fix compatibility
 
 Starlark `fix()` functions return `list[FileEdit]` which maps to the existing `Vec<FileEdit>` consumed by `WritableSandbox`. The existing fix scheduler (`src/fix/scheduler.rs`) orchestrates Starlark fixes identically to WASM component fixes.
 
-### 12.4 Progress reporting
+### 14.4 Progress reporting
 
 The runner reports Starlark check progress through the existing `ProgressReporter` trait. Each Starlark check registers its `applicable_file_count` (derived from `applies_to` glob matching) and ticks progress as files are processed by the adapter.
 
 ---
 
-## 14. Future extensions
+## 15. Future extensions
 
-### 13.1 Additional sandbox tiers
+### 16.1 Additional sandbox tiers
 
 If needed later, new tiers slot in naturally:
 
@@ -1377,7 +1490,7 @@ If needed later, new tiers slot in naturally:
 | `"exec"` | Everything in `network` + subprocess execution via `exec()` built-in. |
 | `"full"` | Unrestricted. Equivalent to a Rust check. For trusted first-party checks only. |
 
-### 13.2 Additional format adapters
+### 16.2 Additional format adapters
 
 The adapter system is open for extension:
 
@@ -1388,7 +1501,7 @@ The adapter system is open for extension:
 
 Each adapter is a Rust crate implementing `FormatAdapter`. No changes to the Starlark infrastructure needed.
 
-### 13.3 Check composition
+### 16.3 Check composition
 
 A future `compose()` built-in could let checks delegate to sub-checks:
 
@@ -1402,17 +1515,17 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 13.4 Interactive fix preview
+### 16.4 Interactive fix preview
 
 A `checkleft fix --preview` mode that shows proposed edits in a TUI diff viewer before applying.
 
 ---
 
-## 15. API reference by example
+## 16. API reference by example
 
 This section provides concrete, copy-pasteable examples of every key operation a check author will perform. These examples define the target API surface.
 
-### 15.1 Constructing findings
+### 16.1 Constructing findings
 
 ```python
 # Minimal finding — just severity, message, and path
@@ -1471,7 +1584,7 @@ findings.append(fail_but_overridable(
 ))
 ```
 
-### 15.2 Constructing file edits (for fixes)
+### 16.2 Constructing file edits (for fixes)
 
 ```python
 # Replace existing text
@@ -1497,7 +1610,7 @@ edits.append(file_edit(
 ))
 ```
 
-### 15.3 Loading shared helpers
+### 16.3 Loading shared helpers
 
 ```python
 # From the package's lib/ directory
@@ -1513,7 +1626,7 @@ load("@acme_checks//lib/wire", "is_wire_compatible", "BREAKING_KINDS")
 load("//lib/matchers", "glob_match", "path_prefix", "is_generated_file")
 ```
 
-### 15.4 Defining shared helper modules
+### 16.4 Defining shared helper modules
 
 **`checkleft/lib/proto_helpers.checkleft`:**
 ```python
@@ -1543,7 +1656,7 @@ WIRE_INCOMPATIBLE_TYPE_CHANGES: dict[str, list[str]] = {
 }
 ```
 
-### 15.5 Working with the proto evolution context
+### 16.5 Working with the proto evolution context
 
 ```python
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -1635,7 +1748,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.6 Proto check: blocking proto file deletion
+### 16.6 Proto check: blocking proto file deletion
 
 ```python
 # checkleft/proto/public/no_deletion/check.checkleft
@@ -1654,7 +1767,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.7 Proto check: detecting moves vs. deletions
+### 16.7 Proto check: detecting moves vs. deletions
 
 A move (rename/relocate) is semantically fine if the package and content remain the same. The adapter gives us `ChangeKind.renamed` in the changeset and `before`/`after` descriptors on file pairs — we can use both to distinguish a real deletion from a harmless move.
 
@@ -1714,7 +1827,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.8 Working with the `module.json` evolution context
+### 16.8 Working with the `module.json` evolution context
 
 ```python
 def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
@@ -1773,7 +1886,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.9 Working with the Java evolution context
+### 16.9 Working with the Java evolution context
 
 ```python
 def check(ctx: JavaEvolutionContext) -> list[Finding]:
@@ -1826,7 +1939,7 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.10 Working with the text adapter (generic checks)
+### 16.10 Working with the text adapter (generic checks)
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -1863,7 +1976,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.11 Writing a fix function
+### 16.11 Writing a fix function
 
 ```python
 # proto/public/evolution/fix.checkleft
@@ -1903,7 +2016,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 15.12 Package manifest with a version set
+### 16.12 Package manifest with a version set
 
 ```toml
 # checkleft/package.toml
@@ -1933,7 +2046,7 @@ version = "0.3.0"
 # package.toml is purely for external deps.
 ```
 
-### 15.13 Network tier: checking against a remote registry
+### 16.13 Network tier: checking against a remote registry
 
 ```python
 # checkleft/proto/public/registry_sync/check.checkleft
@@ -1984,7 +2097,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.14 Using `regex_match` and `glob_match` utilities
+### 16.14 Using `regex_match` and `glob_match` utilities
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -2023,38 +2136,9 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 15.15 Using `json_decode` / `json_encode` in text-adapter checks
-
-The `json_decode` / `json_encode` built-ins are available for text-adapter checks that need to work with JSON content from the parsed line model. They are utility functions, not a replacement for typed adapters.
-
-```python
-def check(ctx: TextEvolutionContext) -> list[Finding]:
-    """Validate that tsconfig.json files have strict mode enabled."""
-    findings: list[Finding] = []
-
-    for pair in ctx.files:
-        if pair.after == None:
-            continue
-        if not glob_match("**/tsconfig.json", pair.path):
-            continue
-
-        # Reconstruct the file content from the line model
-        content: str = "\n".join([line.text for line in pair.after.lines])
-        parsed: dict[str, typing.Any] = json_decode(content)
-
-        compiler_opts: dict[str, typing.Any] = parsed.get("compilerOptions", {})
-        if not compiler_opts.get("strict", False):
-            findings.append(fail_but_overridable(
-                message = "tsconfig.json must have compilerOptions.strict = true",
-                path = pair.path,
-            ))
-
-    return findings
-```
-
 ---
 
-## 16. Summary of conventions
+## 17. Summary of conventions
 
 | Convention | Rule |
 |---|---|
