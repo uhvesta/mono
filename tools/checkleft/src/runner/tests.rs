@@ -295,8 +295,8 @@ id = "capture"
 #[tokio::test]
 async fn runner_executes_discovered_local_starlark_text_check() {
     let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("checkleft/text/public/no_debug")).expect("create check dirs");
-    fs::create_dir_all(temp.path().join("checkleft/text/private/no_todo")).expect("create private check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_todo")).expect("create second check dirs");
     fs::create_dir_all(temp.path().join("checkleft/lib")).expect("create lib dir");
     fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
     fs::write(
@@ -309,7 +309,7 @@ version = "0.1.0"
     )
     .expect("write package manifest");
     fs::write(
-        temp.path().join("checkleft/text/public/no_debug/check.checkleft"),
+        temp.path().join("checkleft/text/no_debug/check.checkleft"),
         r#"
 load("//lib/messages", "message_for")
 
@@ -331,7 +331,7 @@ def check(ctx):
     )
     .expect("write check");
     fs::write(
-        temp.path().join("checkleft/text/private/no_todo/check.checkleft"),
+        temp.path().join("checkleft/text/no_todo/check.checkleft"),
         r#"
 load("//lib/messages", "message_for")
 
@@ -351,7 +351,7 @@ def check(ctx):
     return findings
 "#,
     )
-    .expect("write private check");
+    .expect("write second check");
     fs::write(
         temp.path().join("checkleft/lib/messages.checkleft"),
         r#"
@@ -393,7 +393,7 @@ def message_for(kind):
     let result = results
         .iter()
         .find(|result| result.check_id == "text/no_todo")
-        .expect("private starlark result");
+        .expect("second starlark result");
     assert_eq!(result.findings.len(), 1);
     assert_eq!(result.findings[0].message, "todo text added");
     assert_eq!(
@@ -409,7 +409,7 @@ def message_for(kind):
 #[tokio::test]
 async fn runner_filters_discovered_starlark_checks_by_applies_to() {
     let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("checkleft/text/public/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_debug")).expect("create check dirs");
     fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
     fs::write(
         temp.path().join("checkleft/package.toml"),
@@ -421,7 +421,7 @@ version = "0.1.0"
     )
     .expect("write package manifest");
     fs::write(
-        temp.path().join("checkleft/text/public/no_debug/check.checkleft"),
+        temp.path().join("checkleft/text/no_debug/check.checkleft"),
         r#"
 check_meta(applies_to = ["**/*.txt"])
 
@@ -452,7 +452,7 @@ def check(ctx):
 #[tokio::test]
 async fn runner_lists_discovered_local_starlark_text_check() {
     let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("checkleft/text/public/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_debug")).expect("create check dirs");
     fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
     fs::write(
         temp.path().join("checkleft/package.toml"),
@@ -464,7 +464,7 @@ version = "0.1.0"
     )
     .expect("write package manifest");
     fs::write(
-        temp.path().join("checkleft/text/public/no_debug/check.checkleft"),
+        temp.path().join("checkleft/text/no_debug/check.checkleft"),
         r#"
 check_meta(applies_to = ["**/*.txt"])
 
@@ -494,7 +494,7 @@ def check(ctx):
 #[tokio::test]
 async fn runner_preserves_starlark_finding_severity() {
     let temp = tempdir().expect("create temp dir");
-    fs::create_dir_all(temp.path().join("checkleft/text/public/warn_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/text/warn_debug")).expect("create check dirs");
     fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
     fs::write(
         temp.path().join("checkleft/package.toml"),
@@ -506,7 +506,7 @@ version = "0.1.0"
     )
     .expect("write package manifest");
     fs::write(
-        temp.path().join("checkleft/text/public/warn_debug/check.checkleft"),
+        temp.path().join("checkleft/text/warn_debug/check.checkleft"),
         r#"
 check_meta(applies_to = ["**/*.txt"])
 

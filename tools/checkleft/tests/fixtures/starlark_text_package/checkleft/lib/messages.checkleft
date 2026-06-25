@@ -1,0 +1,2 @@
+def policy_message(kind):
+    return kind + " marker"

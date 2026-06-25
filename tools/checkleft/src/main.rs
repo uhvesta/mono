@@ -29,6 +29,7 @@ use checkleft::progress::render::TermRenderer;
 use checkleft::progress::{DEFAULT_DEBOUNCE, LiveProgress, NoopProgressReporter, ProgressReporter, RenderFindings};
 use checkleft::runner::{DEFAULT_FIX_PASSES, Runner};
 use checkleft::source_tree::LocalSourceTree;
+use checkleft::starlark::testing::{StarlarkTestOptions, run_package_tests};
 use checkleft::vcs::{BaseRevision, Vcs, github_pr_number_for_branch, github_pull_request_description};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::info;
@@ -136,6 +137,12 @@ enum Commands {
     /// machinery to find failing files, then applies each check's declared fix
     /// mechanism. Re-runs each check after fixing to report residual failures.
     Fix(FixArgs),
+    /// Run Starlark check package fixture tests under checkleft/**/testdata.
+    Test {
+        /// Run one check or one check case, e.g. text/no_debug or text/no_debug/debug_added.
+        #[arg(value_name = "SELECTOR")]
+        selector: Option<String>,
+    },
     List {
         #[command(flatten)]
         config: ConfigArgs,
@@ -230,6 +237,7 @@ async fn run_cli() -> Result<ExitCode> {
         None => dispatch_run(default_run_args, &root, &vcs, &env).await,
         Some(Commands::Run(args)) => dispatch_run(args, &root, &vcs, &env).await,
         Some(Commands::Fix(args)) => dispatch_fix(args, &root, &vcs, &env).await,
+        Some(Commands::Test { selector }) => dispatch_starlark_test(&root, selector),
         Some(Commands::List {
             config,
             all,
@@ -304,6 +312,36 @@ async fn run_cli() -> Result<ExitCode> {
         }
         Some(Commands::Install { remove }) => dispatch_install(&root, remove),
         Some(Commands::Uninstall) => dispatch_install(&root, true),
+    }
+}
+
+fn dispatch_starlark_test(root: &Path, selector: Option<String>) -> Result<ExitCode> {
+    let result = run_package_tests(root, Path::new("checkleft"), &StarlarkTestOptions { selector })?;
+    if result.cases.is_empty() {
+        println!("No Starlark check tests found.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let mut failed = 0usize;
+    for case in &result.cases {
+        if case.passed {
+            println!("ok {} / {}", case.check_id, case.case_name);
+            continue;
+        }
+        failed += 1;
+        println!("FAIL {} / {}", case.check_id, case.case_name);
+        if let Some(message) = &case.message {
+            println!("  {message}");
+        }
+    }
+
+    let total = result.cases.len();
+    if failed == 0 {
+        println!("summary: {total} passed");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        println!("summary: {failed} failed, {} passed", total - failed);
+        Ok(ExitCode::from(1))
     }
 }
 

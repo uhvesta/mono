@@ -13,7 +13,6 @@ const BUILTIN_ADAPTERS: &[&str] = &["text", "proto", "module_json", "java"];
 pub struct DiscoveredCheck {
     pub id: String,
     pub adapter: String,
-    pub visibility: CheckVisibility,
     pub checkleft_root: PathBuf,
     pub check_dir: PathBuf,
     pub check_path: PathBuf,
@@ -25,12 +24,6 @@ pub struct DiscoveredCheck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredCheckMeta {
     pub applies_to: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CheckVisibility {
-    Public,
-    Private,
 }
 
 pub fn discover_local_checks(changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<Vec<DiscoveredCheck>> {
@@ -119,20 +112,13 @@ fn validate_directory_entry(checkleft_root: &Path, entry: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    if is_known_adapter(components[0]) && components.len() == 2 && parse_visibility(components[1]).is_err() {
-        bail!(
-            "invalid Starlark check visibility `{}` under adapter `{}`; expected public or private",
-            components[1],
-            components[0]
-        );
-    }
     Ok(())
 }
 
 fn validate_file_entry(checkleft_root: &Path, entry: &Path) -> Result<()> {
     let relative = relative_to_root(checkleft_root, entry)?;
     let components = path_components(&relative)?;
-    if components == ["package.toml"] || components == ["PACKAGE.lock"] {
+    if components == ["package.toml"] {
         return Ok(());
     }
     if components.first() == Some(&"lib") {
@@ -158,9 +144,9 @@ fn parse_check_file(
 ) -> Result<DiscoveredCheck> {
     let relative = relative_to_root(checkleft_root, check_path)?;
     let components = path_components(&relative)?;
-    if components.len() < 4 {
+    if components.len() < 3 {
         bail!(
-            "{} must be under <adapter>/<public|private>/<name>/check.checkleft",
+            "{} must be under <adapter>/<name>/check.checkleft",
             check_path.display()
         );
     }
@@ -172,8 +158,7 @@ fn parse_check_file(
     if !is_known_adapter(&adapter) {
         bail!("unknown Starlark check adapter `{adapter}`");
     }
-    let visibility = parse_visibility(components[1])?;
-    let name_components = &components[2..components.len() - 1];
+    let name_components = &components[1..components.len() - 1];
     if name_components.is_empty() {
         bail!("{} must include a check name directory", check_path.display());
     }
@@ -191,7 +176,6 @@ fn parse_check_file(
     Ok(DiscoveredCheck {
         id: format!("{adapter}/{check_name}"),
         adapter,
-        visibility,
         checkleft_root: checkleft_root.to_path_buf(),
         fix_path: tree
             .exists(&check_dir.join("fix.checkleft"))
@@ -230,14 +214,6 @@ fn parse_applies_to(source: &str) -> Result<Vec<String>> {
         bail!("check_meta.applies_to must contain at least one glob");
     }
     Ok(applies_to)
-}
-
-fn parse_visibility(raw: &str) -> Result<CheckVisibility> {
-    match raw {
-        "public" => Ok(CheckVisibility::Public),
-        "private" => Ok(CheckVisibility::Private),
-        other => bail!("invalid Starlark check visibility `{other}`; expected public or private"),
-    }
 }
 
 fn is_known_adapter(adapter: &str) -> bool {
@@ -289,7 +265,7 @@ version = "0.1.0"
 "#,
         );
         write_file(
-            temp.path().join("checkleft/text/public/root_policy/check.checkleft"),
+            temp.path().join("checkleft/text/root_policy/check.checkleft"),
             r#"check_meta(applies_to = ["**/*.txt"])"#,
         );
         write_file(
@@ -302,12 +278,12 @@ version = "0.1.0"
         );
         write_file(
             temp.path()
-                .join("services/payments/checkleft/text/private/team/policy/check.checkleft"),
+                .join("services/payments/checkleft/text/team/policy/check.checkleft"),
             r#"check_meta(applies_to = ["**/*.txt"])"#,
         );
         write_file(
             temp.path()
-                .join("services/payments/checkleft/text/private/team/policy/fix.checkleft"),
+                .join("services/payments/checkleft/text/team/policy/fix.checkleft"),
             "def fix(ctx, findings): return []",
         );
         write_file(temp.path().join("services/payments/readme.txt"), "hello");
@@ -323,13 +299,9 @@ version = "0.1.0"
         let ids = checks.iter().map(|check| check.id.as_str()).collect::<Vec<_>>();
 
         assert_eq!(ids, vec!["text/root_policy", "text/team/policy"]);
-        assert_eq!(checks[0].visibility, CheckVisibility::Public);
-        assert_eq!(checks[1].visibility, CheckVisibility::Private);
         assert_eq!(
             checks[1].fix_path.as_deref(),
-            Some(Path::new(
-                "services/payments/checkleft/text/private/team/policy/fix.checkleft"
-            ))
+            Some(Path::new("services/payments/checkleft/text/team/policy/fix.checkleft"))
         );
         assert_eq!(checks[1].package.package.name, "myorg/payments");
     }
@@ -338,7 +310,7 @@ version = "0.1.0"
     fn ignores_checkleft_directory_without_package_manifest() {
         let temp = tempdir().expect("create temp dir");
         write_file(
-            temp.path().join("checkleft/text/public/root_policy/check.checkleft"),
+            temp.path().join("checkleft/text/root_policy/check.checkleft"),
             r#"check_meta(applies_to = ["**/*.txt"])"#,
         );
         write_file(temp.path().join("readme.txt"), "hello");
@@ -355,7 +327,7 @@ version = "0.1.0"
     }
 
     #[test]
-    fn rejects_invalid_visibility_directory() {
+    fn rejects_unknown_adapter_directory() {
         let temp = tempdir().expect("create temp dir");
         write_file(
             temp.path().join("checkleft/package.toml"),
@@ -366,14 +338,14 @@ version = "0.1.0"
 "#,
         );
         write_file(
-            temp.path().join("checkleft/text/shared/root_policy/check.checkleft"),
+            temp.path().join("checkleft/unknown/root_policy/check.checkleft"),
             r#"check_meta(applies_to = ["**/*.txt"])"#,
         );
 
         let tree = LocalSourceTree::new(temp.path()).expect("create tree");
-        let err = discover_package_checks(&tree, Path::new("checkleft")).expect_err("visibility must fail");
+        let err = discover_package_checks(&tree, Path::new("checkleft")).expect_err("adapter must fail");
 
-        assert!(err.to_string().contains("invalid Starlark check visibility"), "{err:#}");
+        assert!(err.to_string().contains("unknown Starlark check adapter"), "{err:#}");
     }
 
     fn write_file(path: impl AsRef<Path>, contents: &str) {

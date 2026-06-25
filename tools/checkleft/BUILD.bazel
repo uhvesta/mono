@@ -206,3 +206,22 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+rust_test(
+    name = "starlark_text_package_test",
+    size = "small",
+    srcs = ["tests/starlark_text_package_test.rs"],
+    data = glob(["tests/fixtures/starlark_text_package/**"]),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":checkleft_lib",
+        "@rules_rust//rust/runfiles",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -97,7 +97,7 @@ mod tests {
     fn context() -> LoadContext {
         LoadContext {
             checkleft_root: PathBuf::from("checkleft"),
-            check_dir: PathBuf::from("checkleft/text/public/no_debug"),
+            check_dir: PathBuf::from("checkleft/text/no_debug"),
         }
     }
 
@@ -113,7 +113,7 @@ mod tests {
     fn resolves_colon_load_under_check_directory() {
         assert_eq!(
             resolve_load_path(&context(), ":predicates").expect("resolve"),
-            PathBuf::from("checkleft/text/public/no_debug/predicates.checkleft")
+            PathBuf::from("checkleft/text/no_debug/predicates.checkleft")
         );
     }
 

@@ -553,7 +553,7 @@ def check(ctx):
     return findings
 "#,
         )
-        .with_load_context("checkleft", "checkleft/text/public/no_debug");
+        .with_load_context("checkleft", "checkleft/text/no_debug");
         let mut tree = MapTree::default();
         tree.current.insert(
             PathBuf::from("checkleft/lib/messages.checkleft"),
@@ -564,7 +564,7 @@ def message_for(kind):
             .to_vec(),
         );
         tree.current.insert(
-            PathBuf::from("checkleft/text/public/no_debug/predicates.checkleft"),
+            PathBuf::from("checkleft/text/no_debug/predicates.checkleft"),
             br#"
 def has_debug(s):
     return "debug" in s
@@ -611,7 +611,7 @@ def check(ctx):
     return []
 "#,
         )
-        .with_load_context("checkleft", "checkleft/text/public/no_debug");
+        .with_load_context("checkleft", "checkleft/text/no_debug");
         let mut tree = MapTree::default();
         tree.current
             .insert(PathBuf::from("notes/example.txt"), b"hello\n".to_vec());
@@ -641,7 +641,7 @@ def check(ctx):
     return []
 "#,
         )
-        .with_load_context("checkleft", "checkleft/text/public/no_debug");
+        .with_load_context("checkleft", "checkleft/text/no_debug");
         let mut tree = MapTree::default();
         tree.current
             .insert(PathBuf::from("notes/example.txt"), b"hello\n".to_vec());

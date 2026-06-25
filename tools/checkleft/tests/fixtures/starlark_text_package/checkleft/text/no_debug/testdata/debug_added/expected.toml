@@ -1,0 +1,5 @@
+[[findings]]
+severity = "fail"
+message_contains = "debug marker"
+path = "notes/example.txt"
+line = 2

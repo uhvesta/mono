@@ -1,0 +1,5 @@
+[[findings]]
+severity = "fail_but_overridable"
+message_eq = "TODO marker"
+path = "notes/todo.txt"
+line = 2
