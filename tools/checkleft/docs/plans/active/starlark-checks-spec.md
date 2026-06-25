@@ -585,16 +585,14 @@ load("//lib/matchers", "glob_match", "path_prefix")
 
 # Load from a check-local helper in the same directory
 load(":types", "field_not_reserved")
-
-# Load from an external dependency
-load("@proto_evolution_checks//lib/wire", "is_wire_compatible")
 ```
 
 | Prefix | Resolution |
 |---|---|
 | `//` | Relative to the enclosing `checkleft/` directory. |
 | `:` | Relative to the current check directory. |
-| `@<dep_name>//` | Relative to the named dependency's `checkleft/` root. |
+
+External dependencies provide **checks only** — their `lib/` modules and internal helpers are never loadable by consumers. There is no `@<dep_name>//` load path. Dependencies are consumed as opaque check packages, not as importable libraries.
 
 ---
 
@@ -1671,9 +1669,6 @@ load("//lib/proto_helpers", "has_reservation", "is_internal_package")
 
 # From a check-local helper in the same check directory
 load(":types", "FieldNotReserved", "field_not_reserved")
-
-# From an external versioned dependency
-load("@acme_checks//lib/wire", "is_wire_compatible", "BREAKING_KINDS")
 
 # Multiple symbols from one module
 load("//lib/matchers", "glob_match", "path_prefix", "is_generated_file")
