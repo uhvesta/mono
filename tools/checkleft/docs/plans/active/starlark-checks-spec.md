@@ -58,7 +58,20 @@ repo-root/
 │                       └── check.checkleft
 ```
 
-### 2.2 Rules
+### 2.2 Design philosophy: one way to do things
+
+This folder structure is **intentionally opinionated**. There is exactly one way to determine each property of a check:
+
+- **Which adapter?** → look at the first-level folder (`proto/`, `module_json/`, etc.)
+- **Public or private?** → look at the second-level folder (`public/` or `private/`)
+- **Which check?** → look at the third-level folder (the check name)
+- **What files does it run on?** → read `check_meta()` in `check.checkleft`
+- **Where are shared helpers?** → `lib/`
+- **Where are external deps?** → `package.toml`
+
+No config flags, no overrides, no implicit conventions. The directory tree is the source of truth. This minimizes the number of ways to do things, making the system predictable and auditable.
+
+### 2.3 Rules
 
 | Path pattern | Role |
 |---|---|
@@ -74,16 +87,32 @@ The path structure is: `<adapter>/<visibility>/<name>`.
 
 - **`<adapter>`** — selects the Rust format adapter (e.g. `proto`, `module_json`, `java`, `text`). Must match a registered `FormatAdapter::kind()`. This is the structural guarantee that every check under `proto/` uses the proto adapter and receives a `ProtoEvolutionContext`.
 - **`<visibility>`** — exactly `public` or `private`. No other values.
-- **`<name>`** — the check name. Forms the check ID as `<adapter>/<name>` (e.g. `proto/evolution`). Note: visibility is not part of the check ID.
+- **`<name>`** — the check name. Can be nested (e.g. `evolution/deletions`). Forms the check ID as `<adapter>/<name>` (e.g. `proto/evolution` or `proto/evolution/deletions`). Visibility is not part of the check ID.
+
+Checks can be nested under a parent to create logical groupings:
+
+```
+checkleft/proto/public/
+├── evolution/
+│   ├── check.checkleft              # check ID: proto/evolution
+│   ├── deletions/
+│   │   └── check.checkleft          # check ID: proto/evolution/deletions
+│   └── field_numbering/
+│       └── check.checkleft          # check ID: proto/evolution/field_numbering
+└── naming/
+    └── check.checkleft              # check ID: proto/naming
+```
+
+Each directory with a `check.checkleft` is an independent check. Nesting is purely organizational — a parent check does not compose or invoke its children.
 
 **Enforcement:**
-- A directory containing `check.checkleft` must be exactly three levels deep under `checkleft/` (adapter + visibility + name).
+- A directory containing `check.checkleft` must be at least three levels deep under `checkleft/` (adapter + visibility + name, with name being one or more levels).
 - The second level must be literally `public` or `private`. Anything else is an error.
 - The first level must match a registered adapter. Unknown adapter names are an error at discovery time.
 - `package.toml` must exist at the `checkleft/` root. Without it, the directory is ignored.
 - File extension is always `.checkleft`. No `.star`, `.bzl`, or `.py`.
 
-### 2.3 Nested / hierarchical checks and file scoping
+### 2.4 Nested / hierarchical checks and file scoping
 
 A nested `checkleft/` directory (e.g. `a/b/c/checkleft/`) defines checks that apply to files in that subtree **and all descendant subtrees**.
 
@@ -93,32 +122,34 @@ A nested `checkleft/` directory (e.g. `a/b/c/checkleft/`) defines checks that ap
 
 ```
 repo/
-├── checkleft/                          # root-level checks
+├── checkleft/                                  # root-level checks
 │   └── proto/
-│       └── evolution/
-│           └── check.checkleft         # applies_to: ["**/*.proto"]
+│       └── public/
+│           └── evolution/
+│               └── check.checkleft             # applies_to: ["**/*.proto"]
 ├── a/
 │   └── b/
 │       └── c/
-│           ├── checkleft/              # project-level checks
+│           ├── checkleft/                      # project-level checks
 │           │   └── proto/
-│           │       └── billing_compat/
-│           │           └── check.checkleft  # applies_to: ["**/*.proto"]
-│           ├── foo.proto               # changed file
+│           │       └── private/
+│           │           └── billing_compat/
+│           │               └── check.checkleft # applies_to: ["**/*.proto"]
+│           ├── foo.proto                       # changed file
 │           └── d/
 │               └── e/
 │                   └── f/
-│                       └── bar.proto   # changed file
+│                       └── bar.proto           # changed file
 ```
 
 If `a/b/c/foo.proto` and `a/b/c/d/e/f/bar.proto` are both changed:
 
 - **`a/b/c/foo.proto`** is checked by:
-  - `repo/checkleft/proto/evolution/` (root ancestor, glob matches)
+  - `repo/checkleft/proto/public/evolution/` (root ancestor, glob matches)
   - `repo/a/b/c/checkleft/proto/billing_compat/` (sibling checkleft, glob matches)
 
 - **`a/b/c/d/e/f/bar.proto`** is checked by:
-  - `repo/checkleft/proto/evolution/` (root ancestor, glob matches)
+  - `repo/checkleft/proto/public/evolution/` (root ancestor, glob matches)
   - `repo/a/b/c/checkleft/proto/billing_compat/` (ancestor checkleft, glob matches)
 
 Both proto files get **all** applicable checks run on them. A nested `checkleft/` adds checks for its subtree — it does not remove or replace ancestor checks. Root-level checks always apply repo-wide.
@@ -265,7 +296,7 @@ Resolution is intentionally simple — no complex override logic.
 **Local checks are never listed in `package.toml`.** They are auto-discovered from the folder structure:
 
 - Any directory matching `checkleft/<category>/<name>/` that contains a `check.checkleft` is a check.
-- The check ID is derived from the path: `<category>/<name>` (e.g. `proto/evolution`).
+- The check ID is derived from the path: `<adapter>/<name>` (e.g. `proto/evolution`). Visibility (`public`/`private`) is not part of the ID.
 - The `applies_to` globs, `tier`, and `config` are declared **inside `check.checkleft` itself** via a `check_meta()` call at the top of the file (see §4.1).
 
 This means `package.toml` has exactly two jobs:
@@ -332,7 +363,7 @@ Every check file must:
 2. Define exactly one `check()` function with a typed signature. The parameter type depends on the **file format adapter** (see §6).
 
 ```python
-# checkleft/proto/evolution/check.checkleft
+# checkleft/proto/public/evolution/check.checkleft
 
 load("//lib/proto_helpers", "is_reserved")
 
@@ -372,7 +403,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 Optional. Must define a `fix()` function whose signature mirrors the check but returns `list[FileEdit]`.
 
 ```python
-# checkleft/proto/evolution/fix.checkleft
+# checkleft/proto/public/evolution/fix.checkleft
 
 def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     edits: list[FileEdit] = []
@@ -690,7 +721,7 @@ Third-party or in-repo Rust adapters register via:
 registry.register_adapter(Box::new(MyCustomAdapter));
 ```
 
-The adapter's `kind()` return value must match the `<category>` folder name in the check directory structure. This is the linkage: `checkleft/proto/*/check.checkleft` uses the adapter whose `kind() == "proto"`.
+The adapter's `kind()` return value must match the top-level `<adapter>` folder name in the check directory structure. This is a structural guarantee: every check under `checkleft/proto/` (whether `public/` or `private/`) uses the adapter whose `kind() == "proto"` and receives a `ProtoEvolutionContext`. There is exactly one way to determine which adapter a check uses — look at its parent folder.
 
 ---
 
@@ -705,7 +736,7 @@ Rust checks implement the existing `Check` + `ConfiguredCheck` traits. They are 
 A `check.checkleft` can delegate to a Rust implementation via `source` in `check_meta()`:
 
 ```python
-# checkleft/proto/wire_compat_fast/check.checkleft
+# checkleft/proto/public/wire_compat_fast/check.checkleft
 # This is a thin shim — the real work happens in Rust.
 
 check_meta(
@@ -893,9 +924,10 @@ checkleft/
 ├── lib/
 │   └── proto_helpers.checkleft
 └── proto/
-    └── evolution/
-        ├── check.checkleft
-        └── fix.checkleft
+    └── public/
+        └── evolution/
+            ├── check.checkleft
+            └── fix.checkleft
 ```
 
 **`package.toml`:**
@@ -919,7 +951,7 @@ def is_internal_package(pkg: str) -> bool:
     return pkg.startswith("internal.") or ".internal." in pkg
 ```
 
-**`proto/evolution/check.checkleft`:**
+**`proto/public/evolution/check.checkleft`:**
 ```python
 load("//lib/proto_helpers", "has_reservation", "is_internal_package")
 
@@ -968,7 +1000,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-**`proto/evolution/fix.checkleft`:**
+**`proto/public/evolution/fix.checkleft`:**
 ```python
 def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     edits: list[FileEdit] = []
@@ -990,11 +1022,12 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
 ```
 checkleft/
 └── module_json/
-    └── required_fields/
-        └── check.checkleft
+    └── public/
+        └── required_fields/
+            └── check.checkleft
 ```
 
-**`module_json/required_fields/check.checkleft`:**
+**`module_json/public/required_fields/check.checkleft`:**
 ```python
 check_meta(
     applies_to: list[str] = ["**/module.json"],
@@ -1042,11 +1075,12 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
 ```
 checkleft/
 └── java/
-    └── api_stability/
-        └── check.checkleft
+    └── public/
+        └── api_stability/
+            └── check.checkleft
 ```
 
-**`java/api_stability/check.checkleft`:**
+**`java/public/api_stability/check.checkleft`:**
 ```python
 check_meta(
     applies_to: list[str] = ["**/*.java"],
@@ -1093,154 +1127,114 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
 
 ## 12. Functional testing for checks
 
-Check authors need to test their checks without committing broken code to see if the check catches it. Each check directory can contain a `check_test.checkleft` file with test cases.
+Check authors need to test their checks by running them against real file inputs and asserting on the outputs. Tests use **file fixtures** — actual files on disk organized into `before/` and `after/` workspaces. The test runner diffs the two workspaces, runs the adapter + check, and compares findings against expected output.
 
-### 12.1 Test file structure
+This is a purely functional, black-box approach: files in, findings out. No mocking, no stubbing the adapter.
 
-```python
-# checkleft/proto/evolution/check_test.checkleft
+### 12.1 Test directory structure
 
-load(":check", "check")
+Each test case is a directory under `testdata/` containing a `before/` workspace, an `after/` workspace, and an `expected.toml` file declaring the expected findings.
 
-def test_field_removal_is_caught() -> None:
-    result: list[Finding] = check(test_context(
-        before = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User {
-                    string name = 1;
-                    int32 age = 2;
-                }
-            """),
-        },
-        after = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User {
-                    string name = 1;
-                }
-            """),
-        },
-    ))
-    assert_eq(len(result), 1)
-    assert_contains(result[0].message, "must be reserved")
-    assert_eq(result[0].severity, Severity.fail)
-
-def test_adding_field_is_allowed() -> None:
-    result: list[Finding] = check(test_context(
-        before = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User {
-                    string name = 1;
-                }
-            """),
-        },
-        after = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User {
-                    string name = 1;
-                    string email = 2;
-                }
-            """),
-        },
-    ))
-    assert_eq(len(result), 0)
-
-def test_file_deletion_with_config() -> None:
-    result: list[Finding] = check(test_context(
-        before = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User { string name = 1; }
-            """),
-        },
-        after = {},  # file deleted
-        config = {"severity": "fail"},
-    ))
-    assert_true(len(result) > 0)
+```
+checkleft/proto/public/evolution/
+├── check.checkleft
+├── fix.checkleft
+└── testdata/
+    ├── field_removal/                     # test case name
+    │   ├── before/
+    │   │   └── api/v1/user.proto          # base revision files
+    │   ├── after/
+    │   │   └── api/v1/user.proto          # current revision files
+    │   └── expected.toml                  # expected findings
+    ├── field_addition/
+    │   ├── before/
+    │   │   └── api/v1/user.proto
+    │   ├── after/
+    │   │   └── api/v1/user.proto
+    │   └── expected.toml
+    └── file_deletion/
+        ├── before/
+        │   └── api/v1/user.proto
+        ├── after/                         # empty — file was deleted
+        └── expected.toml
 ```
 
-### 12.2 Test built-ins
+### 12.2 Fixture files
 
-Tests get additional built-ins beyond the normal check environment:
+**`before/`** — contains the files as they existed at the base revision. The adapter parses these as the "before" state.
 
-| Symbol | Type | Description |
-|---|---|---|
-| `test_context(before, after, config=None)` | `fn(dict, dict, dict\|None) -> Context` | Build a synthetic context from file content maps. The adapter parses + diffs the content just as it would in a real run. |
-| `proto(content)` | `fn(str) -> str` | Marker for proto file content (enables adapter-specific parsing in `test_context`). |
-| `json(content)` | `fn(str) -> str` | Marker for JSON file content. |
-| `java(content)` | `fn(str) -> str` | Marker for Java file content. |
-| `text(content)` | `fn(str) -> str` | Marker for plain text content. |
-| `assert_eq(a, b)` | `fn(Any, Any)` | Assert equality. Fails with diff on mismatch. |
-| `assert_true(cond)` | `fn(bool)` | Assert truthy. |
-| `assert_contains(haystack, needle)` | `fn(str, str)` | Assert substring presence. |
-| `assert_finding_count(findings, n)` | `fn(list[Finding], int)` | Assert exact finding count. |
+**`after/`** — contains the files as they exist at the current revision. The adapter parses these as the "after" state. Missing files (present in `before/` but absent in `after/`) are treated as deletions. New files (present in `after/` but absent in `before/`) are treated as additions.
 
-### 12.3 Running tests
+The test runner computes the diff between the two workspaces, runs the adapter to parse both sides, and invokes the check — exactly as a real checkleft run would.
+
+### 12.3 Expected output (`expected.toml`)
+
+```toml
+# testdata/field_removal/expected.toml
+
+[[findings]]
+severity = "fail"
+message_contains = "must be reserved"    # substring match on the message
+path = "api/v1/user.proto"
+
+# For a test that should produce zero findings:
+# testdata/field_addition/expected.toml
+# (empty file or explicit empty list)
+# findings = []
+```
+
+**`expected.toml` fields:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `findings` | `list` | no | Expected findings. Empty or omitted = expect zero findings. |
+| `findings[].severity` | `str` | yes | `"fail"` or `"fail_but_overridable"`. |
+| `findings[].message_contains` | `str` | no | Substring that must appear in the finding message. |
+| `findings[].message_eq` | `str` | no | Exact message match (alternative to `message_contains`). |
+| `findings[].path` | `str` | yes | File path the finding should be on. |
+| `findings[].line` | `int` | no | Expected line number. |
+| `config` | `dict` | no | Override `check_meta()` config for this test case. |
+
+### 12.4 Fix testing
+
+If a check has a `fix.checkleft`, test cases can include an `expected_fix/` directory alongside `expected.toml`. After running the check, the test runner runs the fix and asserts that the resulting files match `expected_fix/`.
+
+```
+testdata/field_removal/
+├── before/
+│   └── api/v1/user.proto
+├── after/
+│   └── api/v1/user.proto           # field removed, no reservation
+├── expected.toml                    # expects a "must be reserved" finding
+└── expected_fix/
+    └── api/v1/user.proto           # after fix: reservation added
+```
+
+The test runner applies the fix edits to the `after/` workspace and diffs the result against `expected_fix/`. Any mismatch fails the test with a unified diff.
+
+### 12.5 Running tests
 
 ```bash
-# Run all check tests in the package
+# Run all tests for all checks in the package
 checkleft test
 
-# Run tests for a specific check
+# Run all tests for a specific check
 checkleft test proto/evolution
 
-# Run a specific test function
-checkleft test proto/evolution::test_field_removal_is_caught
+# Run a specific test case
+checkleft test proto/evolution/field_removal
+
+# Update expected output from actual results (snapshot testing)
+checkleft test --update proto/evolution
 ```
 
-### 12.4 Test discovery
+### 12.6 Test discovery and execution
 
-- Any function in `check_test.checkleft` whose name starts with `test_` is a test case.
-- Tests must have no parameters and return `None`.
-- Tests are type-checked with the same `DialectTypes::Enable` setting as checks.
-- Test failures include the Starlark traceback and assertion details.
-- Tests run hermetically regardless of the check's declared tier — `test_context()` provides all data synthetically.
-
-### 12.5 Fix testing
-
-Fix functions can be tested similarly:
-
-```python
-# checkleft/proto/evolution/check_test.checkleft
-
-load(":check", "check")
-load(":fix", "fix")
-
-def test_fix_adds_reservation() -> None:
-    ctx: ProtoEvolutionContext = test_context(
-        before = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User {
-                    string name = 1;
-                    int32 age = 2;
-                }
-            """),
-        },
-        after = {
-            "api/v1/user.proto": proto("""
-                syntax = "proto3";
-                package api.v1;
-                message User {
-                    string name = 1;
-                }
-            """),
-        },
-    )
-    findings: list[Finding] = check(ctx)
-    edits: list[FileEdit] = fix(ctx, findings)
-    assert_eq(len(edits), 1)
-    assert_contains(edits[0].new_text, "reserved 2")
-```
+- Any directory under `testdata/` that contains both a `before/` (or empty) and an `expected.toml` is a test case.
+- Tests run hermetically — the adapter + check execute against the fixture files, with no access to the real repo.
+- Each test case runs independently. No shared state between test cases.
+- Test failures show: expected findings vs. actual findings, with diffs.
+- `--update` flag regenerates `expected.toml` from actual output (snapshot update).
 
 ---
 
@@ -1253,7 +1247,7 @@ Starlark-defined checks appear in `CHECKS.yaml` the same way external checks do 
 ```yaml
 checks:
   - id: proto/evolution
-    check: starlark://checkleft/proto/evolution  # points at the checkleft/ directory
+    check: starlark://checkleft/proto/public/evolution  # points at the check directory
     policy:
       severity: fail
       allow_bypass: true
@@ -1561,7 +1555,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 ### 15.6 Proto check: blocking proto file deletion
 
 ```python
-# checkleft/proto/no_deletion/check.checkleft
+# checkleft/proto/public/no_deletion/check.checkleft
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Proto files must never be deleted — they represent a published contract."""
@@ -1582,7 +1576,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 A move (rename/relocate) is semantically fine if the package and content remain the same. The adapter gives us `ChangeKind.renamed` in the changeset and `before`/`after` descriptors on file pairs — we can use both to distinguish a real deletion from a harmless move.
 
 ```python
-# checkleft/proto/move_detection/check.checkleft
+# checkleft/proto/public/move_detection/check.checkleft
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Allow proto file moves/renames as long as the package stays the same."""
@@ -1789,7 +1783,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 ### 15.11 Writing a fix function
 
 ```python
-# proto/evolution/fix.checkleft
+# proto/public/evolution/fix.checkleft
 
 load(":check", "RESERVED_PATTERN")  # can load from own check file
 
@@ -1852,14 +1846,14 @@ version = "0.3.0"   # newer than what the version set pins
 source = "git://github.com/myteam/checkleft-checks.git"
 version = "0.3.0"
 
-# Local checks (checkleft/proto/evolution/, etc.) are auto-discovered.
+# Local checks (checkleft/proto/public/evolution/, etc.) are auto-discovered.
 # package.toml is purely for external deps.
 ```
 
 ### 15.13 Network tier: checking against a remote registry
 
 ```python
-# checkleft/proto/registry_sync/check.checkleft
+# checkleft/proto/public/registry_sync/check.checkleft
 # Tier: network (declared in check_meta below)
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -1982,14 +1976,14 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Convention | Rule |
 |---|---|
 | File extension | `.checkleft` always |
-| Check location | `checkleft/<category>/<name>/check.checkleft` |
-| Fix location | `checkleft/<category>/<name>/fix.checkleft` |
+| Check location | `checkleft/<adapter>/<visibility>/<name>/check.checkleft` |
+| Fix location | `checkleft/<adapter>/<visibility>/<name>/fix.checkleft` |
 | Shared code | `checkleft/lib/*.checkleft` |
-| Check-local helpers | `checkleft/<category>/<name>/<anything>.checkleft` (not `check` or `fix`) |
+| Check-local helpers | `checkleft/<adapter>/<visibility>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`) |
 | Package manifest | `checkleft/package.toml` |
 | Lockfile | `checkleft/PACKAGE.lock` (auto-generated, checked in) |
-| Check ID | `<category>/<name>` (e.g. `proto/evolution`) |
+| Check ID | `<adapter>/<name>` (e.g. `proto/evolution`) — visibility is not part of the ID |
 | Type annotations | Required on all function signatures |
 | Default sandbox | `hermetic` |
-| Adapter linkage | `<category>` folder name matches `FormatAdapter::kind()` |
+| Adapter linkage | `<adapter>` top-level folder name matches `FormatAdapter::kind()` |
 | Rust check override | `source: "rust://..."` in `check()` call |
