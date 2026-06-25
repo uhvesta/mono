@@ -156,6 +156,89 @@ Both proto files get **all** applicable checks run on them. A nested `checkleft/
 
 Nested packages can `load()` from ancestor `checkleft/lib/` directories (resolved upward), but not from sibling or child packages.
 
+### 2.5 Producer/consumer model and the meaning of `public` vs `private`
+
+**Every `checkleft/` directory with a `package.toml` is a package.** Root or nested, no distinction. The repo-root `checkleft/` is not special — it's just the top-level package. Its checks apply repo-wide because of the ancestor scoping rule (§2.4), not because of any export magic.
+
+**`public` vs `private` only matters when a package is consumed as a dependency.** Locally, within the repo, all checks run regardless of visibility. A `private/` check under `a/b/c/checkleft/` still runs on files in `a/b/c/` and its descendants. The distinction only kicks in when another package pulls in your package via `depend()`, `version_set()`, or `path://`.
+
+**Cross-package consumption — even within the same monorepo — goes through `package.toml` dependencies.** If project D wants to reuse checks from project C, it declares a `path://` dependency:
+
+```toml
+# a/b/d/checkleft/package.toml
+
+[package]
+name = "myorg/service-d"
+version = "0.1.0"
+
+[dependencies.service_c_checks]
+source = "path://../../c/checkleft"
+version = "0.0.0"
+```
+
+At that point, only `a/b/c/checkleft/<adapter>/public/` checks become active in D's scope. Private checks stay private to C.
+
+**Full scenario table:**
+
+| Scenario | Mechanism | What runs? |
+|---|---|---|
+| Root `checkleft/proto/public/evolution/` runs on `foo.proto` anywhere in repo | Ancestor scoping | **Runs.** All checks run locally regardless of public/private. |
+| Root `checkleft/proto/private/internal_lint/` runs on `foo.proto` anywhere in repo | Ancestor scoping | **Runs.** Private just means not exportable — locally it still runs. |
+| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/foo.proto` | Ancestor scoping | **Runs.** Same package, all checks run locally. |
+| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/d/e/foo.proto` | Ancestor scoping | **Runs.** Ancestor checks apply to all descendant files. |
+| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/private/billing/` check | `path://` dep | **Not visible.** Billing is private. |
+| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/public/wire_compat/` check | `path://` dep | **Visible.** Wire_compat is public. |
+| External repo consumes root package via `git://` | `git://` dep | Only `public/` checks visible. |
+| Version set includes a package | `version_set` | Only `public/` checks activated in consumers. |
+
+**Example: monorepo with cross-project consumption**
+
+```
+repo/
+├── checkleft/                           # root package — applies to entire repo
+│   ├── package.toml
+│   └── proto/
+│       ├── public/
+│       │   └── evolution/               # runs repo-wide, exported to external consumers
+│       │       └── check.checkleft
+│       └── private/
+│           └── internal_lint/           # runs repo-wide, NOT exported
+│               └── check.checkleft
+├── a/b/c/
+│   ├── checkleft/                       # project C's package
+│   │   ├── package.toml
+│   │   └── proto/
+│   │       ├── public/
+│   │       │   └── wire_compat/         # runs on a/b/c/**, visible to other packages
+│   │       │       └── check.checkleft
+│   │       └── private/
+│   │           └── billing/             # runs on a/b/c/**, NOT visible to other packages
+│   │               └── check.checkleft
+│   └── service.proto
+├── a/b/d/
+│   ├── checkleft/                       # project D's package
+│   │   └── package.toml                 # depends on path://../../c/checkleft
+│   └── api.proto
+```
+
+What runs on `a/b/d/api.proto`:
+1. Root `proto/public/evolution/` — ancestor, runs locally
+2. Root `proto/private/internal_lint/` — ancestor, runs locally
+3. C's `proto/public/wire_compat/` — pulled in via D's `path://` dep on C
+4. C's `proto/private/billing/` — **NOT visible** to D (private)
+
+What runs on `a/b/c/service.proto`:
+1. Root `proto/public/evolution/` — ancestor, runs locally
+2. Root `proto/private/internal_lint/` — ancestor, runs locally
+3. C's `proto/public/wire_compat/` — same package, runs locally
+4. C's `proto/private/billing/` — same package, runs locally
+
+**Key principles:**
+- Locally, visibility is irrelevant — all checks run on their subtree.
+- `public` vs `private` is exclusively about what other packages can see.
+- Cross-package consumption always requires an explicit dependency declaration.
+- The root package is not special — it just has the widest scope due to ancestor scoping.
+
 ---
 
 ## 3. `package.toml` — the package manifest
