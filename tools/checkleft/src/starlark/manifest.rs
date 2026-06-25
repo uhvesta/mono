@@ -135,7 +135,10 @@ fn validate_source_uri(section: &str, alias: &str, source: &str) -> Result<()> {
 }
 
 fn is_canonical_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn validate_exact_version(section: &str, alias: &str, version: &str) -> Result<()> {

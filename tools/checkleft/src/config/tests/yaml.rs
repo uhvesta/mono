@@ -5,7 +5,177 @@ use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::config::{CheckConfigOrigin, ConfigResolver, ConfigResolverOptions};
+use crate::config::{
+    CheckConfigOrigin, ConfigResolver, ConfigResolverOptions, StarlarkPackageActivation, StarlarkPackageKind,
+};
+
+#[test]
+fn yaml_parses_starlark_package_activation() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://checkleft
+      version: 0.1.0
+  version_sets:
+    - source: registry://checkleft-hub/baseline
+      version: 2026.06.1
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let packages = checks.starlark_packages();
+
+    assert_eq!(packages.len(), 2);
+    assert_eq!(packages[0].source, "path://checkleft");
+    assert_eq!(packages[0].kind, StarlarkPackageKind::Package);
+    assert_eq!(packages[0].activation, StarlarkPackageActivation::Explicit);
+    assert_eq!(packages[1].source, "registry://checkleft-hub/baseline");
+    assert_eq!(packages[1].kind, StarlarkPackageKind::VersionSet);
+    assert_eq!(packages[1].activation, StarlarkPackageActivation::All);
+    assert_eq!(
+        packages[1].sha256.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+}
+
+#[test]
+fn yaml_parses_starlark_package_activation_modes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: registry://checkleft-hub/core
+      version: 1.2.3
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    - source: path://checkleft
+      version: 0.1.0
+      mode: all
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let packages = checks.starlark_packages();
+
+    assert_eq!(packages[0].activation, StarlarkPackageActivation::All);
+    assert_eq!(packages[1].activation, StarlarkPackageActivation::All);
+}
+
+#[test]
+fn yaml_rejects_invalid_starlark_package_activation_modes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  version_sets:
+    - source: registry://checkleft-hub/baseline
+      version: 2026.06.1
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      mode: explicit
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("version sets always activate all checks")),
+        "expected mode diagnostic, got {diagnostics:?}"
+    );
+    assert!(checks.starlark_packages().is_empty());
+}
+
+#[test]
+fn yaml_normalizes_child_starlark_package_paths_to_repo_root() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("service")).expect("create service dir");
+    fs::write(
+        temp.path().join("service/CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://checkleft
+      version: 0.1.0
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("service/src/lib.rs"))
+        .expect("resolve");
+
+    assert_eq!(checks.starlark_packages()[0].source, "path://service/checkleft");
+}
+
+#[test]
+fn yaml_rejects_fetched_starlark_packages_without_hash() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: registry://checkleft-hub/core
+      version: 1.2.3
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("must declare sha256")),
+        "expected hash diagnostic, got {diagnostics:?}"
+    );
+    assert!(checks.starlark_packages().is_empty());
+}
+
+#[test]
+fn yaml_rejects_non_canonical_starlark_package_hashes() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: registry://checkleft-hub/core
+      version: 1.2.3
+      sha256: ABC123
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("canonical sha256 digest")),
+        "expected canonical hash diagnostic, got {diagnostics:?}"
+    );
+    assert!(checks.starlark_packages().is_empty());
+}
 
 #[test]
 fn resolves_yaml_config_file() {
