@@ -100,11 +100,11 @@ starlark = { version = "0.12", features = ["typing"] }
 
 | File | What it does |
 |---|---|
-| `starlark/discovery.rs` | Walk upward from changeset file paths to find ancestor `checkleft/` dirs. For each, scan `<adapter>/<visibility>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, visibility, path, check_meta }`. |
-| `starlark/manifest.rs` | Parse `package.toml` into `PackageManifest { package: PackageIdentity, version_sets: Vec<VersionSetRef>, dependencies: Vec<DependencyRef>, includes: Vec<PackageRef>, exclude_patterns: Vec<String> }`. Validate exact package refs: fetched refs require `sha256`, version sets may only contain `[package]` and `[includes.*]`, and selected duplicate package names must be byte-identical. |
+| `starlark/discovery.rs` | Walk upward from changeset file paths to find ancestor `checkleft/` dirs. For each, scan `<adapter>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, path, check_meta, package }`. |
+| `starlark/manifest.rs` | Parse `package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata, includes: Vec<PackageRef> }`. Validate producer metadata only: `kind = "check_package"` packages define checks, `kind = "version_set"` packages define exact `[includes.*]` refs and do not define checks. |
 | `starlark/loader.rs` | Custom `FileLoader` impl for Starlark's `load()` statement. Resolve `//lib/foo` → `<checkleft_root>/lib/foo.checkleft`, `:types` → `<check_dir>/types.checkleft`. Enforce: no `@dep//` prefix (deps provide checks only, not importable libs). |
 
-**Integration point:** The runner calls `discovery::discover(changeset)` → gets a list of checks → for each, constructs a `StarlarkCheck` → hands them to the existing runner alongside built-in and external checks. Discovery replaces the current `CheckConfig` resolution path for Starlark checks — they are never listed in `CHECKS.yaml`.
+**Integration point:** `CHECKS.yaml` remains the consumer validation policy. It selects local packages, fetched packages, and version sets. The runner resolves those package refs, calls discovery for the selected package roots, and hands discovered Starlark checks to the existing runner alongside built-in and external checks.
 
 ---
 
@@ -159,19 +159,26 @@ starlark/adapter/proto/
 
 ---
 
-### Phase 5: Versioned distribution (dependencies + version sets)
+### Phase 5: Versioned distribution and `CHECKS.yaml` activation
 
-**Goal:** Fetch external check packages and activate their public checks.
+**Goal:** Fetch external check packages/version sets selected in `CHECKS.yaml` and activate the requested checks.
 
 **Files:**
 
 | File | What it does |
 |---|---|
-| `starlark/manifest.rs` (update) | Add exact, hash-pinned refs for `[dependencies]`, `[version_sets]`, and version-set `[includes]`. |
-| `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. Do not generate a lockfile. |
-| `starlark/visibility.rs` | Enforce `public/` vs `private/` when activating checks from dependencies. Only `public/` checks from deps are activated. |
+| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, activation mode, and per-check include narrowing. |
+| `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity, publishing metadata, and version-set `[includes]`. |
+| `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
+| `starlark/package.rs` | Expand selected version sets to their exact package refs. Version sets activate all checks from all included packages. Individual packages support `all` or `explicit` activation. |
 
-This is the least urgent phase — local checks work without it.
+Package refs and version-set includes validate `sha256` pins as canonical
+lowercase 64-hex digests before any fetch or package discovery step. `path://`
+refs may omit `sha256` for local iteration; any supplied hash must still be
+canonical. Local archive refs verify the archive bytes when `sha256` is present,
+then discover checks from the archive-root package layout.
+
+This phase makes Starlark checks a first-class `CHECKS.yaml` policy input without overloading `package.toml`.
 
 ---
 
@@ -183,7 +190,8 @@ This is the least urgent phase — local checks work without it.
 
 | File | What it does |
 |---|---|
-| `starlark/testing.rs` | Scan `testdata/<case>/` dirs. For each: construct a synthetic `ChangeSet` from `before/` + `after/`, run the adapter + check, compare findings against `expected.toml`. If `expected_fix/` exists, run the fix and diff. |
+| `starlark/testing.rs` | Preserve path-based author semantics: discover checks from `<adapter>/<nested/name>/check.checkleft`, scan sibling `testdata/<case>/` dirs, construct a synthetic `ChangeSet` from `before/` + `after/`, run the adapter + check, compare findings against `expected.toml`. If `expected_fix/` exists, run the fix and diff. |
+| `bazel/defs.bzl` | Expose `starlark_check_test` so check authors can schedule the real `checkleft test` CLI from Bazel with an optional selector. Expose a Checkleft toolchain so testing and validation rules resolve the checkleft binary through Bazel toolchain resolution. |
 
 **CLI integration:** Add `checkleft test [check_id] [--update]` subcommand to `main.rs`.
 
@@ -244,19 +252,28 @@ The [`starlark`](https://github.com/facebook/starlark-rust) crate (by Meta) prov
 
 ---
 
-## Suggested implementation order
+## PR DAG and implementation order
 
-```
-Phase 1  ──→  Phase 2  ──→  Phase 3 (adapters can be parallel)
-                              ├── proto
-                              ├── module_json
-                              └── java
-                                    ↓
-                              Phase 4 (fixes)
-                                    ↓
-                              Phase 5 (distribution)
-                                    ↓
-                              Phase 6 (testing CLI)
-```
+For the active stack, create PRs relative to branches in `uhvesta/mono` so reviewers can see the native DAG. Upstream `spinyfin/mono` PRs can be mirrored later.
 
-Phase 1 is the critical path — it proves the Starlark ↔ Rust bridge works end-to-end. Everything else builds on it. Phase 3 adapters are independent of each other and can be developed in parallel. Phase 5 (distribution) is lowest priority — local checks work without it.
+Already-started nodes:
+
+1. Node 0: spec/design.
+2. Node 1: evaluator foundation.
+3. Node 2: package manifest/discovery scaffolding.
+4. Node 3: `load()` path resolution.
+5. Node 4: local Starlark runner integration.
+6. Node 5: text adapter registry.
+
+Next nodes:
+
+1. Node 6: `checkleft test` for text packages and Bazel author-test integration. Preserve path-based author semantics (`<adapter>/<nested/name>/check.checkleft` plus sibling `testdata/<case>/`).
+2. Node 7: `CHECKS.yaml` activation for Starlark packages/version sets.
+3. Node 8: package tarball and Bazel packaging target for check authors.
+4. Node 9: self-hosted Starlark guard check for `CHECKS.yaml` policy integrity.
+5. Node 10: Starlark fix support.
+6. Node 11: proto adapter. This is the highest-priority non-text adapter; use the existing descriptor/proto/native C++ path and do not directly invoke `protoc`.
+7. Node 12: module_json adapter.
+8. Node 13: Java adapter.
+
+Each node must compile and pass its focused Bazel validation before pushing. Text remains the full lifecycle proof path; proto is the first non-text adapter because it is the highest product priority.
