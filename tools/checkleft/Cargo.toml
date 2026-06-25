@@ -37,6 +37,7 @@ required-features = ["benchmarking"]
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 console = { workspace = true }
 directories = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -45,6 +46,7 @@ jaq-core = { workspace = true }
 jaq-interpret = { workspace = true }
 jaq-parse = { workspace = true }
 hashbrown = { workspace = true }
+flate2 = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }

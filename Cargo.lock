@@ -585,10 +585,12 @@ version = "0.1.0-alpha.8"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "console",
  "directories",
  "filetime",
+ "flate2",
  "globset",
  "hashbrown 0.15.5",
  "ignore",
