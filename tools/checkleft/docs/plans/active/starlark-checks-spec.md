@@ -175,7 +175,7 @@ name = "myorg/service-d"
 version = "0.1.0"
 
 [dependencies.service_c_checks]
-source = "path://../../c/checkleft"
+source = "path://a/b/c/checkleft"
 version = "0.0.0"
 ```
 
@@ -220,7 +220,7 @@ repo/
 │   └── service.proto
 ├── a/b/d/
 │   ├── checkleft/                       # project D's package
-│   │   └── package.toml                 # depends on path://../../c/checkleft
+│   │   └── package.toml                 # depends on path://a/b/c/checkleft
 │   └── api.proto
 ```
 
@@ -938,7 +938,7 @@ Dependencies declared in `[dependencies]` are resolved at `checkleft` startup be
 
 1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs of `checkleft/` directory trees. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/`.
 2. **`git://`** — cloned at the specified tag. Sparse checkout of the `checkleft/` directory only. Cached similarly.
-3. **`path://`** — local filesystem path. For monorepo cross-project dependencies. No caching; always reads live. Relative to the repo root.
+3. **`path://`** — local filesystem path. For monorepo cross-project dependencies. No caching; always reads live. Always relative to the repo root (e.g. `path://a/b/c/checkleft`). Relative paths (`../`) are not allowed — use the repo-root-relative path instead, similar to Bazel's `//` convention.
 
 ### 8.3 Version pinning
 
