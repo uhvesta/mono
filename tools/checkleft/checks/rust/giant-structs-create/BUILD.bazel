@@ -17,7 +17,7 @@ rust_library(
         "//tools/checkleft/sdk:checkleft_check_sdk",
         "@@rules_rust++crate+mono_crates__globset-0.4.18//:globset",
         "@@rules_rust++crate+mono_crates__serde_json-1.0.150//:serde_json",
-        "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
+        "@@rules_rust++crate+mono_crates__syn-2.0.118//:syn",
     ] + all_crate_deps(normal = True),
 )
 

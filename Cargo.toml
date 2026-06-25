@@ -71,6 +71,8 @@ rand = "0.8"
 rayon = "1.10"
 rsa = "0.9"
 regex = "1.11.1"
+protobuf = "3.7.2"
+protobuf-parse = "3.7.2"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls-no-provider"] }
 rpassword = "7.5.0"
 rustls = { version = "0.23.37", default-features = false, features = ["ring", "std", "tls12"] }

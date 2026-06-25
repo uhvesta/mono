@@ -537,6 +537,76 @@ def check(ctx):
 }
 
 #[tokio::test]
+async fn runner_executes_starlark_proto_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("checkleft/proto/no_user_message")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("schemas/api")).expect("create proto dir");
+    fs::write(
+        temp.path().join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("checkleft/proto/no_user_message/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.proto"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        if file.after == None:
+            continue
+        for message in file.after.messages:
+            if message.full_name == "acme.user.User":
+                findings.append(fail(
+                    message = "User message is not allowed",
+                    path = file.path,
+                ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    fs::write(
+        temp.path().join("schemas/api/user.proto"),
+        r#"
+syntax = "proto3";
+
+package acme.user;
+
+message User {
+  string id = 1;
+}
+"#,
+    )
+    .expect("write proto");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("schemas/api/user.proto"),
+            kind: ChangeKind::Added,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "proto/no_user_message")
+        .expect("starlark proto result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "User message is not allowed");
+}
+
+#[tokio::test]
 async fn runner_executes_starlark_text_check_selected_by_checks_yaml_package() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
