@@ -1,0 +1,16 @@
+def fix(ctx, findings):
+    edits = []
+    for finding in findings:
+        if finding.path == None:
+            continue
+        for file in ctx.files:
+            if file.path != finding.path:
+                continue
+            for line in file.added_lines:
+                if "debug" in line.text:
+                    edits.append(file_edit(
+                        path = file.path,
+                        old_text = "\n" + line.text + "\n",
+                        new_text = "\n",
+                    ))
+    return edits

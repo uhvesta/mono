@@ -53,6 +53,9 @@ enum ScheduledExecution {
     StarlarkLocal {
         check: Arc<StarlarkCheckRunner>,
         output: Arc<AdapterPreparedOutput>,
+        fix_path: Option<PathBuf>,
+        checkleft_root: PathBuf,
+        check_dir: PathBuf,
     },
     Invalid {
         message: String,
@@ -341,7 +344,7 @@ impl Runner {
                         })
                     });
                 }
-                ScheduledExecution::StarlarkLocal { check, output } => {
+                ScheduledExecution::StarlarkLocal { check, output, .. } => {
                     let source_tree = Arc::clone(&self.source_tree);
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
@@ -817,6 +820,192 @@ impl Runner {
         }
 
         Ok(accumulated)
+    }
+
+    pub fn run_starlark_fixes(
+        &self,
+        changeset: &ChangeSet,
+        results: &[CheckResult],
+        fix_plan: &BTreeMap<String, Vec<PathBuf>>,
+        repo_root: &Path,
+    ) -> Result<BTreeMap<String, Vec<crate::external::FixInvocationOutcome>>> {
+        use crate::external::FixInvocationOutcome;
+        use crate::external::sandbox::HostCeiling;
+        use crate::fix::WritableSandbox;
+
+        let scheduled = self.schedule_runs(changeset)?;
+        let findings_by_check: BTreeMap<&str, Vec<Finding>> = results
+            .iter()
+            .map(|result| (result.check_id.as_str(), result.findings.clone()))
+            .collect();
+        let ceiling = HostCeiling::new(repo_root);
+        let mut outcomes: BTreeMap<String, Vec<FixInvocationOutcome>> = BTreeMap::new();
+
+        for run in scheduled.runs {
+            let check_id = run.configured_check_id.clone();
+            let Some(fixable_files) = fix_plan.get(&check_id) else {
+                continue;
+            };
+            let ScheduledExecution::StarlarkLocal {
+                check,
+                output,
+                fix_path: Some(fix_path),
+                checkleft_root,
+                check_dir,
+            } = run.execution
+            else {
+                continue;
+            };
+            let fix_source = match self.source_tree.read_file(&fix_path) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(source) => StarlarkCheckSource::file(check_id.clone(), fix_path.clone(), source)
+                        .with_load_context(checkleft_root, check_dir),
+                    Err(err) => {
+                        outcomes.insert(
+                            check_id,
+                            vec![FixInvocationOutcome {
+                                invocation_id: "starlark_fix".to_owned(),
+                                applied: Vec::new(),
+                                per_file_errors: Vec::new(),
+                                error: Some(anyhow!("{} is not valid UTF-8: {err}", fix_path.display())),
+                            }],
+                        );
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    outcomes.insert(
+                        check_id,
+                        vec![FixInvocationOutcome {
+                            invocation_id: "starlark_fix".to_owned(),
+                            applied: Vec::new(),
+                            per_file_errors: Vec::new(),
+                            error: Some(anyhow!("failed to read {}: {err:#}", fix_path.display())),
+                        }],
+                    );
+                    continue;
+                }
+            };
+            let findings = findings_by_check.get(check_id.as_str()).cloned().unwrap_or_default();
+            let edits = match check.evaluate_fix_prepared_adapter(
+                fix_source,
+                output.as_ref(),
+                &findings,
+                self.source_tree.as_ref(),
+            ) {
+                Ok(edits) => edits,
+                Err(err) => {
+                    outcomes.insert(
+                        check_id,
+                        vec![FixInvocationOutcome {
+                            invocation_id: "starlark_fix".to_owned(),
+                            applied: Vec::new(),
+                            per_file_errors: Vec::new(),
+                            error: Some(err),
+                        }],
+                    );
+                    continue;
+                }
+            };
+            let fixable_set: HashSet<&PathBuf> = fixable_files.iter().collect();
+            let mut edits_by_file: BTreeMap<PathBuf, Vec<(String, String)>> = BTreeMap::new();
+            for edit in edits {
+                if fixable_set.contains(&edit.path) && !run.exclusion_matcher.is_excluded(&edit.path) {
+                    edits_by_file
+                        .entry(edit.path)
+                        .or_default()
+                        .push((edit.old_text, edit.new_text));
+                }
+            }
+            if edits_by_file.is_empty() {
+                continue;
+            }
+
+            let files_to_stage = edits_by_file.keys().cloned().collect::<Vec<_>>();
+            let sandbox = match WritableSandbox::stage(&files_to_stage, self.source_tree.as_ref(), &ceiling) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    outcomes.insert(
+                        check_id,
+                        vec![FixInvocationOutcome {
+                            invocation_id: "starlark_fix".to_owned(),
+                            applied: Vec::new(),
+                            per_file_errors: Vec::new(),
+                            error: Some(err),
+                        }],
+                    );
+                    continue;
+                }
+            };
+
+            let mut apply_err = None;
+            'files: for (path, edits) in &edits_by_file {
+                let staged = sandbox.root_path().join(path);
+                if !staged.exists() {
+                    continue;
+                }
+                let content = match std::fs::read_to_string(&staged) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        apply_err = Some(anyhow!("failed to read staged file {}: {err}", path.display()));
+                        break 'files;
+                    }
+                };
+                let mut new_content = content;
+                for (old_text, new_text) in edits {
+                    new_content = new_content.replacen(old_text.as_str(), new_text.as_str(), 1);
+                }
+                if let Err(err) = std::fs::write(&staged, new_content.as_bytes()) {
+                    apply_err = Some(anyhow!(
+                        "failed to write edited file to sandbox {}: {err}",
+                        path.display()
+                    ));
+                    break 'files;
+                }
+            }
+
+            if let Some(err) = apply_err {
+                outcomes.insert(
+                    check_id,
+                    vec![FixInvocationOutcome {
+                        invocation_id: "starlark_fix".to_owned(),
+                        applied: Vec::new(),
+                        per_file_errors: Vec::new(),
+                        error: Some(err),
+                    }],
+                );
+                continue;
+            }
+
+            let changed = match sandbox.detect_changes() {
+                Ok(changed) => changed,
+                Err(err) => {
+                    outcomes.insert(
+                        check_id,
+                        vec![FixInvocationOutcome {
+                            invocation_id: "starlark_fix".to_owned(),
+                            applied: Vec::new(),
+                            per_file_errors: Vec::new(),
+                            error: Some(err),
+                        }],
+                    );
+                    continue;
+                }
+            };
+            let report = sandbox.copy_back(&changed, repo_root);
+            let error = report.failed.map(|(_, err)| err);
+            outcomes.insert(
+                check_id,
+                vec![FixInvocationOutcome {
+                    invocation_id: "starlark_fix".to_owned(),
+                    applied: report.applied,
+                    per_file_errors: Vec::new(),
+                    error,
+                }],
+            );
+        }
+
+        Ok(outcomes)
     }
 
     /// Apply `suggested_fix` edits from built-in check findings through the T2
@@ -1327,6 +1516,9 @@ impl Runner {
                     execution: ScheduledExecution::StarlarkLocal {
                         check: runner,
                         output: adapter_output,
+                        fix_path: check.fix_path.clone(),
+                        checkleft_root: check.checkleft_root.clone(),
+                        check_dir: check.check_dir.clone(),
                     },
                     policy: starlark_policy(&check.id),
                     config: toml::Value::Table(Default::default()),
