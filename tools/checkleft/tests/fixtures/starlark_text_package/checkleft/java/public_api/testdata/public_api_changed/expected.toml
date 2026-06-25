@@ -1,0 +1,9 @@
+[[findings]]
+severity = "fail_but_overridable"
+message_contains = "public class com.acme.UserApi lacks @Since annotation"
+path = "src/main/java/com/acme/UserApi.java"
+
+[[findings]]
+severity = "fail"
+message_contains = "public method removed: com.acme.UserApi.email()"
+path = "src/main/java/com/acme/UserApi.java"
