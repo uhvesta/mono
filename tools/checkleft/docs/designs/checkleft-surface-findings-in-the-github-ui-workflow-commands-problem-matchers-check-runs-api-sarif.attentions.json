@@ -1,0 +1,46 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Is GitHub Advanced Security (GHAS) licensed and enabled for the private spinyfin/mono repo? This single fact decides whether the SARIF code-scanning surface (Option 4) is a v1 task or must be deferred — without GHAS, SARIF uploads light up nothing on mono. Answer Yes if GHAS is available (make the SARIF upload, T5a, a v1 task); No defers T5a while still shipping the credential-free SARIF serializer (T5) for public repos.",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Check Runs API (Option 3) credential model for Buildkite — how should checkleft authenticate to create check runs where there is no ambient GITHUB_TOKEN? A GitHub App installation token is the documented, reliable path (heaviest setup: app id + private key as Buildkite secrets). A fine-grained PAT with Checks:write MAY work but is unvalidated. Which onboarding story should T4/T4a target?",
+    "choices": [
+      "GitHub App installation token (recommended; build T4a)",
+      "Validate fine-grained PAT first; prefer it if it works (could shrink/defer T4a)",
+      "Support both: ambient token / fine-grained PAT, with GitHub App as fallback"
+    ],
+    "anchor": "option-3--github-check-runs-api"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Prioritization: should the Check Runs API backend (Option 3) be the FIRST GitHub-surfacing backend built, as the strategic Buildkite-first investment (validating the operator's hypothesis)? Answer Yes to schedule T0+T3+T4 first; No if you'd rather ship the near-free GHA workflow-commands backend (Option 1) first.",
+    "anchor": "recommendation-for-the-buildkite-first-private-repo-monoflunge-environment"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Flag / CLI surface for selecting annotation backends. The design recommends a single repeatable value-enum --annotations=<gha|check-run|sarif|none> (default none), composable when several are active. The alternative is per-mode boolean flags (--gha-annotations, --check-run, --sarif). Which surface?",
+    "choices": [
+      "Single repeatable --annotations=<mode> enum + --annotations-out (recommended)",
+      "Per-mode boolean flags (--gha-annotations / --check-run / --sarif)"
+    ],
+    "anchor": "flag--cli-surface"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Problem matchers (Option 2) produce the same inline-PR-diff surface as workflow commands (Option 1) but are strictly weaker (no info/notice level, fragile coupling to checkleft's text output, a checked-in file to maintain). Should Option 2 be built in v1?",
+    "choices": [
+      "Option 1 only; defer Option 2 as future / not a v1 blocker (recommended)",
+      "Build both Option 1 and Option 2",
+      "Option 2 only (a no---annotations-mode scraper of existing output)"
+    ],
+    "anchor": "option-2--problem-matchers"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Failure-to-POST handling for the API backends (Check Runs, SARIF upload): should a failure to surface annotations (missing token, network error, 403) log a warning and preserve checkleft's normal content-driven exit code, rather than failing the run? Answer Yes for non-fatal-by-default (with an opt-in --annotations-strict); No to make annotation-posting failures fail the run.",
+    "anchor": "option-3--github-check-runs-api"
+  }
+]
