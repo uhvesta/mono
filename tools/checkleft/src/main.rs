@@ -1361,10 +1361,17 @@ async fn dispatch_fix(
         reporter,
     )?;
 
+    let starlark_outcomes = runner.run_starlark_fixes(&changeset, &results, &fix_plan_map, root)?;
+    for (check_id, inv_outcomes) in starlark_outcomes {
+        let entry = fix_outcomes.entry(check_id).or_default();
+        if entry.is_empty() {
+            *entry = inv_outcomes;
+        }
+    }
+
     // Apply suggested_fix edits from built-in check findings (T10). Only fills in
-    // entries that run_declarative_fixes left empty (no declarative fix block); a
-    // non-empty entry means the declarative path already ran for that check and
-    // takes precedence.
+    // entries left empty by declarative and Starlark fix paths; non-empty entries
+    // mean an explicit fixer already ran for that check and takes precedence.
     let builtin_outcomes = runner.apply_suggested_fixes(&results, &fix_plan_map, root);
     for (check_id, inv_outcomes) in builtin_outcomes {
         let entry = fix_outcomes.entry(check_id).or_default();
