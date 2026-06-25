@@ -1,0 +1,11 @@
+check_meta(applies_to = ["**/*.proto"])
+
+def check(ctx):
+    findings = []
+    for delta in ctx.deltas:
+        if delta.kind == "field_number_changed":
+            findings.append(fail(
+                message = "protobuf field number changed for " + delta.symbol,
+                path = delta.path,
+            ))
+    return findings

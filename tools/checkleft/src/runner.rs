@@ -1198,9 +1198,6 @@ impl Runner {
         let mut starlark_diagnostics = BTreeMap::new();
         if let Ok(discovered) = self.discover_starlark_checks(changeset, &mut starlark_diagnostics) {
             for check in discovered {
-                if check.adapter != "text" {
-                    continue;
-                }
                 if starlark_changeset_for_check(changeset, &check)
                     .map(|changeset| !changeset.changed_files.is_empty())
                     .unwrap_or(false)
@@ -1410,9 +1407,6 @@ impl Runner {
         let adapters = AdapterRegistry::with_builtin_adapters();
         let mut adapter_outputs: BTreeMap<String, Arc<AdapterPreparedOutput>> = BTreeMap::new();
         for check in discovered {
-            if check.adapter != "text" {
-                continue;
-            }
             let check_changeset = match starlark_changeset_for_check(changeset, &check) {
                 Ok(changeset) => changeset,
                 Err(err) => {

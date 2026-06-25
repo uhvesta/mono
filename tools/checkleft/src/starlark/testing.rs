@@ -71,7 +71,6 @@ pub fn run_package_tests(
     let checks = discover_package_checks(&package_tree, checkleft_root)?;
     let selected = checks
         .into_iter()
-        .filter(|check| check.adapter == "text")
         .filter(|check| selector_matches_check(options.selector.as_deref(), check))
         .collect::<Vec<_>>();
 
@@ -135,7 +134,7 @@ fn run_test_case(
         StarlarkCheckSource::file(check.id.clone(), check.check_path.clone(), source)
             .with_load_context(check.checkleft_root.clone(), check.check_dir.clone()),
     );
-    let actual = runner.evaluate_text(&changeset, &tree)?;
+    let actual = runner.evaluate_adapter(&check.adapter, &changeset, &tree)?;
     match compare_findings(&expected.findings, &actual)
         .and_then(|()| compare_expected_fix(repo_root, check, &runner, &changeset, &tree, &actual, case_dir))
     {
@@ -178,7 +177,7 @@ fn compare_expected_fix(
     .with_context(|| format!("{} is not valid UTF-8", fix_path.display()))?;
     let fix_source = StarlarkCheckSource::file(check.id.clone(), fix_path.clone(), fix_source)
         .with_load_context(check.checkleft_root.clone(), check.check_dir.clone());
-    let edits = runner.evaluate_fix_text(fix_source, changeset, &actual.findings, tree)?;
+    let edits = runner.evaluate_fix_adapter(&check.adapter, fix_source, changeset, &actual.findings, tree)?;
 
     let fixed = tempdir().context("failed to create fixed fixture tempdir")?;
     copy_tree_contents(&tree.after_root, fixed.path())?;

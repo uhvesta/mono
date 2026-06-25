@@ -6,8 +6,14 @@ use anyhow::{Result, anyhow};
 use starlark::values::{Heap, Value};
 
 use crate::input::{ChangeSet, SourceTree};
+use crate::starlark::adapter::java::{JavaAdapter, JavaAdapterOutput};
+use crate::starlark::adapter::module_json::{ModuleJsonAdapter, ModuleJsonAdapterOutput};
+use crate::starlark::adapter::proto::{ProtoAdapter, ProtoAdapterOutput};
 use crate::starlark::adapter::text::{TextAdapter, TextAdapterOutput};
 
+pub(crate) mod java;
+pub(crate) mod module_json;
+pub(crate) mod proto;
 pub(crate) mod text;
 
 pub(crate) struct AdapterInput<'a> {
@@ -25,18 +31,27 @@ pub(crate) trait FormatAdapter: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) enum AdapterPreparedOutput {
+    Java(JavaAdapterOutput),
+    ModuleJson(ModuleJsonAdapterOutput),
+    Proto(ProtoAdapterOutput),
     Text(TextAdapterOutput),
 }
 
 impl AdapterPreparedOutput {
     pub fn is_empty(&self) -> bool {
         match self {
+            Self::Java(output) => output.is_empty(),
+            Self::ModuleJson(output) => output.is_empty(),
+            Self::Proto(output) => output.is_empty(),
             Self::Text(output) => output.is_empty(),
         }
     }
 
     pub fn alloc_context<'v>(&self, heap: Heap<'v>) -> Value<'v> {
         match self {
+            Self::Java(output) => output.alloc_context(heap),
+            Self::ModuleJson(output) => output.alloc_context(heap),
+            Self::Proto(output) => output.alloc_context(heap),
             Self::Text(output) => output.alloc_context(heap),
         }
     }
@@ -50,6 +65,9 @@ pub(crate) struct AdapterRegistry {
 impl AdapterRegistry {
     pub fn with_builtin_adapters() -> Self {
         let mut registry = Self::default();
+        registry.register(JavaAdapter);
+        registry.register(ModuleJsonAdapter);
+        registry.register(ProtoAdapter);
         registry.register(TextAdapter);
         registry
     }

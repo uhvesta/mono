@@ -64,10 +64,19 @@ impl StarlarkCheckRunner {
     }
 
     pub fn evaluate_text(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
+        self.evaluate_adapter("text", changeset, tree)
+    }
+
+    pub fn evaluate_adapter(
+        &self,
+        adapter_kind: &str,
+        changeset: &ChangeSet,
+        tree: &dyn SourceTree,
+    ) -> Result<CheckResult> {
         let parsed = ParsedCheck::parse(&self.source)?;
         let package_scope = self.package_scope();
         let output = AdapterRegistry::with_builtin_adapters()
-            .require("text")?
+            .require(adapter_kind)?
             .prepare(AdapterInput {
                 changeset,
                 tree,
@@ -84,10 +93,21 @@ impl StarlarkCheckRunner {
         findings: &[Finding],
         tree: &dyn SourceTree,
     ) -> Result<Vec<FileEdit>> {
+        self.evaluate_fix_adapter("text", fix_source, changeset, findings, tree)
+    }
+
+    pub fn evaluate_fix_adapter(
+        &self,
+        adapter_kind: &str,
+        fix_source: StarlarkCheckSource,
+        changeset: &ChangeSet,
+        findings: &[Finding],
+        tree: &dyn SourceTree,
+    ) -> Result<Vec<FileEdit>> {
         let parsed = ParsedCheck::parse(&self.source)?;
         let package_scope = self.package_scope();
         let output = AdapterRegistry::with_builtin_adapters()
-            .require("text")?
+            .require(adapter_kind)?
             .prepare(AdapterInput {
                 changeset,
                 tree,
