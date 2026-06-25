@@ -364,7 +364,7 @@ Resolution is intentionally simple — no complex override logic.
 2. **`[dependencies]` can only add packages not in any version set, or upgrade.** If a `[dependencies]` entry names a package that a version set already includes, its version **must** be strictly greater than the version set's pin. Pinning at the same or lower version is an error — use the version set's pin or don't.
 3. **Version sets cannot depend on other version sets.** A version set's `package.toml` may only contain `[package]` and `[includes.*]` sections. No `[version_sets.*]` nesting.
 4. **All public checks from all version-set-included packages are automatically active.** No individual activation needed.
-5. **Private checks** (underscore-prefixed categories/names) in version set packages are **not** activated in consumers — they only run in the package's own repo.
+5. **Private checks** (under `<adapter>/private/`) in version set packages are **not** activated in consumers — they only run in the package's own repo.
 
 ### 3.6 `[dependencies.<name>]` fields
 
