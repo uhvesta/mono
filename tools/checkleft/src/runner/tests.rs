@@ -412,6 +412,131 @@ def message_for(kind):
 }
 
 #[tokio::test]
+async fn runner_applies_starlark_fix_checkleft_edits() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        temp.path().join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if "debug" in line.text:
+                findings.append(fail(
+                    message = "debug text added",
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    fs::write(
+        temp.path().join("checkleft/text/no_debug/fix.checkleft"),
+        r#"
+def fix(ctx, findings):
+    edits = []
+    for finding in findings:
+        for file in ctx.files:
+            if file.path == finding.path:
+                edits.append(file_edit(
+                    path = file.path,
+                    old_text = "debug mode\n",
+                    new_text = "",
+                ))
+    return edits
+"#,
+    )
+    .expect("write fix");
+    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("notes/example.txt"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+    let results = runner.run_changeset(&changeset).await.expect("run checks");
+    let fix_plan = BTreeMap::from([("text/no_debug".to_owned(), vec![PathBuf::from("notes/example.txt")])]);
+
+    let outcomes = runner
+        .run_starlark_fixes(&changeset, &results, &fix_plan, temp.path())
+        .expect("run starlark fixes");
+
+    let invocations = outcomes.get("text/no_debug").expect("fix outcome");
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].invocation_id, "starlark_fix");
+    assert_eq!(invocations[0].applied, vec![PathBuf::from("notes/example.txt")]);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("notes/example.txt")).expect("read fixed file"),
+        "hello\n"
+    );
+}
+
+#[tokio::test]
+async fn runner_does_not_read_starlark_fix_during_check_run() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        temp.path().join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return []
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("checkleft/text/no_debug/fix.checkleft"), [0xff, 0xfe]).expect("write invalid fix");
+    fs::write(temp.path().join("notes/example.txt"), "hello\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("notes/example.txt"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+
+    let results = runner.run_changeset(&changeset).await.expect("run checks");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].check_id, "text/no_debug");
+    assert!(results[0].findings.is_empty());
+}
+
+#[tokio::test]
 async fn runner_executes_starlark_text_check_selected_by_checks_yaml_package() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");

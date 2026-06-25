@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use tempfile::tempdir;
 use walkdir::WalkDir;
 
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree, TreeVersion};
-use crate::output::{CheckResult, Finding, Severity};
+use crate::output::{CheckResult, FileEdit, Finding, Severity};
 use crate::path::validate_relative_path;
 use crate::starlark::discovery::{DiscoveredCheck, discover_package_checks};
 use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
@@ -71,7 +72,6 @@ pub fn run_package_tests(
     let checks = discover_package_checks(&package_tree, checkleft_root)?;
     let selected = checks
         .into_iter()
-        .filter(|check| check.adapter == "text")
         .filter(|check| selector_matches_check(options.selector.as_deref(), check))
         .collect::<Vec<_>>();
 
@@ -142,20 +142,30 @@ fn run_test_case(
         StarlarkCheckSource::file(check.id.clone(), check.check_path.clone(), source)
             .with_load_context(check.checkleft_root.clone(), check.check_dir.clone()),
     );
-    let actual = runner.evaluate_text(&changeset, &tree)?;
+    let actual = runner.evaluate_adapter(&check.adapter, &changeset, &tree)?;
 
     if options.update {
         write_expected(&expected_path, &actual)?;
-        return Ok(StarlarkTestCaseResult {
-            check_id: check.id.clone(),
-            case_name: case_name.to_owned(),
-            passed: true,
-            message: None,
-        });
+        return match compare_expected_fix(repo_root, check, &runner, &changeset, &tree, &actual, case_dir) {
+            Ok(()) => Ok(StarlarkTestCaseResult {
+                check_id: check.id.clone(),
+                case_name: case_name.to_owned(),
+                passed: true,
+                message: None,
+            }),
+            Err(err) => Ok(StarlarkTestCaseResult {
+                check_id: check.id.clone(),
+                case_name: case_name.to_owned(),
+                passed: false,
+                message: Some(err.to_string()),
+            }),
+        };
     }
 
     let expected = parse_expected(&expected_path)?;
-    match compare_findings(&expected.findings, &actual) {
+    match compare_findings(&expected.findings, &actual)
+        .and_then(|()| compare_expected_fix(repo_root, check, &runner, &changeset, &tree, &actual, case_dir))
+    {
         Ok(()) => Ok(StarlarkTestCaseResult {
             check_id: check.id.clone(),
             case_name: case_name.to_owned(),
@@ -169,6 +179,44 @@ fn run_test_case(
             message: Some(err.to_string()),
         }),
     }
+}
+
+fn compare_expected_fix(
+    repo_root: &Path,
+    check: &DiscoveredCheck,
+    runner: &StarlarkCheckRunner,
+    changeset: &ChangeSet,
+    tree: &FixturePackageTree,
+    actual: &CheckResult,
+    case_dir: &Path,
+) -> Result<()> {
+    let expected_fix_root = case_dir.join("expected_fix");
+    if !expected_fix_root.exists() {
+        return Ok(());
+    }
+    let fix_path = check
+        .fix_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("{} has expected_fix/ but no fix.checkleft", case_dir.display()))?;
+    let fix_source = String::from_utf8(
+        tree.read_file(fix_path)
+            .with_context(|| format!("failed to read {}", fix_path.display()))?,
+    )
+    .with_context(|| format!("{} is not valid UTF-8", fix_path.display()))?;
+    let fix_source = StarlarkCheckSource::file(check.id.clone(), fix_path.clone(), fix_source)
+        .with_load_context(check.checkleft_root.clone(), check.check_dir.clone());
+    let edits = runner.evaluate_fix_adapter(&check.adapter, fix_source, changeset, &actual.findings, tree)?;
+
+    let fixed = tempdir().context("failed to create fixed fixture tempdir")?;
+    copy_tree_contents(&tree.after_root, fixed.path())?;
+    apply_file_edits(fixed.path(), &edits)?;
+    compare_trees(&expected_fix_root, fixed.path()).with_context(|| {
+        format!(
+            "fixed output for {} did not match {}",
+            check.id,
+            path_relative_to(repo_root, &expected_fix_root).display()
+        )
+    })
 }
 
 fn parse_expected(path: &Path) -> Result<ExpectedOutput> {
@@ -309,6 +357,65 @@ fn fixture_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
         files.insert(relative.to_path_buf());
     }
     Ok(files)
+}
+
+fn copy_tree_contents(from: &Path, to: &Path) -> Result<()> {
+    fs::create_dir_all(to).with_context(|| format!("failed to create {}", to.display()))?;
+    for entry in WalkDir::new(from).follow_links(true).into_iter() {
+        let entry = entry.with_context(|| format!("failed to walk {}", from.display()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(from)
+            .with_context(|| format!("{} is not under {}", entry.path().display(), from.display()))?;
+        let destination = to.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(entry.path(), &destination)
+            .with_context(|| format!("failed to copy {} to {}", entry.path().display(), destination.display()))?;
+    }
+    Ok(())
+}
+
+fn apply_file_edits(root: &Path, edits: &[FileEdit]) -> Result<()> {
+    for edit in edits {
+        validate_relative_path(&edit.path).with_context(|| format!("invalid edit path {}", edit.path.display()))?;
+        let path = root.join(&edit.path);
+        let content =
+            fs::read_to_string(&path).with_context(|| format!("failed to read fixed file {}", path.display()))?;
+        let new_content = content.replacen(&edit.old_text, &edit.new_text, 1);
+        fs::write(&path, new_content).with_context(|| format!("failed to write fixed file {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn compare_trees(expected_root: &Path, actual_root: &Path) -> Result<()> {
+    let expected_files = fixture_files(expected_root)?;
+    let actual_files = fixture_files(actual_root)?;
+    if expected_files != actual_files {
+        bail!(
+            "fixed file set mismatch: expected {:?}, got {:?}",
+            expected_files,
+            actual_files
+        );
+    }
+    for path in expected_files {
+        let expected = fs::read(expected_root.join(&path))
+            .with_context(|| format!("failed to read expected fixed file {}", path.display()))?;
+        let actual = fs::read(actual_root.join(&path))
+            .with_context(|| format!("failed to read actual fixed file {}", path.display()))?;
+        if expected != actual {
+            bail!("fixed file mismatch at {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn path_relative_to<'a>(root: &Path, path: &'a Path) -> &'a Path {
+    path.strip_prefix(root).unwrap_or(path)
 }
 
 fn compare_findings(expected: &[ExpectedFinding], actual: &CheckResult) -> Result<()> {
