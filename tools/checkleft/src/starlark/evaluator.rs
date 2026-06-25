@@ -25,6 +25,15 @@ pub struct StarlarkCheckSource {
 }
 
 impl StarlarkCheckSource {
+    pub fn file(id: impl Into<String>, path: impl Into<PathBuf>, source: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            path: path.into(),
+            source: source.into(),
+            load_context: None,
+        }
+    }
+
     pub fn inline(id: impl Into<String>, source: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -56,7 +65,15 @@ impl StarlarkCheckRunner {
     pub fn evaluate_text(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
         Module::with_temp_heap(|module| {
             let parsed = ParsedCheck::parse(&self.source)?;
-            let files = collect_text_file_pairs(changeset, tree, &parsed.meta.applies_to)?;
+            let package_scope = self.source.load_context.as_ref().map(|context| {
+                context
+                    .checkleft_root
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default()
+            });
+            let files = collect_text_file_pairs(changeset, tree, &parsed.meta.applies_to, package_scope.as_deref())?;
             if files.is_empty() {
                 return Ok(CheckResult {
                     check_id: self.source.id.clone(),
@@ -213,11 +230,12 @@ fn collect_text_file_pairs(
     changeset: &ChangeSet,
     tree: &dyn SourceTree,
     applies_to: &[String],
+    package_scope: Option<&Path>,
 ) -> Result<Vec<TextFilePair>> {
     let glob_set = build_glob_set(applies_to)?;
     let mut files = Vec::new();
     for changed in &changeset.changed_files {
-        if !glob_set.is_match(&changed.path) {
+        if !matches_applies_to(&glob_set, &changed.path, package_scope) {
             continue;
         }
         let before = read_text_file(tree, before_path(changed), TreeVersion::Base).transpose()?;
@@ -233,6 +251,21 @@ fn collect_text_file_pairs(
         });
     }
     Ok(files)
+}
+
+fn matches_applies_to(glob_set: &globset::GlobSet, path: &Path, package_scope: Option<&Path>) -> bool {
+    if glob_set.is_match(path) {
+        return true;
+    }
+    let Some(scope) = package_scope else {
+        return false;
+    };
+    if scope.as_os_str().is_empty() {
+        return false;
+    }
+    path.strip_prefix(scope)
+        .map(|relative| glob_set.is_match(relative))
+        .unwrap_or(false)
 }
 
 fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet> {
