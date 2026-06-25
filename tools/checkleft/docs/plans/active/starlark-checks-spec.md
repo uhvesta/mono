@@ -1516,16 +1516,7 @@ The runner reports Starlark check progress through the existing `ProgressReporte
 
 ## 15. Future extensions
 
-### 15.1 Additional sandbox tiers
-
-If needed later, new tiers slot in naturally:
-
-| Tier | Capabilities |
-|---|---|
-| `"exec"` | Everything in `network` + subprocess execution via `exec()` built-in. |
-| `"full"` | Unrestricted. Equivalent to a Rust check. For trusted first-party checks only. |
-
-### 15.2 Additional format adapters
+### 15.1 Additional format adapters
 
 The adapter system is open for extension:
 
@@ -1536,21 +1527,7 @@ The adapter system is open for extension:
 
 Each adapter is a Rust crate implementing `FormatAdapter`. No changes to the Starlark infrastructure needed.
 
-### 15.3 Check composition
-
-A future `compose()` built-in could let checks delegate to sub-checks:
-
-```python
-def check(ctx: ProtoEvolutionContext) -> list[Finding]:
-    findings: list[Finding] = compose([
-        wire_compat_check,
-        naming_convention_check,
-        deprecation_check,
-    ], ctx)
-    return findings
-```
-
-### 15.4 Interactive fix preview
+### 15.2 Interactive fix preview
 
 A `checkleft fix --preview` mode that shows proposed edits in a TUI diff viewer before applying.
 
