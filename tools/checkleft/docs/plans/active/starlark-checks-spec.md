@@ -610,7 +610,7 @@ Checks declare their required sandbox tier in `check_meta()` inside `check.check
 | Tier | ID | Capabilities | Use case |
 |---|---|---|---|
 | **Hermetic** | `"hermetic"` | Typed data models (injected by the adapter), pure computation, `load()`. No file I/O, no network, no subprocesses. Starlark never sees raw file contents or touches the filesystem. | Most evolution checks. Default. |
-| **Network** | `"network"` | Everything in hermetic + HTTP GET requests via `http_get()` built-in. DNS resolution allowed. Still no file I/O or arbitrary exec. | Checks that validate against a remote schema registry, API catalog, or artifact repository. |
+| **Network** | `"network"` | Everything in hermetic + HTTP GET requests via `http_get()` built-in. DNS resolution allowed. Still no file I/O or arbitrary exec. | Checks that validate against a remote reservation service, API catalog, or internal registry. |
 
 ### 5.2 Tier enforcement
 
@@ -747,7 +747,7 @@ Context type: `ProtoEvolutionContext`
 
 Rust side: invokes `protoc --descriptor_set_out` with `--include_source_info` at both base and current revisions. The resulting `FileDescriptorSet` is enriched with source location info (comments, line/column positions for every element). The Rust adapter parses these descriptor sets, diffs them into `SchemaDelta` values, and injects the typed models into Starlark. Starlark check authors receive a descriptor model that includes comments and source positions — not raw `.proto` text, but the full structured representation that `protoc` produces.
 
-Starlark surface: `ctx.deltas`, `ctx.files`, `ctx.config`, `ctx.registries`, plus all the typed descriptor types (`FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, etc.) and enum constants (`DeltaKind`, `FieldKind`, `FieldLabel`, etc.) already documented in the proto-evolution branch. Source location info is available on descriptors via `.source_location` (line, column, leading/trailing comments).
+Starlark surface: `ctx.deltas`, `ctx.files`, `ctx.config`, plus all the typed descriptor types (`FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, etc.) and enum constants (`DeltaKind`, `FieldKind`, `FieldLabel`, etc.) already documented in the proto-evolution branch. Source location info is available on descriptors via `.source_location` (line, column, leading/trailing comments).
 
 #### `module_json` — `module.json` file evolution
 
@@ -2046,53 +2046,54 @@ version = "0.3.0"
 # package.toml is purely for external deps.
 ```
 
-### 16.13 Network tier: checking against a remote registry
+### 16.13 Network tier: checking field reservations against a remote service
 
 ```python
-# checkleft/proto/public/registry_sync/check.checkleft
-# Tier: network (declared in check_meta below)
+# checkleft/proto/public/reservation_check/check.checkleft
+
+check_meta(
+    applies_to: list[str] = ["**/*.proto"],
+    tier: str = "network",
+    config: dict[str, typing.Any] = {
+        "reservation_service_url": "https://reservations.internal.acme.com",
+    },
+)
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
+    """Verify that removed fields are reserved in the central reservation service."""
     findings: list[Finding] = []
-    registry_url: str = ctx.config["registry_url"]
+    base_url: str = ctx.config["reservation_service_url"]
 
-    for pair in ctx.files:
-        if pair.after == None:
+    for delta in ctx.deltas:
+        if delta.kind != DeltaKind.field_removed:
             continue
 
-        # Fetch the registered schema version from the remote registry
+        # Ask the reservation service if this field number is reserved
         resp: HttpResponse = http_get(
-            "{}/schemas/{}".format(registry_url, pair.after.package),
-            headers = {"Accept": "application/json"},
+            "{}/api/reserved/{}/{}".format(base_url, delta.symbol, delta.before_number),
             timeout_ms = 5000,
         )
 
+        if resp.status == 200:
+            # Field is registered as reserved — good
+            continue
+
         if resp.status == 404:
-            # New schema, not yet registered — that's fine
-            continue
-
-        if resp.status != 200:
+            # Not reserved in the central service
             findings.append(fail(
-                message = "failed to fetch schema registry for {}: HTTP {}".format(
-                    pair.after.package, resp.status,
+                message = "removed field {} (number {}) is not reserved in the central reservation service".format(
+                    delta.symbol, delta.before_number,
                 ),
-                path = pair.path,
+                path = delta.path,
+                remediation = "Register the field reservation at {}/reserve before removing it.".format(base_url),
             ))
-            continue
-
-        registered: dict[str, typing.Any] = json_decode(resp.body)
-        registered_version: int = registered.get("version", 0)
-
-        # Check that we're not regressing below the registered version
-        for msg in pair.after.messages:
-            for field in msg.fields:
-                if field.number > registered.get("max_field_number", 0):
-                    findings.append(fail_but_overridable(
-                        message = "field {} extends beyond registered schema v{}".format(
-                            field.full_name, registered_version,
-                        ),
-                        path = pair.path,
-                    ))
+        else:
+            findings.append(fail(
+                message = "failed to check reservation status for {}: HTTP {}".format(
+                    delta.symbol, resp.status,
+                ),
+                path = delta.path,
+            ))
 
     return findings
 ```
