@@ -14,6 +14,7 @@ pub struct DiscoveredCheck {
     pub id: String,
     pub adapter: String,
     pub checkleft_root: PathBuf,
+    pub scope_root: PathBuf,
     pub check_dir: PathBuf,
     pub check_path: PathBuf,
     pub fix_path: Option<PathBuf>,
@@ -177,6 +178,7 @@ fn parse_check_file(
         id: format!("{adapter}/{check_name}"),
         adapter,
         checkleft_root: checkleft_root.to_path_buf(),
+        scope_root: default_scope_root(checkleft_root),
         fix_path: tree
             .exists(&check_dir.join("fix.checkleft"))
             .then(|| check_dir.join("fix.checkleft")),
@@ -218,6 +220,14 @@ fn parse_applies_to(source: &str) -> Result<Vec<String>> {
 
 fn is_known_adapter(adapter: &str) -> bool {
     BUILTIN_ADAPTERS.contains(&adapter)
+}
+
+fn default_scope_root(checkleft_root: &Path) -> PathBuf {
+    checkleft_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
 }
 
 fn relative_to_root(root: &Path, path: &Path) -> Result<PathBuf> {

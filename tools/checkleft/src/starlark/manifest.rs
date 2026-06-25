@@ -10,8 +10,6 @@ use crate::path::validate_relative_path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageManifest {
     pub package: PackageIdentity,
-    pub version_sets: BTreeMap<String, PackageRef>,
-    pub dependencies: BTreeMap<String, PackageRef>,
     pub includes: BTreeMap<String, PackageRef>,
 }
 
@@ -20,7 +18,6 @@ pub struct PackageIdentity {
     pub name: String,
     pub version: String,
     pub kind: PackageKind,
-    pub exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +30,7 @@ pub enum PackageKind {
 pub struct PackageRef {
     pub source: String,
     pub version: String,
+    pub sha256: Option<String>,
 }
 
 impl PackageManifest {
@@ -57,8 +55,6 @@ impl PackageManifest {
             bail!("[package].version must not be empty");
         }
 
-        let version_sets = validate_refs("version_sets", raw.version_sets)?;
-        let dependencies = validate_refs("dependencies", raw.dependencies)?;
         let includes = validate_refs("includes", raw.includes)?;
 
         Ok(Self {
@@ -66,10 +62,7 @@ impl PackageManifest {
                 name: package.name,
                 version: package.version,
                 kind: package.kind,
-                exclude_patterns: package.exclude_patterns,
             },
-            version_sets,
-            dependencies,
             includes,
         })
     }
@@ -89,11 +82,15 @@ fn validate_refs(section: &'static str, refs: BTreeMap<String, RawPackageRef>) -
         }
         validate_source_uri(section, &alias, &package_ref.source)?;
         validate_exact_version(section, &alias, &package_ref.version)?;
+        if !package_ref.source.starts_with("path://") && package_ref.sha256.is_none() {
+            bail!("[{section}.{alias}].sha256 is required for fetched package refs");
+        }
         result.insert(
             alias,
             PackageRef {
                 source: package_ref.source,
                 version: package_ref.version,
+                sha256: package_ref.sha256,
             },
         );
     }
@@ -139,10 +136,6 @@ fn validate_exact_version(section: &str, alias: &str, version: &str) -> Result<(
 struct RawManifest {
     package: Option<RawPackage>,
     #[serde(default)]
-    version_sets: BTreeMap<String, RawPackageRef>,
-    #[serde(default)]
-    dependencies: BTreeMap<String, RawPackageRef>,
-    #[serde(default)]
     includes: BTreeMap<String, RawPackageRef>,
 }
 
@@ -152,14 +145,14 @@ struct RawPackage {
     version: String,
     #[serde(default)]
     kind: PackageKind,
-    #[serde(default)]
-    exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawPackageRef {
     source: String,
     version: String,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 impl Default for PackageKind {
@@ -187,44 +180,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_package_manifest_with_refs() {
+    fn parses_check_package_manifest_metadata() {
         let manifest = PackageManifest::parse(
             r#"
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
-exclude_patterns = ["third_party/**", "vendor/**"]
-
-[version_sets.acme]
-source = "registry://checkleft-hub/acme"
-version = "2026.06.1"
-
-[dependencies.local]
-source = "path://a/b/c/checkleft"
-version = "0.0.0"
 "#,
         )
         .expect("parse manifest");
 
         assert_eq!(manifest.package.name, "myorg/repo-checks");
         assert_eq!(manifest.package.kind, PackageKind::CheckPackage);
-        assert_eq!(
-            manifest.package.exclude_patterns,
-            vec!["third_party/**".to_owned(), "vendor/**".to_owned()]
-        );
-        assert_eq!(manifest.version_sets["acme"].source, "registry://checkleft-hub/acme");
-        assert_eq!(manifest.dependencies["local"].source, "path://a/b/c/checkleft");
+        assert!(manifest.includes.is_empty());
     }
 
     #[test]
-    fn rejects_path_dependencies_with_parent_traversal() {
+    fn parses_version_set_manifest_includes() {
+        let manifest = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.core]
+source = "registry://checkleft-hub/core"
+version = "1.2.3"
+sha256 = "abc123"
+"#,
+        )
+        .expect("parse manifest");
+
+        assert_eq!(manifest.package.kind, PackageKind::VersionSet);
+        assert_eq!(manifest.includes["core"].source, "registry://checkleft-hub/core");
+        assert_eq!(manifest.includes["core"].sha256.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn rejects_fetched_includes_without_hash() {
+        let err = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.core]
+source = "registry://checkleft-hub/core"
+version = "1.2.3"
+"#,
+        )
+        .expect_err("missing hash must fail");
+
+        assert!(err.to_string().contains("sha256"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_path_includes_with_parent_traversal() {
         let err = PackageManifest::parse(
             r#"
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
 
-[dependencies.bad]
+[includes.bad]
 source = "path://../other/checkleft"
 version = "0.0.0"
 "#,

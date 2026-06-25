@@ -54,6 +54,29 @@ pub struct ResolvedCheckDefinitions {
     pub allow_override_bundled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StarlarkPackageConfig {
+    pub source: String,
+    pub version: String,
+    pub sha256: Option<String>,
+    pub kind: StarlarkPackageKind,
+    pub source_path: PathBuf,
+    pub config_dir: PathBuf,
+    pub origin: CheckConfigOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StarlarkPackageKind {
+    Package,
+    VersionSet,
+}
+
+impl StarlarkPackageConfig {
+    pub fn local_path(&self) -> Option<&Path> {
+        self.source.strip_prefix("path://").map(Path::new)
+    }
+}
+
 fn ensure_rustls_provider() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
@@ -148,6 +171,8 @@ pub struct ResolvedChecks {
     /// add more global excludes, never remove ones declared by an ancestor. Each pattern
     /// in this list is already normalized to repo-root-relative coords.
     global_exclude_patterns: Vec<String>,
+    /// Starlark check packages selected by CHECKS.yaml/CHECKS.toml policy.
+    starlark_packages: Vec<StarlarkPackageConfig>,
 }
 
 impl ResolvedChecks {
@@ -183,6 +208,10 @@ impl ResolvedChecks {
     /// `exclude_files` / `exclude_globs` alias) normalized to repo-root coords.
     pub fn global_exclude_patterns(&self) -> &[String] {
         &self.global_exclude_patterns
+    }
+
+    pub fn starlark_packages(&self) -> &[StarlarkPackageConfig] {
+        &self.starlark_packages
     }
 
     /// Build the effective [`ExclusionMatcher`] for a specific check instance.
@@ -379,6 +408,16 @@ impl ConfigResolver {
             Err(diagnostic) => resolved.push_diagnostic(diagnostic),
         }
 
+        match parse_starlark_packages(
+            &checks_file.checkleft_packages,
+            &check_config_dir,
+            &config_relative_path,
+            CheckConfigOrigin::Local,
+        ) {
+            Ok(packages) => resolved.starlark_packages.extend(packages),
+            Err(diagnostic) => resolved.push_diagnostic(diagnostic),
+        }
+
         for check in checks_file.checks {
             let configured_id = check.id;
             // check_name is the definition name (check: field, defaulting to id).
@@ -455,6 +494,8 @@ struct ParsedChecksFile {
     check_definitions: Option<ParsedCheckDefinitions>,
     #[serde(default)]
     checks: Vec<ParsedCheckConfig>,
+    #[serde(default)]
+    checkleft_packages: ParsedStarlarkPackages,
     /// Top-level global excludes: paths matching these patterns are excluded from
     /// every check. `exclude` is the canonical name; `exclude_files` and `exclude_globs`
     /// are accepted aliases for backward compatibility.
@@ -463,6 +504,14 @@ struct ParsedChecksFile {
     /// `Some(vec![])` means the key was present but empty — rejected as an error.
     #[serde(default, alias = "exclude_files", alias = "exclude_globs")]
     exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ParsedStarlarkPackages {
+    #[serde(default)]
+    packages: Vec<ParsedStarlarkPackageRef>,
+    #[serde(default)]
+    version_sets: Vec<ParsedStarlarkPackageRef>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -509,6 +558,14 @@ struct ParsedCheckConfig {
     /// also read for backward compatibility and merged with this field.
     #[serde(default, alias = "exclude_files", alias = "exclude_globs")]
     exclude: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ParsedStarlarkPackageRef {
+    source: String,
+    version: String,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -633,6 +690,151 @@ fn parse_per_check_exclude_patterns(
         .unwrap_or_default();
     let legacy_patterns = extract_legacy_config_excludes(config, config_dir);
     Ok([framework_patterns, legacy_patterns].concat())
+}
+
+fn parse_starlark_packages(
+    raw: &ParsedStarlarkPackages,
+    config_dir: &Path,
+    source_path: &Path,
+    origin: CheckConfigOrigin,
+) -> std::result::Result<Vec<StarlarkPackageConfig>, ConfigDiagnostic> {
+    let mut packages = Vec::with_capacity(raw.packages.len() + raw.version_sets.len());
+    for package in &raw.packages {
+        packages.push(parse_starlark_package(
+            package,
+            StarlarkPackageKind::Package,
+            config_dir,
+            source_path,
+            origin,
+        )?);
+    }
+    for version_set in &raw.version_sets {
+        packages.push(parse_starlark_package(
+            version_set,
+            StarlarkPackageKind::VersionSet,
+            config_dir,
+            source_path,
+            origin,
+        )?);
+    }
+    Ok(packages)
+}
+
+fn parse_starlark_package(
+    raw: &ParsedStarlarkPackageRef,
+    kind: StarlarkPackageKind,
+    config_dir: &Path,
+    source_path: &Path,
+    origin: CheckConfigOrigin,
+) -> std::result::Result<StarlarkPackageConfig, ConfigDiagnostic> {
+    let source = raw.source.trim();
+    if source.is_empty() {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            "`checkleft_packages` source must not be empty".to_owned(),
+            None,
+            None,
+            Some("Set source to registry://, git://, or path:// with a non-empty target.".to_owned()),
+        ));
+    }
+    let version = raw.version.trim();
+    if version.is_empty() {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            "`checkleft_packages` version must not be empty".to_owned(),
+            None,
+            None,
+            Some("Pin the selected package or version set to an exact version.".to_owned()),
+        ));
+    }
+    if let Err(err) = validate_exact_package_version(version) {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("invalid `checkleft_packages` version `{version}`: {err}"),
+            None,
+            None,
+            Some("Use an exact package version pin, not a range or wildcard.".to_owned()),
+        ));
+    }
+    let source = normalize_package_source(source, config_dir).map_err(|err| {
+        config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("invalid `checkleft_packages` source `{source}`: {err}"),
+            None,
+            None,
+            Some("Use registry://, git://, or a safe repo-root-relative path:// source.".to_owned()),
+        )
+    })?;
+    let sha256 = raw
+        .sha256
+        .as_ref()
+        .map(|hash| hash.trim().to_owned())
+        .filter(|hash| !hash.is_empty());
+    if !source.starts_with("path://") && sha256.is_none() {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("`checkleft_packages` source `{source}` must declare sha256"),
+            None,
+            None,
+            Some("Add the expected sha256 for fetched package bytes.".to_owned()),
+        ));
+    }
+
+    Ok(StarlarkPackageConfig {
+        source,
+        version: version.to_owned(),
+        sha256,
+        kind,
+        source_path: source_path.to_path_buf(),
+        config_dir: config_dir.to_path_buf(),
+        origin,
+    })
+}
+
+fn normalize_package_source(source: &str, config_dir: &Path) -> Result<String> {
+    let Some((scheme, rest)) = source.split_once("://") else {
+        bail!("source must use registry://, git://, or path://");
+    };
+    match scheme {
+        "registry" | "git" => {
+            if rest.is_empty() {
+                bail!("{scheme} source must include a non-empty target");
+            }
+            Ok(source.to_owned())
+        }
+        "path" => {
+            if rest.is_empty() {
+                bail!("path:// source must not be empty");
+            }
+            let raw_path = Path::new(rest);
+            validate_relative_path(raw_path).context("path:// value must be a safe relative path")?;
+            let normalized = if config_dir.as_os_str().is_empty() {
+                raw_path.to_path_buf()
+            } else {
+                config_dir.join(raw_path)
+            };
+            validate_relative_path(&normalized).context("normalized path:// value must be repo-root-relative")?;
+            Ok(format!("path://{}", normalized.display()))
+        }
+        _ => bail!("unsupported source scheme `{scheme}`"),
+    }
+}
+
+fn validate_exact_package_version(version: &str) -> Result<()> {
+    if version.contains('*')
+        || version.contains('^')
+        || version.contains('~')
+        || version.contains('<')
+        || version.contains('>')
+    {
+        bail!("version must be an exact version pin");
+    }
+    Ok(())
 }
 
 fn parse_checks_file(path: &Path, relative_path: &Path) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
@@ -1081,6 +1283,21 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
         }
         resolved.global_exclude_patterns.extend(patterns.iter().cloned());
     }
+
+    let starlark_packages = parse_starlark_packages(
+        &external_checks_file.parsed.checkleft_packages,
+        Path::new(""),
+        &external_checks_file.source_path,
+        external_checks_file.origin,
+    )
+    .map_err(|diagnostic| anyhow::anyhow!("{}", diagnostic.message))?;
+    if starlark_packages.iter().any(|package| package.local_path().is_some()) {
+        bail!(
+            "`checkleft_packages` path:// sources are not allowed in an external checks config ({})",
+            external_checks_file.source_label
+        );
+    }
+    resolved.starlark_packages.extend(starlark_packages);
 
     for check in &external_checks_file.parsed.checks {
         let configured_id = check.id.clone();

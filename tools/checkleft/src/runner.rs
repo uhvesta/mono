@@ -12,7 +12,7 @@ use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count
 
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
-use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver};
+use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver, StarlarkPackageConfig};
 use crate::exclusion::ExclusionStatus;
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::{
@@ -23,6 +23,7 @@ use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
 use crate::starlark::discovery::{self, DiscoveredCheck};
+use crate::starlark::manifest::{PackageKind, PackageManifest};
 use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
 use tracing::info;
 
@@ -1005,7 +1006,8 @@ impl Runner {
             }
         }
 
-        if let Ok(discovered) = discovery::discover_local_checks(changeset, self.source_tree.as_ref()) {
+        let mut starlark_diagnostics = BTreeMap::new();
+        if let Ok(discovered) = self.discover_starlark_checks(changeset, &mut starlark_diagnostics) {
             for check in discovered {
                 if check.adapter != "text" {
                     continue;
@@ -1016,6 +1018,20 @@ impl Runner {
                 {
                     checks.insert(check.id);
                 }
+            }
+        }
+        for diagnostic in starlark_diagnostics.values() {
+            for finding in &diagnostic.findings {
+                config_diagnostics.insert(format!(
+                    "`{}` at {}: {}",
+                    diagnostic.check_id,
+                    finding
+                        .location
+                        .as_ref()
+                        .map(|location| location.path.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_owned()),
+                    finding.message
+                ));
             }
         }
 
@@ -1174,7 +1190,7 @@ impl Runner {
         grouped_runs: &mut BTreeMap<(String, String, String, String, String, String), ScheduledCheckRun>,
         grouped_diagnostics: &mut BTreeMap<(String, PathBuf, Option<u32>, Option<u32>, String, String), CheckResult>,
     ) {
-        let discovered = match discovery::discover_local_checks(changeset, self.source_tree.as_ref()) {
+        let discovered = match self.discover_starlark_checks(changeset, grouped_diagnostics) {
             Ok(checks) => checks,
             Err(err) => {
                 let diagnostic = ConfigDiagnostic {
@@ -1249,12 +1265,11 @@ impl Runner {
                             continue;
                         }
                     };
-                    let package_scope = package_scope_for_checkleft_root(&check.checkleft_root);
                     let output = match adapter.prepare(AdapterInput {
                         changeset: &check_changeset,
                         tree: self.source_tree.as_ref(),
                         applies_to: &check.check_meta.applies_to,
-                        package_scope: Some(&package_scope),
+                        package_scope: Some(&check.scope_root),
                     }) {
                         Ok(output) => Arc::new(output),
                         Err(err) => {
@@ -1320,6 +1335,115 @@ impl Runner {
                 },
             );
         }
+    }
+
+    fn discover_starlark_checks(
+        &self,
+        changeset: &ChangeSet,
+        grouped_diagnostics: &mut BTreeMap<(String, PathBuf, Option<u32>, Option<u32>, String, String), CheckResult>,
+    ) -> Result<Vec<DiscoveredCheck>> {
+        let package_configs = self.starlark_package_configs_for_changeset(changeset);
+        if package_configs.is_empty() {
+            return discovery::discover_local_checks(changeset, self.source_tree.as_ref());
+        }
+
+        let mut checks = Vec::new();
+        for package in package_configs {
+            match self.discover_starlark_package_checks(&package) {
+                Ok(mut package_checks) => {
+                    for check in &mut package_checks {
+                        check.scope_root = package.config_dir.clone();
+                    }
+                    checks.append(&mut package_checks);
+                }
+                Err(err) => self.insert_starlark_package_diagnostic(
+                    grouped_diagnostics,
+                    &package,
+                    format!("failed to activate Starlark package `{}`: {err:#}", package.source),
+                ),
+            }
+        }
+        checks.sort_by(|left, right| left.check_path.cmp(&right.check_path));
+        checks.dedup_by(|left, right| left.check_path == right.check_path);
+        Ok(checks)
+    }
+
+    fn starlark_package_configs_for_changeset(&self, changeset: &ChangeSet) -> Vec<StarlarkPackageConfig> {
+        let mut packages = BTreeMap::new();
+        for changed_file in &changeset.changed_files {
+            let Ok(resolved) = self.resolver.resolve_for_file(&changed_file.path) else {
+                continue;
+            };
+            for package in resolved.starlark_packages() {
+                packages
+                    .entry(package.source.clone())
+                    .or_insert_with(|| package.clone());
+            }
+        }
+        packages.into_values().collect()
+    }
+
+    fn discover_starlark_package_checks(&self, package: &StarlarkPackageConfig) -> Result<Vec<DiscoveredCheck>> {
+        let Some(root) = package.local_path() else {
+            bail!("fetched package sources are parsed but not schedulable yet");
+        };
+
+        match package.kind {
+            crate::config::StarlarkPackageKind::Package => {
+                discovery::discover_package_checks(self.source_tree.as_ref(), root)
+            }
+            crate::config::StarlarkPackageKind::VersionSet => {
+                let manifest = PackageManifest::read_from_tree(self.source_tree.as_ref(), root)?;
+                if manifest.package.kind != PackageKind::VersionSet {
+                    bail!(
+                        "{} declares a version-set activation but package.toml kind is not `version_set`",
+                        root.display()
+                    );
+                }
+                let mut checks = Vec::new();
+                for (alias, include) in manifest.includes {
+                    let Some(include_root) = include.source.strip_prefix("path://").map(Path::new) else {
+                        bail!(
+                            "version-set include `{alias}` uses a fetched source; fetched package resolution is not implemented yet"
+                        );
+                    };
+                    checks.extend(discovery::discover_package_checks(
+                        self.source_tree.as_ref(),
+                        include_root,
+                    )?);
+                }
+                Ok(checks)
+            }
+        }
+    }
+
+    fn insert_starlark_package_diagnostic(
+        &self,
+        grouped_diagnostics: &mut BTreeMap<(String, PathBuf, Option<u32>, Option<u32>, String, String), CheckResult>,
+        package: &StarlarkPackageConfig,
+        message: String,
+    ) {
+        let diagnostic = ConfigDiagnostic {
+            check_id: "starlark-package".to_owned(),
+            message,
+            location: Location {
+                path: package.source_path.clone(),
+                line: None,
+                column: None,
+            },
+            remediation: Some("Fix this checkleft_packages entry in CHECKS.yaml.".to_owned()),
+        };
+        let key = (
+            diagnostic.check_id.clone(),
+            diagnostic.location.path.clone(),
+            diagnostic.location.line,
+            diagnostic.location.column,
+            diagnostic.message.clone(),
+            diagnostic.remediation.clone().unwrap_or_default(),
+        );
+        grouped_diagnostics
+            .entry(key)
+            .or_insert_with(|| config_diagnostic_result(&diagnostic));
     }
 
     fn insert_starlark_invalid_run(
@@ -1463,7 +1587,7 @@ fn starlark_policy(check_id: &str) -> EffectiveCheckPolicy {
 
 fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) -> Result<ChangeSet> {
     let applies_to = build_glob_set(&check.check_meta.applies_to)?;
-    let package_scope = package_scope_for_checkleft_root(&check.checkleft_root);
+    let package_scope = &check.scope_root;
     let changed_files = changeset
         .changed_files
         .iter()
@@ -1525,14 +1649,6 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
         builder.add(Glob::new(pattern)?);
     }
     Ok(builder.build()?)
-}
-
-fn package_scope_for_checkleft_root(checkleft_root: &Path) -> PathBuf {
-    checkleft_root
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
 }
 
 fn path_in_scope(path: &Path, scope: &Path) -> bool {
