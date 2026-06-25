@@ -1,0 +1,14 @@
+[[findings]]
+severity = "fail"
+message_contains = "module.json 'version' must not be empty"
+path = "services/auth/module.json"
+
+[[findings]]
+severity = "fail_but_overridable"
+message_contains = "dependency 'legacy' was removed"
+path = "services/auth/module.json"
+
+[[findings]]
+severity = "fail"
+message_contains = "required key 'version' was removed"
+path = "services/auth/module.json"
