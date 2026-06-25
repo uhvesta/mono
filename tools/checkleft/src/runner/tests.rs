@@ -296,6 +296,8 @@ id = "capture"
 async fn runner_executes_discovered_local_starlark_text_check() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("checkleft/text/public/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/text/private/no_todo")).expect("create private check dirs");
+    fs::create_dir_all(temp.path().join("checkleft/lib")).expect("create lib dir");
     fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
     fs::write(
         temp.path().join("checkleft/package.toml"),
@@ -309,6 +311,8 @@ version = "0.1.0"
     fs::write(
         temp.path().join("checkleft/text/public/no_debug/check.checkleft"),
         r#"
+load("//lib/messages", "message_for")
+
 check_meta(applies_to = ["**/*.txt"])
 
 def check(ctx):
@@ -317,7 +321,7 @@ def check(ctx):
         for line in file.added_lines:
             if "debug" in line.text:
                 findings.append(fail(
-                    message = "debug text added",
+                    message = message_for("debug"),
                     path = file.path,
                     line = line.number,
                     column = 1,
@@ -326,7 +330,37 @@ def check(ctx):
 "#,
     )
     .expect("write check");
-    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\n").expect("write changed file");
+    fs::write(
+        temp.path().join("checkleft/text/private/no_todo/check.checkleft"),
+        r#"
+load("//lib/messages", "message_for")
+
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if "todo" in line.text:
+                findings.append(fail(
+                    message = message_for("todo"),
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings
+"#,
+    )
+    .expect("write private check");
+    fs::write(
+        temp.path().join("checkleft/lib/messages.checkleft"),
+        r#"
+def message_for(kind):
+    return kind + " text added"
+"#,
+    )
+    .expect("write lib");
+    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\ntodo item\n").expect("write changed file");
 
     let runner = Runner::new(
         Arc::new(CheckRegistry::new()),
@@ -353,6 +387,20 @@ def check(ctx):
         Some(Location {
             path: PathBuf::from("notes/example.txt"),
             line: Some(2),
+            column: Some(1),
+        })
+    );
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_todo")
+        .expect("private starlark result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "todo text added");
+    assert_eq!(
+        result.findings[0].location,
+        Some(Location {
+            path: PathBuf::from("notes/example.txt"),
+            line: Some(3),
             column: Some(1),
         })
     );

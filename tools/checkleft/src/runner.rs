@@ -21,6 +21,7 @@ use crate::external::{
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
 use crate::starlark::discovery::{self, DiscoveredCheck};
 use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
 use tracing::info;
@@ -50,6 +51,7 @@ enum ScheduledExecution {
     },
     StarlarkLocal {
         check: Arc<StarlarkCheckRunner>,
+        output: Arc<AdapterPreparedOutput>,
     },
     Invalid {
         message: String,
@@ -338,7 +340,7 @@ impl Runner {
                         })
                     });
                 }
-                ScheduledExecution::StarlarkLocal { check } => {
+                ScheduledExecution::StarlarkLocal { check, output } => {
                     let source_tree = Arc::clone(&self.source_tree);
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
@@ -357,7 +359,7 @@ impl Runner {
                     join_set.spawn(async move {
                         reporter.start(&configured_check_id);
                         let check_start = Instant::now();
-                        match check.run(&run_changeset, source_tree.as_ref()).await {
+                        match check.evaluate_prepared_adapter(output.as_ref(), source_tree.as_ref()) {
                             Ok(mut result) => {
                                 let elapsed = check_start.elapsed();
                                 result.check_id = configured_check_id.clone();
@@ -1200,6 +1202,8 @@ impl Runner {
             }
         };
 
+        let adapters = AdapterRegistry::with_builtin_adapters();
+        let mut adapter_outputs: BTreeMap<String, Arc<AdapterPreparedOutput>> = BTreeMap::new();
         for check in discovered {
             if check.adapter != "text" {
                 continue;
@@ -1234,6 +1238,38 @@ impl Runner {
             if check_changeset.changed_files.is_empty() {
                 continue;
             }
+            let output_key = starlark_adapter_output_key(&check.adapter, &check_changeset);
+            let adapter_output = match adapter_outputs.get(&output_key) {
+                Some(output) => Arc::clone(output),
+                None => {
+                    let adapter = match adapters.require(&check.adapter) {
+                        Ok(adapter) => adapter,
+                        Err(err) => {
+                            self.insert_starlark_invalid_run(grouped_runs, &check, err.to_string());
+                            continue;
+                        }
+                    };
+                    let package_scope = package_scope_for_checkleft_root(&check.checkleft_root);
+                    let output = match adapter.prepare(AdapterInput {
+                        changeset: &check_changeset,
+                        tree: self.source_tree.as_ref(),
+                        applies_to: &check.check_meta.applies_to,
+                        package_scope: Some(&package_scope),
+                    }) {
+                        Ok(output) => Arc::new(output),
+                        Err(err) => {
+                            self.insert_starlark_invalid_run(
+                                grouped_runs,
+                                &check,
+                                format!("failed to prepare Starlark adapter `{}`: {err:#}", check.adapter),
+                            );
+                            continue;
+                        }
+                    };
+                    adapter_outputs.insert(output_key, Arc::clone(&output));
+                    output
+                }
+            };
 
             let source = match self.source_tree.read_file(&check.check_path) {
                 Ok(bytes) => match String::from_utf8(bytes) {
@@ -1273,7 +1309,10 @@ impl Runner {
                 ScheduledCheckRun {
                     configured_check_id: check.id.clone(),
                     source_path: check.check_path.clone(),
-                    execution: ScheduledExecution::StarlarkLocal { check: runner },
+                    execution: ScheduledExecution::StarlarkLocal {
+                        check: runner,
+                        output: adapter_output,
+                    },
                     policy: starlark_policy(&check.id),
                     config: toml::Value::Table(Default::default()),
                     changeset: check_changeset,
@@ -1452,6 +1491,32 @@ fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) 
         }
     }
     Ok(scoped)
+}
+
+fn starlark_adapter_output_key(adapter: &str, changeset: &ChangeSet) -> String {
+    let mut parts = vec![format!("adapter={adapter}")];
+    for changed in &changeset.changed_files {
+        parts.push(format!(
+            "{}:{}:{}",
+            changed.path.display(),
+            change_kind_name(changed.kind),
+            changed
+                .old_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        ));
+    }
+    parts.join("\n")
+}
+
+fn change_kind_name(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Renamed => "renamed",
+    }
 }
 
 fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
