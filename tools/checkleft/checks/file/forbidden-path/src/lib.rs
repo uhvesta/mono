@@ -5,10 +5,13 @@
 //!
 //! ## What the check detects
 //!
-//! Any changed file that (a) matches at least one rule's `patterns` glob, (b) has
-//! a change kind listed in that rule's `when`, and (c) is not excluded by
-//! `exclude_files` is flagged with an error finding carrying the rule's remediation
-//! message.
+//! Any changed file that (a) matches at least one rule's `patterns` glob and (b)
+//! has a change kind listed in that rule's `when` is flagged with an error finding
+//! carrying the rule's remediation message.
+//!
+//! File exclusion (`exclude` / `exclude_files` / `exclude_globs`) is enforced by the
+//! framework host, which subtracts excluded paths from the changeset before it is
+//! lowered into this check — so an excluded file never reaches the loop below.
 //!
 //! For renamed files both the new path and the old path are candidates; the first
 //! matching candidate determines the finding's location.
@@ -24,15 +27,9 @@
 //!       "patterns": ["**/target/**", "**/node_modules/**"]
 //!     }
 //!   ],
-//!   "exclude_files": ["mobile/ios/.build/**"],
 //!   "severity": "error"
 //! }
 //! ```
-//!
-//! `exclude_files` / `exclude_globs` (alias): glob patterns matched against the
-//! file's repo-root-relative path. Patterns authored relative to a subdirectory
-//! CHECKS file are normalized to repo-root-relative by the host before they
-//! reach this check, so matching here is a plain repo-relative glob test.
 //!
 //! `severity`: optional override (`"error"`, `"warning"`, or `"info"`). Defaults
 //! to `"error"`.
@@ -45,8 +42,6 @@ use serde::Deserialize;
 struct Config {
     #[serde(default)]
     rules: Vec<RuleConfig>,
-    #[serde(default, alias = "exclude_globs")]
-    exclude_files: Vec<String>,
     #[serde(default)]
     severity: Option<String>,
 }
@@ -95,19 +90,6 @@ pub fn forbidden_path_check(input: CheckInput) -> Vec<Finding> {
         }
     };
 
-    let exclude_globs = if cfg.exclude_files.is_empty() {
-        None
-    } else {
-        match build_globset(&cfg.exclude_files) {
-            Ok(gs) => Some(gs),
-            Err(e) => {
-                return vec![Finding::error(format!(
-                    "invalid file/forbidden-path check config: invalid glob in exclude_files: {e}"
-                ))];
-            }
-        }
-    };
-
     let mut findings = Vec::new();
 
     for file in &input.changeset.changed_files {
@@ -118,13 +100,6 @@ pub fn forbidden_path_check(input: CheckInput) -> Vec<Finding> {
 
             let candidates = candidate_paths(file);
             for candidate in &candidates {
-                if exclude_globs
-                    .as_ref()
-                    .is_some_and(|globs| globs.is_match(candidate.as_str()))
-                {
-                    continue;
-                }
-
                 let matches = rule.patterns.matches(candidate.as_str());
                 if matches.is_empty() {
                     continue;
@@ -344,32 +319,6 @@ mod tests {
             findings[0].location.as_ref().map(|l| l.path.as_str()),
             Some("frontend/dist/app.js")
         );
-    }
-
-    #[test]
-    fn excludes_configured_paths() {
-        let findings = run(
-            vec![ChangedFile {
-                path: "mobile/ios/.build/workspace-state.json".to_owned(),
-                kind: ChangeKind::Added,
-                old_path: None,
-            }],
-            r#"{"rules":[{"remediation":"Generated artifacts must not be committed.","when":["added"],"patterns":["**/.build/**"]}],"exclude_files":["mobile/ios/.build/**"]}"#,
-        );
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn exclude_globs_alias_still_works() {
-        let findings = run(
-            vec![ChangedFile {
-                path: "mobile/ios/.build/workspace-state.json".to_owned(),
-                kind: ChangeKind::Added,
-                old_path: None,
-            }],
-            r#"{"rules":[{"remediation":"Generated artifacts must not be committed.","when":["added"],"patterns":["**/.build/**"]}],"exclude_globs":["mobile/ios/.build/**"]}"#,
-        );
-        assert!(findings.is_empty());
     }
 
     #[test]

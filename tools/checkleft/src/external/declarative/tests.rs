@@ -1143,6 +1143,52 @@ fn changeset_with_files(paths: &[&str]) -> crate::input::ChangeSet {
     )
 }
 
+/// Task 3: `select_files` subtracts the framework exclude set after the positive
+/// `applies_to` filter, so an excluded file never reaches the `{{files}}` list.
+#[test]
+fn select_files_subtracts_excludes_after_applies_to() {
+    let changeset = changeset_with_files(&["src/a.rs", "vendor/dep.rs", "src/b.rs"]);
+    let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+
+    let files = super::executor::select_files(Path::new(""), &changeset, &["**/*.rs".to_owned()], false, &exclusion)
+        .expect("select_files");
+
+    assert_eq!(files, vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()]);
+}
+
+/// Task 3: excludes always win — a file matched by `applies_to` (or its override)
+/// is still removed when it matches an exclude, so the two compose as a second,
+/// subtractive stage.
+#[test]
+fn select_files_excludes_win_over_applies_to_selection() {
+    let changeset = changeset_with_files(&["src/keep.rs", "src/generated/out.rs"]);
+    // `applies_to` (here standing in for a per-repo override) positively selects both
+    // files; the exclude then subtracts the generated one.
+    let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["**/generated/**".to_owned()]).expect("matcher");
+
+    let files = super::executor::select_files(Path::new(""), &changeset, &["src/**".to_owned()], false, &exclusion)
+        .expect("select_files");
+
+    assert_eq!(files, vec!["src/keep.rs".to_owned()]);
+}
+
+/// Task 3: an empty exclusion matcher subtracts nothing — the positive `applies_to`
+/// set is returned unchanged.
+#[test]
+fn select_files_with_empty_matcher_keeps_all_applies_to_matches() {
+    let changeset = changeset_with_files(&["src/a.rs", "vendor/dep.rs"]);
+    let files = super::executor::select_files(
+        Path::new(""),
+        &changeset,
+        &["**/*.rs".to_owned()],
+        false,
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
+    )
+    .expect("select_files");
+
+    assert_eq!(files, vec!["src/a.rs".to_owned(), "vendor/dep.rs".to_owned()]);
+}
+
 #[test]
 fn applies_to_override_replaces_definition_glob() {
     // The package applies_to is ["**/*.bzl"]. The config override sets ["**/*.rs"].
@@ -2644,6 +2690,7 @@ fn per_file_progress_emits_one_tick_per_file() {
         &changeset,
         &config,
         None,
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
         on_file_processed,
     )
     .expect("check must succeed");
@@ -2692,6 +2739,7 @@ fn batch_progress_emits_one_tick_per_chunk() {
         &changeset,
         &config,
         None,
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
         on_file_processed,
     )
     .expect("check must succeed");

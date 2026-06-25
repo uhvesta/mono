@@ -21,14 +21,13 @@
 //! ```json
 //! {
 //!   "max_fields": 5,
-//!   "exclude_files": ["**/generated/**"],
 //!   "exclude_structs": ["Big", "path/to/file.rs::Big"]
 //! }
 //! ```
 //!
-//! `exclude_files` / `exclude_globs` (alias): glob patterns matched against the
-//! file's repo-root-relative path. The host normalizes any subdirectory-CHECKS
-//! patterns to repo-root-relative globs before they reach this guest.
+//! File exclusion (`exclude` / `exclude_files` / `exclude_globs`) is enforced by the
+//! framework host, which subtracts excluded paths from the changeset before it is
+//! lowered into this check — so an excluded file never reaches the loop below.
 //!
 //! `exclude_structs`: grandfathering exemptions. The guest emits a finding for
 //! every violating struct (in repo-relative coordinates, with no knowledge of
@@ -40,8 +39,7 @@
 //! PR or commit description (requires `allow_bypass = true` in policy).
 
 use checkleft_check_sdk::{ChangeKind, CheckInput, DeclaredExclusion, ExclusionStatus, Finding, check};
-use checkleft_rust_giant_structs_common::{has_cfg_test, is_literal_path, strip_visibility, struct_declaration_line};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use checkleft_rust_giant_structs_common::{has_cfg_test, strip_visibility, struct_declaration_line};
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -51,8 +49,6 @@ const DEFAULT_MAX_FIELDS: usize = 5;
 struct Config {
     #[serde(default)]
     max_fields: Option<usize>,
-    #[serde(default, alias = "exclude_globs")]
-    exclude_files: Option<Vec<String>>,
     #[serde(default)]
     exclude_structs: Option<Vec<String>>,
 }
@@ -67,7 +63,6 @@ struct Config {
 pub fn giant_structs_create_check(input: CheckInput) -> Vec<Finding> {
     let cfg: Config = input.config().unwrap_or_default();
     let max_fields = cfg.max_fields.unwrap_or(DEFAULT_MAX_FIELDS);
-    let exclude_globs = build_globset(cfg.exclude_files.as_deref());
 
     let mut findings = Vec::new();
 
@@ -76,9 +71,6 @@ pub fn giant_structs_create_check(input: CheckInput) -> Vec<Finding> {
             continue;
         }
         if !file.path.ends_with(".rs") {
-            continue;
-        }
-        if exclude_globs.as_ref().is_some_and(|globs| globs.is_match(&file.path)) {
             continue;
         }
 
@@ -145,14 +137,15 @@ pub fn giant_structs_create_check(input: CheckInput) -> Vec<Finding> {
 
 /// Declare the auditable exclusion entries for `rust/giant-structs-create`.
 ///
-/// Two entry forms are auditable, mirroring the native check:
+/// One entry form is auditable:
 /// * `relative/path.rs::Name` — qualified struct exemption; stale once `Name` is
 ///   no longer giant in that file.
-/// * a literal-path `exclude_files` entry — stale once the file no longer exists.
 ///
 /// Simple `exclude_structs` names (no `::`) are NOT auditable: they depend on no
-/// single file. `depends_on` paths are config-file-relative; the host resolves
-/// them to repo-root-relative before re-evaluation.
+/// single file. File exclusion is host-owned (framework `exclude` key) and audited
+/// separately, so this guest only declares `exclude_structs` entries. `depends_on`
+/// paths are config-file-relative; the host resolves them to repo-root-relative
+/// before re-evaluation.
 pub fn giant_structs_create_declared_exclusions(config_json: &str) -> Vec<DeclaredExclusion> {
     let cfg: Config = serde_json::from_str(config_json).unwrap_or_default();
     let mut result = Vec::new();
@@ -162,15 +155,6 @@ pub fn giant_structs_create_declared_exclusions(config_json: &str) -> Vec<Declar
             result.push(DeclaredExclusion {
                 entry: entry.clone(),
                 depends_on: vec![path_part.to_owned()],
-            });
-        }
-    }
-
-    for pattern in cfg.exclude_files.unwrap_or_default() {
-        if is_literal_path(&pattern) {
-            result.push(DeclaredExclusion {
-                entry: pattern.clone(),
-                depends_on: vec![pattern],
             });
         }
     }
@@ -215,11 +199,9 @@ pub fn giant_structs_create_evaluate_exclusion(
                 ExclusionStatus::Stale(format!("`{struct_name}` is no longer defined in `{dep_path}`"))
             }
         }
-        // Literal-path `exclude_files` entry: load-bearing while the file exists.
-        None => match file_content {
-            Some(_) => ExclusionStatus::LoadBearing,
-            None => ExclusionStatus::Stale(format!("the excluded file `{dep_path}` no longer exists")),
-        },
+        // Only qualified `path::Name` exemptions are auditable; anything else is not
+        // declared, so fail safe rather than guess.
+        None => ExclusionStatus::Unknown,
     }
 }
 
@@ -467,20 +449,6 @@ fn find_struct_literal_lines(source: &str, struct_name: &str) -> Vec<u32> {
     if lines.is_empty() { vec![1] } else { lines }
 }
 
-fn build_globset(patterns: Option<&[String]>) -> Option<GlobSet> {
-    let patterns = patterns?;
-    if patterns.is_empty() {
-        return None;
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        if let Ok(glob) = Glob::new(pattern) {
-            builder.add(glob);
-        }
-    }
-    builder.build().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,7 +555,7 @@ fn make() -> Big {
         );
     }
 
-    // ── Exemptions: #[cfg(test)], exclude_files ────────────────────────────────
+    // ── Exemptions: #[cfg(test)] ───────────────────────────────────────────────
 
     #[test]
     fn does_not_flag_literal_in_cfg_test_module() {
@@ -619,30 +587,6 @@ fn make_test_big() -> Big {
         assert!(
             messages.is_empty(),
             "literal in #[cfg(test)] fn should be exempt, got {messages:?}"
-        );
-    }
-
-    #[test]
-    fn exclude_files_skips_changed_file() {
-        let source = r#"
-fn make() -> Big { Big { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 } }
-"#;
-        let messages = run_check("gen.rs", source, r#"{"exclude_files": ["gen.rs"]}"#);
-        assert!(
-            messages.is_empty(),
-            "excluded file should not be flagged, got {messages:?}"
-        );
-    }
-
-    #[test]
-    fn exclude_globs_alias_still_works() {
-        let source = r#"
-fn make() -> Big { Big { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 } }
-"#;
-        let messages = run_check("gen.rs", source, r#"{"exclude_globs": ["gen.rs"]}"#);
-        assert!(
-            messages.is_empty(),
-            "exclude_globs alias should skip the file, got {messages:?}"
         );
     }
 
@@ -678,17 +622,20 @@ pub struct Big {
 "#;
 
     #[test]
-    fn declares_qualified_struct_and_literal_file_exclusions() {
+    fn declares_only_qualified_struct_exclusions() {
+        // `exclude_files` is now host-owned and ignored by this guest; only qualified
+        // `path::Name` struct exemptions are auditable. The simple struct name is not.
         let config = r#"{"exclude_structs": ["types.rs::Big", "Simple"], "exclude_files": ["gen.rs", "**/*.rs"]}"#;
         let declared = giant_structs_create_declared_exclusions(config);
         let entries: Vec<&str> = declared.iter().map(|d| d.entry.as_str()).collect();
-        // Qualified struct + literal-path file are auditable; the simple name and
-        // the glob pattern are not.
         assert!(entries.contains(&"types.rs::Big"), "{entries:?}");
-        assert!(entries.contains(&"gen.rs"), "{entries:?}");
         assert!(
             !entries.contains(&"Simple"),
             "simple name must not be auditable: {entries:?}"
+        );
+        assert!(
+            !entries.contains(&"gen.rs"),
+            "exclude_files entries must not be auditable by the guest: {entries:?}"
         );
         assert!(!entries.contains(&"**/*.rs"), "glob must not be auditable: {entries:?}");
     }
@@ -735,18 +682,20 @@ pub struct Big {
     }
 
     #[test]
-    fn file_exclusion_load_bearing_while_file_exists_else_stale() {
+    fn non_qualified_entry_is_not_audited() {
+        // A bare `exclude_files`-style entry (no `::`) is no longer auditable by the
+        // guest: it fails safe to Unknown rather than guessing staleness.
         let excl = DeclaredExclusion {
             entry: "gen.rs".to_owned(),
             depends_on: vec!["gen.rs".to_owned()],
         };
         assert!(matches!(
             giant_structs_create_evaluate_exclusion("{}", &excl, Some("fn x() {}")),
-            ExclusionStatus::LoadBearing
+            ExclusionStatus::Unknown
         ));
-        match giant_structs_create_evaluate_exclusion("{}", &excl, None) {
-            ExclusionStatus::Stale(reason) => assert!(reason.contains("no longer exists"), "reason: {reason}"),
-            other => panic!("expected stale, got {other:?}"),
-        }
+        assert!(matches!(
+            giant_structs_create_evaluate_exclusion("{}", &excl, None),
+            ExclusionStatus::Unknown
+        ));
     }
 }

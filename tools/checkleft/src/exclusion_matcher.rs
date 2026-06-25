@@ -10,6 +10,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
+use crate::input::ChangeSet;
+
 /// A compiled glob-matcher for repo-root-relative path exclusion.
 ///
 /// Built once per check instance from the union of:
@@ -55,6 +57,29 @@ impl ExclusionMatcher {
     /// references into the original slice.
     pub fn filter_paths<'a>(&self, paths: &'a [std::path::PathBuf]) -> Vec<&'a std::path::PathBuf> {
         paths.iter().filter(|p| !self.is_excluded(p.as_path())).collect()
+    }
+
+    /// Return a copy of `changeset` with every excluded changed file removed.
+    ///
+    /// This is the host's selection-time subtraction for programmatic / component
+    /// checks: lowering the *filtered* changeset means a guest (or a built-in Rust
+    /// check) never sees an excluded path and so cannot target it. The per-file
+    /// `file_line_deltas` / `file_diffs` entries for dropped paths are pruned too so
+    /// the lowered view stays internally consistent. An empty matcher returns an
+    /// equivalent changeset unchanged.
+    pub fn filter_changeset(&self, changeset: &ChangeSet) -> ChangeSet {
+        if self.is_empty() {
+            return changeset.clone();
+        }
+        let mut filtered = changeset.clone();
+        filtered
+            .changed_files
+            .retain(|file| !self.is_excluded(file.path.as_path()));
+        filtered
+            .file_line_deltas
+            .retain(|path, _| !self.is_excluded(path.as_path()));
+        filtered.file_diffs.retain(|path, _| !self.is_excluded(path.as_path()));
+        filtered
     }
 
     /// Returns `true` if this matcher has no patterns and excludes nothing.
@@ -150,5 +175,53 @@ mod tests {
     fn invalid_glob_returns_error() {
         let result = ExclusionMatcher::new(&["[invalid".to_owned()]);
         assert!(result.is_err(), "expected error for invalid glob, got Ok");
+    }
+
+    #[test]
+    fn filter_changeset_drops_excluded_files_and_prunes_diffs() {
+        use crate::input::{ChangeKind, ChangedFile, FileDiff, FileLineDelta};
+
+        let m = ExclusionMatcher::new(&["vendor/**".to_owned()]).unwrap();
+        let changeset = ChangeSet::new(vec![
+            ChangedFile {
+                path: PathBuf::from("src/lib.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: PathBuf::from("vendor/dep/lib.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ])
+        .with_file_line_delta(PathBuf::from("vendor/dep/lib.rs"), FileLineDelta::default())
+        .with_file_diff(PathBuf::from("vendor/dep/lib.rs"), FileDiff::default());
+
+        let filtered = m.filter_changeset(&changeset);
+
+        assert_eq!(
+            filtered
+                .changed_files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("src/lib.rs")]
+        );
+        assert!(filtered.file_line_deltas.is_empty(), "excluded delta should be pruned");
+        assert!(filtered.file_diffs.is_empty(), "excluded diff should be pruned");
+    }
+
+    #[test]
+    fn filter_changeset_on_empty_matcher_retains_everything() {
+        use crate::input::{ChangeKind, ChangedFile};
+
+        let m = ExclusionMatcher::default();
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("vendor/dep/lib.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+        let filtered = m.filter_changeset(&changeset);
+        assert_eq!(filtered.changed_files.len(), 1);
     }
 }

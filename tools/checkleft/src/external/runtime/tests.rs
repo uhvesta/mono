@@ -15,7 +15,7 @@ use super::{
     BASE_COMPONENT_TIMEOUT_MS, EPOCH_DEADLINE_NEVER, ExternalCheckExecutor, HOST_CEILING_TIMEOUT_MS, HostState,
     MemoryLimiter, PER_FILE_COMPONENT_TIMEOUT_MS, apply_edits_to_sandbox, apply_file_edit, apply_struct_exclusions,
     build_wasmtime_engine, call_declared_exclusions, call_evaluate_exclusion, compile_component, is_interrupt_error,
-    lower_changeset, lower_check_input, resolve_component_limits,
+    lower_changeset, resolve_component_limits,
 };
 use wasmtime::{Instance, Module, Store};
 
@@ -87,6 +87,7 @@ fn component_v1_non_component_bytes_give_compile_error() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
         .expect_err("core wasm bytes must not parse as a component");
     let msg = error.to_string();
@@ -135,6 +136,7 @@ fn component_v1_digest_mismatch_is_rejected() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
         .expect_err("digest mismatch must be rejected");
     assert!(error.to_string().contains("artifact sha256 mismatch"));
@@ -808,6 +810,7 @@ fn bundled_giant_structs_check_finds_violation_in_rs_file() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
         .expect("execute");
 
@@ -886,6 +889,7 @@ fn bundled_giant_structs_check_handles_large_rs_file() {
             &toml::Value::Table(Default::default()),
             std::path::Path::new(""),
             None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
         .expect("check must complete without fuel exhaustion or timeout on a large file");
 
@@ -930,48 +934,6 @@ fn struct_name_from_finding_extracts_first_backtick_token() {
     // No backtick pair → None (fail-safe: the finding is never suppressed).
     assert_eq!(super::struct_name_from_finding("no backticks here"), None);
     assert_eq!(super::struct_name_from_finding("only one ` backtick"), None);
-}
-
-#[test]
-fn scope_exclude_globs_prefixes_only_glob_keys() {
-    let config = toml::Value::Table(toml::toml! {
-        max_lines = 2
-        exclude_files = ["a.rs", "nested/*.rs"]
-        exclude_globs = ["b.rs"]
-    });
-    let scoped = super::scope_exclude_globs_to_repo(&config, std::path::Path::new("sub/dir"));
-    let table = scoped.as_table().unwrap();
-    let files: Vec<_> = table["exclude_files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert_eq!(files, vec!["sub/dir/a.rs", "sub/dir/nested/*.rs"]);
-    let globs: Vec<_> = table["exclude_globs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert_eq!(globs, vec!["sub/dir/b.rs"]);
-    // Non-glob keys are untouched.
-    assert_eq!(table["max_lines"].as_integer(), Some(2));
-}
-
-#[test]
-fn scope_exclude_globs_is_noop_at_repo_root() {
-    let config = toml::Value::Table(toml::toml! {
-        exclude_files = ["a.rs"]
-    });
-    let scoped = super::scope_exclude_globs_to_repo(&config, std::path::Path::new(""));
-    let files: Vec<_> = scoped.as_table().unwrap()["exclude_files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert_eq!(files, vec!["a.rs"], "repo-root config must be left untouched");
 }
 
 // --- Host-side exclusion resolution end-to-end tests ---
@@ -1051,6 +1013,7 @@ fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
             &config,
             std::path::Path::new("tools/boss"),
             None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
         .expect("execute");
 
@@ -1065,6 +1028,60 @@ fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
         loc.path,
         std::path::Path::new("other/types.rs"),
         "the surviving finding must be the struct outside the excluded file"
+    );
+}
+
+/// Task 4: the host lowers an exclusion-filtered changeset into a real bundled
+/// component, so an excluded file produces no findings even though it would
+/// otherwise violate the check. Proven against the real `file/size` component
+/// (a framework `exclude`, not the removed guest-side `exclude_files`).
+#[test]
+fn component_check_never_sees_excluded_files() {
+    let temp = tempdir().expect("temp dir");
+    // Both files exceed max_lines=2; Added files always count as grown for file/size.
+    write_file(temp.path(), "src/big.rs", "a\nb\nc\nd\n");
+    write_file(temp.path(), "vendor/big.rs", "a\nb\nc\nd\n");
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: PathBuf::from("src/big.rs"),
+            kind: ChangeKind::Added,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("vendor/big.rs"),
+            kind: ChangeKind::Added,
+            old_path: None,
+        },
+    ]);
+    let config = toml::Value::Table(toml::toml! { max_lines = 2 });
+    let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let result = executor
+        .execute(
+            &bundled_package("file/size"),
+            &changeset,
+            &tree,
+            &config,
+            std::path::Path::new(""),
+            None,
+            &exclusion,
+        )
+        .expect("execute");
+
+    let paths: Vec<_> = result
+        .findings
+        .iter()
+        .filter_map(|f| f.location.as_ref())
+        .map(|l| l.path.clone())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![PathBuf::from("src/big.rs")],
+        "only the non-excluded oversized file may be flagged; got: {:?}",
+        result.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
     );
 }
 
@@ -1149,41 +1166,6 @@ fn apply_struct_exclusions_qualified_exempts_only_named_file() {
     );
 }
 
-/// An `exclude_files` glob authored in a subdirectory CHECKS file
-/// (config_dir = "sub/dir") is rewritten host-side to a repo-relative glob
-/// before the guest sees it. Verifies that `lower_check_input` rewrites `*.rs`
-/// to `sub/dir/*.rs` in the serialized config JSON handed to the executor —
-/// no wasm component required.
-#[test]
-fn lower_check_input_scopes_exclude_files_to_config_dir() {
-    let changeset = ChangeSet::new(vec![ChangedFile {
-        path: PathBuf::from("sub/dir/inside.rs"),
-        kind: ChangeKind::Added,
-        old_path: None,
-    }]);
-
-    let config = toml::Value::Table(toml::toml! {
-        max_lines = 2
-        exclude_files = ["*.rs"]
-    });
-
-    let input = lower_check_input(&changeset, &NoopSourceTree, &config, std::path::Path::new("sub/dir"))
-        .expect("lower_check_input");
-
-    let parsed: serde_json::Value = serde_json::from_str(&input.config_json).expect("parse config_json");
-    let exclude_files: Vec<&str> = parsed["exclude_files"]
-        .as_array()
-        .expect("exclude_files must be an array")
-        .iter()
-        .map(|v| v.as_str().expect("string element"))
-        .collect();
-    assert_eq!(
-        exclude_files,
-        vec!["sub/dir/*.rs"],
-        "exclude_files patterns must be rewritten to repo-relative before being handed to the guest"
-    );
-}
-
 /// An `exclude_structs` entry in a CHECKS config suppresses a
 /// `rust/giant-structs-create` finding: the host's `struct_name_from_finding`
 /// helper parses the create-check message format (`struct \`Name\` is constructed
@@ -1220,6 +1202,7 @@ fn giant_structs_create_exclude_structs_suppresses_finding() {
             &config,
             std::path::Path::new(""),
             None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
         .expect("execute");
 

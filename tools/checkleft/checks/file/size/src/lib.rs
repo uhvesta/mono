@@ -5,26 +5,22 @@
 //!
 //! ## What the check detects
 //!
-//! Any changed file that (a) is not deleted, (b) does not match an `exclude_files`
-//! pattern, (c) exceeds `max_lines`, and (d) actually grew in the current change is
-//! flagged with a warning finding.
+//! Any changed file that (a) is not deleted, (b) exceeds `max_lines`, and (c)
+//! actually grew in the current change is flagged with a warning finding.
+//!
+//! File exclusion (`exclude` / `exclude_files` / `exclude_globs`) is enforced by the
+//! framework host, which subtracts excluded paths from the changeset before it is
+//! lowered into this check — so an excluded file never reaches the loop below.
 //!
 //! ## Configuration (JSON-encoded, passed via `config-json`)
 //!
 //! ```json
 //! {
-//!   "max_lines": 500,
-//!   "exclude_files": ["**/*.md", "**/package-lock.json"]
+//!   "max_lines": 500
 //! }
 //! ```
-//!
-//! `exclude_files` / `exclude_globs` (alias): glob patterns matched against the
-//! file's repo-root-relative path. Patterns authored relative to a subdirectory
-//! CHECKS file are normalized to repo-root-relative by the host before they
-//! reach this check, so matching here is a plain repo-relative glob test.
 
 use checkleft_check_sdk::{ChangeKind, ChangeSet, ChangedFile, CheckInput, Finding, check};
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
 const DEFAULT_MAX_LINES: usize = 500;
@@ -33,8 +29,6 @@ const DEFAULT_MAX_LINES: usize = 500;
 struct Config {
     #[serde(default)]
     max_lines: Option<u64>,
-    #[serde(default, alias = "exclude_globs")]
-    exclude_files: Option<Vec<String>>,
 }
 
 #[check(
@@ -45,15 +39,11 @@ struct Config {
 pub fn file_size_check(input: CheckInput) -> Vec<Finding> {
     let cfg: Config = input.config().unwrap_or_default();
     let max_lines = cfg.max_lines.map(|v| v as usize).unwrap_or(DEFAULT_MAX_LINES);
-    let exclude_globs = build_globset(cfg.exclude_files.as_deref());
 
     let mut findings = Vec::new();
 
     for file in &input.changeset.changed_files {
         if file.kind == ChangeKind::Deleted {
-            continue;
-        }
-        if exclude_globs.as_ref().is_some_and(|globs| globs.is_match(&file.path)) {
             continue;
         }
 
@@ -111,20 +101,6 @@ fn growth_message_for_file(path: &str, changeset: &ChangeSet) -> String {
     let added: u32 = diff.hunks.iter().map(|h| h.added_lines).sum();
     let removed: u32 = diff.hunks.iter().map(|h| h.removed_lines).sum();
     format!(" File grew by +{added} / -{removed} lines in this change.")
-}
-
-fn build_globset(patterns: Option<&[String]>) -> Option<GlobSet> {
-    let patterns = patterns?;
-    if patterns.is_empty() {
-        return None;
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        if let Ok(glob) = Glob::new(pattern) {
-            builder.add(glob);
-        }
-    }
-    builder.build().ok()
 }
 
 #[cfg(test)]
@@ -235,42 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn excludes_configured_paths() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        fs::write(dir.path().join("package-lock.json"), "a\nb\nc\n").unwrap();
-
-        let findings = run_with_config(
-            make_changeset("package-lock.json", ChangeKind::Modified, 2, 0),
-            r#"{"max_lines": 2, "exclude_files": ["**/package-lock.json"]}"#,
-        );
-
-        std::env::set_current_dir(old_cwd).unwrap();
-
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn exclude_globs_alias_still_works() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        fs::write(dir.path().join("package-lock.json"), "a\nb\nc\n").unwrap();
-
-        let findings = run_with_config(
-            make_changeset("package-lock.json", ChangeKind::Modified, 2, 0),
-            r#"{"max_lines": 2, "exclude_globs": ["**/package-lock.json"]}"#,
-        );
-
-        std::env::set_current_dir(old_cwd).unwrap();
-
-        assert!(findings.is_empty());
-    }
-
-    #[test]
     fn newly_added_file_over_limit_is_flagged() {
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
@@ -313,31 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn repo_relative_glob_does_not_match_outside_its_subtree() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        // The host normalizes a subdirectory CHECKS file's `oversized.rs` pattern
-        // to the repo-relative glob `sub/dir/oversized.rs` before it reaches the
-        // guest. That repo-relative glob must NOT match a root-level file.
-        fs::write(dir.path().join("oversized.rs"), "a\nb\nc\n").unwrap();
-
-        let findings = run_with_config(
-            make_changeset("oversized.rs", ChangeKind::Modified, 2, 0),
-            r#"{"max_lines": 2, "exclude_files": ["sub/dir/oversized.rs"]}"#,
-        );
-
-        std::env::set_current_dir(old_cwd).unwrap();
-
-        assert_eq!(
-            findings.len(),
-            1,
-            "repo-relative glob scoped to sub/dir should not exclude a root-level file"
-        );
-    }
-
-    #[test]
     fn deleted_files_are_never_flagged() {
         let _guard = CWD_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
@@ -373,54 +288,6 @@ mod tests {
             findings[0].message.contains("max_lines=500"),
             "message was: {}",
             findings[0].message
-        );
-    }
-
-    #[test]
-    fn multiple_exclude_patterns_are_all_honored() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        fs::write(dir.path().join("a.lock"), "a\nb\nc\n").unwrap();
-        fs::write(dir.path().join("b.gen"), "a\nb\nc\n").unwrap();
-        fs::write(dir.path().join("c.rs"), "a\nb\nc\n").unwrap();
-
-        let config = r#"{"max_lines": 2, "exclude_files": ["**/*.lock", "**/*.gen"]}"#;
-        let excluded_a = run_with_config(make_changeset("a.lock", ChangeKind::Modified, 2, 0), config);
-        let excluded_b = run_with_config(make_changeset("b.gen", ChangeKind::Modified, 2, 0), config);
-        let flagged_c = run_with_config(make_changeset("c.rs", ChangeKind::Modified, 2, 0), config);
-
-        std::env::set_current_dir(old_cwd).unwrap();
-
-        assert!(excluded_a.is_empty(), "*.lock must be excluded");
-        assert!(excluded_b.is_empty(), "*.gen must be excluded");
-        assert_eq!(
-            flagged_c.len(),
-            1,
-            "a non-excluded oversized file must still be flagged"
-        );
-    }
-
-    #[test]
-    fn repo_relative_glob_matches_within_its_subtree() {
-        let _guard = CWD_LOCK.lock().unwrap();
-        let dir = tempdir().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        fs::create_dir_all(dir.path().join("sub/dir")).unwrap();
-        fs::write(dir.path().join("sub/dir/oversized.rs"), "a\nb\nc\n").unwrap();
-
-        let findings = run_with_config(
-            make_changeset("sub/dir/oversized.rs", ChangeKind::Modified, 2, 0),
-            r#"{"max_lines": 2, "exclude_files": ["sub/dir/oversized.rs"]}"#,
-        );
-
-        std::env::set_current_dir(old_cwd).unwrap();
-
-        assert!(
-            findings.is_empty(),
-            "repo-relative glob should exclude the matching repo-relative path"
         );
     }
 }

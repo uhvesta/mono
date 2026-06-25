@@ -943,6 +943,7 @@ impl ExternalCheckExecutor for DeclarativeEligibleCountExecutor {
         _config: &toml::Value,
         _config_dir: &std::path::Path,
         _effective_severity: Option<crate::output::Severity>,
+        _exclusion: &crate::exclusion_matcher::ExclusionMatcher,
     ) -> anyhow::Result<crate::output::CheckResult> {
         Ok(crate::output::CheckResult {
             check_id: package.id.clone(),

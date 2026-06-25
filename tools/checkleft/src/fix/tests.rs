@@ -150,7 +150,15 @@ fn no_fix_block_returns_no_outcomes_and_leaves_originals_untouched() {
     let (dir, tree) = disk_tree(&[("a.txt", b"needs fixing")]);
     let package = declarative_no_fix();
 
-    let outcomes = run_declarative_fix(dir.path(), &package, &paths(&["a.txt"]), &tree, &empty_config(), |_| {});
+    let outcomes = run_declarative_fix(
+        dir.path(),
+        &package,
+        &paths(&["a.txt"]),
+        &tree,
+        &empty_config(),
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        |_| {},
+    );
 
     assert!(
         outcomes.is_empty(),
@@ -188,7 +196,15 @@ printf 'ESCAPED' > sandbox_escape.txt"#,
     );
 
     let package = declarative_with_fixer(&script.to_string_lossy());
-    let outcomes = run_declarative_fix(dir.path(), &package, &paths(&["a.txt"]), &tree, &empty_config(), |_| {});
+    let outcomes = run_declarative_fix(
+        dir.path(),
+        &package,
+        &paths(&["a.txt"]),
+        &tree,
+        &empty_config(),
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        |_| {},
+    );
 
     // The staged file was fixed and applied.
     assert_eq!(outcomes.len(), 1, "one invocation outcome expected");
@@ -208,6 +224,55 @@ printf 'ESCAPED' > sandbox_escape.txt"#,
     assert!(
         !dir.path().join("sandbox_escape.txt").exists(),
         "a file created inside the sandbox but outside the staged set must never appear in the real tree"
+    );
+}
+
+// ── framework exclusion on the fix path ────────────────────────────────────
+
+/// Task 3 (fix path): an excluded file is removed from the fixable set before any
+/// invocation runs, so `--write` never stages or rewrites it. The non-excluded
+/// file is still fixed.
+#[cfg(unix)]
+#[test]
+fn run_declarative_fix_skips_excluded_files() {
+    let (dir, tree) = disk_tree(&[("keep.txt", b"fix me"), ("vendor/skip.txt", b"fix me")]);
+    let scripts_dir = tempdir().expect("scripts dir");
+    let script = make_script(
+        scripts_dir.path(),
+        "fix.sh",
+        r#"for f in "$@"; do
+  printf 'FIXED' > "$f"
+done"#,
+    );
+
+    let package = declarative_with_fixer(&script.to_string_lossy());
+    let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+
+    let outcomes = run_declarative_fix(
+        dir.path(),
+        &package,
+        &paths(&["keep.txt", "vendor/skip.txt"]),
+        &tree,
+        &empty_config(),
+        &exclusion,
+        |_| {},
+    );
+
+    assert_eq!(
+        fs::read(dir.path().join("vendor/skip.txt")).unwrap(),
+        b"fix me",
+        "the excluded file must never be staged or rewritten"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("keep.txt")).unwrap(),
+        b"FIXED",
+        "the non-excluded file must still be fixed"
+    );
+    let applied: Vec<_> = outcomes.iter().flat_map(|o| o.applied.iter().cloned()).collect();
+    assert_eq!(
+        applied,
+        paths(&["keep.txt"]),
+        "only the non-excluded file may be applied"
     );
 }
 
@@ -241,6 +306,7 @@ exit 1"#,
         &paths(&["a.rs", "b.rs"]),
         &tree,
         &empty_config(),
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
         |_| {},
     );
 
@@ -293,7 +359,15 @@ done"#,
     let config = empty_config();
 
     // First pass: "lower" → "LOWER", must be applied.
-    let outcomes1 = run_declarative_fix(dir.path(), &package, &paths(&["a.txt"]), &tree, &config, |_| {});
+    let outcomes1 = run_declarative_fix(
+        dir.path(),
+        &package,
+        &paths(&["a.txt"]),
+        &tree,
+        &config,
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        |_| {},
+    );
     assert_eq!(outcomes1.len(), 1, "one invocation outcome on first pass");
     assert_eq!(outcomes1[0].applied, paths(&["a.txt"]), "first pass must apply the fix");
     assert!(outcomes1[0].error.is_none(), "no error on first pass");
@@ -308,7 +382,15 @@ done"#,
 
     // Second pass: "LOWER" → "LOWER" (already uppercase) → detect_changes
     // finds no byte difference → copy-back writes nothing.
-    let outcomes2 = run_declarative_fix(dir.path(), &package, &paths(&["a.txt"]), &tree, &config, |_| {});
+    let outcomes2 = run_declarative_fix(
+        dir.path(),
+        &package,
+        &paths(&["a.txt"]),
+        &tree,
+        &config,
+        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        |_| {},
+    );
     assert_eq!(outcomes2.len(), 1, "one invocation outcome on second pass");
     assert!(
         outcomes2[0].applied.is_empty(),

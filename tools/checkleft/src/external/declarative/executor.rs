@@ -29,6 +29,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobSetBuilder};
 
+use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::sandbox::HostCeiling;
 use crate::fix::safety::WritableSandbox;
 use crate::input::{ChangeKind, ChangeSet, SourceTree};
@@ -61,12 +62,15 @@ pub fn run_declarative_check(
         changeset,
         config,
         effective_severity,
+        &ExclusionMatcher::default(),
         None,
     )
 }
 
 /// Like [`run_declarative_check`] but emits per-file/per-chunk progress ticks
-/// via `on_file_processed` (cumulative count of eligible files processed so far).
+/// via `on_file_processed` (cumulative count of eligible files processed so far)
+/// and subtracts the framework `exclusion` set during file selection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_declarative_check_with_progress(
     repo_root: &Path,
     package_id: &str,
@@ -74,6 +78,7 @@ pub(crate) fn run_declarative_check_with_progress(
     changeset: &ChangeSet,
     config: &toml::Value,
     effective_severity: Option<Severity>,
+    exclusion: &ExclusionMatcher,
     on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
 ) -> Result<CheckResult> {
     run_declarative_check_impl(
@@ -83,10 +88,12 @@ pub(crate) fn run_declarative_check_with_progress(
         changeset,
         config,
         effective_severity,
+        exclusion,
         Some(on_file_processed),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_declarative_check_impl(
     repo_root: &Path,
     package_id: &str,
@@ -94,6 +101,7 @@ fn run_declarative_check_impl(
     changeset: &ChangeSet,
     config: &toml::Value,
     effective_severity: Option<Severity>,
+    exclusion: &ExclusionMatcher,
     on_file_processed: Option<Arc<dyn Fn(usize) + Send + Sync>>,
 ) -> Result<CheckResult> {
     // A per-repo `applies_to` override in the CHECKS.yaml config blob replaces the
@@ -102,7 +110,7 @@ fn run_declarative_check_impl(
         .transpose()
         .context("invalid `applies_to` config override")?;
     let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
-    let files = select_files(repo_root, changeset, applies_to, package.skip_symlinks)?;
+    let files = select_files(repo_root, changeset, applies_to, package.skip_symlinks, exclusion)?;
     if files.is_empty() {
         return Ok(CheckResult {
             check_id: package_id.to_owned(),
@@ -214,19 +222,33 @@ pub(crate) fn eligible_file_count(
         None => None,
     };
     let applies_to: &[String] = applies_to_override.as_deref().unwrap_or(&package.applies_to);
-    select_files(repo_root, changeset, applies_to, package.skip_symlinks)
-        .map(|f| f.len())
-        .unwrap_or_else(|_| changeset.changed_files.len())
+    // The runner lowers an already-exclusion-filtered changeset into this count, so
+    // the empty matcher here keeps the count consistent with what the run will see.
+    select_files(
+        repo_root,
+        changeset,
+        applies_to,
+        package.skip_symlinks,
+        &ExclusionMatcher::default(),
+    )
+    .map(|f| f.len())
+    .unwrap_or_else(|_| changeset.changed_files.len())
 }
 
 /// Select non-deleted changed files matching any `applies_to` glob, sorted for
 /// determinism. When `skip_symlinks` is true, paths that are symlinks (resolved
 /// against `repo_root`) are excluded without following the link.
-fn select_files(
+///
+/// `exclusion` is the framework exclusion matcher for this check instance. Excluded
+/// paths are subtracted **after** the `applies_to` positive filter (excludes always
+/// win), so an excluded file never reaches the `{{files}}` argument list — it is
+/// neither checked nor, on `fix`, reformatted.
+pub(crate) fn select_files(
     repo_root: &Path,
     changeset: &ChangeSet,
     applies_to: &[String],
     skip_symlinks: bool,
+    exclusion: &ExclusionMatcher,
 ) -> Result<Vec<String>> {
     let mut builder = GlobSetBuilder::new();
     for pattern in applies_to {
@@ -239,6 +261,7 @@ fn select_files(
         .iter()
         .filter(|file| !matches!(file.kind, ChangeKind::Deleted))
         .filter(|file| globset.is_match(&file.path))
+        .filter(|file| !exclusion.is_excluded(&file.path))
         .filter(|file| {
             if !skip_symlinks {
                 return true;
@@ -872,14 +895,29 @@ pub struct FixInvocationOutcome {
 /// `on_file_processed` is called after each file is processed (per-file mode)
 /// or after each batch invocation completes, with the running count of files
 /// processed so far across all invocations.
+///
+/// `exclusion` is the framework exclusion matcher for this check instance. Excluded
+/// paths are removed from the fixable set up front, so `--write` never reformats a
+/// file the repo asked to exclude — the same guarantee `select_files` gives the run
+/// path.
 pub fn run_declarative_fix(
     repo_root: &Path,
     package: &ExternalCheckDeclarativePackage,
     fixable_files: &[PathBuf],
     source_tree: &dyn SourceTree,
     config: &toml::Value,
+    exclusion: &ExclusionMatcher,
     on_file_processed: impl Fn(usize),
 ) -> Vec<FixInvocationOutcome> {
+    // Subtract framework excludes before any invocation sees the fixable set: an
+    // excluded path must never be staged or rewritten on the fix path.
+    let fixable_files: Vec<PathBuf> = fixable_files
+        .iter()
+        .filter(|path| !exclusion.is_excluded(path))
+        .cloned()
+        .collect();
+    let fixable_files = fixable_files.as_slice();
+
     let binaries = match resolve::resolve_all(repo_root, &package.needs, config) {
         Ok(b) => b,
         Err(err) => {

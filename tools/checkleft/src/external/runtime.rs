@@ -12,6 +12,7 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
+use crate::exclusion_matcher::ExclusionMatcher;
 use crate::fix::{ComponentFixOutcome, CopyBackReport, WritableSandbox};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
@@ -19,7 +20,7 @@ use crate::path::validate_relative_path;
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
-use super::declarative::{run_declarative_check, run_declarative_check_with_progress};
+use super::declarative::run_declarative_check_with_progress;
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
@@ -204,6 +205,7 @@ impl Drop for EpochTicker {
 }
 
 pub trait ExternalCheckExecutor: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn execute(
         &self,
         package: &ExternalCheckPackage,
@@ -212,6 +214,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
+        exclusion: &ExclusionMatcher,
     ) -> Result<CheckResult>;
 
     /// Like [`Self::execute`] but accepts a progress callback that is called
@@ -219,6 +222,10 @@ pub trait ExternalCheckExecutor: Send + Sync {
     /// mode) or each chunk (batch mode). The default ignores the callback and
     /// delegates to [`Self::execute`]; override in executors that run
     /// declarative checks to provide live per-file/per-batch progress.
+    ///
+    /// `exclusion` is the framework exclusion matcher for this check instance. The
+    /// host applies it as selection-time subtraction so neither a guest component
+    /// nor a declarative tool ever targets an excluded path.
     #[allow(clippy::too_many_arguments)]
     fn execute_with_progress(
         &self,
@@ -228,9 +235,18 @@ pub trait ExternalCheckExecutor: Send + Sync {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
+        exclusion: &ExclusionMatcher,
         _on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
-        self.execute(package, changeset, source_tree, config, config_dir, effective_severity)
+        self.execute(
+            package,
+            changeset,
+            source_tree,
+            config,
+            config_dir,
+            effective_severity,
+            exclusion,
+        )
     }
 
     /// Count the files in `changeset` that this check will actually process after
@@ -293,6 +309,7 @@ impl ExternalCheckExecutor for NoopExternalCheckExecutor {
         _config: &toml::Value,
         _config_dir: &Path,
         _effective_severity: Option<Severity>,
+        _exclusion: &ExclusionMatcher,
     ) -> Result<CheckResult> {
         bail!(
             "external check package `{}` resolved successfully but runtime execution is not implemented yet",
@@ -462,7 +479,6 @@ impl DefaultExternalCheckExecutor {
         changeset: &ChangeSet,
         source_tree: &dyn SourceTree,
         config: &toml::Value,
-        config_dir: &Path,
         fixable: &[PathBuf],
         dest_root: &Path,
     ) -> Result<ComponentFixOutcome> {
@@ -488,7 +504,6 @@ impl DefaultExternalCheckExecutor {
                 changeset,
                 source_tree,
                 config,
-                config_dir,
                 fixable,
                 dest_root,
             },
@@ -578,10 +593,14 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
+        exclusion: &ExclusionMatcher,
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
-                self.execute_component_check(package, component, changeset, source_tree, config, config_dir)
+                // The host lowers an exclusion-filtered changeset so the guest never
+                // sees an excluded path and cannot target it.
+                let filtered = exclusion.filter_changeset(changeset);
+                self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
                 if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
@@ -593,13 +612,15 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 }
                 // Framework-owned invocation: resolve declared binaries and run
                 // them at the repo root. Sandboxing is deferred by design.
-                run_declarative_check(
+                run_declarative_check_with_progress(
                     &self.root,
                     &package.id,
                     declarative,
                     changeset,
                     config,
                     effective_severity,
+                    exclusion,
+                    Arc::new(|_| {}),
                 )
             }
         }
@@ -614,12 +635,16 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         config: &toml::Value,
         config_dir: &Path,
         effective_severity: Option<Severity>,
+        exclusion: &ExclusionMatcher,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
                 // Component checks are opaque wasm calls — no per-file granularity.
-                self.execute_component_check(package, component, changeset, source_tree, config, config_dir)
+                // The host lowers an exclusion-filtered changeset so the guest never
+                // sees an excluded path and cannot target it.
+                let filtered = exclusion.filter_changeset(changeset);
+                self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
                 if package.runtime != EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1 {
@@ -636,6 +661,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                     changeset,
                     config,
                     effective_severity,
+                    exclusion,
                     on_file_processed,
                 )
             }
@@ -887,9 +913,8 @@ fn resolve_access_scope(
         )
     })?;
 
-    let scoped_config = scope_exclude_globs_to_repo(run.config, run.config_dir);
     let config_json =
-        serde_json::to_string(&scoped_config).context("failed to serialize config for declare-required-files")?;
+        serde_json::to_string(run.config).context("failed to serialize config for declare-required-files")?;
     let wit_changeset = lower_changeset(run.changeset, run.source_tree);
 
     let declared =
@@ -1010,7 +1035,7 @@ fn run_component_check(engine: &Engine, root: &Path, run: ComponentRun) -> Resul
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for `{}`", package.id))?;
 
-    let input = lower_check_input(changeset, source_tree, config, config_dir)?;
+    let input = lower_check_input(changeset, source_tree, config)?;
     let file_list = format_file_list(changeset);
     let run_result = wasmtime(bindings.call_run_check(&mut store, check_name, &input)).map_err(|err| {
         if is_interrupt_error(&err) {
@@ -1062,8 +1087,6 @@ struct FixRun<'a> {
     changeset: &'a ChangeSet,
     source_tree: &'a dyn SourceTree,
     config: &'a toml::Value,
-    /// Repo-root-relative directory of the CHECKS file that configures this check.
-    config_dir: &'a Path,
     /// Repo-relative fixable set `F`: the files this check is permitted to fix.
     fixable: &'a [PathBuf],
     /// Real working-tree root that changed files are copied back to.
@@ -1101,7 +1124,7 @@ fn run_component_fix(engine: &Engine, root: &Path, run: FixRun) -> Result<Compon
     let bindings = wasmtime(WitCheck::new(&mut store, &instance))
         .with_context(|| format!("failed to bind component exports for fix of `{}`", run.package.id))?;
 
-    let input = lower_check_input(run.changeset, run.source_tree, run.config, run.config_dir)?;
+    let input = lower_check_input(run.changeset, run.source_tree, run.config)?;
     let file_list = format_file_list(run.changeset);
     let fix_result = wasmtime(bindings.call_fix_check(&mut store, run.check_name, &input)).map_err(|err| {
         if is_interrupt_error(&err) {
@@ -1420,51 +1443,17 @@ fn lower_check_input(
     changeset: &ChangeSet,
     source_tree: &dyn SourceTree,
     config: &toml::Value,
-    config_dir: &Path,
 ) -> Result<wit_types::CheckInput> {
-    // The guest operates purely in repo-root-relative coordinates and never sees
-    // the CHECKS file's directory. `exclude_files`/`exclude_globs` patterns are
-    // authored relative to that directory, so the host rewrites them to
-    // repo-relative globs here — the guest then matches repo-relative changeset
-    // paths against repo-relative globs with no notion of `config_dir`.
-    let scoped_config = scope_exclude_globs_to_repo(config, config_dir);
+    // Framework exclusion is now host-authoritative: the host filters the changeset
+    // before lowering it (see `ExclusionMatcher::filter_changeset`), so the guest
+    // never sees an excluded path and no longer reads `exclude_files`/`exclude_globs`
+    // from its config. The config is passed through verbatim.
     let config_json =
-        serde_json::to_string(&scoped_config).context("failed to serialize config to JSON for component input")?;
+        serde_json::to_string(config).context("failed to serialize config to JSON for component input")?;
     Ok(wit_types::CheckInput {
         changeset: lower_changeset(changeset, source_tree),
         config_json,
     })
-}
-
-/// Rewrite the framework-level `exclude_files`/`exclude_globs` glob patterns in
-/// `config` from CHECKS-file-relative to repo-root-relative by prefixing
-/// `config_dir`.
-///
-/// Exclude globs are authored relative to the CHECKS file that declares them,
-/// but the guest only ever sees repo-relative changeset paths. Reconciling the
-/// two coordinate systems is a host concern (the host located and parsed the
-/// CHECKS file, so it holds `config_dir`); resolving here keeps the directory
-/// out of the sandboxed guest entirely. A repo-root CHECKS file (`config_dir`
-/// empty) needs no rewrite. Non-glob config is returned untouched.
-fn scope_exclude_globs_to_repo(config: &toml::Value, config_dir: &Path) -> toml::Value {
-    let mut config = config.clone();
-    if config_dir.as_os_str().is_empty() {
-        return config;
-    }
-    let prefix = config_dir.to_string_lossy();
-    if let Some(table) = config.as_table_mut() {
-        for key in ["exclude_files", "exclude_globs"] {
-            let Some(toml::Value::Array(globs)) = table.get_mut(key) else {
-                continue;
-            };
-            for glob in globs.iter_mut() {
-                if let toml::Value::String(pattern) = glob {
-                    *pattern = format!("{prefix}/{pattern}");
-                }
-            }
-        }
-    }
-    config
 }
 
 // --- Type lifting: WIT types → host types ---

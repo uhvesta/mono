@@ -46,6 +46,7 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
         _config: &toml::Value,
         _config_dir: &std::path::Path,
         _effective_severity: Option<crate::output::Severity>,
+        _exclusion: &crate::exclusion_matcher::ExclusionMatcher,
     ) -> Result<CheckResult> {
         self.seen_packages
             .lock()
@@ -88,6 +89,7 @@ impl ExternalCheckExecutor for MockExclusionExecutor {
         _config: &toml::Value,
         _config_dir: &std::path::Path,
         _effective_severity: Option<crate::output::Severity>,
+        _exclusion: &crate::exclusion_matcher::ExclusionMatcher,
     ) -> Result<CheckResult> {
         Ok(CheckResult {
             check_id: package.id.clone(),
@@ -194,6 +196,50 @@ impl ConfiguredCheck for MetadataCapturingCheck {
     }
 }
 
+/// A check that ignores its changeset entirely and always emits an error finding
+/// located on a fixed path. Used to prove the finding-location backstop drops
+/// findings on excluded paths even for a check that derives a path some other way.
+#[derive(Clone)]
+struct EmitsFixedPathCheck {
+    id: String,
+    finding_path: String,
+}
+
+#[async_trait]
+impl Check for EmitsFixedPathCheck {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn description(&self) -> &str {
+        "always emits a finding on a fixed path"
+    }
+
+    fn configure(&self, _config: &toml::Value) -> Result<Arc<dyn ConfiguredCheck>> {
+        Ok(Arc::new(self.clone()))
+    }
+}
+
+#[async_trait]
+impl ConfiguredCheck for EmitsFixedPathCheck {
+    async fn run(&self, _changeset: &ChangeSet, _tree: &dyn SourceTree) -> Result<CheckResult> {
+        Ok(CheckResult {
+            check_id: self.id().to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Error,
+                message: "violation on a path the check derived itself".to_owned(),
+                location: Some(Location {
+                    path: PathBuf::from(&self.finding_path),
+                    line: Some(1),
+                    column: None,
+                }),
+                remediations: vec![],
+                suggested_fix: None,
+            }],
+        })
+    }
+}
+
 #[tokio::test]
 async fn runner_groups_files_by_check() {
     let temp = tempdir().expect("create temp dir");
@@ -244,6 +290,159 @@ id = "capture"
         files,
         vec!["backend/src/a.rs".to_owned(), "backend/src/b.rs".to_owned()]
     );
+}
+
+/// Task 4: a built-in Rust check receives the host's exclusion-filtered view of the
+/// changeset — an excluded path is removed before the check ever sees it, so the
+/// check is never triggered on that path.
+#[tokio::test]
+async fn builtin_check_never_sees_excluded_files() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend/vendor")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["backend/vendor/**"]
+
+[[checks]]
+id = "capture"
+"#,
+    )
+    .expect("write config");
+
+    let seen_files = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(CapturingCheck {
+            id: "capture".to_owned(),
+            seen_files: Arc::clone(&seen_files),
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    runner
+        .run_changeset(&ChangeSet::new(vec![
+            ChangedFile {
+                path: PathBuf::from("backend/src/a.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: PathBuf::from("backend/vendor/dep.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ]))
+        .await
+        .expect("run checks");
+
+    let files = seen_files.lock().expect("lock files").clone();
+    assert_eq!(
+        files,
+        vec!["backend/src/a.rs".to_owned()],
+        "the excluded vendored file must never reach the check"
+    );
+}
+
+/// Task 5: the finding-location backstop drops any finding whose path is excluded,
+/// uniformly — even for a check that ignores the filtered changeset and derives the
+/// path itself. The excluded path is still present in the run's full changeset (so
+/// `scope_findings_to_changeset` keeps it), proving the backstop is what removes it.
+#[tokio::test]
+async fn backstop_drops_findings_on_excluded_path() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("vendor")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["vendor/**"]
+
+[[checks]]
+id = "emits"
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(EmitsFixedPathCheck {
+            id: "emits".to_owned(),
+            finding_path: "vendor/excluded.rs".to_owned(),
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("vendor/excluded.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let findings: Vec<_> = results.iter().flat_map(|r| r.findings.iter()).collect();
+    assert!(
+        findings.is_empty(),
+        "the backstop must drop the finding on the excluded path; got: {findings:?}"
+    );
+}
+
+/// Unit-level proof that the backstop keeps location-less (check-level) findings —
+/// the same exemption that protects framework-meta findings — while dropping
+/// findings located on an excluded path.
+#[test]
+fn drop_excluded_findings_keeps_locationless_and_drops_excluded() {
+    let matcher = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+    let mut result = CheckResult {
+        check_id: "demo".to_owned(),
+        findings: vec![
+            Finding {
+                severity: Severity::Error,
+                message: "on excluded path".to_owned(),
+                location: Some(Location {
+                    path: PathBuf::from("vendor/dep.rs"),
+                    line: None,
+                    column: None,
+                }),
+                remediations: vec![],
+                suggested_fix: None,
+            },
+            Finding {
+                severity: Severity::Error,
+                message: "on a normal path".to_owned(),
+                location: Some(Location {
+                    path: PathBuf::from("src/lib.rs"),
+                    line: None,
+                    column: None,
+                }),
+                remediations: vec![],
+                suggested_fix: None,
+            },
+            Finding {
+                severity: Severity::Error,
+                message: "check-level error, no location".to_owned(),
+                location: None,
+                remediations: vec![],
+                suggested_fix: None,
+            },
+        ],
+    };
+
+    super::drop_excluded_findings(&mut result, &matcher);
+
+    let messages: Vec<&str> = result.findings.iter().map(|f| f.message.as_str()).collect();
+    assert_eq!(messages, vec!["on a normal path", "check-level error, no location"]);
 }
 
 #[tokio::test]
