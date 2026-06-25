@@ -13,6 +13,7 @@ pub mod exclusion;
 pub mod exclusion_matcher;
 pub mod external;
 pub mod fix;
+pub mod github_app_auth;
 pub mod input;
 pub mod install;
 pub mod output;

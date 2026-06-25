@@ -47,6 +47,7 @@ jaq-interpret = { workspace = true }
 jaq-parse = { workspace = true }
 hashbrown = { workspace = true }
 flate2 = { workspace = true }
+jsonwebtoken = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
@@ -81,5 +82,7 @@ wasmtime-wasi = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"
+rand = { workspace = true }
+rsa = { workspace = true }
 wat = { workspace = true }
 wiremock = { workspace = true }

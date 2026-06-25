@@ -240,6 +240,13 @@ const CHECKS_GITHUB_TOKEN_ENV: &str = "CHECKS_GITHUB_TOKEN";
 const CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV: &str = "CHECKLEFT_EXTERNAL_CHECK_INDEX";
 const CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV: &str = "CHECKLEFT_EXTERNAL_PROVIDER_MODE";
 
+// GitHub App credential env vars (fallback when no PAT is available).
+// Aliased here for visibility in error messages; canonical names live in
+// checkleft::github_app_auth.
+use checkleft::github_app_auth::{
+    CHECKS_GITHUB_APP_ID_ENV, CHECKS_GITHUB_APP_PRIVATE_KEY_ENV, CHECKS_GITHUB_INSTALLATION_ID_ENV,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExternalProviderMode {
     Auto,
@@ -641,12 +648,36 @@ async fn post_check_run_annotations(results: &[CheckResult], env: &CiEnvironment
     let head_sha = resolve_head_sha(env, payload.as_ref())
         .context("could not resolve the head commit SHA (no GitHub Actions or Buildkite commit env detected)")?;
 
-    let token = detect_github_token().context(
-        "no GitHub token found (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN and \
-         `gh auth token`); a token with `Checks: write` is required to create a check run",
-    )?;
-
     let base_url = github_api_base_url();
+
+    // Preferred credential: a fine-grained PAT from CHECKS_GITHUB_TOKEN (or the
+    // GH_TOKEN / GITHUB_TOKEN / gh-CLI fallbacks). This is the recommended path
+    // for Buildkite CI onboarding and requires only a single env var.
+    let token = if let Some(pat) = detect_github_token() {
+        pat
+    } else {
+        // Fallback: GitHub App installation token. Reads CHECKS_GITHUB_APP_ID and
+        // CHECKS_GITHUB_APP_PRIVATE_KEY (plus optional CHECKS_GITHUB_INSTALLATION_ID)
+        // and performs the JWT → installation-token exchange. Returns None when the
+        // App env vars are also absent, so the error below is the final report.
+        checkleft::github_app_auth::acquire_installation_token(&owner_repo, &base_url)
+            .await
+            .context(
+                "GitHub App credential exchange failed (CHECKS_GITHUB_APP_ID and \
+                 CHECKS_GITHUB_APP_PRIVATE_KEY are set but the installation token could not be acquired)",
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no GitHub token found; checked: CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, \
+                     `gh auth token`, and the GitHub App env vars \
+                     ({CHECKS_GITHUB_APP_ID_ENV}, {CHECKS_GITHUB_APP_PRIVATE_KEY_ENV}, \
+                     {CHECKS_GITHUB_INSTALLATION_ID_ENV}). \
+                     A token with `Checks: write` is required to create a check run. \
+                     Recommended: set CHECKS_GITHUB_TOKEN to a fine-grained PAT with `Checks: write`."
+                )
+            })?
+    };
+
     let id = check_run::post_check_run(&base_url, &owner_repo, &token, &head_sha, results).await?;
     info!(check_run_id = id, owner_repo = %owner_repo, "posted checkleft check-run annotations");
     Ok(())
