@@ -27,7 +27,7 @@ Every repository (or sub-project) that wants custom checks places a `checkleft/`
 ```
 repo-root/
 ├── checkleft/
-│   ├── Package.toml        # package manifest (required)
+│   ├── package.toml        # package manifest (required)
 │   ├── lib/                     # shared helper modules
 │   │   ├── matchers.checkleft
 │   │   └── proto_helpers.checkleft
@@ -45,7 +45,7 @@ repo-root/
 ├── services/
 │   └── payments/
 │       └── checkleft/           # nested project-level checks
-│           ├── Package.toml
+│           ├── package.toml
 │           └── proto/
 │               └── billing_compat/
 │                   └── check.checkleft
@@ -55,15 +55,16 @@ repo-root/
 
 | Path pattern | Role |
 |---|---|
-| `checkleft/Package.toml` | **Package manifest.** Declares metadata, sandbox tier, dependencies, and which checks are active. Required. |
+| `checkleft/package.toml` | **Package manifest.** Declares metadata, sandbox tier, dependencies, and which checks are active. Required. |
 | `checkleft/lib/*.checkleft` | **Shared modules.** Importable helpers. Any `.checkleft` file under `lib/` is a loadable module, never a check. |
 | `checkleft/<category>/<name>/check.checkleft` | **Check definition.** Exactly one `check()` entry point per directory. The two-level `<category>/<name>` path is required and forms the check ID as `<category>/<name>` (e.g. `proto/evolution`). |
 | `checkleft/<category>/<name>/fix.checkleft` | **Fix definition.** Optional. If present, must export a `fix()` function. |
-| `checkleft/<category>/<name>/*.checkleft` | **Check-local helpers.** Any `.checkleft` file that is not `check.checkleft` or `fix.checkleft` is a local helper, loadable only from within that check directory. |
+| `checkleft/<category>/<name>/check_test.checkleft` | **Check test.** Optional. Functional tests for the check. See §12. |
+| `checkleft/<category>/<name>/*.checkleft` | **Check-local helpers.** Any `.checkleft` file that is not `check.checkleft`, `fix.checkleft`, or `check_test.checkleft` is a local helper, loadable only from within that check directory. |
 
 **Enforcement:**
 - A directory containing `check.checkleft` must be exactly two levels deep under `checkleft/` (category + name).
-- `Package.toml` must exist at the `checkleft/` root. Without it, the directory is ignored.
+- `package.toml` must exist at the `checkleft/` root. Without it, the directory is ignored.
 - File extension is always `.checkleft`. No `.star`, `.bzl`, or `.py`.
 
 ### 2.3 Nested / hierarchical checks and file scoping
@@ -110,14 +111,14 @@ Nested packages can `load()` from ancestor `checkleft/lib/` directories (resolve
 
 ---
 
-## 3. `Package.toml` — the package manifest
+## 3. `package.toml` — the package manifest
 
 Written in TOML. Parsed before any checks. Declares package-level metadata.
 
-Local checks are auto-discovered from the folder structure — they are **not** listed here. `Package.toml` has exactly two jobs: declare package identity and pull in external dependencies/version sets.
+Local checks are auto-discovered from the folder structure — they are **not** listed here. `package.toml` has exactly two jobs: declare package identity and pull in external dependencies/version sets.
 
 ```toml
-# checkleft/Package.toml
+# checkleft/package.toml
 
 [package]
 name = "myorg/repo-checks"
@@ -151,7 +152,7 @@ source = "registry://checkleft-hub/acme-versionset"
 version = "2025.06.1"   # one number, many checks
 ```
 
-A version set is itself a `Package.toml` that re-exports other packages. The version set's manifest:
+A version set is itself a `package.toml` that re-exports other packages. The version set's manifest:
 
 ```toml
 # Published as: acme-versionset v2025.06.1
@@ -187,7 +188,7 @@ version = "3.1.0"
 **Consumer usage** — depend on the version set and all of its public checks are automatically active. No need to individually activate them:
 
 ```toml
-# Consumer's Package.toml
+# Consumer's package.toml
 
 [package]
 name = "myorg/my-repo"
@@ -243,13 +244,13 @@ version = "0.3.0"
 
 ### 3.7 Auto-discovery of local checks
 
-**Local checks are never listed in `Package.toml`.** They are auto-discovered from the folder structure:
+**Local checks are never listed in `package.toml`.** They are auto-discovered from the folder structure:
 
 - Any directory matching `checkleft/<category>/<name>/` that contains a `check.checkleft` is a check.
 - The check ID is derived from the path: `<category>/<name>` (e.g. `proto/evolution`).
 - The `applies_to` globs, `tier`, and `config` are declared **inside `check.checkleft` itself** via a `check_meta()` call at the top of the file (see §4.1).
 
-This means `Package.toml` has exactly two jobs:
+This means `package.toml` has exactly two jobs:
 1. Declare package identity (`package()`).
 2. Pull in external dependencies (`version_set()`, `depend()`).
 
@@ -403,7 +404,7 @@ load("@proto_evolution_checks//lib/wire", "is_wire_compatible")
 
 ## 5. Sandbox tiers
 
-Checks declare their required sandbox tier in `Package.toml` via the `check()` call. The tier determines what host capabilities the Starlark environment exposes.
+Checks declare their required sandbox tier in `package.toml` via the `check()` call. The tier determines what host capabilities the Starlark environment exposes.
 
 ### 5.1 Tier definitions
 
@@ -416,7 +417,7 @@ Checks declare their required sandbox tier in `Package.toml` via the `check()` c
 
 - Starlark code **never has filesystem access**. All data arrives as typed models injected by the Rust adapter. There is no `read_file()`, `open()`, or equivalent. The Starlark environment is a pure computation sandbox over pre-parsed data.
 - The Starlark `Globals` environment is constructed per-tier. Hermetic checks simply never see `http_get` or similar symbols — they don't exist in scope, so misuse is a compile-time name-resolution error, not a runtime denial.
-- **Tier escalation is forbidden.** A check declared `hermetic` cannot `load()` a module that was authored for `network` tier. Tier is a property of the check activation in `Package.toml`, not of individual `.checkleft` files. All code reachable from a check runs at that check's tier.
+- **Tier escalation is forbidden.** A check declared `hermetic` cannot `load()` a module that was authored for `network` tier. Tier is a property of the check activation in `package.toml`, not of individual `.checkleft` files. All code reachable from a check runs at that check's tier.
 - CI environments may **deny the `network` tier entirely** via a runner flag (`--deny-tier=network`). Checks activated at a denied tier are skipped with a warning.
 
 ### 5.3 Severity model
@@ -658,7 +659,7 @@ Line.number: int
 Line.text: str
 ```
 
-The `text` adapter is specified by setting the check category to any name that doesn't match a registered format adapter. Alternatively, checks can explicitly opt in via `adapter = "text"` in the `check()` call in `Package.toml`.
+The `text` adapter is specified by setting the check category to any name that doesn't match a registered format adapter. Alternatively, checks can explicitly opt in via `adapter = "text"` in the `check()` call in `package.toml`.
 
 ### 6.4 Registering custom Rust adapters
 
@@ -720,7 +721,7 @@ This is the recommended pattern for format adapters: the Rust adapter does parsi
 
 ### 8.1 Package identity
 
-Every `checkleft/` directory with a `Package.toml` is a distributable package. The `package(name, version)` call establishes identity.
+Every `checkleft/` directory with a `package.toml` is a distributable package. The `package(name, version)` call establishes identity.
 
 ### 8.2 Resolution
 
@@ -749,7 +750,7 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 
 ```
 1. Walk from repo root, find all checkleft/ directories.
-2. For each, parse Package.toml.
+2. For each, parse package.toml.
 3. Resolve depend() entries (fetch/cache as needed).
 4. Collect all check() entries across all packages.
 5. Scope each check's changeset to its package's subtree.
@@ -788,7 +789,7 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 
 | Error class | Behavior |
 |---|---|
-| `Package.toml` parse error | Fatal. Package is skipped with error diagnostic. |
+| `package.toml` parse error | Fatal. Package is skipped with error diagnostic. |
 | `load()` resolution failure | Fatal for that check. Other checks in the package still run. |
 | Type-check failure in `.checkleft` | Fatal for that check. Reported as a configuration error finding. |
 | Runtime error in `check()` | Check fails. Finding with `severity: fail` and the Starlark traceback. |
@@ -868,7 +869,7 @@ The type checker validates these at load time.
 
 ```
 checkleft/
-├── Package.toml
+├── package.toml
 ├── lib/
 │   └── proto_helpers.checkleft
 └── proto/
@@ -877,15 +878,13 @@ checkleft/
         └── fix.checkleft
 ```
 
-**`Package.toml`:**
-```python
-package(
-    name: str = "mono/checks",
-    version: str = "0.1.0",
-)
+**`package.toml`:**
+```toml
+[package]
+name = "mono/checks"
+version = "0.1.0"
 
-# No check() calls needed — local checks are auto-discovered from the folder structure.
-# This Package.toml is minimal because we have no external dependencies yet.
+# No external dependencies yet — local checks are auto-discovered from the folder structure.
 ```
 
 **`lib/proto_helpers.checkleft`:**
@@ -1072,7 +1071,160 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
 
 ---
 
-## 12. Integration with existing checkleft infrastructure
+## 12. Functional testing for checks
+
+Check authors need to test their checks without committing broken code to see if the check catches it. Each check directory can contain a `check_test.checkleft` file with test cases.
+
+### 12.1 Test file structure
+
+```python
+# checkleft/proto/evolution/check_test.checkleft
+
+load(":check", "check")
+
+def test_field_removal_is_caught() -> None:
+    result: list[Finding] = check(test_context(
+        before = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User {
+                    string name = 1;
+                    int32 age = 2;
+                }
+            """),
+        },
+        after = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User {
+                    string name = 1;
+                }
+            """),
+        },
+    ))
+    assert_eq(len(result), 1)
+    assert_contains(result[0].message, "must be reserved")
+    assert_eq(result[0].severity, Severity.fail)
+
+def test_adding_field_is_allowed() -> None:
+    result: list[Finding] = check(test_context(
+        before = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User {
+                    string name = 1;
+                }
+            """),
+        },
+        after = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User {
+                    string name = 1;
+                    string email = 2;
+                }
+            """),
+        },
+    ))
+    assert_eq(len(result), 0)
+
+def test_file_deletion_with_config() -> None:
+    result: list[Finding] = check(test_context(
+        before = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User { string name = 1; }
+            """),
+        },
+        after = {},  # file deleted
+        config = {"severity": "fail"},
+    ))
+    assert_true(len(result) > 0)
+```
+
+### 12.2 Test built-ins
+
+Tests get additional built-ins beyond the normal check environment:
+
+| Symbol | Type | Description |
+|---|---|---|
+| `test_context(before, after, config=None)` | `fn(dict, dict, dict\|None) -> Context` | Build a synthetic context from file content maps. The adapter parses + diffs the content just as it would in a real run. |
+| `proto(content)` | `fn(str) -> str` | Marker for proto file content (enables adapter-specific parsing in `test_context`). |
+| `json(content)` | `fn(str) -> str` | Marker for JSON file content. |
+| `java(content)` | `fn(str) -> str` | Marker for Java file content. |
+| `text(content)` | `fn(str) -> str` | Marker for plain text content. |
+| `assert_eq(a, b)` | `fn(Any, Any)` | Assert equality. Fails with diff on mismatch. |
+| `assert_true(cond)` | `fn(bool)` | Assert truthy. |
+| `assert_contains(haystack, needle)` | `fn(str, str)` | Assert substring presence. |
+| `assert_finding_count(findings, n)` | `fn(list[Finding], int)` | Assert exact finding count. |
+
+### 12.3 Running tests
+
+```bash
+# Run all check tests in the package
+checkleft test
+
+# Run tests for a specific check
+checkleft test proto/evolution
+
+# Run a specific test function
+checkleft test proto/evolution::test_field_removal_is_caught
+```
+
+### 12.4 Test discovery
+
+- Any function in `check_test.checkleft` whose name starts with `test_` is a test case.
+- Tests must have no parameters and return `None`.
+- Tests are type-checked with the same `DialectTypes::Enable` setting as checks.
+- Test failures include the Starlark traceback and assertion details.
+- Tests run hermetically regardless of the check's declared tier — `test_context()` provides all data synthetically.
+
+### 12.5 Fix testing
+
+Fix functions can be tested similarly:
+
+```python
+# checkleft/proto/evolution/check_test.checkleft
+
+load(":check", "check")
+load(":fix", "fix")
+
+def test_fix_adds_reservation() -> None:
+    ctx: ProtoEvolutionContext = test_context(
+        before = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User {
+                    string name = 1;
+                    int32 age = 2;
+                }
+            """),
+        },
+        after = {
+            "api/v1/user.proto": proto("""
+                syntax = "proto3";
+                package api.v1;
+                message User {
+                    string name = 1;
+                }
+            """),
+        },
+    )
+    findings: list[Finding] = check(ctx)
+    edits: list[FileEdit] = fix(ctx, findings)
+    assert_eq(len(edits), 1)
+    assert_contains(edits[0].new_text, "reserved 2")
+```
+
+---
+
+## 13. Integration with existing checkleft infrastructure
 
 ### 12.1 CHECKS.yaml / CHECKS.toml compatibility
 
@@ -1091,9 +1243,9 @@ checks:
 
 The `starlark://` scheme tells the runner to resolve the check from the `checkleft/` folder structure rather than from a declarative YAML or WASM component.
 
-However, `Package.toml` is the **preferred** way to activate Starlark checks. `CHECKS.yaml` integration exists for repos that want to mix Starlark checks with existing declarative/WASM checks in a single config file.
+However, `package.toml` is the **preferred** way to activate Starlark checks. `CHECKS.yaml` integration exists for repos that want to mix Starlark checks with existing declarative/WASM checks in a single config file.
 
-When both `Package.toml` and `CHECKS.yaml` activate the same check ID, `CHECKS.yaml` policy fields (severity override, bypass, exclusions) take precedence — they are the operator-level override layer.
+When both `package.toml` and `CHECKS.yaml` activate the same check ID, `CHECKS.yaml` policy fields (severity override, bypass, exclusions) take precedence — they are the operator-level override layer.
 
 ### 12.2 Output compatibility
 
@@ -1117,7 +1269,7 @@ The runner reports Starlark check progress through the existing `ProgressReporte
 
 ---
 
-## 13. Future extensions
+## 14. Future extensions
 
 ### 13.1 Additional sandbox tiers
 
@@ -1159,11 +1311,11 @@ A `checkleft fix --preview` mode that shows proposed edits in a TUI diff viewer 
 
 ---
 
-## 14. API reference by example
+## 15. API reference by example
 
 This section provides concrete, copy-pasteable examples of every key operation a check author will perform. These examples define the target API surface.
 
-### 14.1 Constructing findings
+### 15.1 Constructing findings
 
 ```python
 # Minimal finding — just severity, message, and path
@@ -1222,7 +1374,7 @@ findings.append(fail_but_overridable(
 ))
 ```
 
-### 14.2 Constructing file edits (for fixes)
+### 15.2 Constructing file edits (for fixes)
 
 ```python
 # Replace existing text
@@ -1248,7 +1400,7 @@ edits.append(file_edit(
 ))
 ```
 
-### 14.3 Loading shared helpers
+### 15.3 Loading shared helpers
 
 ```python
 # From the package's lib/ directory
@@ -1264,7 +1416,7 @@ load("@acme_checks//lib/wire", "is_wire_compatible", "BREAKING_KINDS")
 load("//lib/matchers", "glob_match", "path_prefix", "is_generated_file")
 ```
 
-### 14.4 Defining shared helper modules
+### 15.4 Defining shared helper modules
 
 **`checkleft/lib/proto_helpers.checkleft`:**
 ```python
@@ -1294,7 +1446,7 @@ WIRE_INCOMPATIBLE_TYPE_CHANGES: dict[str, list[str]] = {
 }
 ```
 
-### 14.5 Working with the proto evolution context
+### 15.5 Working with the proto evolution context
 
 ```python
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -1386,7 +1538,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.6 Proto check: blocking proto file deletion
+### 15.6 Proto check: blocking proto file deletion
 
 ```python
 # checkleft/proto/no_deletion/check.checkleft
@@ -1405,7 +1557,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.7 Proto check: detecting moves vs. deletions
+### 15.7 Proto check: detecting moves vs. deletions
 
 A move (rename/relocate) is semantically fine if the package and content remain the same. The adapter gives us `ChangeKind.renamed` in the changeset and `before`/`after` descriptors on file pairs — we can use both to distinguish a real deletion from a harmless move.
 
@@ -1465,7 +1617,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.8 Working with the `module.json` evolution context
+### 15.8 Working with the `module.json` evolution context
 
 ```python
 def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
@@ -1524,7 +1676,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.7 Working with the Java evolution context
+### 15.9 Working with the Java evolution context
 
 ```python
 def check(ctx: JavaEvolutionContext) -> list[Finding]:
@@ -1577,7 +1729,7 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.8 Working with the text adapter (generic checks)
+### 15.10 Working with the text adapter (generic checks)
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -1614,7 +1766,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.9 Writing a fix function
+### 15.11 Writing a fix function
 
 ```python
 # proto/evolution/fix.checkleft
@@ -1654,51 +1806,41 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 14.10 Package manifest with a version set
+### 15.12 Package manifest with a version set
 
-```python
-# checkleft/Package.toml
-#
-# Instead of pinning 5+ individual check packages, depend on one version set
-# that pins a curated, tested-together set.
+```toml
+# checkleft/package.toml
+# Instead of pinning 5+ individual check packages, depend on one version set.
 
-package(
-    name: str = "acme/payments",
-    version: str = "1.0.0",
-)
+[package]
+name = "acme/payments"
+version = "1.0.0"
 
-# One version set gives us proto, module_json, java, and security checks
-# all at versions the version set author has tested together.
-# All public checks from the version set's packages are automatically active.
-version_set(
-    name: str = "acme-versionset",
-    source: str = "registry://checkleft-hub/acme-versionset",
-    version: str = "2025.06.1",
-)
+# One version set gives us proto, module_json, java, and security checks.
+# All public checks from every included package are automatically active.
+[version_sets.acme-versionset]
+source = "registry://checkleft-hub/acme-versionset"
+version = "2025.06.1"
 
 # Override one package from the version set to use a newer version
-depend(
-    name: str = "proto_evolution",
-    source: str = "registry://checkleft-hub/proto-evolution",
-    version: str = "0.3.0",  # newer than what the version set pins
-)
+[dependencies.proto_evolution]
+source = "registry://checkleft-hub/proto-evolution"
+version = "0.3.0"   # newer than what the version set pins
 
 # Add a package not in the version set at all
-depend(
-    name: str = "custom_team_checks",
-    source: str = "git://github.com/myteam/checkleft-checks.git",
-    version: str = "0.3.0",
-)
+[dependencies.custom_team_checks]
+source = "git://github.com/myteam/checkleft-checks.git"
+version = "0.3.0"
 
 # Local checks (checkleft/proto/evolution/, etc.) are auto-discovered.
-# No check() calls needed — Package.toml is purely for external deps.
+# package.toml is purely for external deps.
 ```
 
-### 14.11 Network tier: checking against a remote registry
+### 15.13 Network tier: checking against a remote registry
 
 ```python
 # checkleft/proto/registry_sync/check.checkleft
-# Tier: network (declared in Package.toml)
+# Tier: network (declared in check_meta below)
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
@@ -1745,7 +1887,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.12 Using `regex_match` and `glob_match` utilities
+### 15.14 Using `regex_match` and `glob_match` utilities
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -1784,7 +1926,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 14.13 Using `json_decode` / `json_encode` in text-adapter checks
+### 15.15 Using `json_decode` / `json_encode` in text-adapter checks
 
 The `json_decode` / `json_encode` built-ins are available for text-adapter checks that need to work with JSON content from the parsed line model. They are utility functions, not a replacement for typed adapters.
 
@@ -1815,7 +1957,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ---
 
-## 15. Summary of conventions
+## 16. Summary of conventions
 
 | Convention | Rule |
 |---|---|
@@ -1824,7 +1966,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Fix location | `checkleft/<category>/<name>/fix.checkleft` |
 | Shared code | `checkleft/lib/*.checkleft` |
 | Check-local helpers | `checkleft/<category>/<name>/<anything>.checkleft` (not `check` or `fix`) |
-| Package manifest | `checkleft/Package.toml` |
+| Package manifest | `checkleft/package.toml` |
 | Lockfile | `checkleft/PACKAGE.lock` (auto-generated, checked in) |
 | Check ID | `<category>/<name>` (e.g. `proto/evolution`) |
 | Type annotations | Required on all function signatures |
