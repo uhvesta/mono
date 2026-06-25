@@ -21,6 +21,7 @@ pub mod path;
 pub mod progress;
 pub mod runner;
 pub mod source_tree;
+pub mod starlark;
 pub mod vcs;
 
 #[cfg(test)]
