@@ -12,9 +12,10 @@
 3. Sandbox tiers declared in `check_meta()` — hermetic by default, opt-in network access.
 4. Versioned check distribution — pull in third-party or org-published check packages at pinned versions.
 5. Optional **fix** functions co-located with checks.
-6. Bidirectional: checks can be authored in Starlark *or* Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
+6. Bidirectional: checks can be authored in Starlark _or_ Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
 7. Hierarchical: repos can define checks at the root; sub-projects can layer on their own.
 8. Maximal Starlark typing via `DialectTypes::Enable` — all function signatures, parameters, and return types must carry type annotations.
+9. People can pull in an assortment of versions (basically a full bundle/version set similar to Brazil from Amazon)
 
 ---
 
@@ -73,15 +74,15 @@ No config flags, no overrides, no implicit conventions. The directory tree is th
 
 ### 2.3 Rules
 
-| Path pattern | Role |
-|---|---|
-| `checkleft/package.toml` | **Package manifest.** Declares metadata and external dependencies. Required. |
-| `checkleft/lib/*.checkleft` | **Shared modules.** Importable helpers. Always private — never exported to consumers. |
-| `checkleft/<adapter>/public/<name>/check.checkleft` | **Public check.** Exported when this package is consumed as a dependency. |
-| `checkleft/<adapter>/private/<name>/check.checkleft` | **Private check.** Runs locally but not exported to consumers. |
-| `checkleft/<adapter>/<visibility>/<name>/fix.checkleft` | **Fix definition.** Optional. Must export a `fix()` function. |
-| `checkleft/<adapter>/<visibility>/<name>/testdata/<case>/` | **Functional tests.** Fixture-based test cases. See §13. |
-| `checkleft/<adapter>/<visibility>/<name>/*.checkleft` | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
+| Path pattern                                               | Role                                                                                                                    |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `checkleft/package.toml`                                   | **Package manifest.** Declares metadata and external dependencies. Required.                                            |
+| `checkleft/lib/*.checkleft`                                | **Shared modules.** Importable helpers. Always private — never exported to consumers.                                   |
+| `checkleft/<adapter>/public/<name>/check.checkleft`        | **Public check.** Exported when this package is consumed as a dependency.                                               |
+| `checkleft/<adapter>/private/<name>/check.checkleft`       | **Private check.** Runs locally but not exported to consumers.                                                          |
+| `checkleft/<adapter>/<visibility>/<name>/fix.checkleft`    | **Fix definition.** Optional. Must export a `fix()` function.                                                           |
+| `checkleft/<adapter>/<visibility>/<name>/testdata/<case>/` | **Functional tests.** Fixture-based test cases. See §13.                                                                |
+| `checkleft/<adapter>/<visibility>/<name>/*.checkleft`      | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
 
 The path structure is: `<adapter>/<visibility>/<name>`.
 
@@ -106,6 +107,7 @@ checkleft/proto/public/
 Each directory with a `check.checkleft` is an independent check. Nesting is purely organizational — a parent check does not compose or invoke its children.
 
 **Enforcement:**
+
 - A directory containing `check.checkleft` must be at least three levels deep under `checkleft/` (adapter + visibility + name, with name being one or more levels).
 - The second level must be literally `public` or `private`. Anything else is an error.
 - The first level must match a registered adapter. Unknown adapter names are an error at discovery time.
@@ -145,6 +147,7 @@ repo/
 If `a/b/c/foo.proto` and `a/b/c/d/e/f/bar.proto` are both changed:
 
 - **`a/b/c/foo.proto`** is checked by:
+
   - `repo/checkleft/proto/public/evolution/` (root ancestor, glob matches)
   - `repo/a/b/c/checkleft/proto/billing_compat/` (sibling checkleft, glob matches)
 
@@ -180,16 +183,16 @@ At that point, only `a/b/c/checkleft/<adapter>/public/` checks become active in 
 
 **Full scenario table:**
 
-| Scenario | Mechanism | What runs? |
-|---|---|---|
-| Root `checkleft/proto/public/evolution/` runs on `foo.proto` anywhere in repo | Ancestor scoping | **Runs.** All checks run locally regardless of public/private. |
+| Scenario                                                                           | Mechanism        | What runs?                                                           |
+| ---------------------------------------------------------------------------------- | ---------------- | -------------------------------------------------------------------- |
+| Root `checkleft/proto/public/evolution/` runs on `foo.proto` anywhere in repo      | Ancestor scoping | **Runs.** All checks run locally regardless of public/private.       |
 | Root `checkleft/proto/private/internal_lint/` runs on `foo.proto` anywhere in repo | Ancestor scoping | **Runs.** Private just means not exportable — locally it still runs. |
-| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/foo.proto` | Ancestor scoping | **Runs.** Same package, all checks run locally. |
-| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/d/e/foo.proto` | Ancestor scoping | **Runs.** Ancestor checks apply to all descendant files. |
-| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/private/billing/` check | `path://` dep | **Not visible.** Billing is private. |
-| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/public/wire_compat/` check | `path://` dep | **Visible.** Wire_compat is public. |
-| External repo consumes root package via `git://` | `git://` dep | Only `public/` checks visible. |
-| Version set includes a package | `version_set` | Only `public/` checks activated in consumers. |
+| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/foo.proto`                 | Ancestor scoping | **Runs.** Same package, all checks run locally.                      |
+| `a/b/c/checkleft/proto/private/billing/` runs on `a/b/c/d/e/foo.proto`             | Ancestor scoping | **Runs.** Ancestor checks apply to all descendant files.             |
+| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/private/billing/` check       | `path://` dep    | **Not visible.** Billing is private.                                 |
+| `a/b/d/checkleft/` wants `a/b/c/checkleft/`'s `proto/public/wire_compat/` check    | `path://` dep    | **Visible.** Wire_compat is public.                                  |
+| External repo consumes root package via `git://`                                   | `git://` dep     | Only `public/` checks visible.                                       |
+| Version set includes a package                                                     | `version_set`    | Only `public/` checks activated in consumers.                        |
 
 **Example: monorepo with cross-project consumption**
 
@@ -222,18 +225,21 @@ repo/
 ```
 
 What runs on `a/b/d/api.proto`:
+
 1. Root `proto/public/evolution/` — ancestor, runs locally
 2. Root `proto/private/internal_lint/` — ancestor, runs locally
 3. C's `proto/public/wire_compat/` — pulled in via D's `path://` dep on C
 4. C's `proto/private/billing/` — **NOT visible** to D (private)
 
 What runs on `a/b/c/service.proto`:
+
 1. Root `proto/public/evolution/` — ancestor, runs locally
 2. Root `proto/private/internal_lint/` — ancestor, runs locally
 3. C's `proto/public/wire_compat/` — same package, runs locally
 4. C's `proto/private/billing/` — same package, runs locally
 
 **Key principles:**
+
 - Locally, visibility is irrelevant — all checks run on their subtree.
 - `public` vs `private` is exclusively about what other packages can see.
 - Cross-package consumption always requires an explicit dependency declaration.
@@ -271,11 +277,11 @@ version = "1.0.3"
 
 ### 3.1 `[package]` fields
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `name` | `str` | yes | Globally unique package name. Convention: `<org>/<descriptor>`. |
-| `version` | `str` | yes | SemVer. Used when this package is consumed as a dependency. |
-| `exclude_patterns` | `list[str]` | no | Glob patterns for files that should be excluded from all checks in this package. Matched relative to the package root. Common uses: `third_party/**`, `vendor/**`, `generated/**`. |
+| Field              | Type        | Required | Description                                                                                                                                                                        |
+| ------------------ | ----------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`             | `str`       | yes      | Globally unique package name. Convention: `<org>/<descriptor>`.                                                                                                                    |
+| `version`          | `str`       | yes      | SemVer. Used when this package is consumed as a dependency.                                                                                                                        |
+| `exclude_patterns` | `list[str]` | no       | Glob patterns for files that should be excluded from all checks in this package. Matched relative to the package root. Common uses: `third_party/**`, `vendor/**`, `generated/**`. |
 
 ### 3.2 `[version_sets]` — curated check collections
 
@@ -347,19 +353,19 @@ version = "0.3.0"
 
 ### 3.3 `[version_sets.<name>]` fields (consumer side)
 
-| TOML key | Type | Required | Description |
-|---|---|---|---|
-| (table key) | `str` | yes | Local alias for the version set. |
-| `source` | `str` | yes | Source URI (same schemes as dependencies). |
-| `version` | `str` | yes | Exact version set version pin. |
+| TOML key    | Type  | Required | Description                                |
+| ----------- | ----- | -------- | ------------------------------------------ |
+| (table key) | `str` | yes      | Local alias for the version set.           |
+| `source`    | `str` | yes      | Source URI (same schemes as dependencies). |
+| `version`   | `str` | yes      | Exact version set version pin.             |
 
 ### 3.4 `[includes.<name>]` fields (version set author side)
 
-| TOML key | Type | Required | Description |
-|---|---|---|---|
-| (table key) | `str` | yes | Local alias for this constituent package. Consumers use this as the check ID prefix. |
-| `source` | `str` | yes | Source URI of the constituent package. |
-| `version` | `str` | yes | Exact version pin. The version set author tests this version. |
+| TOML key    | Type  | Required | Description                                                                          |
+| ----------- | ----- | -------- | ------------------------------------------------------------------------------------ |
+| (table key) | `str` | yes      | Local alias for this constituent package. Consumers use this as the check ID prefix. |
+| `source`    | `str` | yes      | Source URI of the constituent package.                                               |
+| `version`   | `str` | yes      | Exact version pin. The version set author tests this version.                        |
 
 ### 3.5 Version set resolution rules
 
@@ -373,11 +379,11 @@ Resolution is intentionally simple — no complex override logic.
 
 ### 3.6 `[dependencies.<name>]` fields
 
-| TOML key | Type | Required | Description |
-|---|---|---|---|
-| (table key) | `str` | yes | Local alias used to reference this dependency's checks. |
-| `source` | `str` | yes | Source URI. Schemes: `registry://`, `git://`, `path://` (local). |
-| `version` | `str` | yes | SemVer version or git tag. Exact pin, no ranges. |
+| TOML key    | Type  | Required | Description                                                      |
+| ----------- | ----- | -------- | ---------------------------------------------------------------- |
+| (table key) | `str` | yes      | Local alias used to reference this dependency's checks.          |
+| `source`    | `str` | yes      | Source URI. Schemes: `registry://`, `git://`, `path://` (local). |
+| `version`   | `str` | yes      | SemVer version or git tag. Exact pin, no ranges.                 |
 
 ### 3.7 Auto-discovery of local checks
 
@@ -388,6 +394,7 @@ Resolution is intentionally simple — no complex override logic.
 - The `applies_to` globs, `tier`, and `config` are declared **inside `check.checkleft` itself** via a `check_meta()` call at the top of the file (see §4.1).
 
 This means `package.toml` has exactly two jobs:
+
 1. Declare package identity (`[package]`).
 2. Pull in external dependencies (`[version_sets]`, `[dependencies]`).
 
@@ -397,15 +404,15 @@ Visibility is determined entirely by the `public/` or `private/` directory in th
 
 **Checks:**
 
-| Path pattern | Visibility | Description |
-|---|---|---|
-| `checkleft/<adapter>/public/<name>/` | **Public.** | Exported when this package is consumed via `[dependencies]` or `[version_sets]`. Activated in consumers. |
-| `checkleft/<adapter>/private/<name>/` | **Private.** | Runs locally but not exported to consumers. |
+| Path pattern                          | Visibility   | Description                                                                                              |
+| ------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------------- |
+| `checkleft/<adapter>/public/<name>/`  | **Public.**  | Exported when this package is consumed via `[dependencies]` or `[version_sets]`. Activated in consumers. |
+| `checkleft/<adapter>/private/<name>/` | **Private.** | Runs locally but not exported to consumers.                                                              |
 
 **Libraries (`lib/`):**
 
-| Path pattern | Visibility | Description |
-|---|---|---|
+| Path pattern                | Visibility          | Description                                                                                                                                      |
+| --------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `checkleft/lib/*.checkleft` | **Always private.** | All `lib/` modules are private. Loadable by checks in the same package but never exported. Consumers cannot `load()` from a dependency's `lib/`. |
 
 This means consumers can use a dependency's **public checks** but never import its **helper functions** or run its **private checks**.
@@ -434,6 +441,7 @@ checkleft/
 ```
 
 When consumed via `[dependencies]` or `[version_sets]`:
+
 - `proto/evolution` — **activated** (public)
 - `module_json/required_fields` — **activated** (public)
 - `proto/team_policy` — **not activated** (private)
@@ -447,6 +455,7 @@ When consumed via `[dependencies]` or `[version_sets]`:
 ### 4.1 `check.checkleft` — the check file
 
 Every check file must:
+
 1. Call `check_meta()` at the top level to declare metadata (applies_to, tier, config schema).
 2. Define exactly one `check()` function with a typed signature. The parameter type depends on the **file format adapter** (see §6).
 
@@ -480,11 +489,11 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 
 `check_meta()` is required. Without it, the file is not recognized as a check.
 
-| Field | Type | Required | Default | Description |
-|---|---|---|---|---|
-| `applies_to` | `list[str]` | yes | — | Glob patterns for files this check cares about. |
-| `tier` | `str` | no | `"hermetic"` | Sandbox tier. See §5. |
-| `config` | `dict[str, typing.Any]` | no | `{}` | Default config passed to `ctx.config`. |
+| Field        | Type                    | Required | Default      | Description                                     |
+| ------------ | ----------------------- | -------- | ------------ | ----------------------------------------------- |
+| `applies_to` | `list[str]`             | yes      | —            | Glob patterns for files this check cares about. |
+| `tier`       | `str`                   | no       | `"hermetic"` | Sandbox tier. See §5.                           |
+| `config`     | `dict[str, typing.Any]` | no       | `{}`         | Default config passed to `ctx.config`.          |
 
 ### 4.2 `fix.checkleft` — the fix file
 
@@ -564,6 +573,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
 ```
 
 **Type safety guarantees:**
+
 - `fix_data` is typed as `struct | None` on `Finding`. The Starlark type checker validates that the check passes a struct, not an arbitrary dict.
 - The fix does `type(f.fix_data) == FieldNotReserved` for runtime dispatch — this is a real type check, not string matching.
 - Both check and fix `load()` from the same `:types` module, so they share the struct definition. A field rename or type change in the struct is caught by the type checker on both sides.
@@ -592,10 +602,10 @@ load("//lib/matchers", "glob_match", "path_prefix")
 load(":types", "field_not_reserved")
 ```
 
-| Prefix | Resolution |
-|---|---|
-| `//` | Relative to the enclosing `checkleft/` directory. |
-| `:` | Relative to the current check directory. |
+| Prefix | Resolution                                        |
+| ------ | ------------------------------------------------- |
+| `//`   | Relative to the enclosing `checkleft/` directory. |
+| `:`    | Relative to the current check directory.          |
 
 External dependencies provide **checks only** — their `lib/` modules and internal helpers are never loadable by consumers. There is no `@<dep_name>//` load path. Dependencies are consumed as opaque check packages, not as importable libraries.
 
@@ -607,10 +617,10 @@ Checks declare their required sandbox tier in `check_meta()` inside `check.check
 
 ### 5.1 Tier definitions
 
-| Tier | ID | Capabilities | Use case |
-|---|---|---|---|
-| **Hermetic** | `"hermetic"` | Typed data models (injected by the adapter), pure computation, `load()`. No file I/O, no network, no subprocesses. Starlark never sees raw file contents or touches the filesystem. | Most evolution checks. Default. |
-| **Network** | `"network"` | Everything in hermetic + HTTP GET requests via `http_get()` built-in. DNS resolution allowed. Still no file I/O or arbitrary exec. | Checks that validate against a remote reservation service, API catalog, or internal registry. |
+| Tier         | ID           | Capabilities                                                                                                                                                                        | Use case                                                                                      |
+| ------------ | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **Hermetic** | `"hermetic"` | Typed data models (injected by the adapter), pure computation, `load()`. No file I/O, no network, no subprocesses. Starlark never sees raw file contents or touches the filesystem. | Most evolution checks. Default.                                                               |
+| **Network**  | `"network"`  | Everything in hermetic + HTTP GET requests via `http_get()` built-in. DNS resolution allowed. Still no file I/O or arbitrary exec.                                                  | Checks that validate against a remote reservation service, API catalog, or internal registry. |
 
 ### 5.2 Tier enforcement
 
@@ -623,9 +633,9 @@ Checks declare their required sandbox tier in `check_meta()` inside `check.check
 
 Findings have exactly two severity levels. A finding always blocks merge — the only question is whether a human can override it.
 
-| Severity | Starlark constant | CI behavior | Description |
-|---|---|---|---|
-| **Fail** | `Severity.fail` | Blocks merge. Cannot be overridden. | Hard violation. No exceptions. |
+| Severity                 | Starlark constant               | CI behavior                                                                                            | Description                                                                |
+| ------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| **Fail**                 | `Severity.fail`                 | Blocks merge. Cannot be overridden.                                                                    | Hard violation. No exceptions.                                             |
 | **Fail-but-overridable** | `Severity.fail_but_overridable` | Blocks merge by default, but can be overridden with a `BYPASS` directive in the PR/commit description. | The change is almost certainly wrong, but there are legitimate exceptions. |
 
 There is no "informational" / "notice" severity. If something doesn't warrant blocking the build, it doesn't belong as a checkleft finding — use linter warnings or comments for that. Checkleft findings are gates.
@@ -643,23 +653,23 @@ fail_but_overridable(message = "...", path = "...")   # Severity.fail_but_overri
 
 **Hermetic tier** (always available):
 
-| Symbol | Type | Description |
-|---|---|---|
-| `finding(...)` | `fn(...) -> Finding` | Construct a finding. |
-| `file_edit(...)` | `fn(...) -> FileEdit` | Construct a file edit (for fixes). |
-| `Severity` | `enum{fail, fail_but_overridable}` | Severity constants (see §5.3). |
-| `DeltaKind` | `enum{...}` | Format-specific delta kind constants. |
-| `print(...)` | `fn(str)` | Debug print (suppressed in CI, shown with `--verbose`). |
-| `regex_match(pattern, s)` | `fn(str, str) -> bool` | RE2 regex match. |
-| `regex_find_all(pattern, s)` | `fn(str, str) -> list[str]` | RE2 find all matches. |
-| `glob_match(pattern, path)` | `fn(str, str) -> bool` | Glob pattern match. |
+| Symbol                       | Type                               | Description                                             |
+| ---------------------------- | ---------------------------------- | ------------------------------------------------------- |
+| `finding(...)`               | `fn(...) -> Finding`               | Construct a finding.                                    |
+| `file_edit(...)`             | `fn(...) -> FileEdit`              | Construct a file edit (for fixes).                      |
+| `Severity`                   | `enum{fail, fail_but_overridable}` | Severity constants (see §5.3).                          |
+| `DeltaKind`                  | `enum{...}`                        | Format-specific delta kind constants.                   |
+| `print(...)`                 | `fn(str)`                          | Debug print (suppressed in CI, shown with `--verbose`). |
+| `regex_match(pattern, s)`    | `fn(str, str) -> bool`             | RE2 regex match.                                        |
+| `regex_find_all(pattern, s)` | `fn(str, str) -> list[str]`        | RE2 find all matches.                                   |
+| `glob_match(pattern, path)`  | `fn(str, str) -> bool`             | Glob pattern match.                                     |
 
 **Network tier** (additional bindings):
 
-| Symbol | Type | Description |
-|---|---|---|
-| `http_get(url, headers=None, timeout_ms=5000)` | `fn(str, dict[str,str]\|None, int) -> HttpResponse` | HTTP GET. TLS required. No mutations. |
-| `HttpResponse` | `struct{status: int, body: str, headers: dict[str,str]}` | Response type. |
+| Symbol                                         | Type                                                     | Description                           |
+| ---------------------------------------------- | -------------------------------------------------------- | ------------------------------------- |
+| `http_get(url, headers=None, timeout_ms=5000)` | `fn(str, dict[str,str]\|None, int) -> HttpResponse`      | HTTP GET. TLS required. No mutations. |
+| `HttpResponse`                                 | `struct{status: int, body: str, headers: dict[str,str]}` | Response type.                        |
 
 ---
 
@@ -906,13 +916,13 @@ This is the recommended pattern for format adapters: the Rust adapter does parsi
 
 ### 7.3 Decision framework
 
-| Scenario | Use |
-|---|---|
-| Policy logic over pre-parsed data | Starlark check + Rust adapter |
-| Line/text pattern matching | Starlark check + `text` adapter |
-| Binary format parsing (protobuf, class files) | Rust adapter |
-| Checks needing async I/O or subprocess orchestration | Rust check |
-| Simple glob + regex rules | Starlark check + `text` adapter |
+| Scenario                                             | Use                             |
+| ---------------------------------------------------- | ------------------------------- |
+| Policy logic over pre-parsed data                    | Starlark check + Rust adapter   |
+| Line/text pattern matching                           | Starlark check + `text` adapter |
+| Binary format parsing (protobuf, class files)        | Rust adapter                    |
+| Checks needing async I/O or subprocess orchestration | Rust check                      |
+| Simple glob + regex rules                            | Starlark check + `text` adapter |
 
 ---
 
@@ -986,13 +996,13 @@ Out of scope for v1. Packages are distributed via git tags or manual registry up
 
 ### 9.4 Error handling
 
-| Error class | Behavior |
-|---|---|
-| `package.toml` parse error | Fatal. Package is skipped with error diagnostic. |
-| `load()` resolution failure | Fatal for that check. Other checks in the package still run. |
-| Type-check failure in `.checkleft` | Fatal for that check. Reported as a configuration error finding. |
-| Runtime error in `check()` | Check fails. Finding with `severity: fail` and the Starlark traceback. |
-| Adapter parse failure | Check fails with error. Starlark code is not invoked. |
+| Error class                        | Behavior                                                               |
+| ---------------------------------- | ---------------------------------------------------------------------- |
+| `package.toml` parse error         | Fatal. Package is skipped with error diagnostic.                       |
+| `load()` resolution failure        | Fatal for that check. Other checks in the package still run.           |
+| Type-check failure in `.checkleft` | Fatal for that check. Reported as a configuration error finding.       |
+| Runtime error in `check()`         | Check fails. Finding with `severity: fail` and the Starlark traceback. |
+| Adapter parse failure              | Check fails with error. Starlark code is not invoked.                  |
 
 ---
 
@@ -1155,6 +1165,7 @@ checkleft/
 ```
 
 **`package.toml`:**
+
 ```toml
 [package]
 name = "mono/checks"
@@ -1164,6 +1175,7 @@ version = "0.1.0"
 ```
 
 **`lib/proto_helpers.checkleft`:**
+
 ```python
 def has_reservation(msg: MessageDescriptor, field_number: int) -> bool:
     for r in msg.reserved_ranges:
@@ -1176,6 +1188,7 @@ def is_internal_package(pkg: str) -> bool:
 ```
 
 **`proto/public/evolution/types.checkleft`:**
+
 ```python
 # Typed fix_data structs shared between check and fix.
 
@@ -1194,6 +1207,7 @@ def field_not_reserved(field_number: int, field_name: str, insertion_line: int) 
 ```
 
 **`proto/public/evolution/check.checkleft`:**
+
 ```python
 load("//lib/proto_helpers", "has_reservation", "is_internal_package")
 load(":types", "field_not_reserved")
@@ -1249,6 +1263,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 ```
 
 **`proto/public/evolution/fix.checkleft`:**
+
 ```python
 load(":types", "FieldNotReserved")
 
@@ -1281,6 +1296,7 @@ checkleft/
 ```
 
 **`module_json/public/required_fields/check.checkleft`:**
+
 ```python
 check_meta(
     applies_to: list[str] = ["**/module.json"],
@@ -1334,6 +1350,7 @@ checkleft/
 ```
 
 **`java/public/api_stability/check.checkleft`:**
+
 ```python
 check_meta(
     applies_to: list[str] = ["**/*.java"],
@@ -1438,15 +1455,15 @@ path = "api/v1/user.proto"
 
 **`expected.toml` fields:**
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `findings` | `list` | no | Expected findings. Empty or omitted = expect zero findings. |
-| `findings[].severity` | `str` | yes | `"fail"` or `"fail_but_overridable"`. |
-| `findings[].message_contains` | `str` | no | Substring that must appear in the finding message. |
-| `findings[].message_eq` | `str` | no | Exact message match (alternative to `message_contains`). |
-| `findings[].path` | `str` | yes | File path the finding should be on. |
-| `findings[].line` | `int` | no | Expected line number. |
-| `config` | `dict` | no | Override `check_meta()` config for this test case. |
+| Field                         | Type   | Required | Description                                                 |
+| ----------------------------- | ------ | -------- | ----------------------------------------------------------- |
+| `findings`                    | `list` | no       | Expected findings. Empty or omitted = expect zero findings. |
+| `findings[].severity`         | `str`  | yes      | `"fail"` or `"fail_but_overridable"`.                       |
+| `findings[].message_contains` | `str`  | no       | Substring that must appear in the finding message.          |
+| `findings[].message_eq`       | `str`  | no       | Exact message match (alternative to `message_contains`).    |
+| `findings[].path`             | `str`  | yes      | File path the finding should be on.                         |
+| `findings[].line`             | `int`  | no       | Expected line number.                                       |
+| `config`                      | `dict` | no       | Override `check_meta()` config for this test case.          |
 
 ### 13.4 Fix testing
 
@@ -1497,14 +1514,14 @@ checkleft test --update proto/evolution
 
 Starlark checks produce `Finding` values that map 1:1 to the existing `crate::output::Finding`:
 
-| Starlark `Finding` field | Rust `Finding` field |
-|---|---|
-| `severity` | `severity` |
-| `message` | `message` |
-| `path` + `line` + `column` | `location: Option<Location>` |
-| `remediation` | `remediation: Option<String>` |
-| `suggested_fix` | `suggested_fix: Option<SuggestedFix>` |
-| `fix_data` | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
+| Starlark `Finding` field   | Rust `Finding` field                                              |
+| -------------------------- | ----------------------------------------------------------------- |
+| `severity`                 | `severity`                                                        |
+| `message`                  | `message`                                                         |
+| `path` + `line` + `column` | `location: Option<Location>`                                      |
+| `remediation`              | `remediation: Option<String>`                                     |
+| `suggested_fix`            | `suggested_fix: Option<SuggestedFix>`                             |
+| `fix_data`                 | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
 
 ### 14.2 Fix compatibility
 
@@ -1640,6 +1657,7 @@ load("//lib/matchers", "glob_match", "path_prefix", "is_generated_file")
 ### 16.4 Defining shared helper modules
 
 **`checkleft/lib/proto_helpers.checkleft`:**
+
 ```python
 def has_reservation(msg: MessageDescriptor, field_number: int) -> bool:
     """Check if a message reserves the given field number."""
@@ -2143,17 +2161,17 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ## 17. Summary of conventions
 
-| Convention | Rule |
-|---|---|
-| File extension | `.checkleft` always |
-| Check location | `checkleft/<adapter>/<visibility>/<name>/check.checkleft` |
-| Fix location | `checkleft/<adapter>/<visibility>/<name>/fix.checkleft` |
-| Shared code | `checkleft/lib/*.checkleft` |
+| Convention          | Rule                                                                                                 |
+| ------------------- | ---------------------------------------------------------------------------------------------------- |
+| File extension      | `.checkleft` always                                                                                  |
+| Check location      | `checkleft/<adapter>/<visibility>/<name>/check.checkleft`                                            |
+| Fix location        | `checkleft/<adapter>/<visibility>/<name>/fix.checkleft`                                              |
+| Shared code         | `checkleft/lib/*.checkleft`                                                                          |
 | Check-local helpers | `checkleft/<adapter>/<visibility>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`) |
-| Package manifest | `checkleft/package.toml` |
-| Lockfile | `checkleft/PACKAGE.lock` (auto-generated, checked in) |
-| Check ID | `<adapter>/<name>` (e.g. `proto/evolution`) — visibility is not part of the ID |
-| Type annotations | Required on all function signatures |
-| Default sandbox | `hermetic` |
-| Adapter linkage | `<adapter>` top-level folder name matches `FormatAdapter::kind()` |
-| Rust check override | `source: "rust://..."` in `check_meta()` |
+| Package manifest    | `checkleft/package.toml`                                                                             |
+| Lockfile            | `checkleft/PACKAGE.lock` (auto-generated, checked in)                                                |
+| Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`) — visibility is not part of the ID                       |
+| Type annotations    | Required on all function signatures                                                                  |
+| Default sandbox     | `hermetic`                                                                                           |
+| Adapter linkage     | `<adapter>` top-level folder name matches `FormatAdapter::kind()`                                    |
+| Rust check override | `source: "rust://..."` in `check_meta()`                                                             |
