@@ -76,6 +76,7 @@ wasmtime = { version = "42.0.1", default-features = false, features = [
   "std",
 ] }
 wasmtime-wasi = { workspace = true }
+starlark = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"
