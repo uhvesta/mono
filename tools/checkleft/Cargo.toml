@@ -41,12 +41,12 @@ base64 = { workspace = true }
 console = { workspace = true }
 directories = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+flate2 = { workspace = true }
 globset = { workspace = true }
 jaq-core = { workspace = true }
 jaq-interpret = { workspace = true }
 jaq-parse = { workspace = true }
 hashbrown = { workspace = true }
-flate2 = { workspace = true }
 jsonwebtoken = { workspace = true }
 rayon = { workspace = true }
 regex = { workspace = true }
@@ -80,6 +80,7 @@ wasmtime = { version = "42.0.1", default-features = false, features = [
 ] }
 wasmtime-wasi = { workspace = true }
 starlark = { workspace = true }
+tar = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"
