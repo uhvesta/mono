@@ -1,5 +1,15 @@
 """Bazel rules and providers for local checkleft checks."""
 
+_CHECKLEFT_TOOLCHAIN_TYPE = Label("//tools/checkleft/bazel:toolchain_type")
+
+CheckleftToolchainInfo = provider(
+    doc = "Toolchain metadata for running checkleft from Bazel author rules.",
+    fields = {
+        "checkleft": "Executable checkleft binary.",
+        "runfiles": "Runfiles required by the checkleft binary.",
+    },
+)
+
 CheckInfo = provider(
     doc = "Metadata for one repo-local checkleft declarative (passthrough) package.",
     fields = {
@@ -30,6 +40,9 @@ def _toml_string(value):
     return "\"{}\"".format(
         value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n"),
     )
+
+def _sh_single_quote(value):
+    return "\'" + value.replace("\'", "\'\"\'\"\'") + "\'"
 
 def _render_declarative_passthrough_manifest(check_id, executable_path, args):
     # A repo-local check binary is modelled as a single declarative invocation with
@@ -63,6 +76,30 @@ def _workspace_bin_path(file):
     if file.short_path.startswith("../"):
         return "bazel-bin/external/{}".format(file.short_path[len("../"):])
     return "bazel-bin/{}".format(file.short_path)
+
+def _checkleft_toolchain(ctx):
+    return ctx.toolchains[_CHECKLEFT_TOOLCHAIN_TYPE].checkleft_toolchain
+
+def _checkleft_toolchain_impl(ctx):
+    return [
+        platform_common.ToolchainInfo(
+            checkleft_toolchain = CheckleftToolchainInfo(
+                checkleft = ctx.executable.checkleft,
+                runfiles = ctx.attr.checkleft[DefaultInfo].default_runfiles,
+            ),
+        ),
+    ]
+
+checkleft_toolchain = rule(
+    implementation = _checkleft_toolchain_impl,
+    attrs = {
+        "checkleft": attr.label(
+            mandatory = True,
+            executable = True,
+            cfg = "exec",
+        ),
+    },
+)
 
 def _render_bash_runfiles_setup(require_runfiles):
     lines = [
@@ -112,6 +149,72 @@ def _render_bash_runfiles_setup(require_runfiles):
         "fi",
     ])
     return "\n".join(lines)
+
+def _validate_package_root(package_root):
+    package_root = package_root.strip().strip("/")
+    if not package_root:
+        fail("`package_root` must not be empty")
+    if package_root == "." or package_root.startswith("../") or "/../" in package_root or package_root.endswith("/.."):
+        fail("`package_root` must be a safe package-relative path")
+    return package_root
+
+def _workspace_package_root(label_package, package_root):
+    if label_package:
+        return "{}/{}".format(label_package, package_root)
+    return package_root
+
+def _starlark_check_test_impl(ctx):
+    checkleft_toolchain = _checkleft_toolchain(ctx)
+    package_root = _validate_package_root(ctx.attr.package_root)
+    package_root_parts = package_root.split("/")
+    if package_root_parts[-1] != "checkleft":
+        fail("starlark_check_test package_root must point at a `checkleft` directory")
+    package_parent = "/".join(package_root_parts[:-1])
+    workspace_package_root = _workspace_package_root(ctx.label.package, package_root)
+    workspace_package_parent = _workspace_package_root(ctx.label.package, package_parent) if package_parent else ctx.label.package
+    selector_arg = ""
+    if ctx.attr.selector:
+        selector_arg = " {}".format(_sh_single_quote(ctx.attr.selector))
+
+    launcher = ctx.actions.declare_file("{}.sh".format(ctx.label.name))
+    script = """#!/usr/bin/env bash
+set -euo pipefail
+
+{runfiles_setup}
+
+package_parent="$runfiles/{workspace_name}/{workspace_package_parent}"
+if [[ ! -f "$package_parent/checkleft/package.toml" ]]; then
+    echo "missing Starlark check package manifest: $package_parent/checkleft/package.toml" >&2
+    exit 1
+fi
+
+cd "$package_parent"
+exec "$runfiles/{workspace_name}/{checkleft_short_path}" test{selector_arg}
+""".format(
+        runfiles_setup = _render_bash_runfiles_setup(require_runfiles = True),
+        workspace_name = ctx.workspace_name,
+        workspace_package_parent = workspace_package_parent,
+        checkleft_short_path = checkleft_toolchain.checkleft.short_path,
+        selector_arg = selector_arg,
+    )
+    ctx.actions.write(output = launcher, content = script, is_executable = True)
+
+    runfiles = ctx.runfiles(files = ctx.files.srcs + [checkleft_toolchain.checkleft]).merge(checkleft_toolchain.runfiles)
+    return DefaultInfo(executable = launcher, runfiles = runfiles)
+
+starlark_check_test = rule(
+    implementation = _starlark_check_test_impl,
+    test = True,
+    attrs = {
+        "srcs": attr.label_list(
+            mandatory = True,
+            allow_files = True,
+        ),
+        "package_root": attr.string(default = "checkleft"),
+        "selector": attr.string(default = ""),
+    },
+    toolchains = [_CHECKLEFT_TOOLCHAIN_TYPE],
+)
 
 def _local_check_impl(ctx):
     check_id = ctx.attr.id.strip() or ctx.label.name
@@ -292,9 +395,10 @@ def _declare_check_index(name, visibility, checks):
     )
 
 def _checkleft_launcher_impl(ctx):
+    checkleft_toolchain = _checkleft_toolchain(ctx)
     index_file = ctx.attr.check_index[CheckIndexInfo].index
     external_checks_file_arg = ""
-    extra_files = [ctx.executable._checkleft_bin, index_file]
+    extra_files = [checkleft_toolchain.checkleft, index_file]
     if ctx.file.external_checks_file != None:
         external_checks_output = ctx.actions.declare_file(
             "{}__{}".format(ctx.label.name, ctx.file.external_checks_file.basename),
@@ -324,12 +428,12 @@ exec "$workspace_dir/{checkleft_path}" run{external_checks_file_arg} "$@"
 """.format(
         runfiles_setup = _render_bash_runfiles_setup(require_runfiles = False),
         index_path = _workspace_bin_path(index_file),
-        checkleft_path = _workspace_bin_path(ctx.executable._checkleft_bin),
+        checkleft_path = _workspace_bin_path(checkleft_toolchain.checkleft),
         external_checks_file_arg = external_checks_file_arg,
     )
     ctx.actions.write(output = launcher, content = script, is_executable = True)
 
-    runfiles = ctx.runfiles(files = extra_files).merge(
+    runfiles = ctx.runfiles(files = extra_files).merge(checkleft_toolchain.runfiles).merge(
         ctx.attr.check_index[DefaultInfo].default_runfiles,
     )
 
@@ -349,12 +453,8 @@ _checkleft_launcher = rule(
         "external_checks_file": attr.label(
             allow_single_file = True,
         ),
-        "_checkleft_bin": attr.label(
-            default = "//tools/checkleft:checkleft",
-            executable = True,
-            cfg = "target",
-        ),
     },
+    toolchains = [_CHECKLEFT_TOOLCHAIN_TYPE],
 )
 
 def _checkleft_impl(name, visibility, check_index, checks, external_checks_file):
