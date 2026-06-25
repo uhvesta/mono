@@ -1498,7 +1498,47 @@ checkleft test proto/evolution/field_removal
 checkleft test --update proto/evolution
 ```
 
-### 13.6 Test discovery and execution
+### 13.6 Testing network-tier checks
+
+Network-tier checks use `http_get()`, which the test runner mocks at the Rust level. The test author declares HTTP responses in `expected.toml` — the runner injects a mock `http_get` that replays them instead of making real network calls.
+
+```toml
+# testdata/field_not_reserved_remotely/expected.toml
+
+# Mock HTTP responses — matched in order per URL.
+# Multiple entries for the same URL simulate retries/failures.
+[[http_mocks]]
+url = "https://reservations.internal.acme.com/api/reserved/User.old_field/3"
+status = 404
+body = ""
+
+[[http_mocks]]
+url = "https://reservations.internal.acme.com/api/reserved/User.active_field/1"
+status = 200
+body = '{"reserved": true}'
+
+# Simulate a transient failure followed by success (for retry logic)
+[[http_mocks]]
+url = "https://reservations.internal.acme.com/api/reserved/User.flaky_field/5"
+status = 503
+body = "service unavailable"
+
+[[http_mocks]]
+url = "https://reservations.internal.acme.com/api/reserved/User.flaky_field/5"
+status = 200
+body = '{"reserved": true}'
+
+[[findings]]
+severity = "fail"
+message_contains = "not reserved in the central reservation service"
+path = "api/v1/user.proto"
+```
+
+The mock is URL-matched and consumed in declaration order — the first call to a URL returns the first matching entry, the second call returns the next, etc. This lets test authors express retries, transient failures, and varying responses without any code.
+
+The test runner replaces the real `http_get` in the Starlark globals with the mock. The check code is unaware — it calls `http_get()` the same way it would in production.
+
+### 13.7 Test discovery and execution
 
 - Any directory under `testdata/` that contains both a `before/` (or empty) and an `expected.toml` is a test case.
 - Tests run hermetically — the adapter + check execute against the fixture files, with no access to the real repo.
