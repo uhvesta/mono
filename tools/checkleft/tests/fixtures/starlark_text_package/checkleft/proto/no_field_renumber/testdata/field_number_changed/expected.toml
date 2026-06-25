@@ -1,0 +1,4 @@
+[[findings]]
+severity = "fail"
+message_contains = "protobuf field number changed"
+path = "schemas/api/user.proto"
