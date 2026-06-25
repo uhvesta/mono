@@ -958,7 +958,7 @@ The execution model is inherently functional: every `check(ctx)` is a pure funct
 All three layers compose. In the common case of N checks across M adapters, the execution graph is:
 
 ```
-1. Discovery (sequential, fast — see §10.3)
+1. Discovery (sequential, fast — see §10.4)
 2. For each adapter (parallel):
    a. parse(base)  ┐
    b. parse(current)┘  (parallel)
@@ -984,58 +984,19 @@ checkleft/proto/private/team_policy/    ─┘
 
 This means adding a 10th proto check costs approximately zero additional parse time — only the Starlark evaluation time for that check's policy logic.
 
-### 10.3 Discovery caching and filesystem overhead
+### 10.3 Why there is no result cache
 
-Discovery walks the filesystem to find `checkleft/` directories, `package.toml` files, and `check.checkleft` files. In a large monorepo this walk is the dominant fixed cost.
+Caching is unnecessary because the system is already incremental by nature. Checks operate on the **changeset** — the diff between base and current. If a PR touches 3 proto files, the adapter parses only those 3 files (at both revisions), and only checks whose `applies_to` globs match those 3 files run. Everything else is skipped at zero cost (no parse, no Starlark evaluation).
 
-**Mitigations:**
+There is no expensive "full repo scan" to cache away. The input is already minimal — it's the diff. Re-running the same check on the same diff is fast enough that caching the result would add complexity (invalidation, storage, staleness) for negligible gain.
 
-1. **Changeset-scoped discovery.** Don't walk the entire repo. Start from the changed file paths, walk upward to find ancestor `checkleft/` directories. For a PR touching 5 files in `a/b/c/`, discovery visits at most the path segments from `a/b/c/` to repo root — not the entire tree.
+### 10.4 Discovery: changeset-scoped, not repo-wide
 
-2. **Discovery cache.** Cache the mapping `checkleft/ directory path → list of (check_id, adapter, visibility, applies_to globs)` in a file (`checkleft/.discovery-cache`). Invalidate on any change to `checkleft/` directory contents (stat mtime). On cache hit, skip the filesystem walk entirely.
+Discovery does not walk the entire repository. It starts from the changed file paths and walks **upward** to find ancestor `checkleft/` directories. For a PR touching 5 files in `a/b/c/`, discovery visits at most the path segments from `a/b/c/` to repo root — not the entire tree.
 
-3. **Glob pre-filtering.** Before invoking any adapter, intersect each check's `applies_to` globs with the changeset. If no changed files match, the check is skipped entirely — no adapter parse, no Starlark evaluation. This is the single biggest optimization: most PRs touch files in one area, and most checks are irrelevant.
+Before invoking any adapter, each check's `applies_to` globs are intersected with the changeset. If no changed files match, the check is skipped entirely — no adapter parse, no Starlark evaluation. Most PRs touch files in one area, so most checks are irrelevant and skip instantly.
 
-4. **Dependency cache.** External dependencies (`git://`, `registry://`) are fetched once and cached in `~/.cache/checkleft/packages/<name>/<version>/`. The lockfile (`PACKAGE.lock`) records content hashes. On subsequent runs, if the lockfile entry matches, no network fetch occurs. `path://` dependencies are always read live but benefit from the discovery cache.
-
-### 10.4 Incrementality
-
-Because checks are pure functions of `(parsed_before, parsed_after, config)`, results are cacheable:
-
-```
-cache_key = hash(
-    check_id,
-    adapter_kind,
-    hash(matched_files_at_base_revision),
-    hash(matched_files_at_current_revision),
-    hash(check_source_files),     # .checkleft + loaded helpers
-    hash(config),                 # from check_meta + CHECKS.yaml overrides
-)
-```
-
-If the cache key matches a previous run, the findings are replayed from cache without invoking the adapter or Starlark. This is the same principle as Bazel's action cache — deterministic inputs produce deterministic outputs.
-
-**What invalidates the cache:**
-- Any change to a file matching `applies_to` (at either revision)
-- Any change to the `.checkleft` source files (check, fix, loaded helpers)
-- Any change to config (check_meta defaults or CHECKS.yaml overrides)
-- Adapter version change (embedded in the cache key via adapter binary hash)
-
-**What does NOT invalidate the cache:**
-- Changes to files that don't match `applies_to`
-- Changes to other checks (each check is independently cached)
-- Changes to other packages' dependencies
-
-### 10.5 Scaling strategy by repo size
-
-| Repo size | Strategy |
-|---|---|
-| Small (< 100 files) | No special treatment. Discovery + all checks complete in < 1s. |
-| Medium (100–10K files) | Changeset-scoped discovery + glob pre-filtering. Most checks skip. Typical PR: < 3s. |
-| Large monorepo (10K+ files) | All of the above + discovery cache + adapter output sharing + result cache. Typical PR: < 5s for warm cache, < 15s cold. |
-| CI at scale (many concurrent PRs) | Shared result cache (e.g. backed by remote cache like Bazel's). Each PR only computes checks for its unique changeset delta. |
-
-### 10.6 Thread pool and resource bounds
+### 10.5 Thread pool and resource bounds
 
 - **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`. Configurable via `--parallelism=N`.
 - **Memory:** Each Starlark `Module` heap is independent. Peak memory is proportional to `(max concurrent checks) × (largest adapter output shared via Arc) + (per-check heap)`. The `Arc`-shared adapter output is the dominant term but is allocated once per adapter, not per check.
