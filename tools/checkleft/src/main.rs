@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use checkleft::annotate::sarif::write_sarif;
 use checkleft::change_detection::environment::CiEnvironment;
 use checkleft::change_detection::scenario::Scenario;
 use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
@@ -54,6 +55,14 @@ struct RunArgs {
     /// (or `=true`) forces it on.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     show_progress: Option<bool>,
+    /// Activate an annotation output backend. Repeatable: `--annotations=sarif`
+    /// (file-writing mode; also set `--annotations-out`). Default: none.
+    /// Existing `--format` stdout output and exit-code behavior are unchanged.
+    #[arg(long, value_name = "MODE")]
+    annotations: Vec<AnnotationsMode>,
+    /// File path for annotation backends that write to a file (e.g. `--annotations=sarif`).
+    #[arg(long, value_name = "PATH")]
+    annotations_out: Option<PathBuf>,
 }
 
 /// Arguments for `checkleft fix`.
@@ -86,6 +95,13 @@ enum LogLevel {
     Info,
     Debug,
     Trace,
+}
+
+/// Annotation output mode requested via `--annotations`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AnnotationsMode {
+    /// Emit SARIF 2.1.0 JSON to `--annotations-out=<path>`.
+    Sarif,
 }
 
 impl LogLevel {
@@ -426,6 +442,8 @@ async fn dispatch_run(
         default_branch,
         format,
         show_progress,
+        annotations,
+        annotations_out,
     }: RunArgs,
     root: &Path,
     vcs: &Vcs,
@@ -496,6 +514,17 @@ async fn dispatch_run(
             }
         }
         OutputFormat::Json => print_json_results(&results)?,
+    }
+
+    for mode in &annotations {
+        match mode {
+            AnnotationsMode::Sarif => {
+                let path = annotations_out
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--annotations=sarif requires --annotations-out=<path>"))?;
+                write_sarif(&results, path)?;
+            }
+        }
     }
 
     let has_error = results
@@ -1021,6 +1050,8 @@ async fn dispatch_fix(
                 default_branch,
                 format,
                 show_progress,
+                annotations: _,
+                annotations_out: _,
             },
         allow_dirty,
         verify,

@@ -1,3 +1,5 @@
+pub mod sarif;
+
 use std::path::Path;
 
 use tracing::warn;
