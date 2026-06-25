@@ -27,43 +27,59 @@ Every repository (or sub-project) that wants custom checks places a `checkleft/`
 ```
 repo-root/
 ├── checkleft/
-│   ├── package.toml        # package manifest (required)
-│   ├── lib/                     # shared helper modules
+│   ├── package.toml                       # package manifest (required)
+│   ├── lib/                               # shared helper modules (always private)
 │   │   ├── matchers.checkleft
 │   │   └── proto_helpers.checkleft
-│   ├── proto/
-│   │   └── evolution/
-│   │       ├── check.checkleft  # the check definition
-│   │       └── fix.checkleft    # optional fix definition
-│   ├── module_json/
-│   │   └── required_fields/
-│   │       └── check.checkleft
-│   └── java/
-│       └── api_stability/
-│           ├── check.checkleft
-│           └── fix.checkleft
+│   ├── proto/                             # adapter = proto
+│   │   ├── public/                        # exported to consumers
+│   │   │   └── evolution/
+│   │   │       ├── check.checkleft
+│   │   │       └── fix.checkleft
+│   │   └── private/                       # local-only, not exported
+│   │       └── team_policy/
+│   │           └── check.checkleft
+│   ├── module_json/                       # adapter = module_json
+│   │   └── public/
+│   │       └── required_fields/
+│   │           └── check.checkleft
+│   └── java/                              # adapter = java
+│       └── public/
+│           └── api_stability/
+│               ├── check.checkleft
+│               └── fix.checkleft
 ├── services/
 │   └── payments/
-│       └── checkleft/           # nested project-level checks
+│       └── checkleft/                     # nested project-level checks
 │           ├── package.toml
 │           └── proto/
-│               └── billing_compat/
-│                   └── check.checkleft
+│               └── private/               # project-specific, not exported
+│                   └── billing_compat/
+│                       └── check.checkleft
 ```
 
 ### 2.2 Rules
 
 | Path pattern | Role |
 |---|---|
-| `checkleft/package.toml` | **Package manifest.** Declares metadata, sandbox tier, dependencies, and which checks are active. Required. |
-| `checkleft/lib/*.checkleft` | **Shared modules.** Importable helpers. Any `.checkleft` file under `lib/` is a loadable module, never a check. |
-| `checkleft/<category>/<name>/check.checkleft` | **Check definition.** Exactly one `check()` entry point per directory. The two-level `<category>/<name>` path is required and forms the check ID as `<category>/<name>` (e.g. `proto/evolution`). |
-| `checkleft/<category>/<name>/fix.checkleft` | **Fix definition.** Optional. If present, must export a `fix()` function. |
-| `checkleft/<category>/<name>/check_test.checkleft` | **Check test.** Optional. Functional tests for the check. See §12. |
-| `checkleft/<category>/<name>/*.checkleft` | **Check-local helpers.** Any `.checkleft` file that is not `check.checkleft`, `fix.checkleft`, or `check_test.checkleft` is a local helper, loadable only from within that check directory. |
+| `checkleft/package.toml` | **Package manifest.** Declares metadata and external dependencies. Required. |
+| `checkleft/lib/*.checkleft` | **Shared modules.** Importable helpers. Always private — never exported to consumers. |
+| `checkleft/<adapter>/public/<name>/check.checkleft` | **Public check.** Exported when this package is consumed as a dependency. |
+| `checkleft/<adapter>/private/<name>/check.checkleft` | **Private check.** Runs locally but not exported to consumers. |
+| `checkleft/<adapter>/<visibility>/<name>/fix.checkleft` | **Fix definition.** Optional. Must export a `fix()` function. |
+| `checkleft/<adapter>/<visibility>/<name>/check_test.checkleft` | **Check test.** Optional. Functional tests for the check. See §12. |
+| `checkleft/<adapter>/<visibility>/<name>/*.checkleft` | **Check-local helpers.** Any other `.checkleft` file is a local helper, loadable only from within that check directory. |
+
+The path structure is: `<adapter>/<visibility>/<name>`.
+
+- **`<adapter>`** — selects the Rust format adapter (e.g. `proto`, `module_json`, `java`, `text`). Must match a registered `FormatAdapter::kind()`. This is the structural guarantee that every check under `proto/` uses the proto adapter and receives a `ProtoEvolutionContext`.
+- **`<visibility>`** — exactly `public` or `private`. No other values.
+- **`<name>`** — the check name. Forms the check ID as `<adapter>/<name>` (e.g. `proto/evolution`). Note: visibility is not part of the check ID.
 
 **Enforcement:**
-- A directory containing `check.checkleft` must be exactly two levels deep under `checkleft/` (category + name).
+- A directory containing `check.checkleft` must be exactly three levels deep under `checkleft/` (adapter + visibility + name).
+- The second level must be literally `public` or `private`. Anything else is an error.
+- The first level must match a registered adapter. Unknown adapter names are an error at discovery time.
 - `package.toml` must exist at the `checkleft/` root. Without it, the directory is ignored.
 - File extension is always `.checkleft`. No `.star`, `.bzl`, or `.py`.
 
@@ -258,49 +274,51 @@ This means `package.toml` has exactly two jobs:
 
 ### 3.8 Public vs. private visibility (path semantics)
 
-Visibility is determined entirely by folder naming convention — no config needed. The underscore prefix (`_`) marks something as private.
+Visibility is determined entirely by the `public/` or `private/` directory in the path. No convention tricks — it's a literal directory name.
 
 **Checks:**
 
 | Path pattern | Visibility | Description |
 |---|---|---|
-| `checkleft/<category>/<name>/` | **Public.** | Exported when this package is consumed via `depend()` or `version_set()`. Activated in consumers. |
-| `checkleft/_<category>/<name>/` | **Private.** | Runs locally but not exported to consumers. |
-| `checkleft/<category>/_<name>/` | **Private.** | Runs locally but not exported to consumers. |
+| `checkleft/<adapter>/public/<name>/` | **Public.** | Exported when this package is consumed via `depend()` or `version_set()`. Activated in consumers. |
+| `checkleft/<adapter>/private/<name>/` | **Private.** | Runs locally but not exported to consumers. |
 
 **Libraries (`lib/`):**
 
 | Path pattern | Visibility | Description |
 |---|---|---|
-| `checkleft/lib/*.checkleft` | **Always private.** | All `lib/` modules are private. They are loadable by checks in the same package but never exported to consumers. Consumers cannot `load()` from a dependency's `lib/`. |
+| `checkleft/lib/*.checkleft` | **Always private.** | All `lib/` modules are private. Loadable by checks in the same package but never exported. Consumers cannot `load()` from a dependency's `lib/`. |
 
-This means consumers can use a dependency's **checks** but never import its **helper functions**. If you want to share helper functions across packages, publish them as their own package with public check entry points that delegate to the helpers.
+This means consumers can use a dependency's **public checks** but never import its **helper functions** or run its **private checks**.
 
 **Examples:**
 
 ```
 checkleft/
 ├── lib/
-│   ├── proto_helpers.checkleft          # private — loadable within this package only
-│   └── _matchers.checkleft              # private (redundant underscore, lib/ is always private)
+│   └── proto_helpers.checkleft                     # private — same-package only
 ├── proto/
-│   ├── evolution/
-│   │   └── check.checkleft              # PUBLIC — exported to consumers
-│   └── _team_policy/
-│       └── check.checkleft              # PRIVATE — runs locally, not exported
-├── _internal/
-│   └── lint_style/
-│       └── check.checkleft              # PRIVATE — runs locally, not exported
-└── module_json/
-    └── required_fields/
-        └── check.checkleft              # PUBLIC — exported to consumers
+│   ├── public/
+│   │   └── evolution/
+│   │       └── check.checkleft                     # PUBLIC — exported to consumers
+│   └── private/
+│       └── team_policy/
+│           └── check.checkleft                     # PRIVATE — local only
+├── module_json/
+│   └── public/
+│       └── required_fields/
+│           └── check.checkleft                     # PUBLIC — exported to consumers
+└── text/
+    └── private/
+        └── lint_style/
+            └── check.checkleft                     # PRIVATE — local only
 ```
 
-When a package is consumed via `depend()` or `version_set()`:
-- `proto/evolution` — **activated** in the consumer (public)
-- `module_json/required_fields` — **activated** in the consumer (public)
-- `proto/_team_policy` — **not activated** (private)
-- `_internal/lint_style` — **not activated** (private)
+When consumed via `depend()` or `version_set()`:
+- `proto/evolution` — **activated** (public)
+- `module_json/required_fields` — **activated** (public)
+- `proto/team_policy` — **not activated** (private)
+- `text/lint_style` — **not activated** (private)
 - `lib/*` — **not loadable** by consumer checks
 
 ---
