@@ -228,11 +228,13 @@ version = "0.3.0"
 
 ### 3.5 Version set resolution rules
 
-- A `version_set()` is resolved first. All `include()`d packages are fetched and **all of their public checks become active** — the consumer does not need to individually activate them.
-- If a consumer also has a `depend()` for a package that the version set already includes, the explicit `depend()` wins (override). This lets teams pin a newer version of one package while staying on the version set for everything else.
-- Multiple version sets are allowed. If two version sets include the same package at different versions, resolution fails with an error — the consumer must add an explicit `depend()` to break the tie.
-- Version sets can depend on other version sets (composition). Version resolution is depth-first; explicit pins at any level override inherited ones.
-- Private checks (underscore-prefixed categories/names) in version set packages are **not** activated in consumers — they only run in the package's own repo.
+Resolution is intentionally simple — no complex override logic.
+
+1. **Multiple version sets are allowed, but overlap is a hard error.** If two version sets include the same package (by name), resolution fails immediately. Fix it by removing one of the version sets or choosing a single version set that covers both.
+2. **`depend()` can only add packages not in any version set, or upgrade.** If a `depend()` names a package that a version set already includes, the `depend()` version **must** be strictly greater than the version set's pin. Pinning at the same or lower version is an error — use the version set's pin or don't.
+3. **Version sets cannot depend on other version sets.** A version set's `package.toml` may only contain `[package]` and `[includes.*]` sections. No `[version_sets.*]` nesting.
+4. **All public checks from all version-set-included packages are automatically active.** No individual activation needed.
+5. **Private checks** (underscore-prefixed categories/names) in version set packages are **not** activated in consumers — they only run in the package's own repo.
 
 ### 3.6 `[dependencies.<name>]` fields
 
