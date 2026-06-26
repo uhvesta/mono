@@ -35,6 +35,8 @@ checkleft_packages:
     assert_eq!(packages[0].source, "path://checkleft");
     assert_eq!(packages[0].kind, StarlarkPackageKind::Package);
     assert_eq!(packages[0].activation, StarlarkPackageActivation::Explicit);
+    assert_eq!(packages[0].include_patterns, vec!["**"]);
+    assert!(packages[0].exclude_patterns.is_empty());
     assert_eq!(packages[1].source, "registry://checkleft-hub/baseline");
     assert_eq!(packages[1].kind, StarlarkPackageKind::VersionSet);
     assert_eq!(packages[1].activation, StarlarkPackageActivation::All);
@@ -119,7 +121,67 @@ checkleft_packages:
         .resolve_for_file(Path::new("service/src/lib.rs"))
         .expect("resolve");
 
-    assert_eq!(checks.starlark_packages()[0].source, "path://service/checkleft");
+    let package = &checks.starlark_packages()[0];
+    assert_eq!(package.source, "path://service/checkleft");
+    assert_eq!(package.include_patterns, vec!["service/**"]);
+    assert!(package.exclude_patterns.is_empty());
+}
+
+#[test]
+fn yaml_normalizes_starlark_package_activation_globs_to_repo_root() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("service")).expect("create service dir");
+    fs::write(
+        temp.path().join("service/CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://checkleft
+      version: 0.1.0
+      include:
+        - src/**/*.txt
+      exclude:
+        - src/generated/**
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("service/src/example.txt"))
+        .expect("resolve");
+
+    let package = &checks.starlark_packages()[0];
+    assert_eq!(package.include_patterns, vec!["service/src/**/*.txt"]);
+    assert_eq!(package.exclude_patterns, vec!["service/src/generated/**"]);
+}
+
+#[test]
+fn yaml_rejects_empty_starlark_package_include() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://checkleft
+      version: 0.1.0
+      include: []
+"#,
+    )
+    .expect("write CHECKS.yaml");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("include must not be an empty list")),
+        "expected include diagnostic, got {diagnostics:?}"
+    );
+    assert!(checks.starlark_packages().is_empty());
 }
 
 #[test]

@@ -61,6 +61,8 @@ pub struct StarlarkPackageConfig {
     pub sha256: Option<String>,
     pub kind: StarlarkPackageKind,
     pub activation: StarlarkPackageActivation,
+    pub include_patterns: Vec<String>,
+    pub exclude_patterns: Vec<String>,
     pub source_path: PathBuf,
     pub config_dir: PathBuf,
     pub origin: CheckConfigOrigin,
@@ -575,6 +577,10 @@ struct ParsedStarlarkPackageRef {
     sha256: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    include: Option<Vec<String>>,
+    #[serde(default)]
+    exclude: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -815,6 +821,8 @@ fn parse_starlark_package(
             Some("Use mode: all or mode: explicit on packages; omit mode or use all for version_sets.".to_owned()),
         )
     })?;
+    let include_patterns = parse_starlark_package_include_patterns(&raw.include, config_dir, source_path)?;
+    let exclude_patterns = parse_starlark_package_exclude_patterns(&raw.exclude, config_dir, source_path)?;
 
     Ok(StarlarkPackageConfig {
         source,
@@ -822,9 +830,66 @@ fn parse_starlark_package(
         sha256,
         kind,
         activation,
+        include_patterns,
+        exclude_patterns,
         source_path: source_path.to_path_buf(),
         config_dir: config_dir.to_path_buf(),
         origin,
+    })
+}
+
+fn parse_starlark_package_include_patterns(
+    raw_include: &Option<Vec<String>>,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
+    let patterns = match raw_include {
+        Some(patterns) if patterns.is_empty() => {
+            return Err(config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                "`checkleft_packages` include must not be an empty list; omit it to use this CHECKS file's directory"
+                    .to_owned(),
+                None,
+                None,
+                Some("Add at least one include glob, or remove the `include` key entirely.".to_owned()),
+            ));
+        }
+        Some(patterns) => normalize_exclude_patterns(patterns, config_dir),
+        None if config_dir.as_os_str().is_empty() => vec!["**".to_owned()],
+        None => vec![format!("{}/**", config_dir.display())],
+    };
+    validate_glob_patterns("include", &patterns, source_path)?;
+    Ok(patterns)
+}
+
+fn parse_starlark_package_exclude_patterns(
+    raw_exclude: &Option<Vec<String>>,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
+    let patterns = raw_exclude
+        .as_deref()
+        .map(|patterns| normalize_exclude_patterns(patterns, config_dir))
+        .unwrap_or_default();
+    validate_glob_patterns("exclude", &patterns, source_path)?;
+    Ok(patterns)
+}
+
+fn validate_glob_patterns(
+    field: &str,
+    patterns: &[String],
+    source_path: &Path,
+) -> std::result::Result<(), ConfigDiagnostic> {
+    ExclusionMatcher::new(patterns).map(|_| ()).map_err(|err| {
+        config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("invalid `checkleft_packages` {field} glob: {err}"),
+            None,
+            None,
+            Some("Use valid glob syntax for this package activation.".to_owned()),
+        )
     })
 }
 
