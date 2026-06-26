@@ -8,7 +8,7 @@ use starlark::values::{Heap, Value};
 use tree_sitter::{Node, Parser};
 
 use crate::input::{ChangeKind, ChangedFile, SourceTree, TreeVersion};
-use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, FormatAdapter};
+use crate::starlark::adapter::{AdapterFileSelector, AdapterInput, AdapterPreparedOutput, FormatAdapter};
 
 #[derive(Debug)]
 pub(crate) struct JavaAdapterOutput {
@@ -44,6 +44,10 @@ pub(crate) struct JavaAdapter;
 impl FormatAdapter for JavaAdapter {
     fn kind(&self) -> &'static str {
         "java"
+    }
+
+    fn file_selectors(&self) -> &'static [AdapterFileSelector] {
+        &[AdapterFileSelector::Ext("java")]
     }
 
     fn prepare(&self, input: AdapterInput<'_>) -> Result<AdapterPreparedOutput> {

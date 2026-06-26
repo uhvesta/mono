@@ -625,14 +625,14 @@ version = "0.1.0"
         temp.path()
             .join("checkleft/module_json/required_fields/check.checkleft"),
         r#"
-check_meta(applies_to = ["**/module.json"])
+check_meta(applies_to = ["**/module-info.json"])
 
 def check(ctx):
     findings = []
     for pair in ctx.files:
         if pair.after != None and pair.after.version == "":
             findings.append(fail(
-                message = "module.json version is required",
+                message = "module-info.json version is required",
                 path = pair.path,
             ))
     return findings
@@ -640,7 +640,7 @@ def check(ctx):
     )
     .expect("write check");
     fs::write(
-        temp.path().join("services/auth/module.json"),
+        temp.path().join("services/auth/module-info.json"),
         r#"
 {
   "name": "auth",
@@ -648,7 +648,7 @@ def check(ctx):
 }
 "#,
     )
-    .expect("write module.json");
+    .expect("write module-info.json");
 
     let runner = Runner::new(
         Arc::new(CheckRegistry::new()),
@@ -657,7 +657,7 @@ def check(ctx):
     );
     let results = runner
         .run_changeset(&ChangeSet::new(vec![ChangedFile {
-            path: PathBuf::from("services/auth/module.json"),
+            path: PathBuf::from("services/auth/module-info.json"),
             kind: ChangeKind::Added,
             old_path: None,
         }]))
@@ -669,7 +669,7 @@ def check(ctx):
         .find(|result| result.check_id == "module_json/required_fields")
         .expect("starlark module_json result");
     assert_eq!(result.findings.len(), 1);
-    assert_eq!(result.findings[0].message, "module.json version is required");
+    assert_eq!(result.findings[0].message, "module-info.json version is required");
 }
 
 #[tokio::test]
@@ -809,6 +809,52 @@ def check(ctx):
         .expect("starlark result");
     assert_eq!(result.findings.len(), 1);
     assert_eq!(result.findings[0].message, "debug text added");
+}
+
+#[tokio::test]
+async fn runner_filters_starlark_checks_by_adapter_file_selector() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("checkleft/text/no_binary")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("assets")).expect("create assets dir");
+    fs::write(
+        temp.path().join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("checkleft/text/no_binary/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*"])
+
+def check(ctx):
+    return [fail(message = "text adapter should not inspect binary files", path = ctx.files[0].path)]
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("assets/blob.bin"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("assets/blob.bin"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().all(|result| result.check_id != "text/no_binary"),
+        "text adapter selector should skip non-text extension: {results:?}"
+    );
 }
 
 #[tokio::test]

@@ -14,7 +14,7 @@ use starlark::values::{Heap, UnpackValue, Value};
 use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, FileEdit, Finding, Location, Severity};
-use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
+use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry, adapter_matches_changed_file};
 use crate::starlark::loader::{CheckleftFileLoader, LoadContext};
 
 #[derive(Debug, Clone)]
@@ -75,14 +75,14 @@ impl StarlarkCheckRunner {
     ) -> Result<CheckResult> {
         let parsed = ParsedCheck::parse(&self.source)?;
         let package_scope = self.package_scope();
-        let output = AdapterRegistry::with_builtin_adapters()
-            .require(adapter_kind)?
-            .prepare(AdapterInput {
-                changeset,
-                tree,
-                applies_to: &parsed.meta.applies_to,
-                package_scope: package_scope.as_deref(),
-            })?;
+        let adapter = AdapterRegistry::with_builtin_adapters().require(adapter_kind)?;
+        let filtered = adapter_filtered_changeset(changeset, adapter.as_ref());
+        let output = adapter.prepare(AdapterInput {
+            changeset: &filtered,
+            tree,
+            applies_to: &parsed.meta.applies_to,
+            package_scope: package_scope.as_deref(),
+        })?;
         self.evaluate_parsed_adapter(parsed, &output, tree)
     }
 
@@ -106,14 +106,14 @@ impl StarlarkCheckRunner {
     ) -> Result<Vec<FileEdit>> {
         let parsed = ParsedCheck::parse(&self.source)?;
         let package_scope = self.package_scope();
-        let output = AdapterRegistry::with_builtin_adapters()
-            .require(adapter_kind)?
-            .prepare(AdapterInput {
-                changeset,
-                tree,
-                applies_to: &parsed.meta.applies_to,
-                package_scope: package_scope.as_deref(),
-            })?;
+        let adapter = AdapterRegistry::with_builtin_adapters().require(adapter_kind)?;
+        let filtered = adapter_filtered_changeset(changeset, adapter.as_ref());
+        let output = adapter.prepare(AdapterInput {
+            changeset: &filtered,
+            tree,
+            applies_to: &parsed.meta.applies_to,
+            package_scope: package_scope.as_deref(),
+        })?;
         self.evaluate_fix_prepared_adapter(fix_source, &output, findings, tree)
     }
 
@@ -252,6 +252,36 @@ impl StarlarkCheckRunner {
                 .unwrap_or_default()
         })
     }
+}
+
+fn adapter_filtered_changeset(
+    changeset: &ChangeSet,
+    adapter: &dyn crate::starlark::adapter::FormatAdapter,
+) -> ChangeSet {
+    let changed_files = changeset
+        .changed_files
+        .iter()
+        .filter(|changed| adapter_matches_changed_file(adapter, &changed.path, changed.old_path.as_deref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut filtered = ChangeSet {
+        changed_files,
+        file_line_deltas: Default::default(),
+        file_diffs: Default::default(),
+        commit_description: changeset.commit_description.clone(),
+        pr_description: changeset.pr_description.clone(),
+        change_id: changeset.change_id.clone(),
+        repository: changeset.repository.clone(),
+    };
+    for changed in &filtered.changed_files {
+        if let Some(delta) = changeset.file_line_deltas.get(&changed.path) {
+            filtered.file_line_deltas.insert(changed.path.clone(), *delta);
+        }
+        if let Some(diff) = changeset.file_diffs.get(&changed.path) {
+            filtered.file_diffs.insert(changed.path.clone(), diff.clone());
+        }
+    }
+    filtered
 }
 
 #[async_trait::async_trait]

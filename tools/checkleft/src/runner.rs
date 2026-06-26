@@ -28,7 +28,7 @@ use crate::external::{
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
-use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
+use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry, FormatAdapter};
 use crate::starlark::discovery::{self, DiscoveredCheck};
 use crate::starlark::manifest::{PackageKind, PackageManifest, PackageRef};
 use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
@@ -1228,8 +1228,12 @@ impl Runner {
 
         let mut starlark_diagnostics = BTreeMap::new();
         if let Ok(discovered) = self.discover_starlark_checks(changeset, &mut starlark_diagnostics) {
+            let adapters = AdapterRegistry::with_builtin_adapters();
             for (check, _) in discovered {
-                if starlark_changeset_for_check(changeset, &check)
+                let Ok(adapter) = adapters.require(&check.adapter) else {
+                    continue;
+                };
+                if starlark_changeset_for_check(changeset, &check, adapter.as_ref())
                     .map(|changeset| !changeset.changed_files.is_empty())
                     .unwrap_or(false)
                 {
@@ -1493,7 +1497,14 @@ impl Runner {
         let adapters = AdapterRegistry::with_builtin_adapters();
         let mut adapter_outputs: BTreeMap<String, Arc<AdapterPreparedOutput>> = BTreeMap::new();
         for (check, package_tree) in discovered {
-            let check_changeset = match starlark_changeset_for_check(changeset, &check) {
+            let adapter = match adapters.require(&check.adapter) {
+                Ok(adapter) => adapter,
+                Err(err) => {
+                    self.insert_starlark_invalid_run(grouped_runs, &check, err.to_string());
+                    continue;
+                }
+            };
+            let check_changeset = match starlark_changeset_for_check(changeset, &check, adapter.as_ref()) {
                 Ok(changeset) => changeset,
                 Err(err) => {
                     let diagnostic = ConfigDiagnostic {
@@ -1527,13 +1538,6 @@ impl Runner {
             let adapter_output = match adapter_outputs.get(&output_key) {
                 Some(output) => Arc::clone(output),
                 None => {
-                    let adapter = match adapters.require(&check.adapter) {
-                        Ok(adapter) => adapter,
-                        Err(err) => {
-                            self.insert_starlark_invalid_run(grouped_runs, &check, err.to_string());
-                            continue;
-                        }
-                    };
                     let output = match adapter.prepare(AdapterInput {
                         changeset: &check_changeset,
                         tree: self.source_tree.as_ref(),
@@ -2271,7 +2275,11 @@ fn git_archive_checkleft(git_source: &str, version: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) -> Result<ChangeSet> {
+fn starlark_changeset_for_check(
+    changeset: &ChangeSet,
+    check: &DiscoveredCheck,
+    adapter: &dyn FormatAdapter,
+) -> Result<ChangeSet> {
     let applies_to = build_glob_set(&check.check_meta.applies_to)?;
     let activation_include = build_glob_set(&check.activation_include_patterns)?;
     let activation_exclude = build_glob_set(&check.activation_exclude_patterns)?;
@@ -2282,6 +2290,9 @@ fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) 
         .filter(|changed| !matches!(changed.kind, ChangeKind::Deleted))
         .filter(|changed| path_in_scope(&changed.path, &package_scope))
         .filter(|changed| activation_glob_sets_match_path(&activation_include, &activation_exclude, &changed.path))
+        .filter(|changed| {
+            crate::starlark::adapter::adapter_matches_changed_file(adapter, &changed.path, changed.old_path.as_deref())
+        })
         .filter(|changed| starlark_applies_to_path(&applies_to, &changed.path, &package_scope))
         .cloned()
         .collect::<Vec<_>>();
