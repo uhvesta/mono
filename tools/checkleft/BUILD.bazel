@@ -247,6 +247,12 @@ starlark_check_test(
     selector = "text/no_debug/debug_added",
 )
 
+starlark_check_test(
+    name = "starlark_text_fixture_checkleft_all_test",
+    srcs = glob(["tests/fixtures/starlark_text_package/**"]),
+    package_root = "tests/fixtures/starlark_text_package/checkleft",
+)
+
 rust_test(
     name = "checks_policy_guard_package_test",
     size = "small",
