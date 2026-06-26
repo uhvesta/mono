@@ -1613,9 +1613,12 @@ impl Runner {
                 .collect::<BTreeSet<_>>();
             for package in resolved.starlark_packages() {
                 packages
-                    .entry(package.source.clone())
+                    .entry(starlark_package_selection_key(package))
                     .and_modify(|selection| {
                         selection.explicit_check_ids.extend(explicit_ids.iter().cloned());
+                        if package.activation == StarlarkPackageActivation::All {
+                            selection.package.activation = StarlarkPackageActivation::All;
+                        }
                     })
                     .or_insert_with(|| SelectedStarlarkPackage {
                         package: package.clone(),
@@ -1965,6 +1968,16 @@ fn explicit_selection_matches(explicit_check_ids: &BTreeSet<String>, check_id: &
             .iter()
             .filter_map(|configured_id| configured_id.split_once(':').map(|(_, suffix)| suffix))
             .any(|suffix| suffix == check_id)
+}
+
+fn starlark_package_selection_key(package: &StarlarkPackageConfig) -> String {
+    format!(
+        "{:?}\0{}\0{}\0{}",
+        package.kind,
+        package.source,
+        package.version,
+        package.sha256.as_deref().unwrap_or("")
+    )
 }
 
 fn record_selected_package_ref(
