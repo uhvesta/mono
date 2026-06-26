@@ -18,8 +18,8 @@ relative to the previous node branch. The same DAG can be mirrored to
 - Keep `package.toml` producer-only: package identity, publishing metadata, and
   version-set membership.
 - Keep validation policy in `CHECKS.yaml`: selected packages/version sets, local
-  package paths, path scoping, excludes, check configuration, severity, and
-  policy.
+  package paths, activation areas, global excludes, and explicit Starlark package
+  selectors. Starlark package checks are not configured from `CHECKS.yaml`.
 - Do not introduce `PACKAGE.lock`. Exact refs plus hashes on package and
   version-set selections provide the reproducibility boundary. Hash pins are
   canonical lowercase 64-hex SHA-256 digests.
@@ -47,6 +47,13 @@ relative to the previous node branch. The same DAG can be mirrored to
 | 11 | `uhvesta/mono#3` | `abarzega/starlark-checks-fixes` | `abarzega/starlark-checks-proto-adapter` | Proto adapter |
 | 12 | `uhvesta/mono#14` | `abarzega/starlark-checks-proto-adapter` | `abarzega/starlark-checks-module-json-adapter` | `module_json` adapter |
 | 13 | `uhvesta/mono#15` | `abarzega/starlark-checks-module-json-adapter` | `abarzega/starlark-checks-java-adapter` | Java adapter |
+| 14 | `uhvesta/mono#16` | `abarzega/starlark-checks-java-adapter` | `abarzega/starlark-checks-git-resolver` | Git package resolver |
+| 15 | `uhvesta/mono#17` | `abarzega/starlark-checks-git-resolver` | `abarzega/starlark-checks-routing-selection` | Routing and exact package selection |
+| 16 | `uhvesta/mono#18` | `abarzega/starlark-checks-routing-selection` | `abarzega/starlark-checks-selector-policy` | Remove selector-local Starlark config |
+| 17 | `uhvesta/mono#19` | `abarzega/starlark-checks-selector-policy` | `abarzega/starlark-checks-bazel-author-tests` | Harden Bazel author tests |
+| 18 | `uhvesta/mono#20` | `abarzega/starlark-checks-bazel-author-tests` | `abarzega/starlark-checks-enable-spec` | Full enablement model and Linguist mapping |
+| 19 | `uhvesta/mono#21` | `abarzega/starlark-checks-enable-spec` | `abarzega/starlark-checks-package-activation-globs` | Package/version-set activation globs |
+| 20 | planned | `abarzega/starlark-checks-package-activation-globs` | `abarzega/starlark-checks-adapter-file-selectors` | Adapter `ext`/`name` selectors and uniqueness |
 
 ## Node Scopes
 
@@ -150,8 +157,8 @@ Scope:
 - Add Starlark package and version-set selection to `CHECKS.yaml`.
 - Support local path package directories and local `.tar.gz` package archives
   for iteration.
-- Keep package selection, path scoping, excludes, and check configuration in
-  consumer validation policy.
+- Keep package selection, activation areas, global excludes, and explicit
+  selectors in consumer validation policy.
 - Make version-set selection activate all checks from all included packages.
 
 Required verification:
@@ -226,3 +233,77 @@ Scope:
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 14: Git Package Resolver
+
+Scope:
+- Resolve `git://` package refs through archive bytes pinned by `sha256`.
+- Strip the repository `checkleft/` prefix into the same archive-root layout used by package tarballs.
+- Preserve local `path://` directory and archive iteration.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 15: Routing And Exact Package Selection
+
+Scope:
+- Clarify and enforce exact package selection keys: kind, source, version, and `sha256`.
+- Keep package/version-set resolution deterministic without a lockfile or transitive dependency solver.
+- Preserve duplicate-ref de-duplication only for exact equivalent refs.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 16: Selector Policy Cleanup
+
+Scope:
+- Remove configurable/embeddable Starlark package selectors from `CHECKS.yaml`.
+- Treat `checks:` entries for Starlark packages as selectors only.
+- Reject selector-local `config` for Starlark package checks.
+- Apply top-level global excludes before Starlark package scheduling.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 17: Bazel Author-Test Hardening
+
+Scope:
+- Add Bazel coverage for full text package authoring.
+- Exercise `checkleft test` all-test discovery, package archive construction, `fix.checkleft` inclusion, libs, nested paths, and path-based fixture semantics.
+- Keep custom-check author iteration through Bazel first-class.
+
+Required verification:
+- `bazel test //tools/checkleft:starlark_text_fixture_checkleft_all_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test`
+
+### Node 18: Enablement Model Spec And Linguist Mapping
+
+Scope:
+- Document the full Starlark enablement model across package selection, explicit selectors, activation areas, adapter selectors, global excludes, and `check_meta(applies_to)`.
+- Clarify Rust-embedded/bundled Starlark checks as Rust-wired package/check defaults rather than user-editable embedded config blobs.
+- Add `.gitattributes` so GitHub Linguist treats `*.checkleft` as Starlark.
+
+Required verification:
+- `bazel test //tools/checkleft:starlark_text_fixture_checkleft_all_test //tools/checkleft:starlark_text_fixture_package_archive_test`
+
+### Node 19: Package Activation Globs
+
+Scope:
+- Parse `include` and `exclude` on `checkleft_packages` package and version-set refs.
+- Normalize activation globs relative to the declaring `CHECKS.yaml` directory.
+- Apply activation globs when selecting packages and when building each Starlark check changeset.
+- Keep exact duplicate package refs separate when they activate different repo areas.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test`
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 20: Adapter File Selectors
+
+Scope:
+- Replace adapter parseable globs with explicit file selectors: `ext: <extension>` and `name: <basename>`.
+- Enforce selector uniqueness at adapter registry startup: two adapters cannot claim the same extension or basename.
+- Filter changed files through adapter selectors before adapter preparation.
+- Document and test examples: `ext: proto` matches `a.proto`; `name: module-info.json` matches `a/b/c/module-info.json`.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test`

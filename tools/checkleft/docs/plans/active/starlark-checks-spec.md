@@ -206,7 +206,7 @@ If `CHECKS.yaml` instead selects an external version set, all checks from every 
 
 - `package.toml` is producer metadata, not consumer validation policy.
 - Check source paths define reusable check IDs and same-package helper loading.
-- `CHECKS.yaml` decides what runs in a consumer repo, on which paths, with which config and policy.
+- `CHECKS.yaml` decides what packages/version sets run in a consumer repo and on which paths.
 - Version sets are curated bundles: selecting a version set activates all checks from all packages it includes.
 - The root package is not special — it is just the normal place for repo-wide local checks and policy.
 
@@ -332,41 +332,62 @@ checkleft_packages:
     - source: registry://checkleft-hub/acme-versionset
       version: "2025.06.1"
       sha256: "b3d1000000000000000000000000000000000000000000000000000000000000"
+      include:
+        - "api/**"
+        - "services/**"
 
   packages:
     - source: git://github.com/myteam/checkleft-checks.git
       version: "0.3.0"
       sha256: "9f200000000000000000000000000000000000000000000000000000000000"
+      include:
+        - "api/**/*.proto"
 
     - source: path://tools/checkleft-experiments/checkleft
       version: "0.0.0-local"
       mode: explicit
+      include:
+        - "tools/experiments/**"
 
 checks:
-  # Version sets activate all checks from their included packages.
-  # This entry narrows/configures one activated check for this repo.
-  - id: proto/evolution
-    include:
-      - "api/**/*.proto"
-    exclude:
-      - "api/generated/**"
-    config:
-      allow_reserved_field_removal: true
-
   # Local explicit packages do not auto-activate; opt in check-by-check.
   - id: local_experiments:text/no_debug
-    include:
-      - "**/*.txt"
 ```
 
 `checkleft_packages.version_sets` entries activate every check in every package listed by the selected version set. `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
 
-Path selection is two-stage:
+Package and version-set refs can declare activation areas:
 
-1. The check's `check_meta(applies_to = [...])` declares compatible files.
-2. `CHECKS.yaml` `include`/`exclude` narrows the effective file set for this repo.
+| Field     | Type        | Default | Meaning                                                                     |
+| --------- | ----------- | ------- | --------------------------------------------------------------------------- |
+| `include` | `list[str]` | `["**"]` | Repo-relative globs where checks from this package/version set are enabled. |
+| `exclude` | `list[str]` | `[]`    | Repo-relative globs removed from this package/version-set activation area.  |
 
-`CHECKS.yaml` remains the only place for consumer excludes, severity/bypass policy, and per-repo check config.
+These globs scope package activation only. They do not configure individual check behavior and they do not change the check ID, severity, bypass policy, or adapter.
+
+Path selection is structural:
+
+1. `checkleft_packages` selects packages and version sets.
+2. Package/version-set `include`/`exclude` fields define the repo areas where selected package checks are active.
+3. `mode: explicit` package entries use `checks: [{id: ...}]` as selectors for individual package check IDs.
+4. The adapter's file selectors define the file universe the adapter can parse.
+5. The check's `check_meta(applies_to = [...])` declares the semantic subset the check cares about.
+6. Top-level `CHECKS.yaml` `exclude` removes files globally before Starlark package checks are scheduled.
+
+Effective files for a Starlark package check are:
+
+```
+changed files
+∩ package/version-set include
+- package/version-set exclude
+- top-level CHECKS.yaml exclude
+∩ adapter file selectors
+∩ check_meta(applies_to)
+```
+
+The adapter is never selected by `CHECKS.yaml`. It comes from the check ID path: `checkleft/<adapter>/<name>/check.checkleft`. For example, `checkleft/text/no_debug/check.checkleft` always runs with the `text` adapter.
+
+`checks:` entries that select Starlark package checks are selectors only. They cannot set `config`, selector-local path filters, severity overrides, or bypass policy for the selected check. To narrow where package checks run, set `include`/`exclude` on the package or version-set ref. To change Starlark check behavior, publish a new package version or select a different package/version-set pin.
 
 ### 3.5 Resolution rules
 
@@ -376,7 +397,7 @@ Resolution is intentionally simple: there is no transitive dependency graph and 
 2. **Version sets are curated package bundles.** A version set package contains `[package]` metadata and `[includes.*]` entries. It does not define checks of its own and it cannot depend on another version set.
 3. **A version set's `sha256` covers the version-set package.** The package contains the exact ordered constituent `(source, version, sha256)` refs, so changing any included package changes the version-set package hash.
 4. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from selected packages or packages included by selected version sets.
-5. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
+5. **Duplicate package names are a hard error unless they are the same exact ref.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one. Exact duplicate refs are de-duplicated after explicit check selections are merged.
 6. **Version sets activate all checks from included packages.** Consumers control the selected version-set version; the version-set author controls the check set.
 7. **Individual packages can be activated in `all` or `explicit` mode.** Version sets are always `all`.
 
@@ -393,6 +414,31 @@ Initial guard behavior:
 
 This keeps the platform rule explicit: the guard is just another Starlark check supplied by org policy, not hidden behavior in package resolution.
 
+### 3.7 How a Starlark check becomes enabled
+
+A Starlark package check runs only when all activation layers agree:
+
+1. **Package selected:** `CHECKS.yaml` selects a package directly or selects a version set that includes it.
+2. **Check selected:** package mode is `all`, version-set mode is implicit `all`, or package mode is `explicit` and a selector in `checks:` names the check ID.
+3. **Area selected:** the changed file matches the package/version-set `include` globs and does not match its `exclude` globs.
+4. **Global policy allows it:** the changed file does not match a top-level global `exclude`.
+5. **Adapter can parse it:** the changed file matches the adapter's registered file selectors.
+6. **Check wants it:** the changed file matches `check_meta(applies_to = [...])`.
+
+This gives each layer one job:
+
+| Layer | Owns | Does not own |
+| ----- | ---- | ------------ |
+| Adapter | Parseable file universe and typed context shape | Consumer activation policy |
+| `check.checkleft` | Check ID path, semantic applicability, tier, check/fix code | Repo-specific enablement or package pinning |
+| `package.toml` | Producer identity, publishing metadata, version-set includes | Validation policy |
+| `CHECKS.yaml` | Package/version-set pins, activation areas, global excludes, explicit selectors | Embedded per-check config for Starlark package checks |
+| Rust embedded/bundled check registration | Built-in package/check defaults shipped with the binary | User-editable Starlark package internals |
+
+For example, a proto check with `check_meta(applies_to = ["api/**/*.proto"])` in a package enabled with `include = ["services/payments/**"]` runs only on changed files such as `services/payments/api/user.proto` that match both globs, after global excludes and the proto adapter's `ext: proto` selector are applied.
+
+Rust-embedded Starlark checks use the same model, but the "package selection" layer is supplied by Rust code that registers a bundled package/check set with fixed source bytes and Rust-owned defaults. Users can enable or disable those bundled checks through the normal built-in check mechanism, but they do not edit an embedded `CHECKS.yaml` config blob for the check. Changing embedded behavior is a Rust/code review change or a new bundled package version.
+
 ---
 
 ## 4. Check and fix entry points
@@ -401,7 +447,7 @@ This keeps the platform rule explicit: the guard is just another Starlark check 
 
 Every check file must:
 
-1. Call `check_meta()` at the top level to declare metadata (applies_to, tier, config schema).
+1. Call `check_meta()` at the top level to declare metadata (applies_to, tier).
 2. Define exactly one `check()` function with a typed signature. The parameter type depends on the **file format adapter** (see §6).
 
 ```python
@@ -412,9 +458,6 @@ load("//lib/proto_helpers", "is_reserved")
 check_meta(
     applies_to: list[str] = ["**/*.proto"],
     tier: str = "hermetic",
-    config: dict[str, typing.Any] = {
-        "extension_registries": ["proto/options.proto"],
-    },
 )
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -436,9 +479,10 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 
 | Field        | Type                    | Required | Default      | Description                                     |
 | ------------ | ----------------------- | -------- | ------------ | ----------------------------------------------- |
-| `applies_to` | `list[str]`             | yes      | —            | Glob patterns for files this check cares about. |
+| `applies_to` | `list[str]`             | yes      | —            | Semantic applicability globs for files this check cares about. Intersected with the adapter's selectors and package activation globs. |
 | `tier`       | `str`                   | no       | `"hermetic"` | Sandbox tier. See §5.                           |
-| `config`     | `dict[str, typing.Any]` | no       | `{}`         | Default config passed to `ctx.config`.          |
+
+`applies_to` does not select the adapter and it does not make an adapter parse arbitrary files. For example, a check under `checkleft/proto/` still receives only files the proto adapter can parse; `applies_to = ["**/*"]` means "all parseable proto files in the activated area," not every file in the repo.
 
 ### 4.2 `fix.checkleft` — the fix file
 
@@ -661,13 +705,16 @@ pub trait FormatAdapter: Send + Sync + 'static {
     /// Unique identifier matching the check category folder name.
     fn kind(&self) -> &str;
 
+    /// File selectors this adapter can parse. These selectors are global and must
+    /// not overlap with selectors owned by another registered adapter.
+    fn file_selectors(&self) -> &[AdapterFileSelector];
+
     /// Parse files at a given tree version into an opaque descriptor set.
     fn parse(
         &self,
         paths: &[PathBuf],
         tree: &dyn SourceTree,
         version: TreeVersion,
-        config: &toml::Value,
     ) -> Result<Box<dyn AdapterOutput>>;
 
     /// Compute structured deltas between base and current parsed outputs.
@@ -685,16 +732,38 @@ pub trait FormatAdapter: Send + Sync + 'static {
         base: &dyn AdapterOutput,
         current: &dyn AdapterOutput,
         deltas: &dyn AdapterOutput,
-        config: &toml::Value,
         changeset: &ChangeSet,
     ) -> Result<()>;
 
     /// Return the Starlark type name for the context parameter (e.g. "ProtoEvolutionContext").
     fn context_type_name(&self) -> &str;
 }
+
+pub enum AdapterFileSelector {
+    /// Matches any path whose final extension equals this value.
+    /// Example: `Ext("proto")` matches `api/user.proto`.
+    Ext(&'static str),
+    /// Matches any path whose basename equals this value.
+    /// Example: `Name("module-info.json")` matches `a/b/module-info.json`.
+    Name(&'static str),
+}
 ```
 
+Adapter file selectors are intentionally simpler than arbitrary globs:
+
+- `ext: proto` matches any repo path ending in `.proto`.
+- `name: module-info.json` matches any repo path whose filename is exactly `module-info.json`.
+- Two registered adapters cannot claim the same selector. Duplicate `ext` or duplicate `name` selectors are a startup error.
+- Extension and filename selectors are the adapter's parseable universe. `CHECKS.yaml` can narrow where selected packages run, and `check_meta(applies_to)` can narrow where a specific check is meaningful, but neither one can make an adapter parse a file outside its selectors.
+
 ### 6.2 Built-in adapters
+
+| Adapter       | File selectors                | Notes |
+| ------------- | ----------------------------- | ----- |
+| `text`        | `ext: txt`, `ext: md`, `ext: text` initially; may expand deliberately | Generic line/diff context. |
+| `proto`       | `ext: proto`                  | Parsed through the native descriptor provider, never direct `protoc`. |
+| `module_json` | `name: module-info.json`      | Specific module metadata schema, not arbitrary JSON. |
+| `java`        | `ext: java`                   | Tree-sitter Java API surface extraction. |
 
 #### `proto` — Protobuf evolution
 
@@ -702,9 +771,9 @@ Context type: `ProtoEvolutionContext`
 
 Rust side: asks the repository's descriptor provider/native proto path for source-info-rich `FileDescriptorSet` values at both base and current revisions. The adapter must not directly invoke `protoc`; descriptor generation belongs to the existing native descriptor integration. The resulting `FileDescriptorSet` is enriched with source location info (comments, line/column positions for every element). The Rust adapter parses these descriptor sets, diffs them into `SchemaDelta` values, and injects the typed models into Starlark. Starlark check authors receive a descriptor model that includes comments and source positions — not raw `.proto` text, but the full structured descriptor representation.
 
-Starlark surface: `ctx.deltas`, `ctx.files`, `ctx.config`, plus all the typed descriptor types (`FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, etc.) and enum constants (`DeltaKind`, `FieldKind`, `FieldLabel`, etc.) already documented in the proto-evolution branch. Source location info is available on descriptors via `.source_location` (line, column, leading/trailing comments).
+Starlark surface: `ctx.deltas`, `ctx.files`, plus all the typed descriptor types (`FileDescriptor`, `MessageDescriptor`, etc.) and enum constants (`DeltaKind`, `FieldKind`, `FieldLabel`, etc.) already documented in the proto-evolution branch. Source location info is available on descriptors via `.source_location` (line, column, leading/trailing comments).
 
-**Vendored extensions:** The proto adapter makes a set of well-known extension `.proto` files (e.g. org-wide custom options) available to the descriptor provider. Custom options defined in these vendored protos are resolved in every descriptor set automatically — no user configuration needed. Checks can inspect them via `msg.options.extensions`. If a check needs additional project-specific extensions beyond the vendored set, it can list them in `check_meta()` config via `extension_registries`.
+**Vendored extensions:** The proto adapter makes a set of well-known extension `.proto` files (e.g. org-wide custom options) available to the descriptor provider. Custom options defined in these vendored protos are resolved in every descriptor set automatically — no user configuration needed. Checks can inspect them via `msg.options.extensions`. If a check needs additional project-specific extensions beyond the vendored set, publish a distinct adapter/check package version with that behavior built in.
 
 #### `module_json` — `module.json` file evolution
 
@@ -718,7 +787,6 @@ Rust side: parses `module.json` files at both revisions into a typed `ModuleJson
 # Starlark surface
 ctx.files       # list[ModuleJsonFilePair]  — before/after parsed module.json
 ctx.deltas      # list[ModuleJsonDelta]     — structured changes
-ctx.config      # dict[str, typing.Any]
 
 # Types
 ModuleJsonFilePair.path: str
@@ -751,7 +819,6 @@ Rust side: parses `.java` files via tree-sitter-java (syntax-level, no compilati
 # Starlark surface
 ctx.files       # list[JavaFilePair]
 ctx.deltas      # list[JavaDelta]
-ctx.config      # dict[str, typing.Any]
 
 JavaFilePair.path: str
 JavaFilePair.before: JavaFile | None
@@ -796,7 +863,6 @@ The `text` adapter parses files into a structured line-level model on the Rust s
 
 ```python
 ctx.files           # list[TextFilePair]
-ctx.config          # dict[str, typing.Any]
 ctx.changeset       # ChangeSetInfo (metadata about the overall change)
 
 TextFilePair.path: str
@@ -834,24 +900,7 @@ Not everything belongs in Starlark. Performance-critical checks, checks requirin
 
 ### 7.1 How Rust checks coexist
 
-Rust checks implement the existing `Check` + `ConfiguredCheck` traits. They are registered in `CheckRegistry` as today. They produce the same `Finding` / `CheckResult` output types.
-
-A `check.checkleft` can delegate to a Rust implementation via `source` in `check_meta()`:
-
-```python
-# checkleft/proto/wire_compat_fast/check.checkleft
-# This is a thin shim — the real work happens in Rust.
-
-check_meta(
-    applies_to: list[str] = ["**/*.proto"],
-    tier: str = "hermetic",
-    source: str = "rust://protobuf-evolution",  # maps to a registered Check::id()
-)
-
-# No check() function needed — source delegates to Rust.
-```
-
-When `source` is present in `check_meta()`, the runner delegates to the named Rust check. The `check.checkleft` file still exists (for auto-discovery and metadata) but does not need a `check()` function.
+Rust checks implement the existing `Check` + `ConfiguredCheck` traits. They are registered in `CheckRegistry` as today. They produce the same `Finding` / `CheckResult` output types. They are enabled through the existing built-in check path, not by embedding a `rust://` delegation field in `check_meta()`.
 
 ### 7.2 Rust checks calling Starlark policies
 
@@ -933,14 +982,15 @@ starlark_check_package(
 3. Resolve packages and version sets selected by `CHECKS.yaml` (fetch and verify hashes as needed).
 4. Auto-discover checks from folder structure in each selected package.
 5. Scope local checks to their package subtree; consumed package checks run against their declared `applies_to` globs over the consumer repo.
+6. Apply package/version-set activation globs, global excludes, adapter file selectors, and `check_meta(applies_to)` before scheduling adapters.
 ```
 
 ### 9.2 Per-check execution
 
 ```
-1. Filter changeset by applies_to globs.
+1. Filter changeset by package activation globs, global excludes, adapter file selectors, and `check_meta(applies_to)` globs.
 2. If no matching files changed, skip (zero-cost).
-3. Determine adapter from check category (or explicit adapter= override).
+3. Determine adapter from the check ID path's top-level adapter folder.
 4. If Starlark check:
    a. Adapter.parse(base_files, tree, TreeVersion::Base)
    b. Adapter.parse(current_files, tree, TreeVersion::Current)
@@ -953,9 +1003,7 @@ starlark_check_package(
    i. If fix requested and fix.checkleft exists:
       - Evaluate fix(ctx, findings) -> list[FileEdit].
       - Apply edits via WritableSandbox.
-5. If Rust check (source: "rust://..."):
-   a. Delegate to Check::configure() + ConfiguredCheck::run() as today.
-6. Collect findings.
+5. Collect findings.
 ```
 
 ### 9.3 Concurrency
@@ -998,7 +1046,8 @@ The execution model is inherently functional: every `check(ctx)` is a pure funct
 │ Layer 3: File-level parallelism (within an adapter)              │
 │   Adapters that parse files independently (java via tree-sitter, │
 │   text) can parse individual files in parallel.                  │
-│   Proto is constrained: protoc needs the full import graph.      │
+│   Proto is constrained: descriptor generation needs the full     │
+│   import graph through the native descriptor provider.           │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1015,7 +1064,7 @@ All three layers compose. In the common case of N checks across M adapters, the 
    b. evaluate check(ctx) → list[Finding]
 ```
 
-Step 2 is the bottleneck (invoking protoc, running tree-sitter). Step 3 is pure Starlark evaluation — microseconds to low milliseconds per check for typical policy logic.
+Step 2 is the bottleneck (descriptor generation, tree-sitter parsing). Step 3 is pure Starlark evaluation — microseconds to low milliseconds per check for typical policy logic.
 
 ### 10.2 Adapter output sharing (parse once, check many)
 
@@ -1184,9 +1233,6 @@ load(":types", "field_not_reserved")
 check_meta(
     applies_to: list[str] = ["**/*.proto"],
     tier: str = "hermetic",
-    config: dict[str, typing.Any] = {
-        "extension_registries": ["proto/options.proto"],
-    },
 )
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -1322,14 +1368,10 @@ checkleft/
 check_meta(
     applies_to: list[str] = ["**/*.java"],
     tier: str = "hermetic",
-    config: dict[str, typing.Any] = {
-        "track_visibility": ["public", "protected"],
-    },
 )
 
 def check(ctx: JavaEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
-    tracked: list[str] = ctx.config.get("track_visibility", ["public"])
 
     for delta in ctx.deltas:
         if delta.kind == JavaDeltaKind.method_removed:
@@ -1806,10 +1848,6 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                             path = pair.path,
                         ))
 
-    # --- Accessing check config ---
-    severity_override: str = ctx.config.get("severity", "error")
-    ignored_packages: list[str] = ctx.config.get("ignored_packages", [])
-
     return findings
 ```
 
@@ -2092,8 +2130,6 @@ checkleft_packages:
 
 checks:
   - id: proto/evolution
-    include:
-      - "api/**/*.proto"
 ```
 
 ### 16.13 Network tier: checking field reservations against a remote service
@@ -2104,15 +2140,13 @@ checks:
 check_meta(
     applies_to: list[str] = ["**/*.proto"],
     tier: str = "network",
-    config: dict[str, typing.Any] = {
-        "reservation_service_url": "https://reservations.internal.acme.com",
-    },
 )
+
+RESERVATION_SERVICE_URL = "https://reservations.internal.acme.com"
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Verify that removed fields are reserved in the central reservation service."""
     findings: list[Finding] = []
-    base_url: str = ctx.config["reservation_service_url"]
 
     for delta in ctx.deltas:
         if delta.kind != DeltaKind.field_removed:
@@ -2120,7 +2154,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 
         # Ask the reservation service if this field number is reserved
         resp: HttpResponse = http_get(
-            "{}/api/reserved/{}/{}".format(base_url, delta.symbol, delta.before_number),
+            "{}/api/reserved/{}/{}".format(RESERVATION_SERVICE_URL, delta.symbol, delta.before_number),
             timeout_ms = 5000,
         )
 
@@ -2135,7 +2169,9 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                     delta.symbol, delta.before_number,
                 ),
                 path = delta.path,
-                remediation = "Register the field reservation at {}/reserve before removing it.".format(base_url),
+                remediation = "Register the field reservation at {}/reserve before removing it.".format(
+                    RESERVATION_SERVICE_URL,
+                ),
             ))
         else:
             findings.append(fail(
@@ -2201,7 +2237,8 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Package manifest    | `checkleft/package.toml`                                                                             |
 | Package integrity   | Exact `source`/`version`/`sha256` refs in `CHECKS.yaml` and version-set includes; no `PACKAGE.lock`  |
 | Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`)                                                          |
+| Activation areas    | Package/version-set `include`/`exclude` in `CHECKS.yaml`, not per-check config blobs                 |
+| File eligibility    | Changed file ∩ activation area ∩ adapter `ext`/`name` selectors ∩ `check_meta(applies_to)`           |
 | Type annotations    | Required on all function signatures                                                                  |
 | Default sandbox     | `hermetic`                                                                                           |
-| Adapter linkage     | `<adapter>` top-level folder name matches `FormatAdapter::kind()`                                    |
-| Rust check override | `source: "rust://..."` in `check_meta()`                                                             |
+| Adapter linkage     | `<adapter>` top-level folder name matches `FormatAdapter::kind()`; adapters claim unique `ext`/`name` selectors |
