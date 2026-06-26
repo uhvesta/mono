@@ -12,10 +12,47 @@
 3. Sandbox tiers declared in `check_meta()` — hermetic by default, opt-in network access.
 4. Versioned check distribution — pull in third-party or org-published check packages at pinned versions.
 5. Optional **fix** functions co-located with checks.
-6. Bidirectional: checks can be authored in Starlark _or_ Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
+6. Rust provides adapters and built-in checks, but the Starlark package API stays one path: `check.checkleft` policy over typed adapter contexts.
 7. Hierarchical: repos can define checks at the root; sub-projects can layer on their own.
 8. Maximal Starlark typing via `DialectTypes::Enable` — all function signatures, parameters, and return types must carry type annotations.
 9. People can pull in an assortment of versions (basically a full bundle/version set similar to Brazil from Amazon)
+
+---
+
+### 1.1 Public API in one page
+
+The v1 public API has four concepts. Each concept has one job.
+
+| Concept | File or code | Owns | Does not own |
+| ------- | ------------ | ---- | ------------ |
+| Package identity | `checkleft/package.toml` | Package name, version, publish metadata, version-set includes | What runs in a consumer repo |
+| Check implementation | `checkleft/<adapter>/<name>/check.checkleft` plus optional `fix.checkleft` and `lib/` | Check ID, Starlark policy, fix code, helper code | Repo-specific activation, package pins, adapter choice overrides |
+| Consumer activation | `CHECKS.yaml` | Package/version-set refs, exact versions, hashes, activation `include`/`exclude`, explicit selectors | Per-check Starlark config, adapter choice, package internals |
+| Adapter registration | Rust `FormatAdapter` | Typed context shape and unique file selectors such as `ext: proto` or `name: module-info.json` | Consumer policy or check behavior |
+
+The activation formula is the complete scheduling contract:
+
+```
+changed files
+∩ package/version-set include
+- package/version-set exclude
+- top-level CHECKS.yaml exclude
+∩ adapter file selectors
+∩ check_meta(applies_to)
+```
+
+Everything else is intentionally not in v1:
+
+- no `public` / `private` check visibility
+- no per-check Starlark `config` in `CHECKS.yaml`
+- no adapter override in `CHECKS.yaml`
+- no package dependencies for check packages
+- no transitive dependency solver
+- no `PACKAGE.lock`
+- no consumer imports from another package's `lib/`
+- no `rust://` delegation from `check_meta()`
+
+Version sets are the only bundle mechanism. Selecting a version set opts into all checks from all packages it pins. If an organization wants to prevent downgrades or removals, it ships a normal Starlark policy guard check for `CHECKS.yaml`.
 
 ---
 
@@ -60,8 +97,9 @@ This folder structure is **intentionally opinionated**. There is exactly one way
 
 - **Which adapter?** → look at the first-level folder (`proto/`, `module_json/`, etc.)
 - **Which check?** → look at the remaining path under the adapter folder
-- **What files does it run on?** → read `check_meta()` in `check.checkleft`
-- **Which files does this repo choose to validate?** → read `CHECKS.yaml`
+- **What files can the adapter parse?** → read the adapter's registered `ext` / `name` selectors
+- **What files is the check meaningful for?** → read `check_meta(applies_to = ...)` in `check.checkleft`
+- **Which repo areas enable this package?** → read package/version-set `include` / `exclude` in `CHECKS.yaml`
 - **Where are shared helpers?** → `lib/`
 - **Where are external package/version-set pins?** → `CHECKS.yaml`
 
@@ -147,7 +185,7 @@ If `a/b/c/foo.proto` and `a/b/c/d/e/f/bar.proto` are both changed:
 
 Both proto files get **all** applicable checks run on them. A nested `checkleft/` adds checks for its subtree — it does not remove or replace ancestor checks. Root-level checks always apply repo-wide.
 
-Nested packages can `load()` from ancestor `checkleft/lib/` directories (resolved upward), but not from sibling or child packages.
+Nested packages can `load()` from their own `checkleft/lib/` directory and check-local helpers. They cannot import from ancestor, sibling, child, or external package `lib/` directories.
 
 ### 2.5 Producer/consumer model
 
@@ -432,12 +470,9 @@ This gives each layer one job:
 | Adapter | Parseable file universe and typed context shape | Consumer activation policy |
 | `check.checkleft` | Check ID path, semantic applicability, tier, check/fix code | Repo-specific enablement or package pinning |
 | `package.toml` | Producer identity, publishing metadata, version-set includes | Validation policy |
-| `CHECKS.yaml` | Package/version-set pins, activation areas, global excludes, explicit selectors | Embedded per-check config for Starlark package checks |
-| Rust embedded/bundled check registration | Built-in package/check defaults shipped with the binary | User-editable Starlark package internals |
+| `CHECKS.yaml` | Package/version-set pins, activation areas, global excludes, explicit selectors | Starlark check behavior |
 
 For example, a proto check with `check_meta(applies_to = ["api/**/*.proto"])` in a package enabled with `include = ["services/payments/**"]` runs only on changed files such as `services/payments/api/user.proto` that match both globs, after global excludes and the proto adapter's `ext: proto` selector are applied.
-
-Rust-embedded Starlark checks use the same model, but the "package selection" layer is supplied by Rust code that registers a bundled package/check set with fixed source bytes and Rust-owned defaults. Users can enable or disable those bundled checks through the normal built-in check mechanism, but they do not edit an embedded `CHECKS.yaml` config blob for the check. Changing embedded behavior is a Rust/code review change or a new bundled package version.
 
 ---
 
@@ -894,19 +929,17 @@ The adapter's `kind()` return value must match the top-level `<adapter>` folder 
 
 ---
 
-## 7. Rust-native checks (bidirectional support)
+## 7. Rust-native checks and Starlark adapters
 
 Not everything belongs in Starlark. Performance-critical checks, checks requiring complex binary parsing, or checks that need direct access to the Rust async runtime should remain in Rust.
 
-### 7.1 How Rust checks coexist
+### 7.1 Rust checks are separate from Starlark packages
 
 Rust checks implement the existing `Check` + `ConfiguredCheck` traits. They are registered in `CheckRegistry` as today. They produce the same `Finding` / `CheckResult` output types. They are enabled through the existing built-in check path, not by embedding a `rust://` delegation field in `check_meta()`.
 
-### 7.2 Rust checks calling Starlark policies
+### 7.2 Rust adapters feed Starlark policies
 
-A Rust check can **delegate policy decisions** to user-supplied Starlark, exactly as the proto-evolution branch does today. The Rust side does heavy parsing/diffing; the Starlark side decides what constitutes a violation.
-
-This is the recommended pattern for format adapters: the Rust adapter does parsing, the Starlark check does policy.
+The Starlark package API uses Rust through adapters. The Rust adapter parses and diffs a file type, then injects a typed context into Starlark. The Starlark check decides policy over that context. This is the only v1 Rust/Starlark bridge for package checks.
 
 ### 7.3 Decision framework
 
@@ -1096,8 +1129,8 @@ Before invoking any adapter, each check's `applies_to` globs are intersected wit
 
 - **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`. Configurable via `--parallelism=N`.
 - **Memory:** Each Starlark `Module` heap is independent. Peak memory is proportional to `(max concurrent checks) × (largest adapter output shared via Arc) + (per-check heap)`. The `Arc`-shared adapter output is the dominant term but is allocated once per adapter, not per check.
-- **Starlark evaluation timeout:** Each check has a wall-clock timeout (default: 30s, configurable via `check_meta(timeout_ms = ...)`). Runaway checks are killed and reported as failures. This prevents a single pathological check from blocking the entire pipeline.
-- **Adapter parse timeout:** Adapter `parse()` calls have their own timeout (default: 60s). Protoc invocations on large proto graphs are the primary concern here.
+- **Starlark evaluation timeout:** Each check has a runner-enforced wall-clock timeout. Runaway checks are killed and reported as failures. This prevents a single pathological check from blocking the entire pipeline.
+- **Adapter parse timeout:** Adapter `parse()` calls have their own timeout. Large descriptor graphs are the primary concern here.
 
 ---
 
@@ -1472,7 +1505,6 @@ path = "api/v1/user.proto"
 | `findings[].message_eq`       | `str`  | no       | Exact message match (alternative to `message_contains`).    |
 | `findings[].path`             | `str`  | yes      | File path the finding should be on.                         |
 | `findings[].line`             | `int`  | no       | Expected line number.                                       |
-| `config`                      | `dict` | no       | Override `check_meta()` config for this test case.          |
 
 ### 13.4 Fix testing
 
@@ -2127,9 +2159,8 @@ checkleft_packages:
       version: "0.3.0"
       sha256: "9f200000000000000000000000000000000000000000000000000000000000"
       mode: all
-
-checks:
-  - id: proto/evolution
+      include:
+        - "api/**/*.proto"
 ```
 
 ### 16.13 Network tier: checking field reservations against a remote service
