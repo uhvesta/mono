@@ -279,7 +279,7 @@ Required verification:
 
 Scope:
 - Document the full Starlark enablement model across package selection, explicit selectors, activation areas, adapter selectors, global excludes, and `check_meta(applies_to)`.
-- Clarify Rust-embedded/bundled Starlark checks as Rust-wired package/check defaults rather than user-editable embedded config blobs.
+- Clarify the v1 public API as four concepts: package identity, check implementation, consumer activation, and adapter registration.
 - Add `.gitattributes` so GitHub Linguist treats `*.checkleft` as Starlark.
 
 Required verification:
