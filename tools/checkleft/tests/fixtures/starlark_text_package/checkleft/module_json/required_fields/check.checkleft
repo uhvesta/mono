@@ -1,22 +1,22 @@
-check_meta(applies_to = ["**/module.json"])
+check_meta(applies_to = ["**/module-info.json"])
 
 def check(ctx):
     findings = []
     for pair in ctx.files:
         if pair.after == None:
             findings.append(fail(
-                message = "module.json was deleted",
+                message = "module-info.json was deleted",
                 path = pair.path,
             ))
             continue
         if pair.after.name == "":
             findings.append(fail(
-                message = "module.json 'name' must not be empty",
+                message = "module-info.json 'name' must not be empty",
                 path = pair.path,
             ))
         if pair.after.version == "":
             findings.append(fail(
-                message = "module.json 'version' must not be empty",
+                message = "module-info.json 'version' must not be empty",
                 path = pair.path,
             ))
     for delta in ctx.deltas:
