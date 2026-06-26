@@ -1635,6 +1635,8 @@ impl Runner {
                     }
                     for (check, _) in &mut package_checks {
                         check.scope_root = selection.package.config_dir.clone();
+                        check.activation_include_patterns = selection.package.include_patterns.clone();
+                        check.activation_exclude_patterns = selection.package.exclude_patterns.clone();
                     }
                     checks.append(&mut package_checks);
                 }
@@ -1648,8 +1650,12 @@ impl Runner {
                 ),
             }
         }
-        checks.sort_by(|(left, _), (right, _)| left.check_path.cmp(&right.check_path));
-        checks.dedup_by(|(left, _), (right, _)| left.check_path == right.check_path);
+        checks.sort_by(|(left, _), (right, _)| {
+            starlark_discovered_check_key(left).cmp(&starlark_discovered_check_key(right))
+        });
+        checks.dedup_by(|(left, _), (right, _)| {
+            starlark_discovered_check_key(left) == starlark_discovered_check_key(right)
+        });
         Ok(checks)
     }
 
@@ -1664,6 +1670,9 @@ impl Runner {
                 .map(|check| check.id.clone())
                 .collect::<BTreeSet<_>>();
             for package in resolved.starlark_packages() {
+                if !starlark_package_applies_to_path(package, &changed_file.path) {
+                    continue;
+                }
                 packages
                     .entry(starlark_package_selection_key(package))
                     .and_modify(|selection| {
@@ -2028,12 +2037,30 @@ fn toml_value_is_empty_table(value: &toml::Value) -> bool {
 
 fn starlark_package_selection_key(package: &StarlarkPackageConfig) -> String {
     format!(
-        "{:?}\0{}\0{}\0{}",
+        "{:?}\0{}\0{}\0{}\0{}\0{}\0{}",
         package.kind,
         package.source,
         package.version,
-        package.sha256.as_deref().unwrap_or("")
+        package.sha256.as_deref().unwrap_or(""),
+        package.config_dir.display(),
+        package.include_patterns.join("\0"),
+        package.exclude_patterns.join("\0")
     )
+}
+
+fn starlark_discovered_check_key(check: &DiscoveredCheck) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}",
+        check.check_path.display(),
+        check.scope_root.display(),
+        check.id,
+        check.activation_include_patterns.join("\0"),
+        check.activation_exclude_patterns.join("\0")
+    )
+}
+
+fn starlark_package_applies_to_path(package: &StarlarkPackageConfig, path: &Path) -> bool {
+    activation_globs_match_path(&package.include_patterns, &package.exclude_patterns, path).unwrap_or(false)
 }
 
 fn record_selected_package_ref(
@@ -2246,12 +2273,15 @@ fn git_archive_checkleft(git_source: &str, version: &str) -> Result<Vec<u8>> {
 
 fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) -> Result<ChangeSet> {
     let applies_to = build_glob_set(&check.check_meta.applies_to)?;
+    let activation_include = build_glob_set(&check.activation_include_patterns)?;
+    let activation_exclude = build_glob_set(&check.activation_exclude_patterns)?;
     let package_scope = &check.scope_root;
     let changed_files = changeset
         .changed_files
         .iter()
         .filter(|changed| !matches!(changed.kind, ChangeKind::Deleted))
         .filter(|changed| path_in_scope(&changed.path, &package_scope))
+        .filter(|changed| activation_glob_sets_match_path(&activation_include, &activation_exclude, &changed.path))
         .filter(|changed| starlark_applies_to_path(&applies_to, &changed.path, &package_scope))
         .cloned()
         .collect::<Vec<_>>();
@@ -2308,6 +2338,16 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
         builder.add(Glob::new(pattern)?);
     }
     Ok(builder.build()?)
+}
+
+fn activation_globs_match_path(include_patterns: &[String], exclude_patterns: &[String], path: &Path) -> Result<bool> {
+    let include = build_glob_set(include_patterns)?;
+    let exclude = build_glob_set(exclude_patterns)?;
+    Ok(activation_glob_sets_match_path(&include, &exclude, path))
+}
+
+fn activation_glob_sets_match_path(include: &GlobSet, exclude: &GlobSet, path: &Path) -> bool {
+    include.is_match(path) && !exclude.is_match(path)
 }
 
 fn path_in_scope(path: &Path, scope: &Path) -> bool {
