@@ -904,6 +904,108 @@ checkleft_packages:
 }
 
 #[tokio::test]
+async fn runner_rejects_duplicate_package_source_with_different_hash() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("packages")).expect("create packages dir");
+    let archive = starlark_package_archive();
+    let archive_sha256 = sha256_hex_for_test(&archive);
+    fs::write(temp.path().join("packages/checks.tar.gz"), archive).expect("write archive");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+checkleft_packages:
+  packages:
+    - source: path://packages/checks.tar.gz
+      version: 0.1.0
+      sha256: {archive_sha256}
+      mode: all
+    - source: path://packages/checks.tar.gz
+      version: 0.1.0
+      sha256: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+      mode: all
+"#
+        ),
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "starlark-package"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("sha256 mismatch"))
+        }),
+        "expected duplicate source hash diagnostic, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_deduplicates_exact_duplicate_starlark_package_refs() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("packages")).expect("create packages dir");
+    let archive = starlark_package_archive();
+    let archive_sha256 = sha256_hex_for_test(&archive);
+    fs::write(temp.path().join("packages/checks.tar.gz"), archive).expect("write archive");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+checkleft_packages:
+  packages:
+    - source: path://packages/checks.tar.gz
+      version: 0.1.0
+      sha256: {archive_sha256}
+      mode: all
+    - source: path://packages/checks.tar.gz
+      version: 0.1.0
+      sha256: {archive_sha256}
+      mode: all
+"#
+        ),
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let matching = results
+        .iter()
+        .filter(|result| result.check_id == "text/no_debug")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "expected one text/no_debug result, got {results:?}");
+    assert_eq!(matching[0].findings.len(), 1);
+}
+
+#[tokio::test]
 async fn runner_executes_only_explicitly_selected_starlark_package_checks() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create first check dirs");
