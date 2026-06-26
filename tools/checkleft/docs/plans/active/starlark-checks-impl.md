@@ -53,7 +53,7 @@ src/
 │   ├── sandbox.rs                     # Tier-based Globals construction (hermetic vs network)
 │   └── adapter/                       # Format adapter infrastructure
 │       ├── mod.rs                     # FormatAdapter trait + AdapterRegistry
-│       ├── proto.rs                   # Proto adapter (protoc → descriptor set → Starlark values)
+│       ├── proto.rs                   # Proto adapter (native descriptors → Starlark values)
 │       ├── module_json.rs             # module.json adapter
 │       ├── java.rs                    # Java adapter (tree-sitter-java → API surface model)
 │       └── text.rs                    # Text adapter (line model)
@@ -76,9 +76,9 @@ This is a new top-level module under `src/`. It does **not** live inside `extern
 | `starlark/mod.rs` | Module root. Expose `StarlarkCheckRunner`. |
 | `starlark/types.rs` | `#[derive(StarlarkValue)]` impls for `Finding`, `Severity`, `FileEdit`, `Location`. The `finding()` and `fail()` / `fail_but_overridable()` constructor functions as Starlark globals. |
 | `starlark/sandbox.rs` | Build a `GlobalsBuilder` for the hermetic tier: inject `finding`, `fail`, `fail_but_overridable`, `Severity`, `DeltaKind`, `regex_match`, `regex_find_all`, `glob_match`, `print`. |
-| `starlark/check_meta.rs` | `check_meta()` as a Starlark built-in. Parses and stores `applies_to`, `tier`, `config` from the top-level call. |
+| `starlark/check_meta.rs` | `check_meta()` as a Starlark built-in. Parses and stores `applies_to` and `tier` from the top-level call. |
 | `starlark/evaluator.rs` | Load a `.checkleft` file into a `Module`, configure `Dialect { enable_types: DialectTypes::Enable }`, attach globals, evaluate, call `check(ctx)`, collect `Vec<Finding>`. |
-| `starlark/adapter/mod.rs` | `FormatAdapter` trait definition (as per spec §6.1). `AdapterRegistry` for registration. |
+| `starlark/adapter/mod.rs` | `FormatAdapter` trait definition (as per spec §6.1). `AdapterRegistry` for registration, including adapter `ext`/`name` file selector uniqueness. |
 | `starlark/adapter/text.rs` | `TextAdapter` — parse files into `TextFilePair` / `TextFile` / `Line` Starlark values. Simplest adapter, good for proving the pipeline. |
 
 **Key Rust crate:** [`starlark`](https://crates.io/crates/starlark) (Facebook's Starlark implementation). Add to `Cargo.toml`:
@@ -114,7 +114,7 @@ starlark = { version = "0.12", features = ["typing"] }
 
 #### Proto adapter (`starlark/adapter/proto.rs`)
 
-- Use the existing descriptor/proto crate path for descriptor generation/parsing; do not directly invoke `protoc` from the adapter.
+- Use the existing descriptor/proto crate path for descriptor generation/parsing; the adapter must not directly invoke the proto compiler.
 - Parse `FileDescriptorSet` through the repository's native descriptor representation.
 - Build `#[derive(StarlarkValue)]` types: `ProtoEvolutionContext`, `FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, `SchemaDelta`, etc.
 - Diff logic: compare base and current descriptor sets → produce `Vec<SchemaDelta>` with `DeltaKind` variants
@@ -167,7 +167,7 @@ starlark/adapter/proto/
 
 | File | What it does |
 |---|---|
-| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, activation mode, and per-check include narrowing. |
+| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, activation mode, and package/version-set `include`/`exclude` activation globs. Starlark package `checks:` entries are selectors only. |
 | `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity, publishing metadata, and version-set `[includes]`. |
 | `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
 | `starlark/package.rs` | Expand selected version sets to their exact package refs. Version sets activate all checks from all included packages. Individual packages support `all` or `explicit` activation. |
@@ -223,6 +223,27 @@ This is a runner-level concern, not an adapter concern. Implement in `starlark/m
 
 ---
 
+## Adapter file selectors
+
+Adapters declare the file names they can parse with structural selectors, not arbitrary globs:
+
+```rust
+pub enum AdapterFileSelector {
+    Ext(&'static str),
+    Name(&'static str),
+}
+```
+
+Implementation requirements:
+
+- Add `fn file_selectors(&self) -> &[AdapterFileSelector]` to `FormatAdapter`.
+- During `AdapterRegistry` construction, build a uniqueness map for every `Ext` and `Name` selector and fail startup if two adapters claim the same selector.
+- Before adapter preparation, filter the check changeset by the selected adapter's selectors.
+- Keep `check_meta(applies_to)` as a semantic narrowing step after selector matching.
+- Built-in selector assignments are: `proto -> ext: proto`, `module_json -> name: module-info.json`, `java -> ext: java`, and `text -> explicit text-like extensions only`.
+
+---
+
 ## Type mapping: spec → Rust
 
 | Spec type | Rust representation |
@@ -232,7 +253,7 @@ This is a runner-level concern, not an adapter concern. Implement in `starlark/m
 | `Severity.fail_but_overridable` | Maps to `crate::output::Severity::Warning` |
 | `FileEdit` | `#[derive(StarlarkValue)]` wrapper around `crate::fix::FileEdit` |
 | `fix_data` | `OwnedFrozenValue` — opaque Starlark value, passed through from check to fix |
-| `check_meta()` | Parsed into `CheckMeta { applies_to, tier, config, source }` at module load time |
+| `check_meta()` | Parsed into `CheckMeta { applies_to, tier }` at module load time |
 | `struct(...)` (user-defined) | Native Starlark `Struct` — no special Rust type needed |
 | `load("//lib/foo", "bar")` | Custom `FileLoader` impl resolving to `.checkleft` files |
 
@@ -272,8 +293,15 @@ Next nodes:
 3. Node 8: package tarball and Bazel packaging target for check authors.
 4. Node 9: self-hosted Starlark guard check for `CHECKS.yaml` policy integrity.
 5. Node 10: Starlark fix support.
-6. Node 11: proto adapter. This is the highest-priority non-text adapter; use the existing descriptor/proto/native C++ path and do not directly invoke `protoc`.
+6. Node 11: proto adapter. This is the highest-priority non-text adapter; use the existing descriptor/proto/native C++ path and do not directly invoke the proto compiler from the adapter.
 7. Node 12: module_json adapter.
 8. Node 13: Java adapter.
+9. Node 14: git package resolver.
+10. Node 15: routing and exact package selection.
+11. Node 16: selector policy cleanup; Starlark package selectors cannot carry config.
+12. Node 17: Bazel author-test hardening.
+13. Node 18: full enablement model spec and `.checkleft` Linguist mapping.
+14. Node 19: package/version-set activation globs.
+15. Node 20: adapter `ext`/`name` file selectors and uniqueness enforcement.
 
 Each node must compile and pass its focused Bazel validation before pushing. Text remains the full lifecycle proof path; proto is the first non-text adapter because it is the highest product priority.
