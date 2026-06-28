@@ -1,0 +1,26 @@
+check_meta(applies_to = ["**/*.java"])
+
+def _has_since(annotations):
+    for annotation in annotations:
+        if annotation.name == "Since":
+            return True
+    return False
+
+def check(ctx):
+    findings = []
+    for pair in ctx.files:
+        if pair.after == None:
+            continue
+        for cls in pair.after.classes:
+            if cls.visibility == "public" and not _has_since(cls.annotations):
+                findings.append(fail_but_overridable(
+                    message = "public class " + cls.full_name + " lacks @Since annotation",
+                    path = pair.path,
+                ))
+    for delta in ctx.deltas:
+        if delta.kind == "method_removed":
+            findings.append(fail(
+                message = "public method removed: " + delta.symbol,
+                path = delta.path,
+            ))
+    return findings
