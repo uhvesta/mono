@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use sha2::{Digest, Sha256};
+use tar::{Builder, Header};
 use tempfile::tempdir;
 
 use crate::check::{Check, CheckRegistry, ConfiguredCheck};
@@ -403,6 +408,662 @@ def message_for(kind):
             line: Some(3),
             column: Some(1),
         })
+    );
+}
+
+#[tokio::test]
+async fn runner_executes_starlark_text_check_selected_by_checks_yaml_package() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://central/checkleft
+      version: 0.1.0
+      mode: all
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if "debug" in line.text:
+                findings.append(fail(
+                    message = "debug text added",
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_debug")
+        .expect("starlark result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "debug text added");
+}
+
+#[tokio::test]
+async fn runner_executes_starlark_text_check_from_local_package_archive() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("packages")).expect("create packages dir");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    let archive = starlark_package_archive();
+    let archive_sha256 = sha256_hex_for_test(&archive);
+    fs::write(temp.path().join("packages/checks.tar.gz"), archive).expect("write archive");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+checkleft_packages:
+  packages:
+    - source: path://packages/checks.tar.gz
+      version: 0.1.0
+      sha256: {archive_sha256}
+      mode: all
+"#
+        ),
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_debug")
+        .expect("archive-backed starlark result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "debug text added from archive");
+}
+
+#[tokio::test]
+async fn runner_rejects_local_package_archive_hash_mismatch() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("packages")).expect("create packages dir");
+    let archive = starlark_package_archive();
+    fs::write(temp.path().join("packages/checks.tar.gz"), archive).expect("write archive");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://packages/checks.tar.gz
+      version: 0.1.0
+      sha256: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+      mode: all
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "starlark-package"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("sha256 mismatch"))
+        }),
+        "expected archive hash diagnostic, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_executes_only_explicitly_selected_starlark_package_checks() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create first check dirs");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_todo")).expect("create second check dirs");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://central/checkleft
+      version: 0.1.0
+      mode: explicit
+
+checks:
+  - id: text/no_debug
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return [fail(
+        message = "debug text added",
+        path = ctx.files[0].path,
+        line = 1,
+        column = 1,
+    )]
+"#,
+    )
+    .expect("write selected check");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_todo/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return [fail(
+        message = "todo text added",
+        path = ctx.files[0].path,
+        line = 1,
+        column = 1,
+    )]
+"#,
+    )
+    .expect("write unselected check");
+    fs::write(temp.path().join("notes/example.txt"), "debug TODO\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| result.check_id == "text/no_debug"),
+        "selected Starlark check should run: {results:?}"
+    );
+    assert!(
+        results.iter().all(|result| result.check_id != "text/no_todo"),
+        "unselected Starlark check should not run: {results:?}"
+    );
+    assert!(
+        results.iter().all(|result| !result
+            .findings
+            .iter()
+            .any(|finding| finding.message.contains("unknown implementation"))),
+        "explicit Starlark selection must not also produce built-in missing diagnostics: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_executes_starlark_text_check_selected_by_local_version_set() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("baseline")).expect("create version set dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  version_sets:
+    - source: path://baseline
+      version: 2026.06.1
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("baseline/package.toml"),
+        r#"
+[package]
+name = "local/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.central]
+source = "path://central/checkleft"
+version = "0.1.0"
+"#,
+    )
+    .expect("write version set manifest");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return [fail(
+        message = "debug text added",
+        path = ctx.files[0].path,
+        line = 1,
+        column = 1,
+    )]
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("notes/example.txt"), "debug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_debug")
+        .expect("starlark result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "debug text added");
+}
+
+#[tokio::test]
+async fn runner_executes_starlark_text_check_selected_by_local_version_set_archive() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("packages")).expect("create packages dir");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+
+    let package_archive = starlark_package_archive();
+    let package_sha256 = sha256_hex_for_test(&package_archive);
+    fs::write(temp.path().join("packages/checks.tar.gz"), package_archive).expect("write package archive");
+    let version_set_archive = starlark_version_set_archive(&package_sha256);
+    let version_set_sha256 = sha256_hex_for_test(&version_set_archive);
+    fs::write(temp.path().join("packages/baseline.tar.gz"), version_set_archive).expect("write version-set archive");
+
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+checkleft_packages:
+  version_sets:
+    - source: path://packages/baseline.tar.gz
+      version: 2026.06.1
+      sha256: {version_set_sha256}
+"#
+        ),
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(temp.path().join("notes/example.txt"), "hello\ndebug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_debug")
+        .expect("archive-backed version-set starlark result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "debug text added from archive");
+}
+
+#[tokio::test]
+async fn runner_rejects_version_set_selected_as_package() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("baseline")).expect("create version set dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://baseline
+      version: 2026.06.1
+      mode: all
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("baseline/package.toml"),
+        r#"
+[package]
+name = "local/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.central]
+source = "path://central/checkleft"
+version = "0.1.0"
+"#,
+    )
+    .expect("write version set manifest");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "starlark-package"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("kind is not `check_package`"))
+        }),
+        "expected package-kind diagnostic, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_rejects_version_set_include_that_is_another_version_set() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("baseline")).expect("create baseline dir");
+    fs::create_dir_all(temp.path().join("nested")).expect("create nested dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  version_sets:
+    - source: path://baseline
+      version: 2026.06.1
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("baseline/package.toml"),
+        r#"
+[package]
+name = "local/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.nested]
+source = "path://nested"
+version = "2026.06.1"
+"#,
+    )
+    .expect("write baseline manifest");
+    fs::write(
+        temp.path().join("nested/package.toml"),
+        r#"
+[package]
+name = "local/nested"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.central]
+source = "path://central/checkleft"
+version = "0.1.0"
+"#,
+    )
+    .expect("write nested manifest");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "starlark-package"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("included package kind is not `check_package`"))
+        }),
+        "expected version-set include diagnostic, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_rejects_conflicting_selected_package_refs_with_same_name() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("baseline")).expect("create baseline dir");
+    fs::create_dir_all(temp.path().join("central_a/checkleft/text/no_debug")).expect("create first package");
+    fs::create_dir_all(temp.path().join("central_b/checkleft/text/no_debug")).expect("create second package");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://central_a/checkleft
+      version: 0.1.0
+      mode: all
+  version_sets:
+    - source: path://baseline
+      version: 2026.06.1
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("baseline/package.toml"),
+        r#"
+[package]
+name = "local/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.central_b]
+source = "path://central_b/checkleft"
+version = "0.2.0"
+"#,
+    )
+    .expect("write baseline manifest");
+    for (root, version) in [("central_a/checkleft", "0.1.0"), ("central_b/checkleft", "0.2.0")] {
+        fs::write(
+            temp.path().join(root).join("package.toml"),
+            format!(
+                r#"
+[package]
+name = "local/checks"
+version = "{version}"
+"#
+            ),
+        )
+        .expect("write package manifest");
+        fs::write(
+            temp.path().join(root).join("text/no_debug/check.checkleft"),
+            r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return []
+"#,
+        )
+        .expect("write check");
+    }
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "starlark-package"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("resolves to conflicting refs"))
+        }),
+        "expected duplicate package diagnostic, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_rejects_selected_package_version_mismatch() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create package");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://central/checkleft
+      version: 0.2.0
+      mode: all
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return []
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "starlark-package"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("does not match selected version"))
+        }),
+        "expected version mismatch diagnostic, got {results:?}"
     );
 }
 
@@ -1674,4 +2335,98 @@ fn apply_suggested_fixes_is_idempotent_when_old_text_absent() {
         b"goodbye world",
         "file content unchanged"
     );
+}
+
+fn starlark_package_archive() -> Vec<u8> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    append_archive_file(
+        &mut builder,
+        "package.toml",
+        r#"
+[package]
+name = "local/archive-checks"
+version = "0.1.0"
+"#,
+    );
+    append_archive_file(
+        &mut builder,
+        "lib/messages.checkleft",
+        r#"
+def debug_message() -> str:
+    return "debug text added from archive"
+"#,
+    );
+    append_archive_file(
+        &mut builder,
+        "text/no_debug/check.checkleft",
+        r#"
+load("//lib/messages", "debug_message")
+
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if "debug" in line.text:
+                findings.append(fail(
+                    message = debug_message(),
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings
+"#,
+    );
+    let encoder = builder.into_inner().expect("finish tar");
+    encoder.finish().expect("finish gzip")
+}
+
+fn starlark_version_set_archive(package_sha256: &str) -> Vec<u8> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    append_archive_file(
+        &mut builder,
+        "package.toml",
+        &format!(
+            r#"
+[package]
+name = "local/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.archive_checks]
+source = "path://packages/checks.tar.gz"
+version = "0.1.0"
+sha256 = "{package_sha256}"
+"#
+        ),
+    );
+    let encoder = builder.into_inner().expect("finish version set tar");
+    encoder.finish().expect("finish version set gzip")
+}
+
+fn append_archive_file(builder: &mut Builder<GzEncoder<Vec<u8>>>, path: &str, contents: &str) {
+    let bytes = contents.as_bytes();
+    let mut header = Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, Cursor::new(bytes))
+        .expect("append archive entry");
+}
+
+fn sha256_hex_for_test(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
