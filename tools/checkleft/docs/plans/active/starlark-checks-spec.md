@@ -336,6 +336,10 @@ FieldNotReserved = struct(
 
 load(":types", "field_not_reserved")
 
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
     for delta in ctx.deltas:
