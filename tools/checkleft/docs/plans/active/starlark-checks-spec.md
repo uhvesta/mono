@@ -502,7 +502,20 @@ fail(message = "...", path = "...")                   # Severity.fail
 fail_but_overridable(message = "...", path = "...")   # Severity.fail_but_overridable
 ```
 
-### 5.4 Tier-specific built-in bindings
+### 5.4 Diagnostic display model
+
+A finding is an inline diagnostic. The check author controls how precise it is:
+
+- `path` only: file-level diagnostic.
+- `path` + `line`: line-level diagnostic.
+- `path` + `line` + `column`: point diagnostic.
+- `path` + `line` + `column` + `end_line` + `end_column`: span diagnostic.
+
+The UI should render the most precise location present and gracefully degrade when a check only has file-level context. The `message` field explains what is wrong at that location. The optional `remediation` field is the human-facing suggested action or comment text displayed with the finding.
+
+`remediation` is intentionally separate from `fix_data`: `remediation` is for humans, while `fix_data` is typed machine data consumed only by `fix.checkleft`.
+
+### 5.5 Tier-specific built-in bindings
 
 **Hermetic tier** (always available):
 
@@ -794,7 +807,7 @@ directories such as `text/` or `proto/`, and optional `lib/` helpers. Consumers
 can point `CHECKS.yaml` at the archive with `path://...tar.gz` during local
 iteration, or consume the same bytes from `registry://` once published.
 
-The publishable tarball should be buildable by Bazel so check authors can iterate under the same build system that schedules their package tests. See §18 for the `checkleft_package` Bazel rule.
+The publishable tarball should be buildable by Bazel so check authors can iterate under the same build system that schedules their package tests. See §17 for the `checkleft_package` Bazel rule.
 
 ---
 
@@ -960,10 +973,10 @@ def check(ctx):
 
 ```
 # Output types
-Finding(severity: Severity, message: str, path: str | None, line: int | None, column: int | None, remediation: str | None, fix_data: struct | None)
+Finding(severity: Severity, message: str, path: str | None, line: int | None, column: int | None, end_line: int | None, end_column: int | None, remediation: str | None, fix_data: struct | None)
 FileEdit(path: str, old_text: str, new_text: str, after_line: int | None)
 Severity  # enum: fail, fail_but_overridable
-Location(path: str, line: int | None, column: int | None)
+Location(path: str, line: int | None, column: int | None, end_line: int | None, end_column: int | None)
 
 # Standard Starlark types
 str, int, float, bool, list, dict, None
@@ -1420,15 +1433,17 @@ The test runner replaces the real `http_get` in the Starlark globals with the mo
 
 ### 14.1 Output compatibility
 
-Starlark checks produce `Finding` values that map 1:1 to the existing `crate::output::Finding`:
+Starlark checks produce `Finding` values that map to the existing checkleft diagnostic output:
 
 | Starlark `Finding` field   | Rust `Finding` field                                              |
 | -------------------------- | ----------------------------------------------------------------- |
 | `severity`                 | `severity`                                                        |
 | `message`                  | `message`                                                         |
-| `path` + `line` + `column` | `location: Option<Location>`                                      |
+| `path` + optional line/column/span fields | `location: Option<Location>`                         |
 | `remediation`              | `remediation: Option<String>`                                     |
 | `fix_data`                 | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
+
+`message` and `remediation` are the human-facing diagnostic text. They are displayed inline with the file, line, point, or span location supplied by the check. They do not imply an automatic edit.
 
 ### 14.2 Fix compatibility
 
@@ -1440,30 +1455,11 @@ The runner reports Starlark check progress through the existing `ProgressReporte
 
 ---
 
-## 15. Future extensions
-
-### 15.1 Additional format adapters
-
-The adapter system is open for extension:
-
-- **`yaml`** — YAML schema evolution (Kubernetes CRDs, OpenAPI specs).
-- **`graphql`** — GraphQL schema evolution.
-- **`swift`** — Swift API surface (via tree-sitter-swift).
-- **`typescript`** — TypeScript declaration file (`.d.ts`) evolution.
-
-Each adapter is a Rust crate implementing `FormatAdapter`. No changes to the Starlark infrastructure needed.
-
-### 15.2 Interactive fix preview
-
-A `checkleft fix --preview` mode that shows proposed edits in a TUI diff viewer before applying.
-
----
-
-## 16. API reference by example
+## 15. API reference by example
 
 This section provides concrete, copy-pasteable examples of every key operation a check author will perform. These examples define the target API surface.
 
-### 16.1 Constructing findings
+### 15.1 Constructing findings
 
 ```python
 # Minimal finding — just severity, message, and path
@@ -1480,6 +1476,18 @@ findings.append(finding(
     path = "src/com/acme/Api.java",
     line = 42,
     column = 5,
+))
+
+# Finding with a precise source span
+findings.append(finding(
+    severity = Severity.fail,
+    message = "removed field number must be reserved",
+    path = "api/v1/user.proto",
+    line = 17,
+    column = 3,
+    end_line = 17,
+    end_column = 19,
+    remediation = "Add a reserved statement for field number 4.",
 ))
 
 # Finding with remediation guidance
@@ -1506,7 +1514,7 @@ findings.append(fail_but_overridable(
 ))
 ```
 
-### 16.2 Constructing file edits (for fixes)
+### 15.2 Constructing file edits (for fixes)
 
 ```python
 # Replace existing text
@@ -1532,7 +1540,7 @@ edits.append(file_edit(
 ))
 ```
 
-### 16.3 Loading shared helpers
+### 15.3 Loading shared helpers
 
 ```python
 # From the package's lib/ directory
@@ -1545,7 +1553,7 @@ load(":types", "FieldNotReserved", "field_not_reserved")
 load("//lib/matchers", "glob_match", "path_prefix", "is_generated_file")
 ```
 
-### 16.4 Defining shared helper modules
+### 15.4 Defining shared helper modules
 
 **`lib/proto_helpers.checkleft`:**
 
@@ -1576,7 +1584,7 @@ WIRE_INCOMPATIBLE_TYPE_CHANGES: dict[str, list[str]] = {
 }
 ```
 
-### 16.5 Working with the proto evolution context
+### 15.5 Working with the proto evolution context
 
 ```python
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -1664,7 +1672,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.6 Proto check: blocking proto file deletion
+### 15.6 Proto check: blocking proto file deletion
 
 ```python
 # checkleft/proto/no_deletion/check.checkleft
@@ -1683,7 +1691,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.7 Proto check: detecting moves vs. deletions
+### 15.7 Proto check: detecting moves vs. deletions
 
 A move (rename/relocate) is semantically fine if the package and content remain the same. The adapter gives us `ChangeKind.renamed` in the changeset and `before`/`after` descriptors on file pairs — we can use both to distinguish a real deletion from a harmless move.
 
@@ -1743,7 +1751,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.8 Working with the `module.json` evolution context
+### 15.8 Working with the `module.json` evolution context
 
 ```python
 def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
@@ -1802,7 +1810,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.9 Working with the Java evolution context
+### 15.9 Working with the Java evolution context
 
 ```python
 def check(ctx: JavaEvolutionContext) -> list[Finding]:
@@ -1855,7 +1863,7 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.10 Working with the text adapter (generic checks)
+### 15.10 Working with the text adapter (generic checks)
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -1892,7 +1900,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.11 Writing a fix function
+### 15.11 Writing a fix function
 
 The fix function receives typed `fix_data` from the check (see §4.2). No string parsing — pattern-match on the struct type.
 
@@ -1923,7 +1931,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 16.12 `CHECKS.yaml` selecting a version set
+### 15.12 `CHECKS.yaml` selecting a version set
 
 ```yaml
 # CHECKS.yaml
@@ -1947,7 +1955,7 @@ checks:
       - "api/**/*.proto"
 ```
 
-### 16.13 Network tier: checking field reservations against a remote service
+### 15.13 Network tier: checking field reservations against a remote service
 
 ```python
 # checkleft/proto/reservation_check/check.checkleft
@@ -1997,7 +2005,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     return findings
 ```
 
-### 16.14 Using `regex_match` and `glob_match` utilities
+### 15.14 Using `regex_match` and `glob_match` utilities
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -2038,7 +2046,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ---
 
-## 17. Summary of conventions
+## 16. Summary of conventions
 
 | Convention          | Rule                                                                                                 |
 | ------------------- | ---------------------------------------------------------------------------------------------------- |
@@ -2057,11 +2065,11 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ---
 
-## 18. Bazel rules
+## 17. Bazel rules
 
 All Bazel rules use the compiled-from-source checkleft binary (`//tools/checkleft:checkleft`) as a private attribute. No toolchain abstraction — the binary target is referenced directly.
 
-### 18.1 `checkleft_test` — fixture testing
+### 17.1 `checkleft_test` — fixture testing
 
 Runs `checkleft test` for a single check against its fixture test cases. One target per check, BUILD file lives next to the check.
 
@@ -2084,7 +2092,7 @@ checkleft_test(
 
 Validates that exactly one `check.checkleft` exists in `srcs`. Detects `fix.checkleft` automatically. Runs validation (type-checking, `check_meta()` presence, load path resolution, `fix_data` contract) as an implicit first step before executing fixtures. Each target is independently cacheable and parallelizable.
 
-### 18.2 `checkleft_validate` — type-checking without fixtures
+### 17.2 `checkleft_validate` — type-checking without fixtures
 
 Validates a single check without running fixtures. Useful for fast CI feedback before test cases exist, or for checks that have no `testdata/` yet.
 
@@ -2105,7 +2113,7 @@ checkleft_validate(
 
 Runs the same validation as `checkleft_test` (type-checking, `check_meta()` presence, adapter folder name, load paths, `fix_data` contract) but does not require or execute fixtures.
 
-### 18.3 `checkleft_package` — publishable tarball
+### 17.3 `checkleft_package` — publishable tarball
 
 Builds a deterministic `.tar.gz` archive for a check package. The BUILD file lives at the package root.
 
@@ -2132,7 +2140,7 @@ checkleft_package(
 
 The archive layout is rooted at the package: `checkleft-package.toml`, adapter directories, and `lib/`. `testdata/` is excluded. Validation is implicit — all referenced check targets must pass before the archive is emitted.
 
-### 18.4 Default-enabled checks
+### 17.4 Default-enabled checks
 
 The runner has a hardcoded set of always-on checks that run regardless of `CHECKS.yaml`. These include both Rust-native checks and Starlark checks (e.g. the `CHECKS.yaml` policy guard).
 

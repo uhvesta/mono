@@ -32,7 +32,7 @@ Key points:
 - External checks are either **declarative** (YAML manifest → run a tool → parse output) or **component** (WASM)
 - `SourceTree` trait provides `read_file`, `exists`, `list_dir`, `glob`
 - `tree-sitter-starlark` is already a dependency (used by Bazel checks for syntax parsing)
-- Output types: `Finding { severity, message, location, remediation, fix_data }`
+- Output types: `Finding { severity, message, location/file span, remediation, fix_data }`
 - Current `Severity` enum: `Error, Warning, Info` — needs mapping to spec's `fail / fail_but_overridable`
 
 ---
