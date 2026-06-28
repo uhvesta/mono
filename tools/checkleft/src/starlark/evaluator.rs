@@ -14,12 +14,14 @@ use starlark::values::{Heap, UnpackValue, Value};
 use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree, TreeVersion};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::starlark::loader::{CheckleftFileLoader, LoadContext};
 
 #[derive(Debug, Clone)]
 pub struct StarlarkCheckSource {
     pub id: String,
     pub path: PathBuf,
     pub source: String,
+    pub(crate) load_context: Option<LoadContext>,
 }
 
 impl StarlarkCheckSource {
@@ -28,7 +30,16 @@ impl StarlarkCheckSource {
             id: id.into(),
             path: PathBuf::from("<inline>"),
             source: source.into(),
+            load_context: None,
         }
+    }
+
+    pub fn with_load_context(mut self, checkleft_root: impl Into<PathBuf>, check_dir: impl Into<PathBuf>) -> Self {
+        self.load_context = Some(LoadContext {
+            checkleft_root: checkleft_root.into(),
+            check_dir: check_dir.into(),
+        });
+        self
     }
 }
 
@@ -54,23 +65,46 @@ impl StarlarkCheckRunner {
             }
 
             let globals = starlark_globals();
-            let mut eval = Evaluator::new(&module);
-            eval.eval_module(parsed.ast, &globals)
-                .map_err(|e| anyhow!(e.to_string()))
-                .with_context(|| format!("failed to evaluate {}", self.source.path.display()))?;
+            let findings = if let Some(context) = &self.source.load_context {
+                let loader = CheckleftFileLoader {
+                    tree,
+                    globals: &globals,
+                    context: context.clone(),
+                };
+                let mut eval = Evaluator::new(&module);
+                eval.set_loader(&loader);
+                eval.eval_module(parsed.ast, &globals)
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to evaluate {}", self.source.path.display()))?;
 
-            let check = module
-                .get("check")
-                .ok_or_else(|| anyhow!("{} does not define check(ctx)", self.source.path.display()))?;
-            let ctx = alloc_text_context(eval.heap(), &files);
-            let result = eval
-                .eval_function(check, &[ctx], &[])
-                .map_err(|e| anyhow!(e.to_string()))
-                .with_context(|| format!("failed to run check(ctx) in {}", self.source.path.display()))?;
+                let check = module
+                    .get("check")
+                    .ok_or_else(|| anyhow!("{} does not define check(ctx)", self.source.path.display()))?;
+                let ctx = alloc_text_context(eval.heap(), &files);
+                let result = eval
+                    .eval_function(check, &[ctx], &[])
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to run check(ctx) in {}", self.source.path.display()))?;
+                unpack_findings(result)?
+            } else {
+                let mut eval = Evaluator::new(&module);
+                eval.eval_module(parsed.ast, &globals)
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to evaluate {}", self.source.path.display()))?;
 
+                let check = module
+                    .get("check")
+                    .ok_or_else(|| anyhow!("{} does not define check(ctx)", self.source.path.display()))?;
+                let ctx = alloc_text_context(eval.heap(), &files);
+                let result = eval
+                    .eval_function(check, &[ctx], &[])
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to run check(ctx) in {}", self.source.path.display()))?;
+                unpack_findings(result)?
+            };
             Ok(CheckResult {
                 check_id: self.source.id.clone(),
-                findings: unpack_findings(result)?,
+                findings,
             })
         })
     }
@@ -107,7 +141,7 @@ impl ParsedCheck {
     fn parse(source: &StarlarkCheckSource) -> Result<Self> {
         let dialect = Dialect {
             enable_types: DialectTypes::Enable,
-            enable_load: false,
+            enable_load: source.load_context.is_some(),
             enable_keyword_only_arguments: true,
             enable_f_strings: true,
             ..Dialect::Standard
@@ -603,5 +637,134 @@ def check(ctx):
             .expect("evaluate check");
 
         assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn evaluates_check_with_local_and_lib_loads() {
+        let source = StarlarkCheckSource::inline(
+            "text/no-debug",
+            r#"
+load("//lib/messages", "message_for")
+load(":predicates", "has_debug")
+
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if has_debug(line.text):
+                findings.append(fail(
+                    message = message_for("debug"),
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings
+"#,
+        )
+        .with_load_context("checkleft", "checkleft/text/public/no_debug");
+        let mut tree = MapTree::default();
+        tree.current.insert(
+            PathBuf::from("checkleft/lib/messages.checkleft"),
+            br#"
+def message_for(kind):
+    return kind + " text added"
+"#
+            .to_vec(),
+        );
+        tree.current.insert(
+            PathBuf::from("checkleft/text/public/no_debug/predicates.checkleft"),
+            br#"
+def has_debug(s):
+    return "debug" in s
+"#
+            .to_vec(),
+        );
+        tree.base
+            .insert(PathBuf::from("notes/example.txt"), b"hello\n".to_vec());
+        tree.current
+            .insert(PathBuf::from("notes/example.txt"), b"hello\ndebug mode\n".to_vec());
+
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+
+        let result = StarlarkCheckRunner::new(source)
+            .evaluate_text(&changeset, &tree)
+            .expect("evaluate check");
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].message, "debug text added");
+        assert_eq!(
+            result.findings[0].location,
+            Some(Location {
+                path: PathBuf::from("notes/example.txt"),
+                line: Some(2),
+                column: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_external_package_loads() {
+        let source = StarlarkCheckSource::inline(
+            "text/no-debug",
+            r#"
+load("@dep//lib/messages", "message_for")
+
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return []
+"#,
+        )
+        .with_load_context("checkleft", "checkleft/text/public/no_debug");
+        let mut tree = MapTree::default();
+        tree.current
+            .insert(PathBuf::from("notes/example.txt"), b"hello\n".to_vec());
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+
+        let err = StarlarkCheckRunner::new(source)
+            .evaluate_text(&changeset, &tree)
+            .expect_err("external load should fail");
+
+        assert!(err.to_string().contains("failed to evaluate"));
+    }
+
+    #[test]
+    fn rejects_load_path_traversal() {
+        let source = StarlarkCheckSource::inline(
+            "text/no-debug",
+            r#"
+load(":../secrets", "value")
+
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return []
+"#,
+        )
+        .with_load_context("checkleft", "checkleft/text/public/no_debug");
+        let mut tree = MapTree::default();
+        tree.current
+            .insert(PathBuf::from("notes/example.txt"), b"hello\n".to_vec());
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]);
+
+        let err = StarlarkCheckRunner::new(source)
+            .evaluate_text(&changeset, &tree)
+            .expect_err("traversal load should fail");
+
+        assert!(err.to_string().contains("failed to evaluate"));
     }
 }
