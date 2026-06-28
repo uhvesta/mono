@@ -32,7 +32,7 @@ Key points:
 - External checks are either **declarative** (YAML manifest → run a tool → parse output) or **component** (WASM)
 - `SourceTree` trait provides `read_file`, `exists`, `list_dir`, `glob`
 - `tree-sitter-starlark` is already a dependency (used by Bazel checks for syntax parsing)
-- Output types: `Finding { severity, message, location, remediations, suggested_fix }`
+- Output types: `Finding { severity, message, location, remediation, fix_data }`
 - Current `Severity` enum: `Error, Warning, Info` — needs mapping to spec's `fail / fail_but_overridable`
 
 ---
@@ -43,8 +43,8 @@ Key points:
 src/
 ├── starlark/                          # NEW — all Starlark check infrastructure
 │   ├── mod.rs                         # Public API: StarlarkCheckRunner, discover(), types re-export
-│   ├── discovery.rs                   # Changeset-scoped checkleft/ directory discovery
-│   ├── manifest.rs                    # package.toml parsing (PackageManifest, VersionSet, Dependency)
+│   ├── discovery.rs                   # Package directory discovery
+│   ├── manifest.rs                    # checkleft-package.toml parsing (PackageManifest, VersionSet, Dependency)
 │   ├── loader.rs                      # Starlark load() resolution (// and : prefixes)
 │   ├── check_meta.rs                  # check_meta() built-in function + CheckMeta struct
 │   ├── evaluator.rs                   # Starlark Module setup, Globals construction, check(ctx) invocation
@@ -53,7 +53,7 @@ src/
 │   ├── sandbox.rs                     # Tier-based Globals construction (hermetic vs network)
 │   └── adapter/                       # Format adapter infrastructure
 │       ├── mod.rs                     # FormatAdapter trait + AdapterRegistry
-│       ├── proto.rs                   # Proto adapter (native descriptors → Starlark values)
+│       ├── proto.rs                   # Proto adapter (native descriptor provider → Starlark values)
 │       ├── module_json.rs             # module.json adapter
 │       ├── java.rs                    # Java adapter (tree-sitter-java → API surface model)
 │       └── text.rs                    # Text adapter (line model)
@@ -76,9 +76,9 @@ This is a new top-level module under `src/`. It does **not** live inside `extern
 | `starlark/mod.rs` | Module root. Expose `StarlarkCheckRunner`. |
 | `starlark/types.rs` | `#[derive(StarlarkValue)]` impls for `Finding`, `Severity`, `FileEdit`, `Location`. The `finding()` and `fail()` / `fail_but_overridable()` constructor functions as Starlark globals. |
 | `starlark/sandbox.rs` | Build a `GlobalsBuilder` for the hermetic tier: inject `finding`, `fail`, `fail_but_overridable`, `Severity`, `DeltaKind`, `regex_match`, `regex_find_all`, `glob_match`, `print`. |
-| `starlark/check_meta.rs` | `check_meta()` as a Starlark built-in. Parses and stores `applies_to` and `tier` from the top-level call. |
+| `starlark/check_meta.rs` | `check_meta()` as a Starlark built-in. Parses and stores `tier` from the top-level call. |
 | `starlark/evaluator.rs` | Load a `.checkleft` file into a `Module`, configure `Dialect { enable_types: DialectTypes::Enable }`, attach globals, evaluate, call `check(ctx)`, collect `Vec<Finding>`. |
-| `starlark/adapter/mod.rs` | `FormatAdapter` trait definition (as per spec §6.1). `AdapterRegistry` for registration, including adapter `ext`/`name` file selector uniqueness. |
+| `starlark/adapter/mod.rs` | `FormatAdapter` trait definition (as per spec §6.1). `AdapterRegistry` for registration. |
 | `starlark/adapter/text.rs` | `TextAdapter` — parse files into `TextFilePair` / `TextFile` / `Line` Starlark values. Simplest adapter, good for proving the pipeline. |
 
 **Key Rust crate:** [`starlark`](https://crates.io/crates/starlark) (Facebook's Starlark implementation). Add to `Cargo.toml`:
@@ -92,16 +92,16 @@ starlark = { version = "0.12", features = ["typing"] }
 
 ---
 
-### Phase 2: Discovery + `package.toml` + load paths
+### Phase 2: Discovery + `checkleft-package.toml` + load paths
 
-**Goal:** Auto-discover checks from `checkleft/` folder structure, parse `package.toml`, resolve `load()` paths.
+**Goal:** Auto-discover checks from package folder structure, parse `checkleft-package.toml`, resolve `load()` paths.
 
 **Files:**
 
 | File | What it does |
 |---|---|
-| `starlark/discovery.rs` | Walk upward from changeset file paths to find ancestor `checkleft/` dirs. For each, scan `<adapter>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, path, check_meta, package }`. |
-| `starlark/manifest.rs` | Parse `package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata, includes: Vec<PackageRef> }`. Validate producer metadata only: `kind = "check_package"` packages define checks, `kind = "version_set"` packages define exact `[includes.*]` refs and do not define checks. |
+| `starlark/discovery.rs` | Scan package roots for `<adapter>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, path, check_meta, package }`. |
+| `starlark/manifest.rs` | Parse `checkleft-package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata, includes: Vec<PackageRef> }`. Validate producer metadata only: `kind = "check_package"` packages define checks, `kind = "version_set"` packages define exact `[includes.*]` refs and do not define checks. |
 | `starlark/loader.rs` | Custom `FileLoader` impl for Starlark's `load()` statement. Resolve `//lib/foo` → `<checkleft_root>/lib/foo.checkleft`, `:types` → `<check_dir>/types.checkleft`. Enforce: no `@dep//` prefix (deps provide checks only, not importable libs). |
 
 **Integration point:** `CHECKS.yaml` remains the consumer validation policy. It selects local packages, fetched packages, and version sets. The runner resolves those package refs, calls discovery for the selected package roots, and hands discovered Starlark checks to the existing runner alongside built-in and external checks.
@@ -114,7 +114,7 @@ starlark = { version = "0.12", features = ["typing"] }
 
 #### Proto adapter (`starlark/adapter/proto.rs`)
 
-- Use the existing descriptor/proto crate path for descriptor generation/parsing; the adapter must not directly invoke the proto compiler.
+- Use the existing descriptor/proto crate path for descriptor generation/parsing; do not directly invoke `protoc` from the adapter.
 - Parse `FileDescriptorSet` through the repository's native descriptor representation.
 - Build `#[derive(StarlarkValue)]` types: `ProtoEvolutionContext`, `FileDescriptor`, `MessageDescriptor`, `FieldDescriptor`, `SchemaDelta`, etc.
 - Diff logic: compare base and current descriptor sets → produce `Vec<SchemaDelta>` with `DeltaKind` variants
@@ -167,7 +167,7 @@ starlark/adapter/proto/
 
 | File | What it does |
 |---|---|
-| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, activation mode, and package/version-set `include`/`exclude` activation globs. Starlark package `checks:` entries are selectors only. |
+| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, and activation/path selectors. |
 | `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity, publishing metadata, and version-set `[includes]`. |
 | `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
 | `starlark/package.rs` | Expand selected version sets to their exact package refs. Version sets activate all checks from all included packages. Individual packages support `all` or `explicit` activation. |
@@ -178,7 +178,7 @@ refs may omit `sha256` for local iteration; any supplied hash must still be
 canonical. Local archive refs verify the archive bytes when `sha256` is present,
 then discover checks from the archive-root package layout.
 
-This phase makes Starlark checks a first-class `CHECKS.yaml` policy input without overloading `package.toml`.
+This phase makes Starlark checks a first-class `CHECKS.yaml` policy input without overloading `checkleft-package.toml`.
 
 ---
 
@@ -191,7 +191,7 @@ This phase makes Starlark checks a first-class `CHECKS.yaml` policy input withou
 | File | What it does |
 |---|---|
 | `starlark/testing.rs` | Preserve path-based author semantics: discover checks from `<adapter>/<nested/name>/check.checkleft`, scan sibling `testdata/<case>/` dirs, construct a synthetic `ChangeSet` from `before/` + `after/`, run the adapter + check, compare findings against `expected.toml`. If `expected_fix/` exists, run the fix and diff. |
-| `bazel/defs.bzl` | Expose `starlark_check_test` so check authors can schedule the real `checkleft test` CLI from Bazel with an optional selector. Expose a Checkleft toolchain so testing and validation rules resolve the checkleft binary through Bazel toolchain resolution. |
+| `bazel/defs.bzl` | Expose `checkleft_test` so check authors can schedule the real `checkleft test` CLI from Bazel. The checkleft binary is referenced directly as a compiled-from-source target. |
 
 **CLI integration:** Add `checkleft test [check_id] [--update]` subcommand to `main.rs`.
 
@@ -223,27 +223,6 @@ This is a runner-level concern, not an adapter concern. Implement in `starlark/m
 
 ---
 
-## Adapter file selectors
-
-Adapters declare the file names they can parse with structural selectors, not arbitrary globs:
-
-```rust
-pub enum AdapterFileSelector {
-    Ext(&'static str),
-    Name(&'static str),
-}
-```
-
-Implementation requirements:
-
-- Add `fn file_selectors(&self) -> &[AdapterFileSelector]` to `FormatAdapter`.
-- During `AdapterRegistry` construction, build a uniqueness map for every `Ext` and `Name` selector and fail startup if two adapters claim the same selector.
-- Before adapter preparation, filter the check changeset by the selected adapter's selectors.
-- Keep `check_meta(applies_to)` as a semantic narrowing step after selector matching.
-- Built-in selector assignments are: `proto -> ext: proto`, `module_json -> name: module-info.json`, `java -> ext: java`, and `text -> explicit text-like extensions only`.
-
----
-
 ## Type mapping: spec → Rust
 
 | Spec type | Rust representation |
@@ -253,7 +232,7 @@ Implementation requirements:
 | `Severity.fail_but_overridable` | Maps to `crate::output::Severity::Warning` |
 | `FileEdit` | `#[derive(StarlarkValue)]` wrapper around `crate::fix::FileEdit` |
 | `fix_data` | `OwnedFrozenValue` — opaque Starlark value, passed through from check to fix |
-| `check_meta()` | Parsed into `CheckMeta { applies_to, tier }` at module load time |
+| `check_meta()` | Parsed into `CheckMeta { tier }` at module load time |
 | `struct(...)` (user-defined) | Native Starlark `Struct` — no special Rust type needed |
 | `load("//lib/foo", "bar")` | Custom `FileLoader` impl resolving to `.checkleft` files |
 
@@ -293,15 +272,8 @@ Next nodes:
 3. Node 8: package tarball and Bazel packaging target for check authors.
 4. Node 9: self-hosted Starlark guard check for `CHECKS.yaml` policy integrity.
 5. Node 10: Starlark fix support.
-6. Node 11: proto adapter. This is the highest-priority non-text adapter; use the existing descriptor/proto/native C++ path and do not directly invoke the proto compiler from the adapter.
+6. Node 11: proto adapter. This is the highest-priority non-text adapter; use the existing descriptor/proto/native C++ path and do not directly invoke `protoc`.
 7. Node 12: module_json adapter.
 8. Node 13: Java adapter.
-9. Node 14: git package resolver.
-10. Node 15: routing and exact package selection.
-11. Node 16: selector policy cleanup; Starlark package selectors cannot carry config.
-12. Node 17: Bazel author-test hardening.
-13. Node 18: full enablement model spec and `.checkleft` Linguist mapping.
-14. Node 19: package/version-set activation globs.
-15. Node 20: adapter `ext`/`name` file selectors and uniqueness enforcement.
 
 Each node must compile and pass its focused Bazel validation before pushing. Text remains the full lifecycle proof path; proto is the first non-text adapter because it is the highest product priority.
