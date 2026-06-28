@@ -140,7 +140,6 @@ schema_version = 1
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
-kind = "check_package"
 
 [publish]
 description = "Repository policy checks for myorg"
@@ -160,7 +159,6 @@ license = "Apache-2.0"
 | --------- | ----- | -------- | ------------------------------------------------------------------------------------------- |
 | `name`    | `str` | yes      | Globally unique package name. Convention: `<org>/<descriptor>`.                             |
 | `version` | `str` | yes      | SemVer package version. Used by consumers when pinning this package.                         |
-| `kind`    | `str` | no       | `check_package` (default). Reserved for future extension.                                    |
 
 `checkleft-package.toml` intentionally has no `exclude`, no consumer `[dependencies]`, and no "activate these checks" section. Those belong in `CHECKS.yaml`.
 
@@ -216,27 +214,19 @@ checks:
       - "api/generated/**"
 
   # Local explicit packages do not auto-activate; opt in check-by-check.
-  - id: local_experiments:text/no_debug
+  - id: myorg/local-experiments:text/no_debug
     include:
       - "**/*.txt"
-
-runner:
-  check_timeout_ms: 30000
-  adapter_timeout_ms: 60000
-  parallelism: 8
 ```
 
 `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
 
-#### `runner` fields
+Each discovered check has two IDs:
 
-| Field                | Type  | Required | Default | Description                                                                 |
-| -------------------- | ----- | -------- | ------- | --------------------------------------------------------------------------- |
-| `check_timeout_ms`   | `int` | no       | `30000` | Wall-clock timeout per Starlark check evaluation. Runaway checks are killed and reported as failures. |
-| `adapter_timeout_ms` | `int` | no       | `60000` | Timeout per adapter `parse()` call. Protoc on large proto graphs is the primary concern. |
-| `parallelism`        | `int` | no       | `num_cpus` | Thread pool size for concurrent check evaluation.                          |
+- **Package-local ID:** `<adapter>/<name>` from the package directory structure.
+- **Consumer-qualified ID:** `<package.name>:<adapter>/<name>`, where `package.name` comes from `checkleft-package.toml`.
 
-CLI flags (`--check-timeout-ms`, `--adapter-timeout-ms`, `--parallelism`) override `CHECKS.yaml` runner settings. This lets local dev and CI scripts adjust without modifying committed config.
+`CHECKS.yaml` `checks[].id` may use the consumer-qualified ID to target one exact selected package. Unqualified package-local IDs are allowed only when exactly one selected package exports that ID; otherwise config resolution fails and the consumer must qualify the ID. This keeps explicit activation reviewable without adding a package alias or grouping abstraction.
 
 Path selection is two-stage:
 
@@ -802,7 +792,7 @@ Packages selected in `CHECKS.yaml` are resolved at `checkleft` startup before an
 - Fetched packages must declare `sha256` in the `CHECKS.yaml` ref; the resolver verifies fetched bytes before any checks are loaded.
 - `CHECKS.yaml` package refs carry the exact versions and hashes that make selected packages reproducible.
 - `path://` dependencies are an explicit local-iteration escape hatch. Directory refs read live local content and are not reproducible until replaced by a fetched, hash-pinned ref. Archive refs may supply `sha256`; when present, the resolver verifies the archive bytes before loading package code.
-- `checkleft update <dep_name> <new_version>` updates the manifest's exact version and hash.
+- `checkleft update <package_name> <new_version>` updates the selected `CHECKS.yaml` package ref's exact version and hash.
 
 ### 8.4 Publishing
 
@@ -936,10 +926,9 @@ Before invoking any adapter, the adapter's file selectors are intersected with t
 
 ### 10.5 Thread pool and resource bounds
 
-- **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`. Configurable via `CHECKS.yaml` `runner.parallelism` or `--parallelism=N` CLI flag.
+- **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`.
 - **Memory:** Each Starlark `Module` heap is independent. Peak memory is proportional to `(max concurrent checks) × (largest adapter output shared via Arc) + (per-check heap)`. The `Arc`-shared adapter output is the dominant term but is allocated once per adapter, not per check.
-- **Starlark evaluation timeout:** Each check has a wall-clock timeout (default: 30s). Configurable via `CHECKS.yaml` `runner.check_timeout_ms` or `--check-timeout-ms` CLI flag. CLI overrides CHECKS.yaml. Runaway checks are killed and reported as failures.
-- **Adapter parse timeout:** Adapter `parse()` calls have their own timeout (default: 60s). Configurable via `CHECKS.yaml` `runner.adapter_timeout_ms` or `--adapter-timeout-ms` CLI flag. Protoc invocations on large proto graphs are the primary concern here.
+- **Resource limits:** Wall-clock evaluation limits, adapter parse limits, and pool sizing are runner deployment concerns, not package or `CHECKS.yaml` API. A check package cannot declare them, and a consumer policy file cannot tune check behavior through them.
 
 ---
 
@@ -1313,7 +1302,10 @@ path = "api/v1/user.proto"
 | `findings[].message_contains` | `str`  | no       | Substring that must appear in the finding message.          |
 | `findings[].message_eq`       | `str`  | no       | Exact message match (alternative to `message_contains`).    |
 | `findings[].path`             | `str`  | yes      | File path the finding should be on.                         |
-| `findings[].line`             | `int`  | no       | Expected line number.                                       |
+| `findings[].start_line`       | `int`  | no       | Expected starting line number.                              |
+| `findings[].end_line`         | `int`  | no       | Expected ending line number for multi-line spans.           |
+| `findings[].start_column`     | `int`  | no       | Expected starting column.                                   |
+| `findings[].end_column`       | `int`  | no       | Expected ending column.                                     |
 
 ### 13.4 Fix testing
 
@@ -1342,11 +1334,13 @@ checkleft test
 checkleft test proto/evolution
 
 # Run a specific test case
-checkleft test proto/evolution/field_removal
+checkleft test proto/evolution --case field_removal
 
 # Update expected output from actual results (snapshot testing)
 checkleft test --update proto/evolution
 ```
+
+Test case names are selected with `--case`; they are never appended to the check ID. This keeps selectors unambiguous when check IDs themselves are nested, such as `proto/evolution/deletions`.
 
 Check authors can schedule the same test flow in Bazel with `checkleft_test`. The BUILD file lives next to the check itself — one target per check:
 
@@ -1378,9 +1372,9 @@ checkleft_test(
 | ---------- | --------------- | -------- | ------------------------------------------------------------------------------------------------- |
 | `srcs`     | `list[label]`   | yes      | All `.checkleft` files for this check (check, fix, local helpers). Must contain exactly one `check.checkleft`. |
 | `testdata` | `list[label]`   | yes      | Fixture files: `testdata/<case>/{before/, after/, expected.toml, expected_fix/}`.                 |
-| `deps`     | `list[label]`   | no       | Package-level `lib/` helpers or filegroups that this check `load()`s.                             |
+| `deps`     | `list[label]`   | no       | Same-package `lib/` helpers or filegroups that this check `load()`s. Cross-package helper deps are rejected. |
 
-The rule validates that exactly one `check.checkleft` exists in `srcs`. `fix.checkleft` presence is detected automatically. Each target is independently cacheable and parallelizable. Test sharding across `testdata/` cases is a future extension.
+The rule validates that exactly one `check.checkleft` exists in `srcs`. `fix.checkleft` presence is detected automatically. `deps` must resolve to files under the same `checkleft-package.toml` package root, preserving the no cross-package library import rule. Each target is independently cacheable and parallelizable. Test sharding across `testdata/` cases is a future extension.
 
 The checkleft binary is a private attribute defaulting to `//tools/checkleft:checkleft` — the compiled-from-source binary target.
 
@@ -1454,11 +1448,11 @@ Starlark `fix()` functions return `list[FileEdit]` which maps to the existing `V
 
 ### 14.3 GitHub annotation projection
 
-When a finding has a `location`, the runner emits a GitHub Checks API annotation. `Location` fields map 1:1 to annotation fields (`path`, `start_line`, `end_line`, `start_column`, `end_column`).
+When a finding has both `location.path` and `location.start_line`, the runner can emit a GitHub Checks API annotation. `Location` fields map 1:1 to annotation fields (`path`, `start_line`, `end_line`, `start_column`, `end_column`).
 
 Both `Severity.fail` and `Severity.fail_but_overridable` map to `annotation_level = "failure"` — both block merge. Overridability is Checkleft-side metadata (`overridable = true` on the finding) and is not reflected in the annotation level. The annotation `message` is the finding's `message`.
 
-Findings without a `location` are reported in the check run summary but do not produce file-level annotations.
+Machine-readable output includes a normalized `github_annotation` projection when `location.path` and `location.start_line` are available. Findings without a line number are reported in the check run summary but do not produce file-level annotations.
 
 ### 14.4 Progress reporting
 
@@ -1649,6 +1643,10 @@ def bool_option(options: Options, name: str) -> bool:
 ### 16.6 Working with the proto evolution context
 
 ```python
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -1723,6 +1721,10 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 ```python
 # checkleft/proto/no_deletion/check.checkleft
 
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Proto files must never be deleted — they represent a published contract."""
     findings: list[Finding] = []
@@ -1743,6 +1745,10 @@ A move (rename/relocate) is semantically fine if the package and content remain 
 
 ```python
 # checkleft/proto/move_detection/check.checkleft
+
+check_meta(
+    tier = "hermetic",
+)
 
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
     """Allow proto file moves/renames as long as the package stays the same."""
@@ -1800,6 +1806,10 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 ### 16.9 Working with the `module.json` evolution context
 
 ```python
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -1859,6 +1869,10 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
 ### 16.10 Working with the Java evolution context
 
 ```python
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: JavaEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -1912,6 +1926,10 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
 ### 16.11 Working with the text adapter (generic checks)
 
 ```python
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: TextEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -2028,6 +2046,10 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
 ### 16.14 Using `regex_match` and `glob_match` utilities
 
 ```python
+check_meta(
+    tier = "hermetic",
+)
+
 def check(ctx: TextEvolutionContext) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -2075,7 +2097,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Check-local helpers | `<package_root>/<adapter>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`)         |
 | Package manifest    | `checkleft-package.toml` (presence marks a directory as a package root)                              |
 | Package integrity   | Exact `source`/`version`/`sha256` refs in `CHECKS.yaml`                                             |
-| Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`)                                                          |
+| Check ID            | Package-local `<adapter>/<name>`; consumer-qualified `<package.name>:<adapter>/<name>` when needed    |
 | Type annotations    | Required on all function signatures                                                                  |
 | Default sandbox     | `hermetic`                                                                                           |
 | Adapter linkage     | `<adapter>` top-level folder name matches `FormatAdapter::kind()`                                    |
@@ -2106,7 +2128,7 @@ checkleft_test(
 | ---------- | --------------- | -------- | ------------------------------------------------------------------------------------------------- |
 | `srcs`     | `list[label]`   | yes      | All `.checkleft` files for this check. Must contain exactly one `check.checkleft`.                |
 | `testdata` | `list[label]`   | yes      | Fixture files: `testdata/<case>/{before/, after/, expected.toml, expected_fix/}`.                 |
-| `deps`     | `list[label]`   | no       | Package-level `lib/` helpers or filegroups.                                                       |
+| `deps`     | `list[label]`   | no       | Same-package `lib/` helpers or filegroups. Cross-package helper deps are rejected.                 |
 
 Validates that exactly one `check.checkleft` exists in `srcs`. Detects `fix.checkleft` automatically. Runs validation (type-checking, `check_meta()` presence, load path resolution, `fix_data` contract) as an implicit first step before executing fixtures. Each target is independently cacheable and parallelizable. Test sharding across `testdata/` cases is a future extension.
 
@@ -2127,7 +2149,7 @@ checkleft_validate(
 | Attribute  | Type            | Required | Description                                                         |
 | ---------- | --------------- | -------- | ------------------------------------------------------------------- |
 | `srcs`     | `list[label]`   | yes      | All `.checkleft` files for this check. Must contain one `check.checkleft`. |
-| `deps`     | `list[label]`   | no       | Package-level `lib/` helpers or filegroups.                         |
+| `deps`     | `list[label]`   | no       | Same-package `lib/` helpers or filegroups. Cross-package helper deps are rejected. |
 
 Runs the same validation as `checkleft_test` (type-checking, `check_meta()` presence, adapter folder name, load paths, `fix_data` contract) but does not require or execute fixtures.
 
