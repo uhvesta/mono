@@ -47,6 +47,8 @@ jaq-interpret = { workspace = true }
 jaq-parse = { workspace = true }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
+protobuf = { workspace = true }
+protobuf-parse = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
