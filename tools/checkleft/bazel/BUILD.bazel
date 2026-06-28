@@ -3,6 +3,11 @@ load(":defs.bzl", "check_index", "checkleft", "local_check")
 
 package(default_visibility = ["//visibility:private"])
 
+toolchain_type(
+    name = "toolchain_type",
+    visibility = ["//visibility:public"],
+)
+
 sh_binary(
     name = "noop_check_bin",
     srcs = ["testdata/noop_check.sh"],
