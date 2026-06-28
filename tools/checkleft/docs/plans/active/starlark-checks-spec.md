@@ -15,7 +15,6 @@
 6. Bidirectional: checks can be authored in Starlark _or_ Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
 7. Hierarchical: repos can define checks at the root; sub-projects can layer on their own.
 8. Maximal Starlark typing via `DialectTypes::Enable` — all function signatures, parameters, and return types must carry type annotations.
-9. **Version sets** — curated bundles of exact package pins that consumers can adopt as a single dependency, inspired by Amazon Brazil version sets.
 
 ---
 
@@ -63,7 +62,7 @@ This folder structure is **intentionally opinionated**. There is exactly one way
 - **What files does it run on?** → the adapter's file selectors, narrowed by `CHECKS.yaml`
 - **Which files does this repo choose to validate?** → read `CHECKS.yaml`
 - **Where are shared helpers?** → `lib/`
-- **Where are external package/version-set pins?** → `CHECKS.yaml`
+- **Where are external package pins?** → `CHECKS.yaml`
 - **Where is the package root?** → the directory containing `checkleft-package.toml`
 
 No config flags, no overrides, no implicit conventions in package source. The directory tree is the source of truth for check identity and author tests; `CHECKS.yaml` is the source of truth for consumer activation and path policy.
@@ -72,7 +71,7 @@ No config flags, no overrides, no implicit conventions in package source. The di
 
 | Path pattern (relative to package root)    | Role                                                                                                                    |
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
-| `checkleft-package.toml`                   | **Package manifest.** Declares producer metadata and publishing/version-set metadata. Required. Presence marks the directory as a package root. |
+| `checkleft-package.toml`                   | **Package manifest.** Declares producer metadata and publishing metadata. Required. Presence marks the directory as a package root. |
 | `lib/*.checkleft`                          | **Shared modules.** Importable helpers for checks in the same package.                                                  |
 | `<adapter>/<name>/check.checkleft`         | **Check definition.** Exported as part of the package API when published.                                               |
 | `<adapter>/<name>/fix.checkleft`           | **Fix definition.** Optional. Must export a `fix()` function.                                                           |
@@ -113,14 +112,13 @@ Each directory with a `check.checkleft` is an independent check. Nesting is pure
 
 **A check in a published package is part of that package's API.** If a check should not be visible to consumers, keep it out of the published package root or keep it in a local package that is not selected by consumer policy.
 
-**Cross-package consumption — even within the same monorepo — goes through `CHECKS.yaml`.** A consumer selects packages, version sets, and local path packages in validation policy. `checkleft-package.toml` never decides what another repo runs.
+**Cross-package consumption — even within the same monorepo — goes through `CHECKS.yaml`.** A consumer selects registry, git, and local path packages in validation policy. `checkleft-package.toml` never decides what another repo runs.
 
 **Key principles:**
 
 - `checkleft-package.toml` is producer metadata, not consumer validation policy.
 - Check source paths define reusable check IDs and same-package helper loading.
 - `CHECKS.yaml` decides what runs in a consumer repo, on which paths, with which policy.
-- Version sets are curated bundles: selecting a version set activates all checks from all packages it includes.
 
 ---
 
@@ -130,7 +128,7 @@ The Starlark package system deliberately separates producer concerns from consum
 
 - `checkleft-package.toml` answers "what package is this, and how is it published?"
 - Check/fix/lib paths answer "what reusable checks does this package define?"
-- `CHECKS.yaml` answers "which packages/version sets run here, against which files, with which policy?"
+- `CHECKS.yaml` answers "which packages run here, against which files, with which policy?"
 
 ### 3.1 `checkleft-package.toml` — producer metadata
 
@@ -142,7 +140,6 @@ Written in TOML. Parsed before publishing, package testing, and package loading.
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
-kind = "check_package"
 
 [publish]
 description = "Repository policy checks for myorg"
@@ -155,8 +152,7 @@ license = "Apache-2.0"
 | Field     | Type  | Required | Description                                                                                 |
 | --------- | ----- | -------- | ------------------------------------------------------------------------------------------- |
 | `name`    | `str` | yes      | Globally unique package name. Convention: `<org>/<descriptor>`.                             |
-| `version` | `str` | yes      | SemVer package version. Used by consumers and version sets when pinning this package.        |
-| `kind`    | `str` | no       | `check_package` (default) or `version_set`.                                                  |
+| `version` | `str` | yes      | SemVer package version. Used by consumers when pinning this package.                         |
 
 `checkleft-package.toml` intentionally has no `exclude`, no consumer `[dependencies]`, and no "activate these checks" section. Those belong in `CHECKS.yaml`.
 
@@ -189,62 +185,12 @@ my-checks/
 - The adapter's file selectors determine which files the check inspects. Consumer policy can further narrow the target set in `CHECKS.yaml`.
 - `lib/*.checkleft` modules are same-package helpers. Checks inside the package can `load("//lib/foo", ...)`; consumers cannot import package libs directly.
 
-### 3.3 Version-set packages
-
-A version set is a separate package whose `checkleft-package.toml` has `kind = "version_set"`. It pins a curated set of exact package refs and hashes.
-`[includes.<name>]` tables are only valid in version-set manifests. A `check_package` manifest does not declare dependencies or included packages; consumers select packages in `CHECKS.yaml`.
-
-```toml
-# Published as: acme-versionset v2025.06.1
-
-[package]
-name = "acme/versionset"
-version = "2025.06.1"
-kind = "version_set"
-
-[includes.proto_evolution]
-source = "registry://checkleft-hub/proto-evolution"
-version = "0.2.1"
-sha256 = "14c6000000000000000000000000000000000000000000000000000000000000"
-
-[includes.module_json_checks]
-source = "registry://checkleft-hub/module-json"
-version = "1.3.0"
-sha256 = "f041000000000000000000000000000000000000000000000000000000000000"
-
-[includes.java_api_compat]
-source = "registry://checkleft-hub/java-api-compat"
-version = "0.8.2"
-sha256 = "827a000000000000000000000000000000000000000000000000000000000000"
-
-[includes.security_baseline]
-source = "registry://checkleft-hub/security-baseline"
-version = "3.1.0"
-sha256 = "e91d000000000000000000000000000000000000000000000000000000000000"
-```
-
-Selecting a version set in `CHECKS.yaml` activates all checks from all included packages. A version set is therefore a curated API surface: adding, removing, or renaming a check is a meaningful version-set change.
-
-#### `[includes.<name>]` fields
-
-| TOML key    | Type  | Required | Description                                                 |
-| ----------- | ----- | -------- | ----------------------------------------------------------- |
-| (table key) | `str` | yes      | Local alias for this constituent package.                   |
-| `source`    | `str` | yes      | Source URI of the constituent package.                      |
-| `version`   | `str` | yes      | Exact version pin. The version set author tests this pin.   |
-| `sha256`    | `str` | yes      | Canonical SHA-256 digest of the published constituent package bytes: 64 lowercase hex characters. |
-
-### 3.4 `CHECKS.yaml` — consumer validation policy
+### 3.3 `CHECKS.yaml` — consumer validation policy
 
 Consumers select validation policy in `CHECKS.yaml`, alongside existing built-in/declarative check config. This keeps "what runs here?" reviewable in the file that already owns checkleft policy.
 
 ```yaml
 checkleft_packages:
-  version_sets:
-    - source: registry://checkleft-hub/acme-versionset
-      version: "2025.06.1"
-      sha256: "b3d1000000000000000000000000000000000000000000000000000000000000"
-
   packages:
     - source: git://github.com/myteam/checkleft-checks.git
       version: "0.3.0"
@@ -255,7 +201,6 @@ checkleft_packages:
       mode: explicit
 
 checks:
-  # Version sets activate all checks from their included packages.
   # This entry narrows the file scope for one activated check in this repo.
   - id: proto/evolution
     include:
@@ -269,7 +214,7 @@ checks:
       - "**/*.txt"
 ```
 
-`checkleft_packages.version_sets` entries activate every check in every package listed by the selected version set. `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
+`checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
 
 Path selection is two-stage:
 
@@ -278,27 +223,24 @@ Path selection is two-stage:
 
 `CHECKS.yaml` controls which checks run and on which paths — it does not configure check behavior.
 
-### 3.5 Resolution rules
+### 3.4 Resolution rules
 
-A consumer activates exactly the version sets and packages selected in `CHECKS.yaml`.
+A consumer activates exactly the packages selected in `CHECKS.yaml`.
 
 1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`. `sha256` values are canonical lowercase 64-hex digests; placeholder or mixed-case values are rejected at parse time.
-2. **Version sets are curated package bundles.** A version set package contains `[package]` metadata and `[includes.*]` entries. It does not define checks of its own and it cannot depend on another version set.
-3. **A version set's `sha256` covers the version-set package.** The package contains the exact ordered constituent `(source, version, sha256)` refs, so changing any included package changes the version-set package hash.
-4. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from selected packages or packages included by selected version sets.
-5. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
-6. **Version sets activate all checks from included packages.** Consumers control the selected version-set version; the version-set author controls the check set.
-7. **Individual packages can be activated in `all` or `explicit` mode.** Version sets are always `all`.
+2. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from packages selected directly by `CHECKS.yaml`.
+3. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
+4. **Individual packages can be activated in `all` or `explicit` mode.**
 
-### 3.6 Self-hosted guard check for policy integrity
+### 3.5 Self-hosted guard check for policy integrity
 
 Organizations that want to prevent removal or downgrade of required policy can supply an external root `CHECKS.yaml` through the existing external config mechanism. That root config enables a Starlark guard check targeting `CHECKS.yaml` / `CHECKS.toml`.
 
 Initial guard behavior:
 
 - Compare the base and current config files.
-- Fail if a selected version set or package pin is downgraded.
-- Fail if a hardcoded protected version set or package entry is removed.
+- Fail if a selected package pin is downgraded.
+- Fail if a hardcoded protected package entry is removed.
 - Use hardcoded placeholder protected entries to prove the policy-check execution path.
 
 This keeps the platform rule explicit: the guard is just another Starlark check supplied by org policy, not hidden behavior in package resolution.
@@ -783,7 +725,7 @@ Every directory with a `checkleft-package.toml` is a distributable package. The 
 
 ### 8.2 Resolution
 
-Packages and version sets selected in `CHECKS.yaml` are resolved at `checkleft` startup before any checks run:
+Packages selected in `CHECKS.yaml` are resolved at `checkleft` startup before any checks run:
 
 1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs containing `checkleft-package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/<sha256>/`.
 2. **`git://`** — cloned at the specified tag and packed into the same package byte format. Sparse checkout of the package directory only. Cached similarly and verified against `sha256`.
@@ -793,14 +735,13 @@ Packages and version sets selected in `CHECKS.yaml` are resolved at `checkleft` 
 
 - Only exact versions are supported. No ranges, no `^`, no `~`.
 - Fetched packages must declare `sha256` in the `CHECKS.yaml` ref; the resolver verifies fetched bytes before any checks are loaded.
-- Version sets are reproducible because the version-set package is itself hash-pinned, and its manifest lists exact constituent package refs and hashes.
-- `CHECKS.yaml` package refs and version-set manifests carry the exact versions and hashes that make selected packages reproducible.
+- `CHECKS.yaml` package refs carry the exact versions and hashes that make selected packages reproducible.
 - `path://` dependencies are an explicit local-iteration escape hatch. Directory refs read live local content and are not reproducible until replaced by a fetched, hash-pinned ref. Archive refs may supply `sha256`; when present, the resolver verifies the archive bytes before loading package code.
 - `checkleft update <dep_name> <new_version>` updates the manifest's exact version and hash.
 
 ### 8.4 Publishing
 
-Publishing produces a simple `tar.gz` package. The archive contains `checkleft-package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. It does not vendor package dependencies; consumers activate packages only when they list them directly or select a version set in `CHECKS.yaml`.
+Publishing produces a simple `tar.gz` package. The archive contains `checkleft-package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. It does not vendor package dependencies; consumers activate packages only when they list them directly in `CHECKS.yaml`.
 
 The archive layout is rooted at the package itself. The top-level entries are `checkleft-package.toml`, adapter
 directories such as `text/` or `proto/`, and optional `lib/` helpers. Consumers
@@ -816,7 +757,7 @@ The publishable tarball should be buildable by Bazel so check authors can iterat
 ### 9.1 Discovery
 
 ```
-1. Resolve packages and version sets selected by `CHECKS.yaml` (fetch and verify hashes as needed).
+1. Resolve packages selected by `CHECKS.yaml` (fetch and verify hashes as needed).
 2. For each selected package, parse checkleft-package.toml.
 3. Auto-discover checks from folder structure in each selected package.
 4. Run always-on checks (hardcoded in the runner).
@@ -2008,18 +1949,12 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 15.12 `CHECKS.yaml` selecting a version set
+### 15.12 `CHECKS.yaml` selecting packages
 
 ```yaml
 # CHECKS.yaml
-# Instead of pinning 5+ individual check packages, depend on one version set.
 
 checkleft_packages:
-  version_sets:
-    - source: registry://checkleft-hub/acme-versionset
-      version: "2025.06.1"
-      sha256: "b3d1000000000000000000000000000000000000000000000000000000000000"
-
   packages:
     - source: git://github.com/myteam/checkleft-checks.git
       version: "0.3.0"
@@ -2133,7 +2068,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 | Shared code         | `<package_root>/lib/*.checkleft`                                                                     |
 | Check-local helpers | `<package_root>/<adapter>/<name>/<anything>.checkleft` (not `check`, `fix`, or `check_test`)         |
 | Package manifest    | `checkleft-package.toml` (presence marks a directory as a package root)                              |
-| Package integrity   | Exact `source`/`version`/`sha256` refs in `CHECKS.yaml` and version-set includes                    |
+| Package integrity   | Exact `source`/`version`/`sha256` refs in `CHECKS.yaml`                                             |
 | Check ID            | `<adapter>/<name>` (e.g. `proto/evolution`)                                                          |
 | Type annotations    | Required on all function signatures                                                                  |
 | Default sandbox     | `hermetic`                                                                                           |
