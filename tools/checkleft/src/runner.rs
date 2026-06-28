@@ -1,18 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use flate2::read::GzDecoder;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use sha2::{Digest, Sha256};
+use tar::Archive;
 use tokio::task::JoinSet;
 
 use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
 
 use crate::bypass::{bypass_applied_finding, bypass_failure_guidance, bypass_name_for_check_id};
 use crate::check::{CheckRegistry, ConfiguredCheck};
-use crate::config::{CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver, StarlarkPackageConfig};
+use crate::config::{
+    CheckConfig, CheckConfigOrigin, ConfigDiagnostic, ConfigResolver, StarlarkPackageActivation, StarlarkPackageConfig,
+};
 use crate::exclusion::ExclusionStatus;
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::external::{
@@ -23,7 +29,7 @@ use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
 use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
 use crate::starlark::discovery::{self, DiscoveredCheck};
-use crate::starlark::manifest::{PackageKind, PackageManifest};
+use crate::starlark::manifest::{PackageKind, PackageManifest, PackageRef};
 use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
 use tracing::info;
 
@@ -53,6 +59,7 @@ enum ScheduledExecution {
     StarlarkLocal {
         check: Arc<StarlarkCheckRunner>,
         output: Arc<AdapterPreparedOutput>,
+        package_tree: Arc<dyn SourceTree>,
         fix_path: Option<PathBuf>,
         checkleft_root: PathBuf,
         check_dir: PathBuf,
@@ -88,6 +95,24 @@ impl EffectiveCheckPolicy {
 struct ScheduledRuns {
     runs: Vec<ScheduledCheckRun>,
     diagnostics: Vec<CheckResult>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedStarlarkPackage {
+    package: StarlarkPackageConfig,
+    explicit_check_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedPackageRef {
+    source: String,
+    version: String,
+    sha256: Option<String>,
+}
+
+struct ResolvedStarlarkPackage {
+    root: PathBuf,
+    tree: Arc<dyn SourceTree>,
 }
 
 /// The number of fix passes `dispatch_fix` applies when `--max-passes` is not
@@ -344,8 +369,12 @@ impl Runner {
                         })
                     });
                 }
-                ScheduledExecution::StarlarkLocal { check, output, .. } => {
-                    let source_tree = Arc::clone(&self.source_tree);
+                ScheduledExecution::StarlarkLocal {
+                    check,
+                    output,
+                    package_tree,
+                    ..
+                } => {
                     let configured_check_id = run.configured_check_id.clone();
                     let run_changeset = run.changeset;
                     let run_policy = run.policy;
@@ -363,7 +392,7 @@ impl Runner {
                     join_set.spawn(async move {
                         reporter.start(&configured_check_id);
                         let check_start = Instant::now();
-                        match check.evaluate_prepared_adapter(output.as_ref(), source_tree.as_ref()) {
+                        match check.evaluate_prepared_adapter(output.as_ref(), package_tree.as_ref()) {
                             Ok(mut result) => {
                                 let elapsed = check_start.elapsed();
                                 result.check_id = configured_check_id.clone();
@@ -849,6 +878,7 @@ impl Runner {
             let ScheduledExecution::StarlarkLocal {
                 check,
                 output,
+                package_tree,
                 fix_path: Some(fix_path),
                 checkleft_root,
                 check_dir,
@@ -856,7 +886,7 @@ impl Runner {
             else {
                 continue;
             };
-            let fix_source = match self.source_tree.read_file(&fix_path) {
+            let fix_source = match package_tree.read_file(&fix_path) {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(source) => StarlarkCheckSource::file(check_id.clone(), fix_path.clone(), source)
                         .with_load_context(checkleft_root, check_dir),
@@ -891,7 +921,7 @@ impl Runner {
                 fix_source,
                 output.as_ref(),
                 &findings,
-                self.source_tree.as_ref(),
+                package_tree.as_ref(),
             ) {
                 Ok(edits) => edits,
                 Err(err) => {
@@ -1197,7 +1227,7 @@ impl Runner {
 
         let mut starlark_diagnostics = BTreeMap::new();
         if let Ok(discovered) = self.discover_starlark_checks(changeset, &mut starlark_diagnostics) {
-            for check in discovered {
+            for (check, _) in discovered {
                 if starlark_changeset_for_check(changeset, &check)
                     .map(|changeset| !changeset.changed_files.is_empty())
                     .unwrap_or(false)
@@ -1272,6 +1302,9 @@ impl Runner {
                 continue;
             }
             for check in resolved.enabled() {
+                if self.is_explicit_starlark_selection(&resolved, check) {
+                    continue;
+                }
                 let policy = self.resolve_effective_policy(check);
                 let config_fingerprint = toml::to_string(&check.config).unwrap_or_default();
                 let implementation_fingerprint = check
@@ -1406,7 +1439,7 @@ impl Runner {
 
         let adapters = AdapterRegistry::with_builtin_adapters();
         let mut adapter_outputs: BTreeMap<String, Arc<AdapterPreparedOutput>> = BTreeMap::new();
-        for check in discovered {
+        for (check, package_tree) in discovered {
             let check_changeset = match starlark_changeset_for_check(changeset, &check) {
                 Ok(changeset) => changeset,
                 Err(err) => {
@@ -1469,7 +1502,7 @@ impl Runner {
                 }
             };
 
-            let source = match self.source_tree.read_file(&check.check_path) {
+            let source = match package_tree.read_file(&check.check_path) {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(source) => source,
                     Err(err) => {
@@ -1510,6 +1543,7 @@ impl Runner {
                     execution: ScheduledExecution::StarlarkLocal {
                         check: runner,
                         output: adapter_output,
+                        package_tree,
                         fix_path: check.fix_path.clone(),
                         checkleft_root: check.checkleft_root.clone(),
                         check_dir: check.check_dir.clone(),
@@ -1527,80 +1561,205 @@ impl Runner {
         &self,
         changeset: &ChangeSet,
         grouped_diagnostics: &mut BTreeMap<(String, PathBuf, Option<u32>, Option<u32>, String, String), CheckResult>,
-    ) -> Result<Vec<DiscoveredCheck>> {
-        let package_configs = self.starlark_package_configs_for_changeset(changeset);
-        if package_configs.is_empty() {
-            return discovery::discover_local_checks(changeset, self.source_tree.as_ref());
+    ) -> Result<Vec<(DiscoveredCheck, Arc<dyn SourceTree>)>> {
+        let package_selections = self.starlark_package_selections_for_changeset(changeset);
+        if package_selections.is_empty() {
+            let tree: Arc<dyn SourceTree> = Arc::clone(&self.source_tree);
+            return Ok(discovery::discover_local_checks(changeset, self.source_tree.as_ref())?
+                .into_iter()
+                .map(|check| (check, Arc::clone(&tree)))
+                .collect());
         }
 
         let mut checks = Vec::new();
-        for package in package_configs {
-            match self.discover_starlark_package_checks(&package) {
+        let mut selected_refs = BTreeMap::new();
+        for selection in package_selections {
+            match self.discover_starlark_package_checks(&selection.package, &mut selected_refs) {
                 Ok(mut package_checks) => {
-                    for check in &mut package_checks {
-                        check.scope_root = package.config_dir.clone();
+                    if selection.package.activation == StarlarkPackageActivation::Explicit {
+                        package_checks
+                            .retain(|(check, _)| explicit_selection_matches(&selection.explicit_check_ids, &check.id));
+                    }
+                    for (check, _) in &mut package_checks {
+                        check.scope_root = selection.package.config_dir.clone();
                     }
                     checks.append(&mut package_checks);
                 }
                 Err(err) => self.insert_starlark_package_diagnostic(
                     grouped_diagnostics,
-                    &package,
-                    format!("failed to activate Starlark package `{}`: {err:#}", package.source),
+                    &selection.package,
+                    format!(
+                        "failed to activate Starlark package `{}`: {err:#}",
+                        selection.package.source
+                    ),
                 ),
             }
         }
-        checks.sort_by(|left, right| left.check_path.cmp(&right.check_path));
-        checks.dedup_by(|left, right| left.check_path == right.check_path);
+        checks.sort_by(|(left, _), (right, _)| left.check_path.cmp(&right.check_path));
+        checks.dedup_by(|(left, _), (right, _)| left.check_path == right.check_path);
         Ok(checks)
     }
 
-    fn starlark_package_configs_for_changeset(&self, changeset: &ChangeSet) -> Vec<StarlarkPackageConfig> {
-        let mut packages = BTreeMap::new();
+    fn starlark_package_selections_for_changeset(&self, changeset: &ChangeSet) -> Vec<SelectedStarlarkPackage> {
+        let mut packages: BTreeMap<String, SelectedStarlarkPackage> = BTreeMap::new();
         for changed_file in &changeset.changed_files {
             let Ok(resolved) = self.resolver.resolve_for_file(&changed_file.path) else {
                 continue;
             };
+            let explicit_ids = resolved
+                .enabled()
+                .map(|check| check.id.clone())
+                .collect::<BTreeSet<_>>();
             for package in resolved.starlark_packages() {
                 packages
                     .entry(package.source.clone())
-                    .or_insert_with(|| package.clone());
+                    .and_modify(|selection| {
+                        selection.explicit_check_ids.extend(explicit_ids.iter().cloned());
+                    })
+                    .or_insert_with(|| SelectedStarlarkPackage {
+                        package: package.clone(),
+                        explicit_check_ids: explicit_ids.clone(),
+                    });
             }
         }
         packages.into_values().collect()
     }
 
-    fn discover_starlark_package_checks(&self, package: &StarlarkPackageConfig) -> Result<Vec<DiscoveredCheck>> {
-        let Some(root) = package.local_path() else {
-            bail!("fetched package sources are parsed but not schedulable yet");
-        };
+    fn is_explicit_starlark_selection(&self, resolved: &crate::config::ResolvedChecks, check: &CheckConfig) -> bool {
+        if check.implementation.is_some() || self.registry.get(&check.check).is_some() {
+            return false;
+        }
+        resolved
+            .starlark_packages()
+            .iter()
+            .any(|package| package.activation == StarlarkPackageActivation::Explicit)
+    }
+
+    fn discover_starlark_package_checks(
+        &self,
+        package: &StarlarkPackageConfig,
+        selected_refs: &mut BTreeMap<String, SelectedPackageRef>,
+    ) -> Result<Vec<(DiscoveredCheck, Arc<dyn SourceTree>)>> {
+        let resolved = self.resolve_starlark_package_source(&package.source, package.sha256.as_deref())?;
+        let root = resolved.root.as_path();
+        let tree = resolved.tree;
 
         match package.kind {
             crate::config::StarlarkPackageKind::Package => {
-                discovery::discover_package_checks(self.source_tree.as_ref(), root)
+                let manifest = PackageManifest::read_from_tree(tree.as_ref(), root)?;
+                if manifest.package.kind != PackageKind::CheckPackage {
+                    bail!(
+                        "{} declares a package activation but package.toml kind is not `check_package`",
+                        root.display()
+                    );
+                }
+                ensure_selected_version_matches(&manifest, &package.version, root)?;
+                record_selected_package_ref(
+                    selected_refs,
+                    &manifest.package.name,
+                    SelectedPackageRef {
+                        source: package.source.clone(),
+                        version: package.version.clone(),
+                        sha256: package.sha256.clone(),
+                    },
+                )?;
+                Ok(discovery::discover_package_checks(tree.as_ref(), root)?
+                    .into_iter()
+                    .map(|check| (check, Arc::clone(&tree)))
+                    .collect())
             }
             crate::config::StarlarkPackageKind::VersionSet => {
-                let manifest = PackageManifest::read_from_tree(self.source_tree.as_ref(), root)?;
+                let manifest = PackageManifest::read_from_tree(tree.as_ref(), root)?;
                 if manifest.package.kind != PackageKind::VersionSet {
                     bail!(
                         "{} declares a version-set activation but package.toml kind is not `version_set`",
                         root.display()
                     );
                 }
+                ensure_selected_version_matches(&manifest, &package.version, root)?;
+                record_selected_package_ref(
+                    selected_refs,
+                    &manifest.package.name,
+                    SelectedPackageRef {
+                        source: package.source.clone(),
+                        version: package.version.clone(),
+                        sha256: package.sha256.clone(),
+                    },
+                )?;
                 let mut checks = Vec::new();
                 for (alias, include) in manifest.includes {
-                    let Some(include_root) = include.source.strip_prefix("path://").map(Path::new) else {
+                    let include_resolved =
+                        self.resolve_starlark_package_source(&include.source, include.sha256.as_deref())?;
+                    let include_root = include_resolved.root.as_path();
+                    let include_tree = include_resolved.tree;
+                    let include_manifest = PackageManifest::read_from_tree(include_tree.as_ref(), include_root)?;
+                    if include_manifest.package.kind != PackageKind::CheckPackage {
                         bail!(
-                            "version-set include `{alias}` uses a fetched source; fetched package resolution is not implemented yet"
+                            "version-set include `{alias}` points at {}, but included package kind is not `check_package`",
+                            include_root.display()
                         );
-                    };
-                    checks.extend(discovery::discover_package_checks(
-                        self.source_tree.as_ref(),
-                        include_root,
-                    )?);
+                    }
+                    ensure_include_version_matches(&alias, &include_manifest, &include, include_root)?;
+                    record_selected_package_ref(
+                        selected_refs,
+                        &include_manifest.package.name,
+                        SelectedPackageRef {
+                            source: include.source.clone(),
+                            version: include.version.clone(),
+                            sha256: include.sha256.clone(),
+                        },
+                    )?;
+                    checks.extend(
+                        discovery::discover_package_checks(include_tree.as_ref(), include_root)?
+                            .into_iter()
+                            .map(|check| (check, Arc::clone(&include_tree))),
+                    );
                 }
                 Ok(checks)
             }
         }
+    }
+
+    fn resolve_starlark_package_source(
+        &self,
+        source: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<ResolvedStarlarkPackage> {
+        let Some(path) = source.strip_prefix("path://").map(Path::new) else {
+            bail!("fetched package sources are parsed but not schedulable yet");
+        };
+        if path.extension().and_then(|ext| ext.to_str()) == Some("gz")
+            && path
+                .file_stem()
+                .and_then(|stem| Path::new(stem).extension())
+                .and_then(|ext| ext.to_str())
+                == Some("tar")
+        {
+            let bytes = self
+                .source_tree
+                .read_file(path)
+                .with_context(|| format!("failed to read Starlark package archive {}", path.display()))?;
+            if let Some(expected) = expected_sha256 {
+                let actual = sha256_hex(&bytes);
+                if actual != expected {
+                    bail!(
+                        "Starlark package archive {} sha256 mismatch: expected {}, got {}",
+                        path.display(),
+                        expected,
+                        actual
+                    );
+                }
+            }
+            let tree = Arc::new(ArchivePackageTree::from_tar_gz(&bytes)?);
+            return Ok(ResolvedStarlarkPackage {
+                root: PathBuf::new(),
+                tree,
+            });
+        }
+        Ok(ResolvedStarlarkPackage {
+            root: path.to_path_buf(),
+            tree: Arc::clone(&self.source_tree),
+        })
     }
 
     fn insert_starlark_package_diagnostic(
@@ -1769,6 +1928,180 @@ fn starlark_policy(check_id: &str) -> EffectiveCheckPolicy {
         bypass_name: bypass_name_for_check_id(check_id),
         preserve_finding_severity: true,
     }
+}
+
+fn explicit_selection_matches(explicit_check_ids: &BTreeSet<String>, check_id: &str) -> bool {
+    explicit_check_ids.contains(check_id)
+        || explicit_check_ids
+            .iter()
+            .filter_map(|configured_id| configured_id.split_once(':').map(|(_, suffix)| suffix))
+            .any(|suffix| suffix == check_id)
+}
+
+fn record_selected_package_ref(
+    selected_refs: &mut BTreeMap<String, SelectedPackageRef>,
+    package_name: &str,
+    selected_ref: SelectedPackageRef,
+) -> Result<()> {
+    if let Some(existing) = selected_refs.get(package_name) {
+        if existing != &selected_ref {
+            bail!(
+                "selected package `{package_name}` resolves to conflicting refs: {}@{} and {}@{}",
+                existing.source,
+                existing.version,
+                selected_ref.source,
+                selected_ref.version
+            );
+        }
+        return Ok(());
+    }
+    selected_refs.insert(package_name.to_owned(), selected_ref);
+    Ok(())
+}
+
+fn ensure_selected_version_matches(manifest: &PackageManifest, selected_version: &str, root: &Path) -> Result<()> {
+    if manifest.package.version != selected_version {
+        bail!(
+            "{} package.toml version `{}` does not match selected version `{}`",
+            root.display(),
+            manifest.package.version,
+            selected_version
+        );
+    }
+    Ok(())
+}
+
+fn ensure_include_version_matches(
+    alias: &str,
+    manifest: &PackageManifest,
+    include: &PackageRef,
+    include_root: &Path,
+) -> Result<()> {
+    if manifest.package.version != include.version {
+        bail!(
+            "version-set include `{alias}` points at {}, whose package.toml version `{}` does not match selected version `{}`",
+            include_root.display(),
+            manifest.package.version,
+            include.version
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ArchivePackageTree {
+    files: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl ArchivePackageTree {
+    fn from_tar_gz(bytes: &[u8]) -> Result<Self> {
+        let decoder = GzDecoder::new(bytes);
+        let mut archive = Archive::new(decoder);
+        let mut files = BTreeMap::new();
+        for entry in archive
+            .entries()
+            .context("failed to read Starlark package archive entries")?
+        {
+            let mut entry = entry.context("failed to read Starlark package archive entry")?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let path = entry
+                .path()
+                .context("failed to read Starlark package archive entry path")?
+                .into_owned();
+            validate_archive_path(&path)?;
+            let mut contents = Vec::new();
+            entry
+                .read_to_end(&mut contents)
+                .with_context(|| format!("failed to read Starlark package archive entry {}", path.display()))?;
+            files.insert(path, contents);
+        }
+        if !files.contains_key(Path::new("package.toml")) {
+            bail!("Starlark package archive must contain package.toml at the archive root");
+        }
+        Ok(Self { files })
+    }
+}
+
+impl SourceTree for ArchivePackageTree {
+    fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        validate_archive_path(path)?;
+        self.files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| anyhow!("Starlark package archive has no file {}", path.display()))
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        validate_archive_path(path).is_ok()
+            && (self.files.contains_key(path)
+                || self
+                    .files
+                    .keys()
+                    .any(|file| path.as_os_str().is_empty() || file.starts_with(path)))
+    }
+
+    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        validate_archive_path(path)?;
+        if self.files.contains_key(path) {
+            bail!("Starlark package archive path is not a directory: {}", path.display());
+        }
+        let mut entries = BTreeSet::new();
+        for file in self.files.keys() {
+            let relative = if path.as_os_str().is_empty() {
+                file.as_path()
+            } else {
+                let Ok(relative) = file.strip_prefix(path) else {
+                    continue;
+                };
+                relative
+            };
+            let Some(first) = relative.components().next() else {
+                continue;
+            };
+            if let std::path::Component::Normal(part) = first {
+                entries.insert(if path.as_os_str().is_empty() {
+                    PathBuf::from(part)
+                } else {
+                    path.join(part)
+                });
+            }
+        }
+        if entries.is_empty() && !self.exists(path) {
+            bail!("Starlark package archive has no directory {}", path.display());
+        }
+        Ok(entries.into_iter().collect())
+    }
+
+    fn glob(&self, pattern: &str) -> Result<Vec<PathBuf>> {
+        let glob = Glob::new(pattern).with_context(|| format!("invalid glob pattern: {pattern}"))?;
+        let matcher = glob.compile_matcher();
+        Ok(self
+            .files
+            .keys()
+            .filter(|path| matcher.is_match(path))
+            .cloned()
+            .collect())
+    }
+}
+
+fn validate_archive_path(path: &Path) -> Result<()> {
+    if path.is_absolute() {
+        bail!("Starlark package archive paths must be relative: {}", path.display());
+    }
+    crate::path::validate_relative_path(path)
+        .with_context(|| format!("invalid Starlark package archive path {}", path.display()))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) -> Result<ChangeSet> {

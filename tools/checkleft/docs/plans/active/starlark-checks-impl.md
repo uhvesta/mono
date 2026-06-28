@@ -169,8 +169,14 @@ starlark/adapter/proto/
 |---|---|
 | `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, activation mode, and per-check include narrowing. |
 | `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity, publishing metadata, and version-set `[includes]`. |
-| `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. Do not generate a lockfile. |
+| `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
 | `starlark/package.rs` | Expand selected version sets to their exact package refs. Version sets activate all checks from all included packages. Individual packages support `all` or `explicit` activation. |
+
+Package refs and version-set includes validate `sha256` pins as canonical
+lowercase 64-hex digests before any fetch or package discovery step. `path://`
+refs may omit `sha256` for local iteration; any supplied hash must still be
+canonical. Local archive refs verify the archive bytes when `sha256` is present,
+then discover checks from the archive-root package layout.
 
 This phase makes Starlark checks a first-class `CHECKS.yaml` policy input without overloading `package.toml`.
 
@@ -185,6 +191,7 @@ This phase makes Starlark checks a first-class `CHECKS.yaml` policy input withou
 | File | What it does |
 |---|---|
 | `starlark/testing.rs` | Preserve path-based author semantics: discover checks from `<adapter>/<nested/name>/check.checkleft`, scan sibling `testdata/<case>/` dirs, construct a synthetic `ChangeSet` from `before/` + `after/`, run the adapter + check, compare findings against `expected.toml`. If `expected_fix/` exists, run the fix and diff. |
+| `bazel/defs.bzl` | Expose `starlark_check_test` so check authors can schedule the real `checkleft test` CLI from Bazel with an optional selector. Expose a Checkleft toolchain so testing and validation rules resolve the checkleft binary through Bazel toolchain resolution. |
 
 **CLI integration:** Add `checkleft test [check_id] [--update]` subcommand to `main.rs`.
 

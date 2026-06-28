@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::input::{ChangeSet, SourceTree};
 use crate::path::validate_relative_path;
-use crate::starlark::manifest::PackageManifest;
+use crate::starlark::manifest::{PackageKind, PackageManifest};
 
 const BUILTIN_ADAPTERS: &[&str] = &["text", "proto", "module_json", "java"];
 
@@ -40,10 +40,45 @@ pub fn discover_local_checks(changeset: &ChangeSet, tree: &dyn SourceTree) -> Re
 pub fn discover_package_checks(tree: &dyn SourceTree, checkleft_root: &Path) -> Result<Vec<DiscoveredCheck>> {
     validate_relative_path(checkleft_root)?;
     let manifest = PackageManifest::read_from_tree(tree, checkleft_root)?;
+    if manifest.package.kind == PackageKind::VersionSet {
+        ensure_version_set_defines_no_checks(tree, checkleft_root)?;
+        return Ok(Vec::new());
+    }
     let mut checks = Vec::new();
     scan_dir(tree, checkleft_root, checkleft_root, &manifest, &mut checks)?;
     checks.sort_by(|a, b| a.check_path.cmp(&b.check_path));
     Ok(checks)
+}
+
+fn ensure_version_set_defines_no_checks(tree: &dyn SourceTree, checkleft_root: &Path) -> Result<()> {
+    for entry in tree
+        .list_dir(checkleft_root)
+        .with_context(|| format!("failed to list {}", checkleft_root.display()))?
+    {
+        let relative = relative_to_root(checkleft_root, &entry)?;
+        let components = path_components(&relative)?;
+        if components.first() == Some(&"lib") {
+            bail!(
+                "version_set package {} must not define lib/ helpers",
+                checkleft_root.display()
+            );
+        }
+        if components
+            .first()
+            .is_some_and(|component| *component != "package.toml" && is_known_adapter(component))
+        {
+            bail!(
+                "version_set package {} must not define checks; use [includes.<name>] only",
+                checkleft_root.display()
+            );
+        }
+        if is_directory(tree, &entry) {
+            validate_directory_entry(checkleft_root, &entry)?;
+        } else {
+            validate_file_entry(checkleft_root, &entry)?;
+        }
+    }
+    Ok(())
 }
 
 fn candidate_checkleft_roots(changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<Vec<PathBuf>> {
@@ -356,6 +391,58 @@ version = "0.1.0"
         let err = discover_package_checks(&tree, Path::new("checkleft")).expect_err("adapter must fail");
 
         assert!(err.to_string().contains("unknown Starlark check adapter"), "{err:#}");
+    }
+
+    #[test]
+    fn version_set_package_does_not_discover_checks() {
+        let temp = tempdir().expect("create temp dir");
+        write_file(
+            temp.path().join("checkleft/package.toml"),
+            r#"
+[package]
+name = "myorg/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.core]
+source = "registry://checkleft-hub/core"
+version = "1.2.3"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        );
+
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let checks = discover_package_checks(&tree, Path::new("checkleft")).expect("discover version set");
+
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn rejects_version_set_package_with_checks() {
+        let temp = tempdir().expect("create temp dir");
+        write_file(
+            temp.path().join("checkleft/package.toml"),
+            r#"
+[package]
+name = "myorg/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.core]
+source = "registry://checkleft-hub/core"
+version = "1.2.3"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        );
+        write_file(
+            temp.path().join("checkleft/text/no_debug/check.checkleft"),
+            r#"check_meta(applies_to = ["**/*.txt"])"#,
+        );
+
+        let tree = LocalSourceTree::new(temp.path()).expect("create tree");
+        let err = discover_package_checks(&tree, Path::new("checkleft")).expect_err("version set checks must fail");
+
+        assert!(err.to_string().contains("must not define checks"), "{err:#}");
     }
 
     fn write_file(path: impl AsRef<Path>, contents: &str) {

@@ -60,6 +60,7 @@ pub struct StarlarkPackageConfig {
     pub version: String,
     pub sha256: Option<String>,
     pub kind: StarlarkPackageKind,
+    pub activation: StarlarkPackageActivation,
     pub source_path: PathBuf,
     pub config_dir: PathBuf,
     pub origin: CheckConfigOrigin,
@@ -69,6 +70,12 @@ pub struct StarlarkPackageConfig {
 pub enum StarlarkPackageKind {
     Package,
     VersionSet,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StarlarkPackageActivation {
+    All,
+    Explicit,
 }
 
 impl StarlarkPackageConfig {
@@ -566,6 +573,8 @@ struct ParsedStarlarkPackageRef {
     version: String,
     #[serde(default)]
     sha256: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -774,6 +783,18 @@ fn parse_starlark_package(
         .as_ref()
         .map(|hash| hash.trim().to_owned())
         .filter(|hash| !hash.is_empty());
+    if let Some(hash) = &sha256
+        && !is_canonical_sha256(hash)
+    {
+        return Err(config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            format!("`checkleft_packages` sha256 for source `{source}` must be a canonical sha256 digest"),
+            None,
+            None,
+            Some("Use 64 lowercase hexadecimal characters.".to_owned()),
+        ));
+    }
     if !source.starts_with("path://") && sha256.is_none() {
         return Err(config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
@@ -784,16 +805,52 @@ fn parse_starlark_package(
             Some("Add the expected sha256 for fetched package bytes.".to_owned()),
         ));
     }
+    let activation = parse_starlark_package_activation(raw.mode.as_deref(), kind, &source).map_err(|message| {
+        config_file_diagnostic(
+            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+            source_path.to_path_buf(),
+            message,
+            None,
+            None,
+            Some("Use mode: all or mode: explicit on packages; omit mode or use all for version_sets.".to_owned()),
+        )
+    })?;
 
     Ok(StarlarkPackageConfig {
         source,
         version: version.to_owned(),
         sha256,
         kind,
+        activation,
         source_path: source_path.to_path_buf(),
         config_dir: config_dir.to_path_buf(),
         origin,
     })
+}
+
+fn parse_starlark_package_activation(
+    raw_mode: Option<&str>,
+    kind: StarlarkPackageKind,
+    source: &str,
+) -> std::result::Result<StarlarkPackageActivation, String> {
+    let mode = raw_mode.map(str::trim).filter(|mode| !mode.is_empty());
+    match kind {
+        StarlarkPackageKind::VersionSet => match mode {
+            None | Some("all") => Ok(StarlarkPackageActivation::All),
+            Some(other) => Err(format!(
+                "`checkleft_packages` version_sets do not support mode `{other}`; version sets always activate all checks"
+            )),
+        },
+        StarlarkPackageKind::Package => match mode {
+            Some("all") => Ok(StarlarkPackageActivation::All),
+            Some("explicit") => Ok(StarlarkPackageActivation::Explicit),
+            Some(other) => Err(format!(
+                "`checkleft_packages` packages mode must be `all` or `explicit`, got `{other}`"
+            )),
+            None if source.starts_with("path://") => Ok(StarlarkPackageActivation::Explicit),
+            None => Ok(StarlarkPackageActivation::All),
+        },
+    }
 }
 
 fn normalize_package_source(source: &str, config_dir: &Path) -> Result<String> {
@@ -823,6 +880,13 @@ fn normalize_package_source(source: &str, config_dir: &Path) -> Result<String> {
         }
         _ => bail!("unsupported source scheme `{scheme}`"),
     }
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn validate_exact_package_version(version: &str) -> Result<()> {

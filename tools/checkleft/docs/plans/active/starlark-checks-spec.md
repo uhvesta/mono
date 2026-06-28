@@ -280,6 +280,7 @@ checkleft/
 ### 3.3 Version-set packages
 
 A version set is a separate `checkleft/` package whose `package.toml` has `kind = "version_set"`. It pins a curated set of exact package refs and hashes.
+`[includes.<name>]` tables are only valid in version-set manifests. A `check_package` manifest does not declare dependencies or included packages; consumers select packages in `CHECKS.yaml`.
 
 ```toml
 # Published as: acme-versionset v2025.06.1
@@ -292,22 +293,22 @@ kind = "version_set"
 [includes.proto_evolution]
 source = "registry://checkleft-hub/proto-evolution"
 version = "0.2.1"
-sha256 = "14c6..."
+sha256 = "14c6000000000000000000000000000000000000000000000000000000000000"
 
 [includes.module_json_checks]
 source = "registry://checkleft-hub/module-json"
 version = "1.3.0"
-sha256 = "f041..."
+sha256 = "f041000000000000000000000000000000000000000000000000000000000000"
 
 [includes.java_api_compat]
 source = "registry://checkleft-hub/java-api-compat"
 version = "0.8.2"
-sha256 = "827a..."
+sha256 = "827a000000000000000000000000000000000000000000000000000000000000"
 
 [includes.security_baseline]
 source = "registry://checkleft-hub/security-baseline"
 version = "3.1.0"
-sha256 = "e91d..."
+sha256 = "e91d000000000000000000000000000000000000000000000000000000000000"
 ```
 
 Selecting a version set in `CHECKS.yaml` activates all checks from all included packages. A version set is therefore a curated API surface: adding, removing, or renaming a check is a meaningful version-set change.
@@ -319,7 +320,7 @@ Selecting a version set in `CHECKS.yaml` activates all checks from all included 
 | (table key) | `str` | yes      | Local alias for this constituent package.                   |
 | `source`    | `str` | yes      | Source URI of the constituent package.                      |
 | `version`   | `str` | yes      | Exact version pin. The version set author tests this pin.   |
-| `sha256`    | `str` | yes      | SHA-256 of the published constituent package bytes.         |
+| `sha256`    | `str` | yes      | Canonical SHA-256 digest of the published constituent package bytes: 64 lowercase hex characters. |
 
 ### 3.4 `CHECKS.yaml` — consumer validation policy
 
@@ -328,19 +329,17 @@ Consumers select validation policy in `CHECKS.yaml`, alongside existing built-in
 ```yaml
 checkleft_packages:
   version_sets:
-    acme_baseline:
-      source: registry://checkleft-hub/acme-versionset
+    - source: registry://checkleft-hub/acme-versionset
       version: "2025.06.1"
-      sha256: "b3d1..."
+      sha256: "b3d1000000000000000000000000000000000000000000000000000000000000"
 
   packages:
-    team_checks:
-      source: git://github.com/myteam/checkleft-checks.git
+    - source: git://github.com/myteam/checkleft-checks.git
       version: "0.3.0"
-      sha256: "9f20..."
+      sha256: "9f200000000000000000000000000000000000000000000000000000000000"
 
-    local_experiments:
-      path: tools/checkleft-experiments/checkleft
+    - source: path://tools/checkleft-experiments/checkleft
+      version: "0.0.0-local"
       mode: explicit
 
 checks:
@@ -360,7 +359,7 @@ checks:
       - "**/*.txt"
 ```
 
-`checkleft_packages.version_sets` entries activate every check in every package listed by the selected version set. `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration.
+`checkleft_packages.version_sets` entries activate every check in every package listed by the selected version set. `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
 
 Path selection is two-stage:
 
@@ -373,7 +372,7 @@ Path selection is two-stage:
 
 Resolution is intentionally simple: there is no transitive dependency graph and no dependency solver. A consumer activates exactly the version sets and packages selected in `CHECKS.yaml`.
 
-1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`.
+1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`. `sha256` values are canonical lowercase 64-hex digests; placeholder or mixed-case values are rejected at parse time.
 2. **Version sets are curated package bundles.** A version set package contains `[package]` metadata and `[includes.*]` entries. It does not define checks of its own and it cannot depend on another version set.
 3. **A version set's `sha256` covers the version-set package.** The package contains the exact ordered constituent `(source, version, sha256)` refs, so changing any included package changes the version-set package hash.
 4. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from selected packages or packages included by selected version sets.
@@ -884,7 +883,7 @@ Packages and version sets selected in `CHECKS.yaml` are resolved at `checkleft` 
 
 1. **`registry://`** — fetched from a check registry (HTTP API). The registry serves tarballs containing `package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. Cached locally in `~/.cache/checkleft/packages/<name>/<version>/<sha256>/`.
 2. **`git://`** — cloned at the specified tag and packed into the same package byte format. Sparse checkout of the `checkleft/` directory only. Cached similarly and verified against `sha256`.
-3. **`path://`** — local filesystem path. For monorepo cross-project dependencies. No caching; always reads live. Always relative to the repo root (e.g. `path://a/b/c/checkleft`). Relative paths (`../`) are not allowed — use the repo-root-relative path instead, similar to Bazel's `//` convention.
+3. **`path://`** — local filesystem path. For monorepo cross-project dependencies and local registry/tarball iteration. Always relative to the repo root. A `path://a/b/c/checkleft` directory reads live package contents; a `path://dist/acme-checks.tar.gz` archive reads the same publishable tarball format produced by `starlark_check_package`. Relative paths (`../`) are not allowed — use the repo-root-relative path instead, similar to Bazel's `//` convention.
 
 ### 8.3 Reproducibility and hash pinning
 
@@ -892,14 +891,35 @@ Packages and version sets selected in `CHECKS.yaml` are resolved at `checkleft` 
 - Fetched packages must declare `sha256` in `package.toml`; the resolver verifies fetched bytes before any checks are loaded.
 - Version sets are reproducible because the version-set package is itself hash-pinned, and its manifest lists exact constituent package refs and hashes.
 - There is no `PACKAGE.lock`. `CHECKS.yaml` package refs and version-set manifests already carry the exact versions and hashes that make selected packages reproducible.
-- `path://` dependencies are an explicit local-iteration escape hatch. They read live local content and are not reproducible until replaced by a fetched, hash-pinned ref.
+- `path://` dependencies are an explicit local-iteration escape hatch. Directory refs read live local content and are not reproducible until replaced by a fetched, hash-pinned ref. Archive refs may supply `sha256`; when present, the resolver verifies the archive bytes before loading package code.
 - `checkleft update <dep_name> <new_version>` updates the manifest's exact version and hash.
 
 ### 8.4 Publishing
 
 Publishing produces a simple `tar.gz` package. The archive contains `package.toml`, published `check.checkleft`/`fix.checkleft` files, and the internal `lib/` files those checks load. It does not vendor package dependencies; consumers activate packages only when they list them directly or select a version set in `CHECKS.yaml`.
 
-The publishable tarball should be buildable by Bazel (for example with a `pkg_tar`-style target) so check authors can iterate under the same build system that schedules their package tests. A `checkleft publish` command is a future convenience layer over the same package format.
+The archive layout is rooted at the package itself, not at a containing
+`checkleft/` directory. The top-level entries are `package.toml`, adapter
+directories such as `text/` or `proto/`, and optional `lib/` helpers. Consumers
+can point `CHECKS.yaml` at the archive with `path://...tar.gz` during local
+iteration, or consume the same bytes from `registry://` once published.
+
+The publishable tarball should be buildable by Bazel so check authors can iterate under the same build system that schedules their package tests. The author-facing Bazel API is:
+
+```starlark
+load("//tools/checkleft/bazel:defs.bzl", "starlark_check_package")
+
+starlark_check_package(
+    name = "api_checks_pkg",
+    srcs = glob(
+        ["checkleft/**"],
+        exclude = ["checkleft/**/testdata/**"],
+    ),
+    package_root = "checkleft",
+)
+```
+
+`starlark_check_package` emits the deterministic publishable `.tar.gz`, rejects `PACKAGE.lock`, rejects author-only `testdata/`, and only accepts `package.toml` plus `.checkleft` sources. A `checkleft publish` command is a future convenience layer over the same package format.
 
 ---
 
@@ -1444,6 +1464,35 @@ checkleft test proto/evolution/field_removal
 # Update expected output from actual results (snapshot testing)
 checkleft test --update proto/evolution
 ```
+
+Check authors can schedule the same test flow in Bazel with `starlark_check_test`:
+
+```starlark
+load("//tools/checkleft/bazel:defs.bzl", "starlark_check_test")
+
+starlark_check_test(
+    name = "api_checks_test",
+    srcs = glob(["checkleft/**"]),
+    package_root = "checkleft",
+)
+
+starlark_check_test(
+    name = "proto_evolution_field_removal_test",
+    srcs = glob(["checkleft/**"]),
+    package_root = "checkleft",
+    selector = "proto/evolution/field_removal",
+)
+```
+
+`starlark_check_test` runs the real `checkleft test` CLI from the package parent directory. The `package_root` must point at a `checkleft` directory, and `selector` follows the same syntax as the CLI.
+
+The Bazel rules resolve the checkleft binary through the Checkleft toolchain:
+
+```starlark
+register_toolchains("//tools/checkleft:checkleft_toolchain")
+```
+
+Repos can provide their own compatible toolchain later if they need to run a pinned or vendored checkleft binary. The in-repo toolchain is the default author-iteration path.
 
 ### 13.6 Testing network-tier checks
 
@@ -2031,16 +2080,14 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
 
 checkleft_packages:
   version_sets:
-    acme_versionset:
-      source: registry://checkleft-hub/acme-versionset
+    - source: registry://checkleft-hub/acme-versionset
       version: "2025.06.1"
-      sha256: "b3d1..."
+      sha256: "b3d1000000000000000000000000000000000000000000000000000000000000"
 
   packages:
-    custom_team_checks:
-      source: git://github.com/myteam/checkleft-checks.git
+    - source: git://github.com/myteam/checkleft-checks.git
       version: "0.3.0"
-      sha256: "9f20..."
+      sha256: "9f200000000000000000000000000000000000000000000000000000000000"
       mode: all
 
 checks:

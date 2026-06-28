@@ -56,6 +56,15 @@ impl PackageManifest {
         }
 
         let includes = validate_refs("includes", raw.includes)?;
+        match package.kind {
+            PackageKind::CheckPackage if !includes.is_empty() => {
+                bail!("check_package manifests must not declare [includes]; select packages in CHECKS.yaml instead");
+            }
+            PackageKind::VersionSet if includes.is_empty() => {
+                bail!("version_set manifests must declare at least one [includes.<name>] entry");
+            }
+            _ => {}
+        }
 
         Ok(Self {
             package: PackageIdentity {
@@ -84,6 +93,11 @@ fn validate_refs(section: &'static str, refs: BTreeMap<String, RawPackageRef>) -
         validate_exact_version(section, &alias, &package_ref.version)?;
         if !package_ref.source.starts_with("path://") && package_ref.sha256.is_none() {
             bail!("[{section}.{alias}].sha256 is required for fetched package refs");
+        }
+        if let Some(hash) = &package_ref.sha256
+            && !is_canonical_sha256(hash)
+        {
+            bail!("[{section}.{alias}].sha256 must be a canonical sha256 digest");
         }
         result.insert(
             alias,
@@ -118,6 +132,13 @@ fn validate_source_uri(section: &str, alias: &str, source: &str) -> Result<()> {
         _ => bail!("[{section}.{alias}].source uses unsupported scheme `{scheme}`"),
     }
     Ok(())
+}
+
+fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn validate_exact_version(section: &str, alias: &str, version: &str) -> Result<()> {
@@ -196,6 +217,40 @@ version = "0.1.0"
     }
 
     #[test]
+    fn rejects_check_package_includes() {
+        let err = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/repo-checks"
+version = "0.1.0"
+
+[includes.bad]
+source = "registry://checkleft-hub/core"
+version = "1.2.3"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+        )
+        .expect_err("check package includes must fail");
+
+        assert!(err.to_string().contains("must not declare [includes]"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_empty_version_set_manifest() {
+        let err = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/baseline"
+version = "2026.06.1"
+kind = "version_set"
+"#,
+        )
+        .expect_err("empty version set must fail");
+
+        assert!(err.to_string().contains("must declare at least one"), "{err:#}");
+    }
+
+    #[test]
     fn parses_version_set_manifest_includes() {
         let manifest = PackageManifest::parse(
             r#"
@@ -207,14 +262,17 @@ kind = "version_set"
 [includes.core]
 source = "registry://checkleft-hub/core"
 version = "1.2.3"
-sha256 = "abc123"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#,
         )
         .expect("parse manifest");
 
         assert_eq!(manifest.package.kind, PackageKind::VersionSet);
         assert_eq!(manifest.includes["core"].source, "registry://checkleft-hub/core");
-        assert_eq!(manifest.includes["core"].sha256.as_deref(), Some("abc123"));
+        assert_eq!(
+            manifest.includes["core"].sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]
@@ -234,6 +292,26 @@ version = "1.2.3"
         .expect_err("missing hash must fail");
 
         assert!(err.to_string().contains("sha256"), "{err:#}");
+    }
+
+    #[test]
+    fn rejects_non_canonical_include_hashes() {
+        let err = PackageManifest::parse(
+            r#"
+[package]
+name = "myorg/baseline"
+version = "2026.06.1"
+kind = "version_set"
+
+[includes.core]
+source = "registry://checkleft-hub/core"
+version = "1.2.3"
+sha256 = "ABC123"
+"#,
+        )
+        .expect_err("non-canonical hash must fail");
+
+        assert!(err.to_string().contains("canonical sha256 digest"), "{err:#}");
     }
 
     #[test]

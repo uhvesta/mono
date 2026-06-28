@@ -16,6 +16,7 @@ use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
 #[derive(Debug, Clone, Default)]
 pub struct StarlarkTestOptions {
     pub selector: Option<String>,
+    pub update: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +91,14 @@ pub fn run_package_tests(
             if !selector_matches(options.selector.as_deref(), &check, Some(&case_name)) {
                 continue;
             }
-            cases.push(run_test_case(repo_root, checkleft_root, &check, &case_dir, &case_name)?);
+            cases.push(run_test_case(
+                repo_root,
+                checkleft_root,
+                &check,
+                &case_dir,
+                &case_name,
+                options,
+            )?);
         }
     }
     cases.sort_by(|left, right| {
@@ -107,6 +115,7 @@ fn run_test_case(
     check: &DiscoveredCheck,
     case_dir: &Path,
     case_name: &str,
+    options: &StarlarkTestOptions,
 ) -> Result<StarlarkTestCaseResult> {
     let before_root = case_dir.join("before");
     let after_root = case_dir.join("after");
@@ -117,7 +126,6 @@ fn run_test_case(
     if !after_root.exists() {
         bail!("{} is missing after/", case_dir.display());
     }
-    let expected = parse_expected(&expected_path)?;
     let changeset = fixture_changeset(&before_root, &after_root)?;
     let tree = FixturePackageTree {
         repo_root: repo_root.to_path_buf(),
@@ -135,6 +143,26 @@ fn run_test_case(
             .with_load_context(check.checkleft_root.clone(), check.check_dir.clone()),
     );
     let actual = runner.evaluate_adapter(&check.adapter, &changeset, &tree)?;
+
+    if options.update {
+        write_expected(&expected_path, &actual)?;
+        return match compare_expected_fix(repo_root, check, &runner, &changeset, &tree, &actual, case_dir) {
+            Ok(()) => Ok(StarlarkTestCaseResult {
+                check_id: check.id.clone(),
+                case_name: case_name.to_owned(),
+                passed: true,
+                message: None,
+            }),
+            Err(err) => Ok(StarlarkTestCaseResult {
+                check_id: check.id.clone(),
+                case_name: case_name.to_owned(),
+                passed: false,
+                message: Some(err.to_string()),
+            }),
+        };
+    }
+
+    let expected = parse_expected(&expected_path)?;
     match compare_findings(&expected.findings, &actual)
         .and_then(|()| compare_expected_fix(repo_root, check, &runner, &changeset, &tree, &actual, case_dir))
     {
@@ -198,6 +226,41 @@ fn parse_expected(path: &Path) -> Result<ExpectedOutput> {
         return Ok(ExpectedOutput::default());
     }
     toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_expected(path: &Path, actual: &CheckResult) -> Result<()> {
+    let expected = ExpectedOutput {
+        findings: actual
+            .findings
+            .iter()
+            .enumerate()
+            .map(|(index, finding)| expected_finding_from_actual(index, finding))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let mut text = toml::to_string_pretty(&expected).context("failed to serialize expected findings")?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn expected_finding_from_actual(index: usize, finding: &Finding) -> Result<ExpectedFinding> {
+    let severity = match finding.severity {
+        Severity::Error => ExpectedSeverity::Fail,
+        Severity::Warning => ExpectedSeverity::FailButOverridable,
+        Severity::Info => bail!("finding {index} has unsupported snapshot severity: info"),
+    };
+    let location = finding
+        .location
+        .as_ref()
+        .ok_or_else(|| anyhow!("finding {index} has no location"))?;
+    Ok(ExpectedFinding {
+        severity,
+        message_contains: None,
+        message_eq: Some(finding.message.clone()),
+        path: location.path.clone(),
+        line: location.line,
+    })
 }
 
 fn test_case_dirs(testdata: &Path) -> Result<Vec<PathBuf>> {
@@ -508,6 +571,7 @@ mod tests {
             Path::new("checkleft"),
             &StarlarkTestOptions {
                 selector: Some("text/no_debug/debug_added".to_owned()),
+                update: false,
             },
         )
         .expect("run tests");
@@ -546,6 +610,33 @@ path = "notes/example.txt"
                 .expect("message")
                 .contains("message mismatch")
         );
+    }
+
+    #[test]
+    fn updates_expected_finding_snapshot() {
+        let temp = tempdir().expect("create temp dir");
+        write_package_fixture(temp.path());
+        let expected_path = temp
+            .path()
+            .join("checkleft/text/no_debug/testdata/debug_added/expected.toml");
+        fs::write(&expected_path, "").expect("clear expected");
+
+        let result = run_package_tests(
+            temp.path(),
+            Path::new("checkleft"),
+            &StarlarkTestOptions {
+                selector: Some("text/no_debug/debug_added".to_owned()),
+                update: true,
+            },
+        )
+        .expect("run tests");
+
+        assert_eq!(result.cases.len(), 1);
+        assert!(result.cases[0].passed, "{:?}", result.cases[0].message);
+        let updated = fs::read_to_string(expected_path).expect("read expected");
+        assert!(updated.contains("message_eq = \"debug text added\""), "{updated}");
+        assert!(updated.contains("path = \"notes/example.txt\""), "{updated}");
+        assert!(updated.contains("line = 2"), "{updated}");
     }
 
     fn write_package_fixture(root: &Path) {
