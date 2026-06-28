@@ -156,7 +156,8 @@ Scope:
   for iteration.
 - Keep package selection, path scoping, and excludes in consumer validation
   policy.
-- Support package activation in `all` and `explicit` modes.
+- Support package activation modes (`all` and `explicit`) without transitive
+  package activation.
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test`
