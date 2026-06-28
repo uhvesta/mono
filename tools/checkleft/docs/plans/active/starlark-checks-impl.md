@@ -43,8 +43,8 @@ Key points:
 src/
 ├── starlark/                          # NEW — all Starlark check infrastructure
 │   ├── mod.rs                         # Public API: StarlarkCheckRunner, discover(), types re-export
-│   ├── discovery.rs                   # Changeset-scoped checkleft/ directory discovery
-│   ├── manifest.rs                    # package.toml parsing (PackageManifest, VersionSet, Dependency)
+│   ├── discovery.rs                   # Package directory discovery
+│   ├── manifest.rs                    # checkleft-package.toml parsing (PackageManifest, VersionSet, Dependency)
 │   ├── loader.rs                      # Starlark load() resolution (// and : prefixes)
 │   ├── check_meta.rs                  # check_meta() built-in function + CheckMeta struct
 │   ├── evaluator.rs                   # Starlark Module setup, Globals construction, check(ctx) invocation
@@ -76,7 +76,7 @@ This is a new top-level module under `src/`. It does **not** live inside `extern
 | `starlark/mod.rs` | Module root. Expose `StarlarkCheckRunner`. |
 | `starlark/types.rs` | `#[derive(StarlarkValue)]` impls for `Finding`, `Severity`, `FileEdit`, `Location`. The `finding()` and `fail()` / `fail_but_overridable()` constructor functions as Starlark globals. |
 | `starlark/sandbox.rs` | Build a `GlobalsBuilder` for the hermetic tier: inject `finding`, `fail`, `fail_but_overridable`, `Severity`, `DeltaKind`, `regex_match`, `regex_find_all`, `glob_match`, `print`. |
-| `starlark/check_meta.rs` | `check_meta()` as a Starlark built-in. Parses and stores `applies_to`, `tier`, `config` from the top-level call. |
+| `starlark/check_meta.rs` | `check_meta()` as a Starlark built-in. Parses and stores `tier` from the top-level call. |
 | `starlark/evaluator.rs` | Load a `.checkleft` file into a `Module`, configure `Dialect { enable_types: DialectTypes::Enable }`, attach globals, evaluate, call `check(ctx)`, collect `Vec<Finding>`. |
 | `starlark/adapter/mod.rs` | `FormatAdapter` trait definition (as per spec §6.1). `AdapterRegistry` for registration. |
 | `starlark/adapter/text.rs` | `TextAdapter` — parse files into `TextFilePair` / `TextFile` / `Line` Starlark values. Simplest adapter, good for proving the pipeline. |
@@ -92,16 +92,16 @@ starlark = { version = "0.12", features = ["typing"] }
 
 ---
 
-### Phase 2: Discovery + `package.toml` + load paths
+### Phase 2: Discovery + `checkleft-package.toml` + load paths
 
-**Goal:** Auto-discover checks from `checkleft/` folder structure, parse `package.toml`, resolve `load()` paths.
+**Goal:** Auto-discover checks from package folder structure, parse `checkleft-package.toml`, resolve `load()` paths.
 
 **Files:**
 
 | File | What it does |
 |---|---|
-| `starlark/discovery.rs` | Walk upward from changeset file paths to find ancestor `checkleft/` dirs. For each, scan `<adapter>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, path, check_meta, package }`. |
-| `starlark/manifest.rs` | Parse `package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata, includes: Vec<PackageRef> }`. Validate producer metadata only: `kind = "check_package"` packages define checks, `kind = "version_set"` packages define exact `[includes.*]` refs and do not define checks. |
+| `starlark/discovery.rs` | Scan package directories for `<adapter>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, path, check_meta, package }`. |
+| `starlark/manifest.rs` | Parse `checkleft-package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata, includes: Vec<PackageRef> }`. Validate producer metadata only: `kind = "check_package"` packages define checks, `kind = "version_set"` packages define exact `[includes.*]` refs and do not define checks. |
 | `starlark/loader.rs` | Custom `FileLoader` impl for Starlark's `load()` statement. Resolve `//lib/foo` → `<checkleft_root>/lib/foo.checkleft`, `:types` → `<check_dir>/types.checkleft`. Enforce: no `@dep//` prefix (deps provide checks only, not importable libs). |
 
 **Integration point:** `CHECKS.yaml` remains the consumer validation policy. It selects local packages, fetched packages, and version sets. The runner resolves those package refs, calls discovery for the selected package roots, and hands discovered Starlark checks to the existing runner alongside built-in and external checks.
@@ -167,7 +167,7 @@ starlark/adapter/proto/
 
 | File | What it does |
 |---|---|
-| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, activation mode, and per-check include narrowing. |
+| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, and activation mode. |
 | `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity, publishing metadata, and version-set `[includes]`. |
 | `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
 | `starlark/package.rs` | Expand selected version sets to their exact package refs. Version sets activate all checks from all included packages. Individual packages support `all` or `explicit` activation. |
@@ -178,7 +178,7 @@ refs may omit `sha256` for local iteration; any supplied hash must still be
 canonical. Local archive refs verify the archive bytes when `sha256` is present,
 then discover checks from the archive-root package layout.
 
-This phase makes Starlark checks a first-class `CHECKS.yaml` policy input without overloading `package.toml`.
+This phase makes Starlark checks a first-class `CHECKS.yaml` policy input without overloading `checkleft-package.toml`.
 
 ---
 
@@ -191,7 +191,7 @@ This phase makes Starlark checks a first-class `CHECKS.yaml` policy input withou
 | File | What it does |
 |---|---|
 | `starlark/testing.rs` | Preserve path-based author semantics: discover checks from `<adapter>/<nested/name>/check.checkleft`, scan sibling `testdata/<case>/` dirs, construct a synthetic `ChangeSet` from `before/` + `after/`, run the adapter + check, compare findings against `expected.toml`. If `expected_fix/` exists, run the fix and diff. |
-| `bazel/defs.bzl` | Expose `starlark_check_test` so check authors can schedule the real `checkleft test` CLI from Bazel with an optional selector. Expose a Checkleft toolchain so testing and validation rules resolve the checkleft binary through Bazel toolchain resolution. |
+| `bazel/defs.bzl` | Expose `checkleft_test` so check authors can schedule the real `checkleft test` CLI from Bazel. The checkleft binary is referenced directly as a compiled-from-source target. |
 
 **CLI integration:** Add `checkleft test [check_id] [--update]` subcommand to `main.rs`.
 
@@ -232,7 +232,7 @@ This is a runner-level concern, not an adapter concern. Implement in `starlark/m
 | `Severity.fail_but_overridable` | Maps to `crate::output::Severity::Warning` |
 | `FileEdit` | `#[derive(StarlarkValue)]` wrapper around `crate::fix::FileEdit` |
 | `fix_data` | `OwnedFrozenValue` — opaque Starlark value, passed through from check to fix |
-| `check_meta()` | Parsed into `CheckMeta { applies_to, tier, config, source }` at module load time |
+| `check_meta()` | Parsed into `CheckMeta { tier }` at module load time |
 | `struct(...)` (user-defined) | Native Starlark `Struct` — no special Rust type needed |
 | `load("//lib/foo", "bar")` | Custom `FileLoader` impl resolving to `.checkleft` files |
 

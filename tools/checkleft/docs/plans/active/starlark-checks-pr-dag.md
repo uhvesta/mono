@@ -15,17 +15,13 @@ relative to the previous node branch. The same DAG can be mirrored to
 - Validate each node with focused `bazel test` targets before pushing.
 - When the spec or operating model changes, update the earliest affected node
   first and propagate the change through every dependent branch.
-- Keep `package.toml` producer-only: package identity, publishing metadata, and
-  version-set membership.
+- Keep `checkleft-package.toml` producer-only: package identity, publishing
+  metadata, and version-set membership.
 - Keep validation policy in `CHECKS.yaml`: selected packages/version sets, local
-  package paths, path scoping, excludes, check configuration, severity, and
-  policy.
-- Do not introduce `PACKAGE.lock`. Exact refs plus hashes on package and
-  version-set selections provide the reproducibility boundary. Hash pins are
-  canonical lowercase 64-hex SHA-256 digests.
-- Do not model public/private check visibility in v1. A check in a selected
-  package is opt-in runnable; a version set opts into all checks from all
-  included packages.
+  package paths, path scoping, excludes, severity, and policy.
+- Exact refs plus hashes on package and version-set selections provide the
+  reproducibility boundary. Hash pins are canonical lowercase 64-hex SHA-256
+  digests.
 - Use Bazel for check-author integration: fixture tests should be schedulable by
   Bazel, and publishable package archives should be buildable by Bazel.
 
@@ -79,7 +75,7 @@ Required verification:
 ### Node 2: Package Manifest And Directory Discovery
 
 Scope:
-- Parse `checkleft/package.toml` as producer metadata only.
+- Parse `checkleft-package.toml` as producer metadata only.
 - Discover local checks from `checkleft/<adapter>/<nested/name>/check.checkleft`.
 - Validate unknown adapters, missing package manifests, and invalid `.checkleft`
   placement.
@@ -105,7 +101,7 @@ Required verification:
 
 Scope:
 - Wire discovered local Starlark checks into the existing runner path.
-- Filter checks by `check_meta(applies_to = ...)` before evaluation.
+- Filter checks by adapter file selectors before evaluation.
 - Preserve existing Rust, declarative, and WASM check behavior.
 - Emit configuration/runtime failures as checkleft findings or errors according
   to the spec.
@@ -135,7 +131,7 @@ Scope:
   `expected_fix/`.
 - Support `checkleft test --update` to regenerate `expected.toml` snapshots from
   actual findings.
-- Add `starlark_check_test` Bazel author-test integration and use it for the
+- Add `checkleft_test` Bazel author-test integration and use it for the
   checked-in fixture package.
 - Add the Checkleft Bazel toolchain used by author-test and validation rules.
 - Exercise the full text path: nested check IDs, lib loading, expected findings,
@@ -150,8 +146,8 @@ Scope:
 - Add Starlark package and version-set selection to `CHECKS.yaml`.
 - Support local path package directories and local `.tar.gz` package archives
   for iteration.
-- Keep package selection, path scoping, excludes, and check configuration in
-  consumer validation policy.
+- Keep package selection, path scoping, and excludes in consumer validation
+  policy.
 - Make version-set selection activate all checks from all included packages.
 
 Required verification:
@@ -160,10 +156,10 @@ Required verification:
 ### Node 8: Package Tarball And Bazel Packaging
 
 Scope:
-- Build publishable `.tar.gz` archives containing `package.toml`, selected
+- Build publishable `.tar.gz` archives containing `checkleft-package.toml`, selected
   check/fix files, and internal libs required by those checks.
 - Exclude transient test artifacts from publishable packages.
-- Add `starlark_check_package` Bazel integration for check authors to build
+- Add `checkleft_package` Bazel integration for check authors to build
   package archives.
 - Allow consumers to point at local package paths during iteration.
 
