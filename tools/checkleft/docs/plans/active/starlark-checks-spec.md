@@ -15,7 +15,6 @@
 6. Bidirectional: checks can be authored in Starlark _or_ Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
 7. Hierarchical: repos can define checks at the root; sub-projects can layer on their own.
 8. Maximal Starlark typing via `DialectTypes::Enable` — all function signatures, parameters, and return types must carry type annotations.
-
 ---
 
 ## 2. Folder structure
@@ -112,7 +111,7 @@ Each directory with a `check.checkleft` is an independent check. Nesting is pure
 
 **A check in a published package is part of that package's API.** If a check should not be visible to consumers, keep it out of the published package root or keep it in a local package that is not selected by consumer policy.
 
-**Cross-package consumption — even within the same monorepo — goes through `CHECKS.yaml`.** A consumer selects registry, git, and local path packages in validation policy. `checkleft-package.toml` never decides what another repo runs.
+**Cross-package consumption — even within the same monorepo — goes through `CHECKS.yaml`.** A consumer selects packages and local path packages in validation policy. `checkleft-package.toml` never decides what another repo runs.
 
 **Key principles:**
 
@@ -136,10 +135,12 @@ Written in TOML. Parsed before publishing, package testing, and package loading.
 
 ```toml
 # checks/checkleft-package.toml
+schema_version = 1
 
 [package]
 name = "myorg/repo-checks"
 version = "0.1.0"
+kind = "check_package"
 
 [publish]
 description = "Repository policy checks for myorg"
@@ -147,12 +148,19 @@ license = "Apache-2.0"
 # Consumed during `checkleft publish` and registry upload. Ignored at check-run time.
 ```
 
+#### Top-level fields
+
+| Field            | Type  | Required | Description                                                                                   |
+| ---------------- | ----- | -------- | --------------------------------------------------------------------------------------------- |
+| `schema_version` | `int` | yes      | Schema version of this manifest file. Currently `1`. Allows future format evolution.          |
+
 #### `[package]` fields
 
 | Field     | Type  | Required | Description                                                                                 |
 | --------- | ----- | -------- | ------------------------------------------------------------------------------------------- |
 | `name`    | `str` | yes      | Globally unique package name. Convention: `<org>/<descriptor>`.                             |
 | `version` | `str` | yes      | SemVer package version. Used by consumers when pinning this package.                         |
+| `kind`    | `str` | no       | `check_package` (default). Reserved for future extension.                                    |
 
 `checkleft-package.toml` intentionally has no `exclude`, no consumer `[dependencies]`, and no "activate these checks" section. Those belong in `CHECKS.yaml`.
 
@@ -201,7 +209,6 @@ checkleft_packages:
       mode: explicit
 
 checks:
-  # This entry narrows the file scope for one activated check in this repo.
   - id: proto/evolution
     include:
       - "api/**/*.proto"
@@ -212,9 +219,24 @@ checks:
   - id: local_experiments:text/no_debug
     include:
       - "**/*.txt"
+
+runner:
+  check_timeout_ms: 30000
+  adapter_timeout_ms: 60000
+  parallelism: 8
 ```
 
 `checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
+
+#### `runner` fields
+
+| Field                | Type  | Required | Default | Description                                                                 |
+| -------------------- | ----- | -------- | ------- | --------------------------------------------------------------------------- |
+| `check_timeout_ms`   | `int` | no       | `30000` | Wall-clock timeout per Starlark check evaluation. Runaway checks are killed and reported as failures. |
+| `adapter_timeout_ms` | `int` | no       | `60000` | Timeout per adapter `parse()` call. Protoc on large proto graphs is the primary concern. |
+| `parallelism`        | `int` | no       | `num_cpus` | Thread pool size for concurrent check evaluation.                          |
+
+CLI flags (`--check-timeout-ms`, `--adapter-timeout-ms`, `--parallelism`) override `CHECKS.yaml` runner settings. This lets local dev and CI scripts adjust without modifying committed config.
 
 Path selection is two-stage:
 
@@ -228,9 +250,9 @@ Path selection is two-stage:
 A consumer activates exactly the packages selected in `CHECKS.yaml`.
 
 1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`. `sha256` values are canonical lowercase 64-hex digests; placeholder or mixed-case values are rejected at parse time.
-2. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from packages selected directly by `CHECKS.yaml`.
+2. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from directly selected packages.
 3. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
-4. **Individual packages can be activated in `all` or `explicit` mode.**
+4. **Packages can be activated in `all` or `explicit` mode.**
 
 ### 3.5 Self-hosted guard check for policy integrity
 
@@ -241,7 +263,7 @@ Initial guard behavior:
 - Compare the base and current config files.
 - Fail if a selected package pin is downgraded.
 - Fail if a hardcoded protected package entry is removed.
-- Use hardcoded placeholder protected entries to prove the policy-check execution path.
+- Use hardcoded placeholder protected entries in v1 to prove the API path; later this can become normal check config.
 
 This keeps the platform rule explicit: the guard is just another Starlark check supplied by org policy, not hidden behavior in package resolution.
 
@@ -276,8 +298,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 findings.append(finding(
                     severity = Severity.fail,
                     message = "removed field {} must be reserved".format(delta.symbol),
-                    path = delta.path,
-                    line = delta.line,
+                    location = Location(path = delta.path, start_line = delta.line),
                 ))
     return findings
 ```
@@ -332,7 +353,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
             findings.append(finding(
                 severity = Severity.fail,
                 message = "removed field {} must be reserved".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
                 fix_data = field_not_reserved(
                     field_number = delta.before_number,
                     field_name = delta.symbol.split(".")[-1],
@@ -356,7 +377,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
             continue
         if type(f.fix_data) == FieldNotReserved:
             edits.append(file_edit(
-                path = f.path,
+                path = f.location.path,
                 old_text = "",
                 new_text = "  reserved {};\n  reserved \"{}\";\n".format(
                     f.fix_data.field_number,
@@ -431,7 +452,7 @@ Findings have exactly two severity levels. A finding always blocks merge — the
 | Severity                 | Starlark constant               | CI behavior                                                                                            | Description                                                                |
 | ------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
 | **Fail**                 | `Severity.fail`                 | Blocks merge. Cannot be overridden.                                                                    | Hard violation. No exceptions.                                             |
-| **Fail-but-overridable** | `Severity.fail_but_overridable` | Blocks merge by default, but can be overridden through the repository's approved override mechanism. | The change is almost certainly wrong, but there are legitimate exceptions. |
+| **Fail-but-overridable** | `Severity.fail_but_overridable` | Blocks merge by default, but can be overridden with a `BYPASS` directive in the PR/commit description. | The change is almost certainly wrong, but there are legitimate exceptions. |
 
 There is no "informational" / "notice" severity. If something doesn't warrant blocking the build, it doesn't belong as a checkleft finding — use linter warnings or comments for that. Checkleft findings are gates.
 
@@ -440,30 +461,19 @@ Severity is set per-finding by the check author. The system can only **escalate*
 Shorthand constructors match the severity names:
 
 ```python
-fail(message = "...", path = "...")                   # Severity.fail
-fail_but_overridable(message = "...", path = "...")   # Severity.fail_but_overridable
+fail(message = "...", location = Location(path = "...", start_line = 1))        # Severity.fail
+fail_but_overridable(message = "...", location = Location(path = "..."))       # Severity.fail_but_overridable
 ```
 
-### 5.4 Diagnostic display model
-
-A finding is an inline diagnostic. The check author controls how precise it is:
-
-- `path` only: file-level diagnostic.
-- `path` + `line`: line-level diagnostic.
-- `path` + `line` + `column`: point diagnostic.
-- `path` + `line` + `column` + `end_line` + `end_column`: span diagnostic.
-
-The UI should render the most precise location present and gracefully degrade when a check only has file-level context. The `message` field is the primary human-facing diagnostic text; it may include both what is wrong and how to remediate it. The optional `remediation` field is secondary structured guidance for checks that want the UI to render the suggested action separately.
-
-`message` and `remediation` are intentionally separate from `fix_data`: they are for humans, while `fix_data` is typed machine data consumed only by `fix.checkleft`.
-
-### 5.5 Tier-specific built-in bindings
+### 5.4 Tier-specific built-in bindings
 
 **Hermetic tier** (always available):
 
 | Symbol                       | Type                               | Description                                             |
 | ---------------------------- | ---------------------------------- | ------------------------------------------------------- |
 | `finding(...)`               | `fn(...) -> Finding`               | Construct a finding.                                    |
+| `fail(...)`                  | `fn(...) -> Finding`               | Shorthand for `finding(severity = Severity.fail, ...)`. |
+| `fail_but_overridable(...)`  | `fn(...) -> Finding`               | Shorthand for `finding(severity = Severity.fail_but_overridable, ...)`. |
 | `file_edit(...)`             | `fn(...) -> FileEdit`              | Construct a file edit (for fixes).                      |
 | `Severity`                   | `enum{fail, fail_but_overridable}` | Severity constants (see §5.3).                          |
 | `DeltaKind`                  | adapter-specific enum               | Each adapter injects its own variants (e.g., `DeltaKind.field_removed` for proto, `DeltaKind.method_removed` for java). Only the variants for the check's adapter are in scope. |
@@ -552,12 +562,47 @@ pub trait FormatAdapter: Send + Sync + 'static {
 
     /// Return the Starlark type name for the context parameter (e.g. "ProtoEvolutionContext").
     fn context_type_name(&self) -> &str;
+
+    /// File selectors that determine which files this adapter claims.
+    fn file_selectors(&self) -> FileSelectors;
+}
+
+/// Determines which files an adapter operates on.
+///
+/// - `name`: exact filename matches (e.g. `"module.json"`). Highest priority.
+/// - `ext`: extension matches (e.g. `"proto"`, `"java"`).
+///
+/// Precedence: an exact `name` match always wins over an `ext` match.
+/// At most one adapter may match a given file. If two adapters both claim
+/// the same file via `ext`, that is a bug in the adapter registry and
+/// checkleft fails with an error at startup.
+pub struct FileSelectors {
+    /// Exact filenames this adapter claims (e.g. `["module.json"]`).
+    pub name: Vec<String>,
+    /// File extensions this adapter claims, without the leading dot (e.g. `["proto"]`).
+    pub ext: Vec<String>,
 }
 ```
 
-### 6.2 Built-in adapters
+### 6.2 File selector precedence
+
+Each changed file is matched to at most one adapter using its file selectors:
+
+1. **Exact name match wins.** If any adapter's `name` selector matches the file's basename, that adapter owns the file. No other adapter is considered.
+2. **Extension match.** If no adapter claims the file by name, the file's extension is checked against all adapters' `ext` selectors.
+3. **No match.** Files that no adapter claims are invisible to Starlark checks. They are not passed to any adapter.
+
+**Uniqueness invariant:** Each `ext` value and each `name` value may appear in exactly one adapter's selectors across the entire registry. Two adapters claiming `ext: ["java"]` is a registration error. Two adapters claiming `name: ["module.json"]` is a registration error. This is enforced at compile time or as a `panic!` at registry initialization (see §6.4).
+
+This means each file has a single, deterministic adapter. The `text` adapter uses `ext` selectors for the extensions it should cover (configured at registration time) — it does not implicitly match all files.
+
+After adapter matching, the effective file set is further narrowed by `CHECKS.yaml` `include`/`exclude` globs and the global exclude list (§6.5).
+
+### 6.3 Built-in adapters
 
 #### `proto` — Protobuf evolution
+
+File selectors: `ext: ["proto"]`
 
 Context type: `ProtoEvolutionContext`
 
@@ -568,6 +613,8 @@ Starlark surface: `ctx.deltas`, `ctx.files`, plus all the typed descriptor types
 **Vendored extensions:** The proto adapter makes a set of well-known extension `.proto` files (e.g. org-wide custom options) available to the descriptor provider. Custom options defined in these vendored protos are resolved in every descriptor set automatically — no user configuration needed. Checks can inspect them via `msg.options.extensions`.
 
 #### `module_json` — `module.json` file evolution
+
+File selectors: `name: ["module.json"]`
 
 Context type: `ModuleJsonEvolutionContext`
 
@@ -602,6 +649,8 @@ ModuleJsonDelta.after_value: str | None
 ```
 
 #### `java` — Java API surface evolution
+
+File selectors: `ext: ["java"]`
 
 Context type: `JavaEvolutionContext`
 
@@ -645,9 +694,11 @@ JavaDelta.path: str
 JavaDelta.symbol: str
 ```
 
-### 6.3 The `text` adapter — generic / no special parsing
+#### `text` — generic / no special parsing
 
 For checks that operate on raw file content and line-level diffs (no format-specific parsing), a built-in `text` adapter is provided. This is the escape hatch for checks that don't need a Rust-side parser.
+
+File selectors: configured at registration time with the extensions the deployment wants covered (e.g. `ext: ["txt", "md", "yaml", "yml"]`). The text adapter does **not** implicitly match all files — consumers must register it with explicit extensions, and can further narrow via `CHECKS.yaml` `include`/`exclude`.
 
 Context type: `TextEvolutionContext`
 
@@ -655,7 +706,6 @@ The `text` adapter parses files into a structured line-level model on the Rust s
 
 ```python
 ctx.files           # list[TextFilePair]
-ctx.changeset       # ChangeSetInfo (metadata about the overall change)
 
 TextFilePair.path: str
 TextFilePair.before: TextFile | None    # parsed line model at base revision
@@ -669,6 +719,8 @@ TextFile.line_count: int               # total number of lines
 
 Line.number: int
 Line.text: str
+
+ChangeKind  # enum: added, modified, deleted, renamed (text-adapter-specific)
 ```
 
 `text` is a registered adapter like any other. Checks under `text/` use the text adapter. There is no implicit fallback — an unrecognized adapter folder name is an error at discovery time (see §2.3).
@@ -683,6 +735,19 @@ registry.register_adapter(Box::new(MyCustomAdapter));
 ```
 
 The adapter's `kind()` return value must match the top-level `<adapter>` folder name in the package directory structure. This is a structural guarantee: every check under `proto/` uses the adapter whose `kind() == "proto"` and receives a `ProtoEvolutionContext`. There is exactly one way to determine which adapter a check uses — look at its parent folder.
+
+**Selector overlap is a checkleft bug, not a user error.** Since `kind()`, `file_selectors()`, and the built-in adapter set are all static data known at compile time, duplicate `ext` or `name` values across adapters can be caught as a compile-time error (e.g. via `const` assertions or a build-time registry check). A duplicate that slips through to runtime is a `panic!` at registry initialization — before any checks run.
+
+### 6.5 Global excludes
+
+The runner applies a hardcoded global exclude list before adapter matching. Files matching these patterns are never passed to any adapter:
+
+- `.git/`
+- `node_modules/`
+- `vendor/` (Go convention)
+- `target/` (Rust/Bazel build output)
+
+Additional global excludes can be added via `CHECKS.yaml` top-level `global_excludes` (list of glob patterns). Global excludes apply to all adapters and all checks uniformly.
 
 ---
 
@@ -748,7 +813,7 @@ directories such as `text/` or `proto/`, and optional `lib/` helpers. Consumers
 can point `CHECKS.yaml` at the archive with `path://...tar.gz` during local
 iteration, or consume the same bytes from `registry://` once published.
 
-The publishable tarball should be buildable by Bazel so check authors can iterate under the same build system that schedules their package tests. See §17 for the `checkleft_package` Bazel rule.
+The publishable tarball should be buildable by Bazel so check authors can iterate under the same build system that schedules their package tests. See §18 for the `checkleft_package` Bazel rule.
 
 ---
 
@@ -826,8 +891,7 @@ The execution model is inherently functional: every `check(ctx)` is a pure funct
 │ Layer 3: File-level parallelism (within an adapter)              │
 │   Adapters that parse files independently (java via tree-sitter, │
 │   text) can parse individual files in parallel.                  │
-│   Proto is constrained: descriptor generation needs the full     │
-│   import graph.                                                  │
+│   Proto is constrained: protoc needs the full import graph.      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -844,7 +908,7 @@ All three layers compose. In the common case of N checks across M adapters, the 
    b. evaluate check(ctx) → list[Finding]
 ```
 
-Step 2 is the bottleneck (generating proto descriptors, running tree-sitter). Step 3 is pure Starlark evaluation — microseconds to low milliseconds per check for typical policy logic.
+Step 2 is the bottleneck (invoking protoc, running tree-sitter). Step 3 is pure Starlark evaluation — microseconds to low milliseconds per check for typical policy logic.
 
 ### 10.2 Adapter output sharing (parse once, check many)
 
@@ -872,10 +936,10 @@ Before invoking any adapter, the adapter's file selectors are intersected with t
 
 ### 10.5 Thread pool and resource bounds
 
-- **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`. Configurable via `--parallelism=N`.
+- **Thread pool:** Starlark checks run on a blocking thread pool (`spawn_blocking`). Default size: `num_cpus`. Configurable via `CHECKS.yaml` `runner.parallelism` or `--parallelism=N` CLI flag.
 - **Memory:** Each Starlark `Module` heap is independent. Peak memory is proportional to `(max concurrent checks) × (largest adapter output shared via Arc) + (per-check heap)`. The `Arc`-shared adapter output is the dominant term but is allocated once per adapter, not per check.
-- **Starlark evaluation timeout:** Each check has a wall-clock timeout (default: 30s, configurable via `--check-timeout-ms` CLI flag or `CHECKS.yaml` runner settings). Runaway checks are killed and reported as failures. This prevents a single pathological check from blocking the entire pipeline.
-- **Adapter parse timeout:** Adapter `parse()` calls have their own timeout (default: 60s). Protoc invocations on large proto graphs are the primary concern here.
+- **Starlark evaluation timeout:** Each check has a wall-clock timeout (default: 30s). Configurable via `CHECKS.yaml` `runner.check_timeout_ms` or `--check-timeout-ms` CLI flag. CLI overrides CHECKS.yaml. Runaway checks are killed and reported as failures.
+- **Adapter parse timeout:** Adapter `parse()` calls have their own timeout (default: 60s). Configurable via `CHECKS.yaml` `runner.adapter_timeout_ms` or `--adapter-timeout-ms` CLI flag. Protoc invocations on large proto graphs are the primary concern here.
 
 ---
 
@@ -914,16 +978,14 @@ def check(ctx):
 
 ```
 # Output types
-Finding(severity: Severity, message: str, path: str | None, line: int | None, column: int | None, end_line: int | None, end_column: int | None, remediation: str | None, fix_data: struct | None)
+Finding(severity: Severity, message: str, location: Location | None, remediation: str | None, fix_data: struct | None)
+Location(path: str, start_line: int, end_line: int | None, start_column: int | None, end_column: int | None)
 FileEdit(path: str, old_text: str, new_text: str, after_line: int | None)
 Severity  # enum: fail, fail_but_overridable
-Location(path: str, line: int | None, column: int | None, end_line: int | None, end_column: int | None)
 
 # Standard Starlark types
 str, int, float, bool, list, dict, None
 
-# Utility
-ChangeKind  # enum: added, modified, deleted, renamed
 ```
 
 ### 11.4 Adapter-injected types
@@ -962,6 +1024,8 @@ checks/
 **`checkleft-package.toml`:**
 
 ```toml
+schema_version = 1
+
 [package]
 name = "mono/checks"
 version = "0.1.0"
@@ -1023,7 +1087,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
             findings.append(finding(
                 severity = Severity.fail,
                 message = "removed field {} must be reserved to prevent reuse".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
                 remediation = "Add a `reserved` statement for the removed field number.",
                 fix_data = field_not_reserved(
                     field_number = delta.before_number,
@@ -1036,7 +1100,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
             findings.append(finding(
                 severity = Severity.fail,
                 message = "field number changed for {} — this breaks wire compatibility".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
         if delta.kind == DeltaKind.field_type_changed:
@@ -1047,7 +1111,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                     delta.before_kind,
                     delta.after_kind,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
     return findings
@@ -1065,7 +1129,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
             continue
         if type(f.fix_data) == FieldNotReserved:
             edits.append(file_edit(
-                path = f.path,
+                path = f.location.path,
                 old_text = "",
                 new_text = "  reserved {};\n  reserved \"{}\";\n".format(
                     f.fix_data.field_number,
@@ -1104,12 +1168,12 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
         if after.name == "":
             findings.append(fail(
                 message = "module.json 'name' must not be empty",
-                path = pair.path,
+                location = Location(path = pair.path),
             ))
         if after.version == "":
             findings.append(fail(
                 message = "module.json 'version' must not be empty",
-                path = pair.path,
+                location = Location(path = pair.path),
             ))
 
         # Use structured deltas for evolution violations
@@ -1119,12 +1183,12 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
             if delta.kind == ModuleJsonDeltaKind.required_key_removed:
                 findings.append(fail(
                     message = "module.json required key '{}' was removed".format(delta.key),
-                    path = pair.path,
+                    location = Location(path = pair.path),
                 ))
             if delta.kind == ModuleJsonDeltaKind.dependency_removed:
                 findings.append(fail_but_overridable(
                     message = "dependency '{}' was removed — downstream consumers may break".format(delta.key),
-                    path = pair.path,
+                    location = Location(path = pair.path),
                 ))
     return findings
 ```
@@ -1156,7 +1220,7 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
             findings.append(finding(
                 severity = Severity.fail,
                 message = "public API method removed: {}".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
                 remediation = "Deprecate the method with @Deprecated before removing.",
             ))
 
@@ -1166,14 +1230,14 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
                 message = "visibility narrowed for {}: this is a breaking change for downstream consumers".format(
                     delta.symbol,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
         if delta.kind == JavaDeltaKind.method_signature_changed:
             findings.append(finding(
                 severity = Severity.fail,
                 message = "method signature changed for {}".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
                 remediation = "Add a new overload instead of changing the existing signature.",
             ))
 
@@ -1316,7 +1380,7 @@ checkleft_test(
 | `testdata` | `list[label]`   | yes      | Fixture files: `testdata/<case>/{before/, after/, expected.toml, expected_fix/}`.                 |
 | `deps`     | `list[label]`   | no       | Package-level `lib/` helpers or filegroups that this check `load()`s.                             |
 
-The rule validates that exactly one `check.checkleft` exists in `srcs`. `fix.checkleft` presence is detected automatically. Each target is independently cacheable and parallelizable.
+The rule validates that exactly one `check.checkleft` exists in `srcs`. `fix.checkleft` presence is detected automatically. Each target is independently cacheable and parallelizable. Test sharding across `testdata/` cases is a future extension.
 
 The checkleft binary is a private attribute defaulting to `//tools/checkleft:checkleft` — the compiled-from-source binary target.
 
@@ -1374,91 +1438,27 @@ The test runner replaces the real `http_get` in the Starlark globals with the mo
 
 ### 14.1 Output compatibility
 
-Starlark checks produce `Finding` values that map to the existing checkleft diagnostic output:
+Starlark checks produce `Finding` values that map 1:1 to the existing `crate::output::Finding`:
 
 | Starlark `Finding` field   | Rust `Finding` field                                              |
 | -------------------------- | ----------------------------------------------------------------- |
 | `severity`                 | `severity`                                                        |
 | `message`                  | `message`                                                         |
-| `path` + optional line/column/span fields | `location: Option<Location>`                         |
+| `location`                 | `location: Option<Location>` — maps 1:1 to GitHub Checks API annotation fields (`path`, `start_line`, `end_line`, `start_column`, `end_column`) |
 | `remediation`              | `remediation: Option<String>`                                     |
 | `fix_data`                 | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
 
-`message` is the primary human-facing diagnostic text and may include remediation instructions directly. `remediation` is optional secondary human-facing text for checks that want a separate suggested-action field. Both are displayed inline with the file, line, point, or span location supplied by the check. Neither implies an automatic edit.
-
-### 14.2 GitHub PR annotations
-
-Checkleft findings must be exportable to GitHub PR annotations. This lets checkleft errors appear inline in the pull request file view and checks UI.
-
-The GitHub annotation shape is:
-
-```json
-{
-  "path": "api/v1/user.proto",
-  "start_line": 17,
-  "end_line": 17,
-  "start_column": 3,
-  "end_column": 19,
-  "annotation_level": "failure",
-  "title": "proto/evolution",
-  "message": "removed field number must be reserved"
-}
-```
-
-Checkleft machine-readable output must include this normalized shape when it can be derived from the finding. The native finding remains the source of truth; the GitHub object is a renderer-ready projection.
-
-```json
-{
-  "check_id": "proto/evolution",
-  "severity": "fail_but_overridable",
-  "overridable": true,
-  "message": "removed field number must be reserved",
-  "location": {
-    "path": "api/v1/user.proto",
-    "line": 17,
-    "column": 3,
-    "end_line": 17,
-    "end_column": 19
-  },
-  "github_annotation": {
-    "path": "api/v1/user.proto",
-    "start_line": 17,
-    "end_line": 17,
-    "start_column": 3,
-    "end_column": 19,
-    "annotation_level": "failure",
-    "title": "proto/evolution",
-    "message": "removed field number must be reserved"
-  }
-}
-```
-
-`github_annotation` is present when `path` and `line` are present. It is omitted for file-only findings unless the renderer explicitly chooses to anchor file-only diagnostics to line 1. This keeps the default JSON honest: a missing line cannot masquerade as a precise line annotation.
-
-Mapping:
-
-| Checkleft field             | GitHub annotation field                                                   |
-| --------------------------- | ------------------------------------------------------------------------- |
-| `path`                      | `path`                                                                    |
-| `line`                      | `start_line`                                                              |
-| `end_line` or `line`        | `end_line`                                                                |
-| `column`                    | `start_column` when `start_line == end_line`                              |
-| `end_column`                | `end_column` when `start_line == end_line`                                |
-| `Severity.fail`             | `annotation_level = "failure"`                                            |
-| `Severity.fail_but_overridable` | `annotation_level = "failure"`                                        |
-| check ID                    | `title`                                                                   |
-| `message`                   | `message`                                                                 |
-| `remediation`               | appended to `message` or emitted as `raw_details`, depending on renderer |
-
-GitHub annotations require line numbers. File-only findings still remain valid checkleft findings, but a GitHub renderer must anchor them to line 1 or put them in the check-run summary instead of creating a line annotation. Multi-line spans omit column fields because GitHub only supports column ranges for same-line annotations.
-
-Both Checkleft severities map to GitHub `failure` annotations because both severities are blocking findings. Overridability is Checkleft policy metadata (`severity = "fail_but_overridable"` / `overridable = true`), not a GitHub warning level.
-
-When checkleft runs inside GitHub Actions without a GitHub App integration, the runner can also emit workflow commands such as `::error file=...,line=...,col=...::message`. This produces GitHub annotations from stdout. The richer Checks API path is preferred for first-class check-run output because it supports appendable annotations and summary text.
-
-### 14.3 Fix compatibility
+### 14.2 Fix compatibility
 
 Starlark `fix()` functions return `list[FileEdit]` which maps to the existing `Vec<FileEdit>` consumed by `WritableSandbox`. The existing fix scheduler (`src/fix/scheduler.rs`) orchestrates Starlark fixes identically to WASM component fixes.
+
+### 14.3 GitHub annotation projection
+
+When a finding has a `location`, the runner emits a GitHub Checks API annotation. `Location` fields map 1:1 to annotation fields (`path`, `start_line`, `end_line`, `start_column`, `end_column`).
+
+Both `Severity.fail` and `Severity.fail_but_overridable` map to `annotation_level = "failure"` — both block merge. Overridability is Checkleft-side metadata (`overridable = true` on the finding) and is not reflected in the annotation level. The annotation `message` is the finding's `message`.
+
+Findings without a `location` are reported in the check run summary but do not produce file-level annotations.
 
 ### 14.4 Progress reporting
 
@@ -1466,73 +1466,81 @@ The runner reports Starlark check progress through the existing `ProgressReporte
 
 ---
 
-## 15. API reference by example
+## 15. Future extensions
+
+### 15.1 Additional format adapters
+
+The adapter system is open for extension:
+
+- **`yaml`** — YAML schema evolution (Kubernetes CRDs, OpenAPI specs).
+- **`graphql`** — GraphQL schema evolution.
+- **`swift`** — Swift API surface (via tree-sitter-swift).
+- **`typescript`** — TypeScript declaration file (`.d.ts`) evolution.
+
+Each adapter is a Rust crate implementing `FormatAdapter`. No changes to the Starlark infrastructure needed.
+
+### 15.2 Interactive fix preview
+
+A `checkleft fix --preview` mode that shows proposed edits in a TUI diff viewer before applying.
+
+---
+
+## 16. API reference by example
 
 This section provides concrete, copy-pasteable examples of every key operation a check author will perform. These examples define the target API surface.
 
-### 15.1 Constructing findings
+### 16.1 Constructing findings
 
 ```python
-# Minimal finding — just severity, message, and path
+# Minimal finding — just severity, message, and location with path
 findings.append(finding(
     severity = Severity.fail,
     message = "field was removed without reservation",
-    path = "api/v1/service.proto",
+    location = Location(path = "api/v1/service.proto"),
 ))
 
-# Finding with line and column
+# Finding with line and column range (maps 1:1 to GitHub Checks API annotation)
 findings.append(finding(
     severity = Severity.fail_but_overridable,
     message = "method visibility narrowed from public to protected",
-    path = "src/com/acme/Api.java",
-    line = 42,
-    column = 5,
+    location = Location(
+        path = "src/com/acme/Api.java",
+        start_line = 42,
+        start_column = 5,
+    ),
 ))
 
-# Finding with a precise source span
+# Finding with multi-line span
 findings.append(finding(
     severity = Severity.fail,
-    message = "removed field number must be reserved",
-    path = "api/v1/user.proto",
-    line = 17,
-    column = 3,
-    end_line = 17,
-    end_column = 19,
-    remediation = "Add a reserved statement for field number 4.",
+    message = "this entire block violates policy",
+    location = Location(
+        path = "src/com/acme/Api.java",
+        start_line = 10,
+        end_line = 25,
+    ),
 ))
 
-# Finding with remediation included directly in the message
-findings.append(finding(
-    severity = Severity.fail,
-    message = "required key 'version' removed from module.json; restore it because it is required by the module loader",
-    path = "services/auth/module.json",
-))
-
-# Finding with separate remediation guidance
+# Finding with remediation guidance
 findings.append(finding(
     severity = Severity.fail,
     message = "required key 'version' removed from module.json",
-    path = "services/auth/module.json",
+    location = Location(path = "services/auth/module.json"),
     remediation = "Restore the 'version' key. It is required by the module loader.",
 ))
 
 # Shorthand constructors for common severities
 findings.append(fail(
     message = "service removed",
-    path = "api/v1/service.proto",
+    location = Location(path = "api/v1/service.proto"),
 ))
 findings.append(fail_but_overridable(
     message = "enum value name changed",
-    path = "api/v1/status.proto",
-    line = 8,
-))
-findings.append(fail_but_overridable(
-    message = "new field added (non-breaking)",
-    path = "api/v1/user.proto",
+    location = Location(path = "api/v1/status.proto", start_line = 8),
 ))
 ```
 
-### 15.2 Constructing file edits (for fixes)
+### 16.2 Constructing file edits (for fixes)
 
 ```python
 # Replace existing text
@@ -1558,7 +1566,7 @@ edits.append(file_edit(
 ))
 ```
 
-### 15.3 Loading shared helpers
+### 16.3 Loading shared helpers
 
 ```python
 # From the package's lib/ directory
@@ -1571,7 +1579,7 @@ load(":types", "FieldNotReserved", "field_not_reserved")
 load("//lib/matchers", "glob_match", "path_prefix", "is_generated_file")
 ```
 
-### 15.4 Defining shared helper modules
+### 16.4 Defining shared helper modules
 
 **`lib/proto_helpers.checkleft`:**
 
@@ -1602,7 +1610,43 @@ WIRE_INCOMPATIBLE_TYPE_CHANGES: dict[str, list[str]] = {
 }
 ```
 
-### 15.5 Working with the proto evolution context
+### 16.5 Recommended `lib/` helpers
+
+These are **not** built-ins — they are package-level helpers that check authors define in `lib/*.checkleft` and `load()` into their checks. They are implementation details of a specific check package, not part of the checkleft runtime API.
+
+**`lib/delta_helpers.checkleft`:**
+
+```python
+def filter_deltas(ctx: ProtoEvolutionContext, kind: DeltaKind) -> list[SchemaDelta]:
+    """Filter deltas by kind."""
+    return [d for d in ctx.deltas if d.kind == kind]
+
+def removed_fields(ctx: ProtoEvolutionContext) -> list[SchemaDelta]:
+    return filter_deltas(ctx, DeltaKind.field_removed)
+
+def removed_messages(ctx: ProtoEvolutionContext) -> list[SchemaDelta]:
+    return filter_deltas(ctx, DeltaKind.message_removed)
+```
+
+**`lib/option_helpers.checkleft`:**
+
+```python
+def has_option(options: Options, name: str) -> bool:
+    """Check if a named extension option is present."""
+    for ext in options.extensions:
+        if ext.full_name == name:
+            return True
+    return False
+
+def bool_option(options: Options, name: str) -> bool:
+    """Get a boolean extension option value, defaulting to False."""
+    for ext in options.extensions:
+        if ext.full_name == name:
+            return ext.value == True
+    return False
+```
+
+### 16.6 Working with the proto evolution context
 
 ```python
 def check(ctx: ProtoEvolutionContext) -> list[Finding]:
@@ -1613,23 +1657,8 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
         if delta.kind == DeltaKind.field_removed:
             findings.append(fail(
                 message = "field {} removed".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
-
-    # --- Filtering deltas with helpers ---
-    removed: list[SchemaDelta] = filter_deltas(ctx, kind = DeltaKind.field_removed)
-    for delta in removed:
-        findings.append(fail(message = "removed: " + delta.symbol, path = delta.path))
-
-    # Shorthand filter functions
-    for delta in removed_fields(ctx):
-        pass  # ...
-    for delta in removed_messages(ctx):
-        pass  # ...
-    for delta in changed_field_numbers(ctx):
-        pass  # ...
-    for delta in option_changed_deltas(ctx):
-        pass  # ...
 
     # --- Inspecting descriptors directly ---
     for pair in ctx.files:
@@ -1641,7 +1670,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 if field.name.startswith("_"):
                     findings.append(fail_but_overridable(
                         message = "field name {} starts with underscore".format(field.full_name),
-                        path = pair.path,
+                        location = Location(path = pair.path),
                     ))
 
     # --- Comparing before/after ---
@@ -1652,7 +1681,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
             if before_pkg != after_pkg:
                 findings.append(fail(
                     message = "package changed from {} to {}".format(before_pkg, after_pkg),
-                    path = pair.path,
+                    location = Location(path = pair.path),
                 ))
 
     # --- Using delta detail fields ---
@@ -1662,7 +1691,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 message = "field {} type changed: {} -> {}".format(
                     delta.symbol, delta.before_kind, delta.after_kind,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
         if delta.kind == DeltaKind.method_signature_changed:
             findings.append(fail(
@@ -1671,7 +1700,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                     delta.before_input_type, delta.before_output_type,
                     delta.after_input_type, delta.after_output_type,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
     # --- Inspecting custom options via extension registries ---
@@ -1680,17 +1709,16 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
             continue
         for msg in pair.after.messages:
             for ext in msg.options.extensions:
-                if ext.full_name == "acme.deprecated" and has_option(msg.options, "acme.deprecated"):
-                    if bool_option(msg.options, "acme.deprecated"):
-                        findings.append(fail_but_overridable(
-                            message = "message {} is deprecated".format(msg.full_name),
-                            path = pair.path,
-                        ))
+                if ext.full_name == "acme.deprecated" and ext.value == True:
+                    findings.append(fail_but_overridable(
+                        message = "message {} is deprecated".format(msg.full_name),
+                        location = Location(path = pair.path),
+                    ))
 
     return findings
 ```
 
-### 15.6 Proto check: blocking proto file deletion
+### 16.7 Proto check: blocking proto file deletion
 
 ```python
 # checkleft/proto/no_deletion/check.checkleft
@@ -1703,13 +1731,13 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
             # File existed at base, gone at current = deleted
             findings.append(fail(
                 message = "proto file '{}' was deleted — proto files represent a published wire contract and must not be removed".format(pair.path),
-                path = pair.path,
+                location = Location(path = pair.path),
                 remediation = "Mark all messages/services as deprecated instead of deleting the file. If this is a rename/move, use the proto/move_detection check alongside this one.",
             ))
     return findings
 ```
 
-### 15.7 Proto check: detecting moves vs. deletions
+### 16.8 Proto check: detecting moves vs. deletions
 
 A move (rename/relocate) is semantically fine if the package and content remain the same. The adapter gives us `ChangeKind.renamed` in the changeset and `before`/`after` descriptors on file pairs — we can use both to distinguish a real deletion from a harmless move.
 
@@ -1752,7 +1780,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                     message = "proto file '{}' moved to '{}' but lost messages: {}".format(
                         pair.path, new_path, ", ".join(missing),
                     ),
-                    path = pair.path,
+                    location = Location(path = pair.path),
                     remediation = "Ensure all messages from the original file exist in the new location.",
                 ))
             # else: clean move, no finding
@@ -1762,14 +1790,14 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 message = "proto file '{}' was deleted and package '{}' no longer exists anywhere".format(
                     pair.path, old_package,
                 ),
-                path = pair.path,
+                location = Location(path = pair.path),
                 remediation = "Proto files must not be deleted. Deprecate instead, or move to a new path while preserving the package.",
             ))
 
     return findings
 ```
 
-### 15.8 Working with the `module.json` evolution context
+### 16.9 Working with the `module.json` evolution context
 
 ```python
 def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
@@ -1781,7 +1809,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
             # File was deleted
             findings.append(fail(
                 message = "module.json was deleted",
-                path = pair.path,
+                location = Location(path = pair.path),
             ))
             continue
 
@@ -1790,7 +1818,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
         if after.name == "":
             findings.append(fail(
                 message = "'name' must not be empty",
-                path = pair.path,
+                location = Location(path = pair.path),
             ))
 
         # Typed dependency access
@@ -1800,7 +1828,7 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
                     message = "dependency '{}' should use caret version range, got '{}'".format(
                         dep_name, dep_version,
                     ),
-                    path = pair.path,
+                    location = Location(path = pair.path),
                 ))
 
     # --- Use structured deltas ---
@@ -1808,27 +1836,27 @@ def check(ctx: ModuleJsonEvolutionContext) -> list[Finding]:
         if delta.kind == ModuleJsonDeltaKind.required_key_removed:
             findings.append(fail(
                 message = "required key '{}' was removed".format(delta.key),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
         if delta.kind == ModuleJsonDeltaKind.dependency_removed:
             findings.append(fail_but_overridable(
                 message = "dependency '{}' was removed (was version '{}')".format(
                     delta.key, delta.before_value,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
         if delta.kind == ModuleJsonDeltaKind.version_changed:
             findings.append(fail_but_overridable(
                 message = "module version changed from '{}' to '{}'".format(
                     delta.before_value, delta.after_value,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
     return findings
 ```
 
-### 15.9 Working with the Java evolution context
+### 16.10 Working with the Java evolution context
 
 ```python
 def check(ctx: JavaEvolutionContext) -> list[Finding]:
@@ -1848,7 +1876,7 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
                 if not has_since:
                     findings.append(fail_but_overridable(
                         message = "public class {} lacks @Since annotation".format(cls.full_name),
-                        path = pair.path,
+                        location = Location(path = pair.path),
                     ))
 
     # --- Use deltas for evolution violations ---
@@ -1856,32 +1884,32 @@ def check(ctx: JavaEvolutionContext) -> list[Finding]:
         if delta.kind == JavaDeltaKind.method_removed:
             findings.append(fail(
                 message = "public method removed: {}".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
                 remediation = "Mark with @Deprecated(forRemoval=true) for at least one release before removing.",
             ))
 
         if delta.kind == JavaDeltaKind.visibility_narrowed:
             findings.append(fail(
                 message = "visibility narrowed for {}, this is a binary-incompatible change".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
         if delta.kind == JavaDeltaKind.superclass_changed:
             findings.append(fail_but_overridable(
                 message = "superclass changed for {}".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
         if delta.kind == JavaDeltaKind.interface_removed:
             findings.append(fail(
                 message = "interface removed from {}: downstream casts will break".format(delta.symbol),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
     return findings
 ```
 
-### 15.10 Working with the text adapter (generic checks)
+### 16.11 Working with the text adapter (generic checks)
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -1896,15 +1924,13 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
             if regex_match(r"TODO\(nobody\)", line.text):
                 findings.append(fail_but_overridable(
                     message = "TODO assigned to 'nobody' — assign to a real owner",
-                    path = pair.path,
-                    line = line.number,
+                    location = Location(path = pair.path, start_line = line.number),
                 ))
 
             if regex_match(r"(?i)password\s*=\s*['\"]", line.text):
                 findings.append(fail(
                     message = "possible hardcoded password",
-                    path = pair.path,
-                    line = line.number,
+                    location = Location(path = pair.path, start_line = line.number),
                 ))
 
         # Full-file model checks (parsed line model, not raw string)
@@ -1912,13 +1938,13 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
         if after.line_count > 1000:
             findings.append(fail_but_overridable(
                 message = "file exceeds 1000 lines ({})".format(after.line_count),
-                path = pair.path,
+                location = Location(path = pair.path),
             ))
 
     return findings
 ```
 
-### 15.11 Writing a fix function
+### 16.12 Writing a fix function
 
 The fix function receives typed `fix_data` from the check (see §4.2). No string parsing — pattern-match on the struct type.
 
@@ -1937,7 +1963,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
 
         if type(f.fix_data) == FieldNotReserved:
             edits.append(file_edit(
-                path = f.path,
+                path = f.location.path,
                 old_text = "",
                 new_text = "  reserved {};\n  reserved \"{}\";\n".format(
                     f.fix_data.field_number,
@@ -1949,25 +1975,7 @@ def fix(ctx: ProtoEvolutionContext, findings: list[Finding]) -> list[FileEdit]:
     return edits
 ```
 
-### 15.12 `CHECKS.yaml` selecting packages
-
-```yaml
-# CHECKS.yaml
-
-checkleft_packages:
-  packages:
-    - source: git://github.com/myteam/checkleft-checks.git
-      version: "0.3.0"
-      sha256: "9f200000000000000000000000000000000000000000000000000000000000"
-      mode: all
-
-checks:
-  - id: proto/evolution
-    include:
-      - "api/**/*.proto"
-```
-
-### 15.13 Network tier: checking field reservations against a remote service
+### 16.13 Network tier: checking field reservations against a remote service
 
 ```python
 # checkleft/proto/reservation_check/check.checkleft
@@ -2003,7 +2011,7 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 message = "removed field {} (number {}) is not reserved in the central reservation service".format(
                     delta.symbol, delta.before_number,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
                 remediation = "Register the field reservation at {}/reserve before removing it.".format(base_url),
             ))
         else:
@@ -2011,13 +2019,13 @@ def check(ctx: ProtoEvolutionContext) -> list[Finding]:
                 message = "failed to check reservation status for {}: HTTP {}".format(
                     delta.symbol, resp.status,
                 ),
-                path = delta.path,
+                location = Location(path = delta.path),
             ))
 
     return findings
 ```
 
-### 15.14 Using `regex_match` and `glob_match` utilities
+### 16.14 Using `regex_match` and `glob_match` utilities
 
 ```python
 def check(ctx: TextEvolutionContext) -> list[Finding]:
@@ -2039,8 +2047,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
             if regex_match(r"System\.exit\(\d+\)", line.text):
                 findings.append(fail(
                     message = "System.exit() call in non-test code",
-                    path = pair.path,
-                    line = line.number,
+                    location = Location(path = pair.path, start_line = line.number),
                 ))
 
             # regex_find_all returns list[str] of all matches
@@ -2049,8 +2056,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
                 if owner == "fixme" or owner == "hack":
                     findings.append(fail_but_overridable(
                         message = "TODO assigned to '{}' — use a real username".format(owner),
-                        path = pair.path,
-                        line = line.number,
+                        location = Location(path = pair.path, start_line = line.number),
                     ))
 
     return findings
@@ -2058,7 +2064,7 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ---
 
-## 16. Summary of conventions
+## 17. Summary of conventions
 
 | Convention          | Rule                                                                                                 |
 | ------------------- | ---------------------------------------------------------------------------------------------------- |
@@ -2077,11 +2083,11 @@ def check(ctx: TextEvolutionContext) -> list[Finding]:
 
 ---
 
-## 17. Bazel rules
+## 18. Bazel rules
 
 All Bazel rules use the compiled-from-source checkleft binary (`//tools/checkleft:checkleft`) as a private attribute. No toolchain abstraction — the binary target is referenced directly.
 
-### 17.1 `checkleft_test` — fixture testing
+### 18.1 `checkleft_test` — fixture testing
 
 Runs `checkleft test` for a single check against its fixture test cases. One target per check, BUILD file lives next to the check.
 
@@ -2102,9 +2108,9 @@ checkleft_test(
 | `testdata` | `list[label]`   | yes      | Fixture files: `testdata/<case>/{before/, after/, expected.toml, expected_fix/}`.                 |
 | `deps`     | `list[label]`   | no       | Package-level `lib/` helpers or filegroups.                                                       |
 
-Validates that exactly one `check.checkleft` exists in `srcs`. Detects `fix.checkleft` automatically. Runs validation (type-checking, `check_meta()` presence, load path resolution, `fix_data` contract) as an implicit first step before executing fixtures. Each target is independently cacheable and parallelizable.
+Validates that exactly one `check.checkleft` exists in `srcs`. Detects `fix.checkleft` automatically. Runs validation (type-checking, `check_meta()` presence, load path resolution, `fix_data` contract) as an implicit first step before executing fixtures. Each target is independently cacheable and parallelizable. Test sharding across `testdata/` cases is a future extension.
 
-### 17.2 `checkleft_validate` — type-checking without fixtures
+### 18.2 `checkleft_validate` — type-checking without fixtures
 
 Validates a single check without running fixtures. Useful for fast CI feedback before test cases exist, or for checks that have no `testdata/` yet.
 
@@ -2125,7 +2131,7 @@ checkleft_validate(
 
 Runs the same validation as `checkleft_test` (type-checking, `check_meta()` presence, adapter folder name, load paths, `fix_data` contract) but does not require or execute fixtures.
 
-### 17.3 `checkleft_package` — publishable tarball
+### 18.3 `checkleft_package` — publishable tarball
 
 Builds a deterministic `.tar.gz` archive for a check package. The BUILD file lives at the package root.
 
@@ -2152,7 +2158,7 @@ checkleft_package(
 
 The archive layout is rooted at the package: `checkleft-package.toml`, adapter directories, and `lib/`. `testdata/` is excluded. Validation is implicit — all referenced check targets must pass before the archive is emitted.
 
-### 17.4 Default-enabled checks
+### 18.4 Default-enabled checks
 
 The runner has a hardcoded set of always-on checks that run regardless of `CHECKS.yaml`. These include both Rust-native checks and Starlark checks (e.g. the `CHECKS.yaml` policy guard).
 
