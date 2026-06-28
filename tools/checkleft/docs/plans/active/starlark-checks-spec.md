@@ -511,9 +511,9 @@ A finding is an inline diagnostic. The check author controls how precise it is:
 - `path` + `line` + `column`: point diagnostic.
 - `path` + `line` + `column` + `end_line` + `end_column`: span diagnostic.
 
-The UI should render the most precise location present and gracefully degrade when a check only has file-level context. The `message` field explains what is wrong at that location. The optional `remediation` field is the human-facing suggested action or comment text displayed with the finding.
+The UI should render the most precise location present and gracefully degrade when a check only has file-level context. The `message` field is the primary human-facing diagnostic text; it may include both what is wrong and how to remediate it. The optional `remediation` field is secondary structured guidance for checks that want the UI to render the suggested action separately.
 
-`remediation` is intentionally separate from `fix_data`: `remediation` is for humans, while `fix_data` is typed machine data consumed only by `fix.checkleft`.
+`message` and `remediation` are intentionally separate from `fix_data`: they are for humans, while `fix_data` is typed machine data consumed only by `fix.checkleft`.
 
 ### 5.5 Tier-specific built-in bindings
 
@@ -1443,7 +1443,7 @@ Starlark checks produce `Finding` values that map to the existing checkleft diag
 | `remediation`              | `remediation: Option<String>`                                     |
 | `fix_data`                 | `fix_data: Option<StarlarkValue>` (opaque, passed through to fix) |
 
-`message` and `remediation` are the human-facing diagnostic text. They are displayed inline with the file, line, point, or span location supplied by the check. They do not imply an automatic edit.
+`message` is the primary human-facing diagnostic text and may include remediation instructions directly. `remediation` is optional secondary human-facing text for checks that want a separate suggested-action field. Both are displayed inline with the file, line, point, or span location supplied by the check. Neither implies an automatic edit.
 
 ### 14.2 Fix compatibility
 
@@ -1490,7 +1490,14 @@ findings.append(finding(
     remediation = "Add a reserved statement for field number 4.",
 ))
 
-# Finding with remediation guidance
+# Finding with remediation included directly in the message
+findings.append(finding(
+    severity = Severity.fail,
+    message = "required key 'version' removed from module.json; restore it because it is required by the module loader",
+    path = "services/auth/module.json",
+))
+
+# Finding with separate remediation guidance
 findings.append(finding(
     severity = Severity.fail,
     message = "required key 'version' removed from module.json",
