@@ -229,7 +229,7 @@ This is a runner-level concern, not an adapter concern. Implement in `starlark/m
 |---|---|
 | `Finding` | `#[derive(StarlarkValue)]` wrapper around `crate::output::Finding` |
 | `Severity.fail` | Maps to `crate::output::Severity::Error` |
-| `Severity.fail_but_overridable` | Maps to `crate::output::Severity::Warning` |
+| `Severity.fail_but_overridable` | Maps to a blocking finding with `overridable = true`; GitHub annotation level remains `failure` |
 | `FileEdit` | `#[derive(StarlarkValue)]` wrapper around `crate::fix::FileEdit` |
 | `fix_data` | `OwnedFrozenValue` — opaque Starlark value, passed through from check to fix |
 | `check_meta()` | Parsed into `CheckMeta { tier }` at module load time |
