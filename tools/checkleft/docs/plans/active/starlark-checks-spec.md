@@ -1445,11 +1445,49 @@ Starlark checks produce `Finding` values that map to the existing checkleft diag
 
 `message` is the primary human-facing diagnostic text and may include remediation instructions directly. `remediation` is optional secondary human-facing text for checks that want a separate suggested-action field. Both are displayed inline with the file, line, point, or span location supplied by the check. Neither implies an automatic edit.
 
-### 14.2 Fix compatibility
+### 14.2 GitHub PR annotations
+
+Checkleft findings must be exportable to GitHub PR annotations. This lets checkleft errors appear inline in the pull request file view and checks UI.
+
+The GitHub annotation shape is:
+
+```json
+{
+  "path": "api/v1/user.proto",
+  "start_line": 17,
+  "end_line": 17,
+  "start_column": 3,
+  "end_column": 19,
+  "annotation_level": "failure",
+  "title": "proto/evolution",
+  "message": "removed field number must be reserved"
+}
+```
+
+Mapping:
+
+| Checkleft field             | GitHub annotation field                                                   |
+| --------------------------- | ------------------------------------------------------------------------- |
+| `path`                      | `path`                                                                    |
+| `line`                      | `start_line`                                                              |
+| `end_line` or `line`        | `end_line`                                                                |
+| `column`                    | `start_column` when `start_line == end_line`                              |
+| `end_column`                | `end_column` when `start_line == end_line`                                |
+| `Severity.fail`             | `annotation_level = "failure"`                                            |
+| `Severity.fail_but_overridable` | `annotation_level = "warning"`                                        |
+| check ID                    | `title`                                                                   |
+| `message`                   | `message`                                                                 |
+| `remediation`               | appended to `message` or emitted as `raw_details`, depending on renderer |
+
+GitHub annotations require line numbers. File-only findings still remain valid checkleft findings, but a GitHub renderer must anchor them to line 1 or put them in the check-run summary instead of creating a line annotation. Multi-line spans omit column fields because GitHub only supports column ranges for same-line annotations.
+
+When checkleft runs inside GitHub Actions without a GitHub App integration, the runner can also emit workflow commands such as `::error file=...,line=...,col=...::message`. This produces GitHub annotations from stdout. The richer Checks API path is preferred for first-class check-run output because it supports appendable annotations and summary text.
+
+### 14.3 Fix compatibility
 
 Starlark `fix()` functions return `list[FileEdit]` which maps to the existing `Vec<FileEdit>` consumed by `WritableSandbox`. The existing fix scheduler (`src/fix/scheduler.rs`) orchestrates Starlark fixes identically to WASM component fixes.
 
-### 14.3 Progress reporting
+### 14.4 Progress reporting
 
 The runner reports Starlark check progress through the existing `ProgressReporter` trait. Each adapter registers its `applicable_file_count` (derived from file selector matching against the changeset) and ticks progress as files are processed.
 
