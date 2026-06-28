@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1640,7 +1641,8 @@ impl Runner {
         package: &StarlarkPackageConfig,
         selected_refs: &mut BTreeMap<String, SelectedPackageRef>,
     ) -> Result<Vec<(DiscoveredCheck, Arc<dyn SourceTree>)>> {
-        let resolved = self.resolve_starlark_package_source(&package.source, package.sha256.as_deref())?;
+        let resolved =
+            self.resolve_starlark_package_source(&package.source, &package.version, package.sha256.as_deref())?;
         let root = resolved.root.as_path();
         let tree = resolved.tree;
 
@@ -1688,8 +1690,11 @@ impl Runner {
                 )?;
                 let mut checks = Vec::new();
                 for (alias, include) in manifest.includes {
-                    let include_resolved =
-                        self.resolve_starlark_package_source(&include.source, include.sha256.as_deref())?;
+                    let include_resolved = self.resolve_starlark_package_source(
+                        &include.source,
+                        &include.version,
+                        include.sha256.as_deref(),
+                    )?;
                     let include_root = include_resolved.root.as_path();
                     let include_tree = include_resolved.tree;
                     let include_manifest = PackageManifest::read_from_tree(include_tree.as_ref(), include_root)?;
@@ -1723,10 +1728,34 @@ impl Runner {
     fn resolve_starlark_package_source(
         &self,
         source: &str,
+        version: &str,
         expected_sha256: Option<&str>,
     ) -> Result<ResolvedStarlarkPackage> {
+        if let Some(git_source) = source.strip_prefix("git://") {
+            let expected = expected_sha256.ok_or_else(|| anyhow!("git package refs must declare sha256"))?;
+            let bytes = git_archive_checkleft(git_source, version)?;
+            let actual = sha256_hex(&bytes);
+            if actual != expected {
+                bail!(
+                    "Starlark package git archive {} at {} sha256 mismatch: expected {}, got {}",
+                    git_source,
+                    version,
+                    expected,
+                    actual
+                );
+            }
+            let tree = Arc::new(ArchivePackageTree::from_tar_with_stripped_prefix(
+                &bytes,
+                Path::new("checkleft"),
+            )?);
+            return Ok(ResolvedStarlarkPackage {
+                root: PathBuf::new(),
+                tree,
+            });
+        }
+
         let Some(path) = source.strip_prefix("path://").map(Path::new) else {
-            bail!("fetched package sources are parsed but not schedulable yet");
+            bail!("registry package sources are parsed but not schedulable yet");
         };
         if path.extension().and_then(|ext| ext.to_str()) == Some("gz")
             && path
@@ -1996,7 +2025,15 @@ struct ArchivePackageTree {
 impl ArchivePackageTree {
     fn from_tar_gz(bytes: &[u8]) -> Result<Self> {
         let decoder = GzDecoder::new(bytes);
-        let mut archive = Archive::new(decoder);
+        Self::from_tar_reader(decoder, None)
+    }
+
+    fn from_tar_with_stripped_prefix(bytes: &[u8], prefix: &Path) -> Result<Self> {
+        Self::from_tar_reader(Cursor::new(bytes), Some(prefix))
+    }
+
+    fn from_tar_reader<R: Read>(reader: R, strip_prefix: Option<&Path>) -> Result<Self> {
+        let mut archive = Archive::new(reader);
         let mut files = BTreeMap::new();
         for entry in archive
             .entries()
@@ -2010,12 +2047,21 @@ impl ArchivePackageTree {
                 .path()
                 .context("failed to read Starlark package archive entry path")?
                 .into_owned();
+            let path = match strip_prefix {
+                Some(prefix) => match path.strip_prefix(prefix) {
+                    Ok(stripped) if !stripped.as_os_str().is_empty() => stripped.to_path_buf(),
+                    _ => continue,
+                },
+                None => path,
+            };
             validate_archive_path(&path)?;
             let mut contents = Vec::new();
             entry
                 .read_to_end(&mut contents)
                 .with_context(|| format!("failed to read Starlark package archive entry {}", path.display()))?;
-            files.insert(path, contents);
+            if files.insert(path.clone(), contents).is_some() {
+                bail!("Starlark package archive contains duplicate file {}", path.display());
+            }
         }
         if !files.contains_key(Path::new("package.toml")) {
             bail!("Starlark package archive must contain package.toml at the archive root");
@@ -2102,6 +2148,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn git_archive_checkleft(git_source: &str, version: &str) -> Result<Vec<u8>> {
+    if git_source.trim().is_empty() {
+        bail!("git package source must not be empty");
+    }
+    if version.trim().is_empty() {
+        bail!("git package version must not be empty");
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(git_source)
+        .args(["archive", "--format=tar", version, "checkleft"])
+        .output()
+        .with_context(|| format!("failed to run git archive for {git_source} at {version}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "failed to archive git package {} at {}: {}",
+            git_source,
+            version,
+            stderr.trim()
+        );
+    }
+    Ok(output.stdout)
 }
 
 fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) -> Result<ChangeSet> {
