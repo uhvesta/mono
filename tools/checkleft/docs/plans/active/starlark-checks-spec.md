@@ -1464,6 +1464,35 @@ The GitHub annotation shape is:
 }
 ```
 
+Checkleft machine-readable output must include this normalized shape when it can be derived from the finding. The native finding remains the source of truth; the GitHub object is a renderer-ready projection.
+
+```json
+{
+  "check_id": "proto/evolution",
+  "severity": "fail",
+  "message": "removed field number must be reserved",
+  "location": {
+    "path": "api/v1/user.proto",
+    "line": 17,
+    "column": 3,
+    "end_line": 17,
+    "end_column": 19
+  },
+  "github_annotation": {
+    "path": "api/v1/user.proto",
+    "start_line": 17,
+    "end_line": 17,
+    "start_column": 3,
+    "end_column": 19,
+    "annotation_level": "failure",
+    "title": "proto/evolution",
+    "message": "removed field number must be reserved"
+  }
+}
+```
+
+`github_annotation` is present when `path` and `line` are present. It is omitted for file-only findings unless the renderer explicitly chooses to anchor file-only diagnostics to line 1. This keeps the default JSON honest: a missing line cannot masquerade as a precise line annotation.
+
 Mapping:
 
 | Checkleft field             | GitHub annotation field                                                   |
