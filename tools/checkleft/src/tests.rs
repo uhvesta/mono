@@ -9,8 +9,8 @@ use checkleft::change_detection::environment::CiEnvironment;
 use checkleft::external::FixInvocationOutcome;
 
 use super::{
-    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_MAX_LINE_LEN, TRUNCATE_MAX_LINES,
-    TRUNCATE_MAX_TOTAL_CHARS, ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
+    ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_HEAD_LINES, TRUNCATE_MAX_LINE_LEN,
+    TRUNCATE_TAIL_LINES, ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
     normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_fix_results,
     render_human_footer, render_human_results, resolve_github_token_from_sources, should_show_progress,
     sort_results_for_output, still_failing_from_verify, truncate_tool_output,
@@ -734,9 +734,10 @@ fn truncate_tool_output_short_message_passes_through_unchanged() {
 }
 
 #[test]
-fn truncate_tool_output_clips_excess_lines_and_appends_marker() {
-    // Build a message with more lines than TRUNCATE_MAX_LINES.
-    let line_count = TRUNCATE_MAX_LINES + 15;
+fn truncate_tool_output_elides_middle_preserves_head_and_tail() {
+    // Build a message with more lines than HEAD + TAIL.
+    let extra = 5;
+    let line_count = TRUNCATE_HEAD_LINES + TRUNCATE_TAIL_LINES + extra;
     let input: String = (1..=line_count)
         .map(|i| format!("error output line {i}"))
         .collect::<Vec<_>>()
@@ -744,80 +745,94 @@ fn truncate_tool_output_clips_excess_lines_and_appends_marker() {
     let result = truncate_tool_output(&input);
     let output_lines: Vec<&str> = result.lines().collect();
 
-    // TRUNCATE_MAX_LINES content lines + 1 truncation marker.
+    // HEAD + elision marker + TAIL lines total.
     assert_eq!(
         output_lines.len(),
-        TRUNCATE_MAX_LINES + 1,
-        "expected {TRUNCATE_MAX_LINES} content lines plus marker"
+        TRUNCATE_HEAD_LINES + 1 + TRUNCATE_TAIL_LINES,
+        "expected head + elision marker + tail lines"
     );
 
-    // First and last content lines are preserved in order.
+    // First HEAD lines are preserved.
+    for (i, line) in output_lines.iter().enumerate().take(TRUNCATE_HEAD_LINES) {
+        assert!(
+            line.contains(&format!("error output line {}", i + 1)),
+            "head line {} must be preserved",
+            i + 1
+        );
+    }
+
+    // Elision marker is in the middle.
+    let marker = output_lines[TRUNCATE_HEAD_LINES];
     assert!(
-        output_lines[0].contains("error output line 1"),
-        "first line must be preserved"
+        marker.contains(&format!("{extra} line(s) elided")),
+        "marker must report {extra} elided lines; got: {marker}"
     );
-    assert!(output_lines[TRUNCATE_MAX_LINES - 1].contains(&format!("error output line {TRUNCATE_MAX_LINES}")));
 
-    // Marker names elided lines and chars.
-    let marker = output_lines[TRUNCATE_MAX_LINES];
-    assert!(marker.contains("truncated"), "marker must say 'truncated'");
-    assert!(marker.contains("15 more line(s)"), "marker must report 15 elided lines");
+    // Last TAIL lines are preserved (the real error is here).
+    let tail_start_line_num = line_count - TRUNCATE_TAIL_LINES + 1;
+    for (i, line) in output_lines[TRUNCATE_HEAD_LINES + 1..]
+        .iter()
+        .enumerate()
+        .take(TRUNCATE_TAIL_LINES)
+    {
+        let expected_num = tail_start_line_num + i;
+        assert!(
+            line.contains(&format!("error output line {expected_num}")),
+            "tail line {expected_num} must be preserved"
+        );
+    }
 }
 
 #[test]
-fn truncate_tool_output_clips_oversized_single_line_and_appends_marker() {
+fn truncate_tool_output_preserves_all_lines_within_head_plus_tail_limit() {
+    // Lines at exactly HEAD + TAIL should all be shown with no elision marker.
+    let line_count = TRUNCATE_HEAD_LINES + TRUNCATE_TAIL_LINES;
+    let input: String = (1..=line_count)
+        .map(|i| format!("error output line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = truncate_tool_output(&input);
+    let output_lines: Vec<&str> = result.lines().collect();
+
+    assert_eq!(
+        output_lines.len(),
+        line_count,
+        "all lines within head+tail limit should be shown without elision"
+    );
+    // No elision marker.
+    assert!(
+        !output_lines.iter().any(|l| l.contains("elided")),
+        "no elision marker expected when lines fit within head+tail"
+    );
+}
+
+#[test]
+fn truncate_tool_output_clips_oversized_single_line() {
     // A single line far exceeding TRUNCATE_MAX_LINE_LEN (like prettier's full-file echo).
     let huge_line = "x".repeat(TRUNCATE_MAX_LINE_LEN * 10);
     let result = truncate_tool_output(&huge_line);
     let output_lines: Vec<&str> = result.lines().collect();
 
-    // 1 clipped content line + 1 truncation marker.
-    assert_eq!(output_lines.len(), 2, "expect clipped content line and marker");
+    // Single long line produces one clipped output line (no separate marker line).
+    assert_eq!(
+        output_lines.len(),
+        1,
+        "single long line produces one clipped output line"
+    );
 
     // Content line ends with the ellipsis character and is within the char cap (+1 for '…').
     assert!(output_lines[0].ends_with('\u{2026}'), "clipped line must end with '…'");
     assert!(
         output_lines[0].chars().count() <= TRUNCATE_MAX_LINE_LEN + 1,
-        "clipped line must not exceed TRUNCATE_MAX_LINE_LEN + 1 char for '…'"
+        "clipped line must not exceed TRUNCATE_MAX_LINE_LEN + 1 chars"
     );
-
-    // Marker reports more chars were elided.
-    assert!(output_lines[1].contains("truncated"), "marker must say 'truncated'");
-    assert!(
-        output_lines[1].contains("more char(s)"),
-        "marker must report elided char count"
-    );
-}
-
-#[test]
-fn truncate_tool_output_total_char_cap_across_lines() {
-    // Each line is just under TRUNCATE_MAX_LINE_LEN but there are enough to
-    // exhaust TRUNCATE_MAX_TOTAL_CHARS before TRUNCATE_MAX_LINES is reached.
-    let line = "a".repeat(TRUNCATE_MAX_LINE_LEN - 1); // 199 chars per line
-    let lines_to_exhaust = TRUNCATE_MAX_TOTAL_CHARS / (TRUNCATE_MAX_LINE_LEN - 1) + 2;
-    let input: String = std::iter::repeat_n(line.as_str(), lines_to_exhaust)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let result = truncate_tool_output(&input);
-    let output_lines: Vec<&str> = result.lines().collect();
-
-    // Must be bounded: content lines + marker ≤ TRUNCATE_MAX_LINES + 1.
-    assert!(
-        output_lines.len() <= TRUNCATE_MAX_LINES + 1,
-        "total output must be bounded by TRUNCATE_MAX_LINES + marker"
-    );
-
-    // Last line must be the truncation marker.
-    let marker = output_lines[output_lines.len() - 1];
-    assert!(marker.contains("truncated"), "last line must be truncation marker");
 }
 
 #[test]
 fn truncate_tool_output_does_not_affect_json_serialization() {
     // JSON output uses CheckResult directly (serde), never render_finding.
     // Verify the full message survives serde round-trip regardless of size.
-    let huge_message = "x".repeat(TRUNCATE_MAX_TOTAL_CHARS * 5);
+    let huge_message = "x".repeat(TRUNCATE_MAX_LINE_LEN * 10);
     let results = vec![CheckResult {
         check_id: "fmt".to_owned(),
         findings: vec![Finding {
@@ -834,7 +849,7 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
         "JSON output must contain the full untruncated message"
     );
 
-    // Verify the human render of the same result IS truncated.
+    // Verify the human render of the same result clips the line.
     let human = render_human_results(
         &results,
         OutputStyle {
@@ -847,8 +862,8 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
         "human output must NOT contain the full huge message"
     );
     assert!(
-        human.contains("truncated"),
-        "human output must contain the truncation marker"
+        human.contains('\u{2026}'),
+        "human output must contain the ellipsis truncation marker"
     );
 }
 

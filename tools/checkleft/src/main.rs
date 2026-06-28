@@ -2114,6 +2114,13 @@ fn render_human_results(results: &[CheckResult], style: OutputStyle, elapsed: Du
 fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -> String {
     let mut out = String::new();
     let message = truncate_tool_output(&finding.message);
+    // When truncation occurred, write the full output to a temp file so the
+    // complete error is always reachable without re-running the check.
+    let dump_path: Option<PathBuf> = if matches!(message, std::borrow::Cow::Owned(_)) {
+        write_full_output_to_temp(&result.check_id, &finding.message)
+    } else {
+        None
+    };
     out.push_str(&format!(
         "{}[{}]: {}\n",
         style.paint_severity(finding.severity),
@@ -2127,6 +2134,14 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         .map(format_location)
         .unwrap_or_else(|| "<unknown>".to_owned());
     out.push_str(&format!("  --> {location}\n"));
+
+    if let Some(ref path) = dump_path {
+        out.push_str(&format!(
+            "   = {}: {}\n",
+            style.paint_help_label("full output"),
+            style.paint_help_body(&path.display().to_string())
+        ));
+    }
 
     if !finding.remediations.is_empty() {
         if finding.remediations.len() > 1 {
@@ -2165,48 +2180,65 @@ fn format_location(location: &Location) -> String {
     }
 }
 
-/// Maximum lines kept when truncating tool output for human display.
-const TRUNCATE_MAX_LINES: usize = 5;
+/// Lines from the beginning of tool output to keep when the middle is elided.
+const TRUNCATE_HEAD_LINES: usize = 3;
+/// Lines from the end of tool output to keep when the middle is elided.
+/// The tail is where actionable errors (exit reasons, file paths, line numbers)
+/// almost always appear, so it is kept in preference to the head.
+const TRUNCATE_TAIL_LINES: usize = 10;
 /// Maximum chars kept per line when truncating tool output for human display.
 const TRUNCATE_MAX_LINE_LEN: usize = 200;
-/// Maximum total chars kept across all lines when truncating tool output for human display.
-const TRUNCATE_MAX_TOTAL_CHARS: usize = 1000;
 
 /// Truncate potentially huge tool-error output for human display.
 ///
-/// Caps to [`TRUNCATE_MAX_LINES`] lines, [`TRUNCATE_MAX_LINE_LEN`] chars per line,
-/// and [`TRUNCATE_MAX_TOTAL_CHARS`] chars total. When anything is elided, appends a
-/// marker like `… [output truncated: N more line(s), M more char(s)]`. Short/normal
-/// messages return unchanged (Borrowed). Never called for JSON/structured output —
-/// callers serialize CheckResult directly in that case.
+/// When output exceeds [`TRUNCATE_HEAD_LINES`] + [`TRUNCATE_TAIL_LINES`] lines,
+/// the middle is elided with a `… [N lines elided]` marker so both the start
+/// (invocation context) and the end (actual error location) remain visible.
+/// Each line is also independently capped at [`TRUNCATE_MAX_LINE_LEN`] chars.
+/// Short/normal messages return unchanged (Borrowed). Never called for
+/// JSON/structured output — callers serialize CheckResult directly in that case.
 fn truncate_tool_output(text: &str) -> std::borrow::Cow<'_, str> {
-    let original_char_count: usize = text.chars().count();
-    let original_line_count: usize = text.lines().count();
+    let all_lines: Vec<&str> = text.lines().collect();
+    let total_lines = all_lines.len();
+
+    // Fast path: short output with no long lines.
+    let any_line_too_long = all_lines.iter().any(|l| l.chars().count() > TRUNCATE_MAX_LINE_LEN);
+    let needs_middle_elision = total_lines > TRUNCATE_HEAD_LINES + TRUNCATE_TAIL_LINES;
+    if !any_line_too_long && !needs_middle_elision {
+        return std::borrow::Cow::Borrowed(text);
+    }
 
     let mut result_lines: Vec<String> = Vec::new();
-    let mut kept_chars: usize = 0;
     let mut any_truncated = false;
 
-    for line in text.lines() {
-        if result_lines.len() >= TRUNCATE_MAX_LINES {
-            any_truncated = true;
-            break;
-        }
-        if kept_chars >= TRUNCATE_MAX_TOTAL_CHARS {
-            any_truncated = true;
-            break;
-        }
-        let remaining = TRUNCATE_MAX_TOTAL_CHARS - kept_chars;
-        let line_chars: Vec<char> = line.chars().collect();
-        let take = line_chars.len().min(TRUNCATE_MAX_LINE_LEN).min(remaining);
-        if take < line_chars.len() {
-            any_truncated = true;
-            let clipped: String = line_chars[..take].iter().collect();
-            kept_chars += take;
-            result_lines.push(format!("{clipped}\u{2026}"));
+    let cap_line = |line: &str, any_truncated: &mut bool| -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let take = chars.len().min(TRUNCATE_MAX_LINE_LEN);
+        if take < chars.len() {
+            *any_truncated = true;
+            format!("{}\u{2026}", chars[..take].iter().collect::<String>())
         } else {
-            kept_chars += line_chars.len();
-            result_lines.push(line.to_owned());
+            line.to_owned()
+        }
+    };
+
+    if needs_middle_elision {
+        // Head section.
+        for line in &all_lines[..TRUNCATE_HEAD_LINES] {
+            result_lines.push(cap_line(line, &mut any_truncated));
+        }
+        // Middle elision marker.
+        let elided = total_lines - TRUNCATE_HEAD_LINES - TRUNCATE_TAIL_LINES;
+        result_lines.push(format!("\u{2026} [{elided} line(s) elided]"));
+        // Tail section (where the actual error is).
+        for line in &all_lines[total_lines - TRUNCATE_TAIL_LINES..] {
+            result_lines.push(cap_line(line, &mut any_truncated));
+        }
+        any_truncated = true;
+    } else {
+        // No structural elision; only per-line caps apply.
+        for line in &all_lines {
+            result_lines.push(cap_line(line, &mut any_truncated));
         }
     }
 
@@ -2214,14 +2246,25 @@ fn truncate_tool_output(text: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(text);
     }
 
-    let lines_shown = result_lines.len();
-    let more_lines = original_line_count.saturating_sub(lines_shown);
-    let more_chars = original_char_count.saturating_sub(kept_chars);
-    result_lines.push(format!(
-        "\u{2026} [output truncated: {more_lines} more line(s), {more_chars} more char(s)]"
-    ));
-
     std::borrow::Cow::Owned(result_lines.join("\n"))
+}
+
+/// Write the full, untruncated text to a temp file so a human or tool can inspect
+/// it without the console cap. Returns the path on success; silently returns `None`
+/// on I/O failure so the caller can treat the dump as best-effort.
+fn write_full_output_to_temp(check_id: &str, text: &str) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    let hash = h.finish();
+    let safe_id: String = check_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    let filename = format!("checkleft-output-{safe_id}-{hash:016x}.txt");
+    let path = std::env::temp_dir().join(filename);
+    std::fs::write(&path, text).ok()?;
+    Some(path)
 }
 
 fn format_fix_summary(suggested_fix: &SuggestedFix) -> String {
