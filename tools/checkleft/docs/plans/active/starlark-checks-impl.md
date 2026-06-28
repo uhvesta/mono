@@ -44,7 +44,7 @@ src/
 ├── starlark/                          # NEW — all Starlark check infrastructure
 │   ├── mod.rs                         # Public API: StarlarkCheckRunner, discover(), types re-export
 │   ├── discovery.rs                   # Package directory discovery
-│   ├── manifest.rs                    # checkleft-package.toml parsing (PackageManifest, VersionSet, Dependency)
+│   ├── manifest.rs                    # checkleft-package.toml parsing (PackageManifest)
 │   ├── loader.rs                      # Starlark load() resolution (// and : prefixes)
 │   ├── check_meta.rs                  # check_meta() built-in function + CheckMeta struct
 │   ├── evaluator.rs                   # Starlark Module setup, Globals construction, check(ctx) invocation
@@ -101,10 +101,10 @@ starlark = { version = "0.12", features = ["typing"] }
 | File | What it does |
 |---|---|
 | `starlark/discovery.rs` | Scan package roots for `<adapter>/<name>/check.checkleft`. Return a list of `DiscoveredCheck { id, adapter, path, check_meta, package }`. |
-| `starlark/manifest.rs` | Parse `checkleft-package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata, includes: Vec<PackageRef> }`. Validate producer metadata only: `kind = "check_package"` packages define checks, `kind = "version_set"` packages define exact `[includes.*]` refs and do not define checks. |
+| `starlark/manifest.rs` | Parse `checkleft-package.toml` into `PackageManifest { package: PackageIdentity, publish: PublishMetadata }`. Validate producer metadata only: package identity and publishing metadata. |
 | `starlark/loader.rs` | Custom `FileLoader` impl for Starlark's `load()` statement. Resolve `//lib/foo` → `<checkleft_root>/lib/foo.checkleft`, `:types` → `<check_dir>/types.checkleft`. Enforce: no `@dep//` prefix (deps provide checks only, not importable libs). |
 
-**Integration point:** `CHECKS.yaml` remains the consumer validation policy. It selects local packages, fetched packages, and version sets. The runner resolves those package refs, calls discovery for the selected package roots, and hands discovered Starlark checks to the existing runner alongside built-in and external checks.
+**Integration point:** `CHECKS.yaml` remains the consumer validation policy. It selects local packages and fetched packages. The runner resolves those package refs, calls discovery for the selected package roots, and hands discovered Starlark checks to the existing runner alongside built-in and external checks.
 
 ---
 
@@ -161,19 +161,19 @@ starlark/adapter/proto/
 
 ### Phase 5: Versioned distribution and `CHECKS.yaml` activation
 
-**Goal:** Fetch external check packages/version sets selected in `CHECKS.yaml` and activate the requested checks.
+**Goal:** Fetch external check packages selected in `CHECKS.yaml` and activate the requested checks.
 
 **Files:**
 
 | File | What it does |
 |---|---|
-| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: version sets, packages, local path packages, and activation/path selectors. |
-| `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity, publishing metadata, and version-set `[includes]`. |
+| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: registry/git packages, local path packages, and activation/path selectors. |
+| `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity and publishing metadata. |
 | `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
-| `starlark/package.rs` | Expand selected version sets to their exact package refs. Version sets activate all checks from all included packages. Individual packages support `all` or `explicit` activation. |
+| `starlark/package.rs` | Resolve selected package refs. Individual packages support `all` or `explicit` activation. |
 
-Package refs and version-set includes validate `sha256` pins as canonical
-lowercase 64-hex digests before any fetch or package discovery step. `path://`
+Package refs validate `sha256` pins as canonical lowercase 64-hex digests
+before any fetch or package discovery step. `path://`
 refs may omit `sha256` for local iteration; any supplied hash must still be
 canonical. Local archive refs verify the archive bytes when `sha256` is present,
 then discover checks from the archive-root package layout.
@@ -268,7 +268,7 @@ Already-started nodes:
 Next nodes:
 
 1. Node 6: `checkleft test` for text packages and Bazel author-test integration. Preserve path-based author semantics (`<adapter>/<nested/name>/check.checkleft` plus sibling `testdata/<case>/`).
-2. Node 7: `CHECKS.yaml` activation for Starlark packages/version sets.
+2. Node 7: `CHECKS.yaml` activation for Starlark packages.
 3. Node 8: package tarball and Bazel packaging target for check authors.
 4. Node 9: self-hosted Starlark guard check for `CHECKS.yaml` policy integrity.
 5. Node 10: Starlark fix support.

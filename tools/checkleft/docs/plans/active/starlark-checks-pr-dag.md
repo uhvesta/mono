@@ -15,11 +15,11 @@ relative to the previous node branch. The same DAG can be mirrored to
 - Validate each node with focused `bazel test` targets before pushing.
 - When the spec or operating model changes, update the earliest affected node
   first and propagate the change through every dependent branch.
-- Keep `checkleft-package.toml` producer-only: package identity, publishing
-  metadata, and version-set membership.
-- Keep validation policy in `CHECKS.yaml`: selected packages/version sets, local
+- Keep `checkleft-package.toml` producer-only: package identity and publishing
+  metadata.
+- Keep validation policy in `CHECKS.yaml`: selected packages, local
   package paths, path scoping, excludes, severity, and policy.
-- Exact refs plus hashes on package and version-set selections provide the
+- Exact refs plus hashes on package selections provide the
   reproducibility boundary. Hash pins are canonical lowercase 64-hex SHA-256
   digests.
 - Use Bazel for check-author integration: fixture tests should be schedulable by
@@ -59,7 +59,7 @@ Scope:
 - Document the Starlark-backed checkleft API.
 - Define the split between producer packaging metadata and consumer validation
   policy.
-- Specify package distribution, version sets, text package tests, fixes, Bazel
+- Specify package distribution, text package tests, fixes, Bazel
   check-author integration, and adapter semantics.
 
 Required verification:
@@ -151,12 +151,12 @@ Required verification:
 ### Node 7: `CHECKS.yaml` Activation
 
 Scope:
-- Add Starlark package and version-set selection to `CHECKS.yaml`.
+- Add Starlark package selection to `CHECKS.yaml`.
 - Support local path package directories and local `.tar.gz` package archives
   for iteration.
 - Keep package selection, path scoping, and excludes in consumer validation
   policy.
-- Make version-set selection activate all checks from all included packages.
+- Support package activation in `all` and `explicit` modes.
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test`
@@ -178,7 +178,7 @@ Required verification:
 
 Scope:
 - Add a Starlark policy guard check targeting `CHECKS.yaml` and `CHECKS.toml`.
-- Fail downgrades of selected package/version-set versions.
+- Fail downgrades of selected package versions.
 - Fail removal of hardcoded protected entries.
 - Keep this policy as a normal Starlark check so organizations can supply it
   through their own always-merged root policy.
@@ -245,9 +245,9 @@ Required verification:
 ### Node 15: Routing And Exact Package Selection
 
 Scope:
-- Clarify and enforce exact package selection keys: kind, source, version, and
+- Clarify and enforce exact package selection keys: source, version, and
   `sha256`.
-- Keep package/version-set resolution deterministic without a lockfile or
+- Keep package resolution deterministic without a lockfile or
   transitive dependency solver.
 - Preserve duplicate-ref de-duplication only for exact equivalent refs.
 
