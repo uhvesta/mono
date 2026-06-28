@@ -489,7 +489,7 @@ Findings have exactly two severity levels. A finding always blocks merge — the
 | Severity                 | Starlark constant               | CI behavior                                                                                            | Description                                                                |
 | ------------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
 | **Fail**                 | `Severity.fail`                 | Blocks merge. Cannot be overridden.                                                                    | Hard violation. No exceptions.                                             |
-| **Fail-but-overridable** | `Severity.fail_but_overridable` | Blocks merge by default, but can be overridden with a `BYPASS` directive in the PR/commit description. | The change is almost certainly wrong, but there are legitimate exceptions. |
+| **Fail-but-overridable** | `Severity.fail_but_overridable` | Blocks merge by default, but can be overridden through the repository's approved override mechanism. | The change is almost certainly wrong, but there are legitimate exceptions. |
 
 There is no "informational" / "notice" severity. If something doesn't warrant blocking the build, it doesn't belong as a checkleft finding — use linter warnings or comments for that. Checkleft findings are gates.
 
@@ -1469,7 +1469,8 @@ Checkleft machine-readable output must include this normalized shape when it can
 ```json
 {
   "check_id": "proto/evolution",
-  "severity": "fail",
+  "severity": "fail_but_overridable",
+  "overridable": true,
   "message": "removed field number must be reserved",
   "location": {
     "path": "api/v1/user.proto",
@@ -1503,12 +1504,14 @@ Mapping:
 | `column`                    | `start_column` when `start_line == end_line`                              |
 | `end_column`                | `end_column` when `start_line == end_line`                                |
 | `Severity.fail`             | `annotation_level = "failure"`                                            |
-| `Severity.fail_but_overridable` | `annotation_level = "warning"`                                        |
+| `Severity.fail_but_overridable` | `annotation_level = "failure"`                                        |
 | check ID                    | `title`                                                                   |
 | `message`                   | `message`                                                                 |
 | `remediation`               | appended to `message` or emitted as `raw_details`, depending on renderer |
 
 GitHub annotations require line numbers. File-only findings still remain valid checkleft findings, but a GitHub renderer must anchor them to line 1 or put them in the check-run summary instead of creating a line annotation. Multi-line spans omit column fields because GitHub only supports column ranges for same-line annotations.
+
+Both Checkleft severities map to GitHub `failure` annotations because both severities are blocking findings. Overridability is Checkleft policy metadata (`severity = "fail_but_overridable"` / `overridable = true`), not a GitHub warning level.
 
 When checkleft runs inside GitHub Actions without a GitHub App integration, the runner can also emit workflow commands such as `::error file=...,line=...,col=...::message`. This produces GitHub annotations from stdout. The richer Checks API path is preferred for first-class check-run output because it supports appendable annotations and summary text.
 
