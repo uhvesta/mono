@@ -13,8 +13,7 @@
 4. Versioned check distribution — pull in third-party or org-published check packages at pinned versions.
 5. Optional **fix** functions co-located with checks.
 6. Bidirectional: checks can be authored in Starlark _or_ Rust. Rust checks and Starlark checks share the same output types and runner pipeline.
-7. Hierarchical: repos can define checks at the root; sub-projects can layer on their own.
-8. Maximal Starlark typing via `DialectTypes::Enable` — all function signatures, parameters, and return types must carry type annotations.
+7. Maximal Starlark typing via `DialectTypes::Enable` — all function signatures, parameters, and return types must carry type annotations.
 ---
 
 ## 2. Folder structure
@@ -45,7 +44,7 @@ repo-root/
 │           └── fix.checkleft
 ├── services/
 │   └── payments/
-│       └── billing-checks/                # nested project-level checks
+│       └── billing-checks/                # another package, if imported from CHECKS.yaml
 │           ├── checkleft-package.toml
 │           └── proto/
 │               └── billing_compat/
@@ -64,7 +63,7 @@ This folder structure is **intentionally opinionated**. There is exactly one way
 - **Where are external package pins?** → `CHECKS.yaml`
 - **Where is the package root?** → the directory containing `checkleft-package.toml`
 
-No config flags, no overrides, no implicit conventions in package source. The directory tree is the source of truth for check identity and author tests; `CHECKS.yaml` is the source of truth for consumer activation and path policy.
+`checkleft-package.toml` marks a package root and declares producer metadata for publishing. The directory tree under that root defines the exported check IDs, adapter selection, shared helper layout, and author tests. Consumers keep using `CHECKS.yaml` as the reviewable place to select package refs and, where allowed by policy, narrow which repo paths a check validates.
 
 ### 2.3 Rules
 
@@ -204,7 +203,6 @@ checkleft_packages:
 
     - source: path://tools/my-checks
       version: "0.0.0-local"
-      mode: explicit
 
 checks:
   - id: proto/evolution
@@ -213,36 +211,35 @@ checks:
     exclude:
       - "api/generated/**"
 
-  # Local explicit packages do not auto-activate; opt in check-by-check.
   - id: myorg/local-experiments:text/no_debug
     include:
       - "**/*.txt"
 ```
 
-`checkleft_packages.packages` entries can opt into `mode: all` or `mode: explicit`; local path packages default to `explicit` for safe iteration, while fetched packages default to `all`.
+Selecting a package enables the checks exported by that package. `checks[]` entries are optional per-check policy overrides for path narrowing, severity policy, and other normal Checkleft policy fields that already live in `CHECKS.yaml`.
 
 Each discovered check has two IDs:
 
 - **Package-local ID:** `<adapter>/<name>` from the package directory structure.
 - **Consumer-qualified ID:** `<package.name>:<adapter>/<name>`, where `package.name` comes from `checkleft-package.toml`.
 
-`CHECKS.yaml` `checks[].id` may use the consumer-qualified ID to target one exact selected package. Unqualified package-local IDs are allowed only when exactly one selected package exports that ID; otherwise config resolution fails and the consumer must qualify the ID. This keeps explicit activation reviewable without adding a package alias or grouping abstraction.
+`CHECKS.yaml` `checks[].id` may use the consumer-qualified ID to target one exact selected package. Unqualified package-local IDs are allowed only when exactly one selected package exports that ID; otherwise config resolution fails and the consumer must qualify the ID. This keeps policy overrides reviewable without adding a package alias or grouping abstraction.
 
 Path selection is two-stage:
 
 1. The adapter's file selectors determine which files are relevant (e.g. `*.proto` for the proto adapter).
-2. `CHECKS.yaml` `include`/`exclude` narrows the effective file set for this repo.
+2. `CHECKS.yaml` `include`/`exclude` can narrow the effective file set for this repo when the selected check's policy allows consumer path narrowing.
 
-`CHECKS.yaml` controls which checks run and on which paths — it does not configure check behavior.
+Consumers can exclude generated files or limit a check to a subtree with the same CHECKS.yaml path policy used by existing checks. Some protected checks can reject repo-local path narrowing; in that case, a consumer-provided `include` or `exclude` for that check is a configuration error rather than a silent bypass. `CHECKS.yaml` still does not configure check behavior.
 
 ### 3.4 Resolution rules
 
-A consumer activates exactly the packages selected in `CHECKS.yaml`.
+A consumer loads exactly the packages selected in `CHECKS.yaml`.
 
 1. **Every external ref is exact and hash-pinned.** The resolver fetches package bytes for `source`/`version` and fails closed unless the bytes match `sha256`. `sha256` values are canonical lowercase 64-hex digests; placeholder or mixed-case values are rejected at parse time.
 2. **No transitive dependency closure is loaded.** Packages do not activate other packages. Checks run only from directly selected packages.
-3. **Duplicate package names are a hard error unless they are byte-identical.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one.
-4. **Packages can be activated in `all` or `explicit` mode.**
+3. **Duplicate package names are a hard error unless they are the same exact ref.** If two selected refs name the same package with different `source`/`version`/`sha256`, resolution fails and the consumer must choose one. Exact duplicate refs are de-duplicated before checks are loaded.
+4. **Package selection enables the package's exported checks.** There is no package grouping abstraction or per-package activation mode in v1.
 
 ### 3.5 Self-hosted guard check for policy integrity
 

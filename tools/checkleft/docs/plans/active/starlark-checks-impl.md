@@ -159,18 +159,18 @@ starlark/adapter/proto/
 
 ---
 
-### Phase 5: Versioned distribution and `CHECKS.yaml` activation
+### Phase 5: Versioned distribution and `CHECKS.yaml` package selection
 
-**Goal:** Fetch external check packages selected in `CHECKS.yaml` and activate the requested checks.
+**Goal:** Fetch external check packages selected in `CHECKS.yaml` and run their exported checks.
 
 **Files:**
 
 | File | What it does |
 |---|---|
-| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: registry/git packages, local path packages, and activation/path selectors. |
+| `config.rs` (update) | Add `checkleft_packages` parsing to `CHECKS.yaml`: registry/git packages, local path packages, and per-check path policy overrides. |
 | `starlark/manifest.rs` (update) | Keep producer metadata parsing focused on package identity and publishing metadata. |
 | `starlark/resolver.rs` | Fetch packages from `registry://`, `git://`, `path://`. Cache fetched packages by `<name>/<version>/<sha256>`. Verify `sha256` before loading. `path://` supports live package directories and local publishable `.tar.gz` archives. Do not generate a lockfile. |
-| `starlark/package.rs` | Resolve directly selected package refs and apply package activation modes (`all` or `explicit`). Packages do not activate other packages. |
+| `starlark/package.rs` | Resolve directly selected package refs. Selecting a package enables its exported checks; packages do not activate other packages. |
 
 Package refs validate `sha256` pins as canonical lowercase 64-hex digests
 before any fetch or package discovery step. `path://`

@@ -48,7 +48,7 @@ relative to the previous node branch. The same DAG can be mirrored to
 | 16 | `uhvesta/mono#18` | `abarzega/starlark-checks-routing-selection` | `abarzega/starlark-checks-selector-policy` | Remove selector-local Starlark config |
 | 17 | `uhvesta/mono#19` | `abarzega/starlark-checks-selector-policy` | `abarzega/starlark-checks-bazel-author-tests` | Harden Bazel author tests |
 | 18 | `uhvesta/mono#20` | `abarzega/starlark-checks-bazel-author-tests` | `abarzega/starlark-checks-enable-spec` | Full enablement model and Linguist mapping |
-| 19 | `uhvesta/mono#21` | `abarzega/starlark-checks-enable-spec` | `abarzega/starlark-checks-package-activation-globs` | Package activation path policy |
+| 19 | `uhvesta/mono#21` | `abarzega/starlark-checks-enable-spec` | `abarzega/starlark-checks-package-activation-globs` | Package path policy |
 | 20 | `uhvesta/mono#22` | `abarzega/starlark-checks-package-activation-globs` | `abarzega/starlark-checks-adapter-file-selectors` | Adapter `ext`/`name` selectors and uniqueness |
 
 ## Node Scopes
@@ -156,8 +156,8 @@ Scope:
   for iteration.
 - Keep package selection, path scoping, and excludes in consumer validation
   policy.
-- Support package activation modes (`all` and `explicit`) without transitive
-  package activation.
+- Selecting a package enables its exported checks; no transitive package
+  activation.
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test`
@@ -282,8 +282,8 @@ Required verification:
 ### Node 18: Enablement Model Spec And Linguist Mapping
 
 Scope:
-- Document the full Starlark enablement model across package selection, explicit
-  activation selectors, path policy, adapter selectors, and global excludes.
+- Document the full Starlark enablement model across package selection, path
+  policy, adapter selectors, and global excludes.
 - Clarify the public API as producer package identity, check/fix
   implementation, consumer activation, and Rust adapter registration.
 - Add `.gitattributes` so GitHub Linguist treats `*.checkleft` as Starlark.
@@ -291,16 +291,15 @@ Scope:
 Required verification:
 - `bazel test //tools/checkleft:starlark_text_fixture_checkleft_all_test //tools/checkleft:starlark_text_fixture_package_archive_test`
 
-### Node 19: Package Activation Path Policy
+### Node 19: Package Path Policy
 
 Scope:
-- Parse `include` and `exclude` on `CHECKS.yaml` Starlark check activation
-  selectors.
-- Normalize activation globs relative to the declaring `CHECKS.yaml` directory.
-- Apply activation globs when selecting packages and when building each
-  Starlark check changeset.
-- Keep exact duplicate package refs separate when they activate different repo
-  areas.
+- Parse `include` and `exclude` on `CHECKS.yaml` Starlark check policy entries.
+- Normalize path globs relative to the declaring `CHECKS.yaml` directory.
+- Apply path globs when building each Starlark check changeset, for checks whose
+  policy allows consumer path narrowing.
+- Keep exact duplicate package refs de-duplicated; package selection is not
+  scoped by path policy.
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test`
