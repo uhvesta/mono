@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use boss_protocol::TaskKind;
+use boss_protocol::{NormalizeError, TaskKind, WorkerEvent};
 
 /// A named capability Boss needs from an agent driver.
 ///
@@ -211,6 +211,61 @@ pub enum WorkerErrorClass {
     Indeterminate,
 }
 
+/// Fidelity tier of the [`WorkerEvent`] stream a driver's
+/// [`Capability::ProgressObservation`] produces (design §Capabilities).
+///
+/// The activity machine downstream consumes the same `WorkerEvent` type at
+/// every tier; the tier records how much resolution the driver's event source
+/// actually carries, so degrade decisions (and the staleness sweep) can
+/// account for a driver that observes less than Claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressFidelity {
+    /// Per-tool events plus lifecycle. Claude provides this from its hook
+    /// stream — `PreToolUse`/`PostToolUse` give per-tool granularity.
+    Rich,
+    /// Turn + lifecycle boundaries only, with no per-tool granularity.
+    Coarse,
+    /// Process alive/exited only — no in-run signal.
+    Minimal,
+}
+
+/// Inputs the rich-tier ProgressObservation wiring needs to point a worker's
+/// event source at the engine: the events-socket endpoint, the run/lease
+/// identity tags, the worker's workspace, and the event-forwarder binary the
+/// worker invokes (the `boss-event` shim for Claude).
+#[derive(Debug, Clone)]
+pub struct ProgressObservationConfig {
+    /// Engine events-socket path the forwarder connects to.
+    pub events_socket_path: PathBuf,
+    /// Cube lease id, surfaced to the forwarder via `BOSS_LEASE_ID`.
+    pub lease_id: String,
+    /// Run id, inline-prefixed as `BOSS_RUN_ID` so the forwarder can splice
+    /// `_boss_run_id` into every payload for run correlation.
+    pub run_id: String,
+    /// Worker workspace, where the forwarder buffers events when the engine
+    /// is unreachable (`BOSS_WORKSPACE`).
+    pub workspace_path: PathBuf,
+    /// Absolute path to the event-forwarder binary (the `boss-event` shim).
+    pub forwarder_binary: PathBuf,
+}
+
+/// A driver's event-source wiring for [`Capability::ProgressObservation`].
+///
+/// For the Claude driver, `hooks` is the settings-file `hooks` map that routes
+/// every lifecycle + tool hook event to the `boss-event` shim, which forwards
+/// each payload to the engine events socket; the spawn flow merges this
+/// fragment into the worker settings file. A driver whose event source is
+/// configured at spawn time instead (e.g. a CLI `--output-format json`
+/// stream) returns an empty `hooks` map and wires its observation through
+/// [`AgentDriver::spawn_invocation`].
+#[derive(Debug, Clone, Default)]
+pub struct ProgressObservationWiring {
+    /// Hook-event name → array of hook entries. Claude wires all seven
+    /// lifecycle events to the forwarder; the caller may extend the
+    /// `PreToolUse` entry with interception guards (a separate capability).
+    pub hooks: serde_json::Map<String, serde_json::Value>,
+}
+
 /// An agent driver: the abstraction layer between Boss and a coding-agent CLI.
 ///
 /// A driver declares its [`CapabilitySet`] and implements the behavioural
@@ -251,6 +306,24 @@ pub trait AgentDriver: Send + Sync {
     /// path to the settings file (passed as `--settings` or equivalent to the
     /// worker CLI).
     async fn write_permission_config(&self, dest_dir: &Path) -> anyhow::Result<PathBuf>;
+
+    // ── ProgressObservation capability ──────────────────────────────────────
+
+    /// Fidelity tier of the [`WorkerEvent`] stream this driver produces.
+    /// Claude declares [`ProgressFidelity::Rich`] (per-tool hook events).
+    fn progress_fidelity(&self) -> ProgressFidelity;
+
+    /// Build the driver's event-source wiring so the worker emits a lifecycle
+    /// + tool-use stream the engine decodes into [`WorkerEvent`]s. For the
+    /// Claude driver this is the `hooks` block routing every hook event to the
+    /// `boss-event` shim; the spawn flow merges it into the worker settings.
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressObservationWiring;
+
+    /// Decode one raw event-source payload into a typed [`WorkerEvent`] that
+    /// drives the (driver-agnostic) activity machine. For the Claude driver
+    /// the raw payload is a hook JSON object; this delegates to
+    /// [`boss_protocol::normalize_hook_event`].
+    fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
     // ── PromptComposition capability ────────────────────────────────────────
 

@@ -1,6 +1,14 @@
 //! `boss-event` — a thin stdin-to-Unix-socket shim invoked by claude
 //! hooks running inside a Boss-managed worker.
 //!
+//! This is the delivery channel for the Claude driver's rich-tier
+//! **ProgressObservation** capability: the engine wires every Claude hook
+//! event to this shim (see `driver::ClaudeDriver::progress_observation_wiring`),
+//! the shim forwards each payload to the engine, and the engine decodes it
+//! into a `WorkerEvent` (`driver::ClaudeDriver::normalize_progress_event`).
+//! The shim itself is driver-agnostic transport — it splices run identity and
+//! forwards bytes; it does not interpret the hook schema.
+//!
 //! Each claude hook is configured (via the engine's per-worker
 //! settings-file template) to spawn this binary, with the hook
 //! payload arriving on stdin. The shim reads stdin to EOF, opens the

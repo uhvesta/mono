@@ -60,6 +60,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json;
 
+use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig};
+
 /// The kind of worker being spawned, used to select the per-kind tool
 /// denylist. Kept in this module so the denylist rules and the kind
 /// definition are co-located and can evolve together.
@@ -123,6 +125,7 @@ pub struct WorkerSetupInput {
     /// When `true`, the CLAUDE.md includes a directive to use
     /// `--draft` when running `gh pr create`. Omitted when `false`
     /// so workers on default installs see no behaviour change.
+    #[builder(default = false)]
     pub draft_pr_mode: bool,
     /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
     /// Used to install kind-specific hook guards — currently a PreToolUse deny
@@ -140,6 +143,7 @@ pub struct WorkerSetupInput {
     /// worker settings file. Defaults to [`WorkerKind::Standard`] which adds
     /// no additional denies beyond the static sandbox rules. Set to
     /// [`WorkerKind::Reviewer`] to enforce the read-only mandate (§9).
+    #[builder(default = WorkerKind::Standard)]
     pub worker_kind: WorkerKind,
 }
 
@@ -495,39 +499,24 @@ pub fn render_remote_settings_json(input: &WorkerSetupInput) -> String {
 }
 
 fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
-    // Inline-prefix all env vars the shim needs. `BOSS_RUN_ID` is the
-    // load-bearing one for live-worker-state correlation: if it's
-    // missing from the shim's env, the splice that adds `_boss_run_id`
-    // to the payload silently fails and the engine drops the hook
-    // event, pinning the worker's activity at `Spawning`. Setting it
-    // here (rather than relying on env inheritance from the worker
-    // pane through claude into the hook subprocess) guarantees the
-    // shim sees it regardless of how claude handles env propagation.
+    // Rich-tier ProgressObservation (design §1.5): the Claude driver wires
+    // every hook event to the `boss-event` forwarder, producing the
+    // `WorkerEvent` stream that drives the activity machine. The env-prefix
+    // rationale (`BOSS_RUN_ID` correlation, `BOSS_WORKSPACE` buffering) and
+    // the shim command live in `ClaudeDriver::progress_observation_wiring`.
     //
-    // `BOSS_WORKSPACE` tells the shim where to write its on-disk event
-    // buffer when the engine is unreachable (see the shim's
-    // resilience docs). Without it the shim falls back to cwd, which
-    // is normally the workspace anyway — but inline-prefixing is the
-    // belt that survives any future change to how claude propagates
-    // cwd to hook subprocesses.
-    let command = format!(
-        "BOSS_EVENTS_SOCKET={socket} BOSS_LEASE_ID={lease} BOSS_RUN_ID={run_id} BOSS_WORKSPACE={workspace} {shim}",
-        socket = shell_escape(&input.events_socket_path.display().to_string()),
-        lease = shell_escape(&input.lease_id),
-        run_id = shell_escape(&input.run_id),
-        workspace = shell_escape(&input.workspace_path.display().to_string()),
-        shim = shell_escape(&input.boss_event_path.display().to_string()),
-    );
-
-    let hook = serde_json::json!({
-        "matcher": "*",
-        "hooks": [
-            {
-                "type": "command",
-                "command": command,
-            }
-        ],
+    // The settings file is still assembled here because the permission rules
+    // (PermissionPolicy) and the PreToolUse interception guards
+    // (ToolUseInterception) share this JSON and are extracted in later tasks;
+    // for now they layer on top of the driver-produced hooks.
+    let wiring = ClaudeDriver.progress_observation_wiring(&ProgressObservationConfig {
+        events_socket_path: input.events_socket_path.clone(),
+        lease_id: input.lease_id.clone(),
+        run_id: input.run_id.clone(),
+        workspace_path: input.workspace_path.clone(),
+        forwarder_binary: input.boss_event_path.clone(),
     });
+    let mut hooks = wiring.hooks;
 
     // For revision tasks, add a PreToolUse guard that blocks any PR-creation
     // invocation (`gh pr create`, `cube pr create`, or the deprecated
@@ -541,7 +530,13 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     // is `revision_implementation` OR the task kind is `revision`.
     // This ensures a mis-derived execution kind (e.g. revision
     // re-dispatched as `task_implementation`) still cannot open a PR.
-    let mut pre_tool_use_hooks = vec![hook.clone()];
+    //
+    // All of these interception guards are appended to the forwarder hook
+    // the driver wired, which stays the first `PreToolUse` entry.
+    let pre_tool_use_hooks = hooks
+        .get_mut("PreToolUse")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("Claude ProgressObservation wiring always includes PreToolUse");
 
     // Deterministic Boss-data-dir gate (every session, every tool). The
     // script canonicalises the working dir and every candidate path
@@ -729,16 +724,12 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
             "defaultMode": "auto",
             "deny": deny_rules(input, sandbox),
         },
-        "hooks": {
-            "SessionStart":     [hook.clone()],
-            "UserPromptSubmit": [hook.clone()],
-            "PreToolUse":       pre_tool_use_hooks,
-            "PostToolUse":      [hook.clone()],
-            "Stop":             [hook.clone()],
-            "Notification":     [hook.clone()],
-            "SessionEnd":       [hook],
-        },
     });
+    // `hooks` is the driver-produced map (all seven lifecycle events wired to
+    // the forwarder), with the interception guards layered onto `PreToolUse`
+    // above. Assigned after the `permissions` block so the borrow of `hooks`
+    // held by `pre_tool_use_hooks` has ended.
+    value["hooks"] = serde_json::Value::Object(hooks);
 
     // Reviewer sessions are latency-sensitive review passes: fast mode
     // keeps Opus quality while cutting turnaround. Scoped to reviewers

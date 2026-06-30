@@ -13,8 +13,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use boss_protocol::{NormalizeError, WorkerEvent, normalize_hook_event};
+use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
+
+use crate::driver::{AgentDriver, ClaudeDriver};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -205,7 +207,13 @@ pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, 
         payload_run_id
     };
     let transcript_path = extract_transcript_path_from_payload(&raw);
-    let event = normalize_hook_event(&raw)?;
+    // Decode through the Claude driver's ProgressObservation capability: the
+    // raw hook payload becomes a typed `WorkerEvent`. The engine is
+    // Claude-default today; once the dispatch gate selects a driver per run
+    // (design Depth 3), this picks the run's driver instead of hardcoding
+    // `ClaudeDriver`. The decoded event drives the (driver-agnostic) activity
+    // machine downstream, unchanged.
+    let event = ClaudeDriver.normalize_progress_event(&raw)?;
     Ok(IncomingHookEvent {
         peer_pid: peer_pid_value,
         run_id,
