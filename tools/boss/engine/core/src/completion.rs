@@ -1316,6 +1316,30 @@ impl WorkerCompletionHandler {
                 {
                     return outcome;
                 }
+                // Deliverable-satisfied gate (zombie-worker fix): if the
+                // bound PR is already in a satisfactory state at this Stop
+                // boundary — CI clean and no merge conflict, or already
+                // merged — the worker's deliverable is complete regardless
+                // of whether it pushed new commits this run. Finalize now
+                // instead of nudging, preventing the "nothing left to do"
+                // spin loop where workers park in waiting_for_input and
+                // hold their pool slot indefinitely.
+                //
+                // IMPORTANT: this gate is intentionally placed only in
+                // on_stop, not in recheck_for_pr. The merge-poller sweep
+                // runs for waiting_human executions even when the worker
+                // died without a clean Stop (crash, API cut). Applying
+                // "head unchanged + CI clean → finalize" there would reap
+                // dead workers that still need reconciliation — the exact
+                // race rolled back in #1262. The on_stop path is safe
+                // because the Stop hook fires only when the worker
+                // completed a turn (real activity boundary, not a crash).
+                if let Some(outcome) = self
+                    .try_finalize_satisfied_deliverable_on_stop(execution_id, &execution, &pr_url)
+                    .await
+                {
+                    return outcome;
+                }
                 tracing::info!(
                     execution_id,
                     bound_pr_url = %pr_url,
@@ -3243,6 +3267,10 @@ must not be asked to open one",
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,
+            // Deliverable-satisfied gate: the bound PR was already clean
+            // (CI green + no conflict) or merged when the worker stopped
+            // without pushing. The execution is finalized, not failed.
+            StopOutcome::DeliverableSatisfied { .. } => false,
             // Worker re-triggered a flaky/infra failure — the attempt was
             // already flipped to terminal `retriggered` by mark-retriggered,
             // so there is no running row to retire here, and this is
@@ -4348,6 +4376,106 @@ must not be asked to open one",
         )
     }
 
+    /// Deliverable-satisfied finalization gate (zombie-worker / "nothing
+    /// left to do" loop fix, T740 follow-on).
+    ///
+    /// Called in the `NoContribution` branch of `on_stop_inner` after all
+    /// per-kind signal-clearing and metadata-only gates have returned
+    /// `None`. Probes the bound PR; if it is already in a satisfactory
+    /// state — open with CI clean and no merge conflict, or already merged
+    /// — the worker's deliverable is complete regardless of whether it
+    /// pushed new commits this run. Finalizes immediately instead of
+    /// nudging, preventing the spin loop where workers park at the Stop
+    /// boundary emitting "nothing left to do" and hold their pool slot
+    /// indefinitely until manually reaped.
+    ///
+    /// Returns `Some(DeliverableSatisfied { pr_url })` when finalized (CI
+    /// clean open PR or already-merged), or `None` when the PR is not yet
+    /// satisfied (CI in-flight, CI failing, merge conflict) or the probe
+    /// fails (safe fallback to the normal nudge path).
+    ///
+    /// Safety: intentionally NOT called from `recheck_for_pr`. The merge-
+    /// poller sweep runs for `waiting_human` executions even when the
+    /// worker died without a clean Stop (crash, network cut). Applying
+    /// "head unchanged + CI clean → finalize" there would reap dead
+    /// workers that still need reconciliation — the exact race rolled back
+    /// in #1262. The `on_stop` path is safe because the Stop hook fires
+    /// only when the worker completed a turn (real activity, not a crash).
+    async fn try_finalize_satisfied_deliverable_on_stop(
+        &self,
+        execution_id: &str,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+    ) -> Option<StopOutcome> {
+        let probe = match self.merge_probe.probe(bound_pr_url).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::debug!(
+                    execution_id,
+                    bound_pr_url,
+                    ?err,
+                    "satisfied-deliverable gate: PR probe failed; falling through to nudge"
+                );
+                return None;
+            }
+        };
+
+        let inner = match probe.state {
+            PrLifecycleState::Merged => {
+                tracing::info!(
+                    execution_id,
+                    bound_pr_url,
+                    "satisfied-deliverable gate: PR already merged — finalizing without nudge"
+                );
+                self.finalize_pr_transition(
+                    execution_id,
+                    bound_pr_url.to_owned(),
+                    WorkerPrCompletionTarget::Done,
+                    "stop_satisfied_merged",
+                )
+                .await
+            }
+            PrLifecycleState::Open(ref open)
+                if open.mergeability != OpenPrMergeability::Conflict && matches!(open.ci, OpenPrCiStatus::Clean) =>
+            {
+                tracing::info!(
+                    execution_id,
+                    bound_pr_url,
+                    kind = %execution.kind,
+                    "satisfied-deliverable gate: PR open with CI clean and no conflict — finalizing without nudge"
+                );
+                self.finalize_pr_transition(
+                    execution_id,
+                    bound_pr_url.to_owned(),
+                    WorkerPrCompletionTarget::InReview,
+                    "stop_satisfied_clean",
+                )
+                .await
+            }
+            _ => {
+                tracing::debug!(
+                    execution_id,
+                    bound_pr_url,
+                    state = ?probe.state,
+                    "satisfied-deliverable gate: PR not yet satisfied (CI in-flight / failing / conflict); falling through to nudge"
+                );
+                return None;
+            }
+        };
+
+        // Map through DeliverableSatisfied so logs and tests can
+        // identify this path distinctly from a fresh-push finalization.
+        // ReviewerEnqueued is also a successful finalization — the PR
+        // advanced to InReview and a reviewer pass was triggered; the
+        // deliverable is still satisfied.
+        Some(match inner {
+            StopOutcome::PrDetected { pr_url }
+            | StopOutcome::PrMerged { pr_url }
+            | StopOutcome::ReviewerEnqueued { pr_url } => StopOutcome::DeliverableSatisfied { pr_url },
+            other => other,
+        })
+    }
+
     /// Evaluate the resume-bounce SHA-delta gate. The gate uses the
     /// chore's bound `pr_url` (set by an earlier run's on-Stop
     /// machinery) as the authoritative PR identifier — never
@@ -4683,6 +4811,14 @@ pub enum StopOutcome {
     /// task is snapped back to `in_review`, and the execution is
     /// finalised. No nudge is sent.
     SignalAlreadyCleared { pr_url: String },
+    /// The bound PR was in a deliverable-satisfied state at Stop time
+    /// — open with CI clean and no merge conflict, or already merged —
+    /// even though the worker did not push new commits this run.
+    /// Detected by `try_finalize_satisfied_deliverable_on_stop` in
+    /// the `NoContribution` branch of `on_stop_inner`. The execution
+    /// is finalised and the worker reaped without nudging, preventing
+    /// the "nothing left to do" zombie loop (T740 follow-on).
+    DeliverableSatisfied { pr_url: String },
     /// A CI-remediation worker classified the failure as flaky/infra and
     /// re-triggered the failing job (`boss engine ci mark-retriggered`),
     /// which stamped the `ci_flaky_retriggered` signal on the parent.
@@ -12172,6 +12308,260 @@ PR #379. PR #379. PR #379. PR #379. PR #379.";
             rev_task.status,
             TaskStatus::InReview,
             "step 4: revision task must be in_review after clean reviewer pass",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // Deliverable-satisfied gate tests (zombie-worker / "nothing left to do"
+    // loop fix, T740 follow-on).
+    //
+    // When a worker stops without pushing new commits (NoContribution),
+    // but the bound PR is already in a satisfactory state — open with
+    // CI clean and no conflict, or already merged — the engine should
+    // finalize immediately instead of nudging. Prevents the spin loop
+    // where workers park in waiting_for_input emitting "nothing left to
+    // do" and hold their pool slot indefinitely until manually reaped.
+    // -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn on_stop_finalizes_satisfied_revision_when_pr_clean_and_sha_unchanged() {
+        // T1490 / T1486 regression: revision worker stopped without pushing
+        // (NoContribution — SHA unchanged), but the bound PR is open with
+        // CI green and no conflict. The deliverable-satisfied gate must
+        // finalize without nudging.
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1490";
+        let head = "abcdef1111111111111111111111111111111111";
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        // SHA unchanged → SHA-delta gate returns NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+        // PR is open, CI clean, no conflict.
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+            "satisfied-deliverable gate must finalize a no-push revision whose PR is clean; \
+             got {outcome:?}",
+        );
+        // Revision advances to InReview — deliverable satisfied.
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
+                t.status,
+                TaskStatus::InReview,
+                "revision must advance to in_review when deliverable satisfied",
+            ),
+            other => panic!("expected task, got {other:?}"),
+        }
+        // Execution finalized, worker reaped.
+        let exec = db.get_execution(&execution_id).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::Completed);
+        assert!(exec.cube_lease_id.is_none(), "lease must be released");
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
+        // No nudge probe queued.
+        assert!(
+            probes.snapshot().is_empty(),
+            "satisfied deliverable must NOT nudge; got {:?}",
+            probes.snapshot(),
+        );
+    }
+
+    #[tokio::test]
+    async fn on_stop_does_not_finalize_satisfied_revision_when_ci_inflight() {
+        // When CI is still in-flight (checks running), the deliverable is NOT
+        // yet satisfied. The gate must fall through to the nudge path.
+        use crate::merge_poller::{OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let parent_pr_url = "https://github.com/spinyfin/mono/pull/1491";
+        let head = "1111111111111111111111111111111111111111";
+        let (db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+        // SHA unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_parent");
+        verifier.set_head_oid(Ok(head.into())).await;
+        // PR is open but CI is still in-flight.
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus {
+            mergeability: OpenPrMergeability::Clean,
+            ci: OpenPrCiStatus::InFlight,
+        })));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        // Gate must NOT fire — CI in-flight is not a satisfied state.
+        assert!(
+            !matches!(outcome, StopOutcome::DeliverableSatisfied { .. }),
+            "CI in-flight must not trigger the satisfied-deliverable gate; got {outcome:?}",
+        );
+        // Worker must NOT be reaped.
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+        );
+        assert!(cube.release_calls.lock().await.is_empty());
+        assert!(pane.calls.lock().await.is_empty());
+        // Revision task stays in Doing.
+        match db.get_work_item(&revision_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Active),
+            other => panic!("expected task, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_stop_finalizes_satisfied_chore_when_pr_clean_and_sha_unchanged() {
+        // T1473 regression: a chore_implementation worker stopped without
+        // pushing new commits (PR was already open from a prior run,
+        // NoContribution), but the PR is open with CI green and no conflict.
+        // The deliverable-satisfied gate must finalize without nudging.
+        use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
+
+        let workspace = tempdir().unwrap();
+        let expected_pr_url = "https://github.com/spinyfin/mono/pull/1473";
+        let head = "deadbeef11111111111111111111111111111111";
+
+        // Create a chore with a bound PR URL (simulates a prior run's completion).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boss.db");
+        std::mem::forget(dir);
+        let db = Arc::new(WorkDb::open(path).unwrap());
+        let product = db
+            .create_product(CreateProductInput {
+                name: "Satisfied Chore Test".into(),
+                description: None,
+                repo_remote_url: Some("git@github.com:spinyfin/mono.git".into()),
+                design_repo: None,
+                docs_repo: None,
+                worker_branch_prefix: None,
+            })
+            .unwrap();
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id.clone())
+                    .name("Implement feature X")
+                    .build(),
+            )
+            .unwrap();
+        {
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+                rusqlite::params![chore.id, expected_pr_url],
+            )
+            .unwrap();
+        }
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Ready)
+                    .repo_remote_url("git@github.com:spinyfin/mono.git")
+                    .build(),
+            )
+            .unwrap();
+        let (execution, run) = db
+            .start_execution_run(
+                &execution.id,
+                "worker-1",
+                "mono",
+                "lease-chore-1",
+                "mono-agent-001",
+                workspace.path().to_str().unwrap(),
+            )
+            .unwrap();
+        let _ = db
+            .finish_execution_run(
+                &execution.id,
+                &run.id,
+                ExecutionStatus::WaitingHuman,
+                "completed",
+                Some("spawned worker pane"),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+        db.set_execution_pr_head_before(&execution.id, head).unwrap();
+
+        // SHA unchanged → NoContribution.
+        let verifier = StubBranchVerifier::ok("boss/exec_chore");
+        verifier.set_head_oid(Ok(head.into())).await;
+        // PR open, CI clean, no conflict.
+        let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
+
+        let detector = StubPrDetector::ok(None);
+        let cube = Arc::new(StubCubeClient::default());
+        let publisher = Arc::new(RecordingPublisher::default());
+        let pane = Arc::new(RecordingPaneReleaser::default());
+        let probes = Arc::new(RecordingProbeQueuer::default());
+        let handler = WorkerCompletionHandler::new(
+            db.clone(),
+            detector,
+            cube.clone(),
+            publisher.clone(),
+            pane.clone(),
+            probes.clone(),
+        )
+        .with_branch_verifier(verifier)
+        .with_merge_probe(probe);
+
+        let outcome = handler.on_stop(&execution.id).await;
+        assert!(
+            matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == expected_pr_url),
+            "satisfied-deliverable gate must finalize a no-push chore whose PR is clean; \
+             got {outcome:?}",
+        );
+        // Chore stays InReview (was already; idempotent).
+        match db.get_work_item(&chore.id).unwrap() {
+            WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
+            other => panic!("expected chore, got {other:?}"),
+        }
+        // Execution finalized, worker reaped.
+        let exec_after = db.get_execution(&execution.id).unwrap();
+        assert_eq!(exec_after.status, ExecutionStatus::Completed);
+        assert!(exec_after.cube_lease_id.is_none(), "lease must be released");
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-chore-1"]);
+        assert_eq!(pane.calls.lock().await.as_slice(), [execution.id.as_str()]);
+        // No nudge probe.
+        assert!(
+            probes.snapshot().is_empty(),
+            "satisfied deliverable must NOT nudge; got {:?}",
+            probes.snapshot(),
         );
     }
 }

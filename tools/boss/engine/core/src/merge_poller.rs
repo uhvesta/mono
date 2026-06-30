@@ -1715,6 +1715,9 @@ async fn sweep_pending_pr(handler: &WorkerCompletionHandler, execution_id: &str,
         // is also only reachable via on-Stop, not recheck_for_pr.
         | StopOutcome::NudgeBreakerParked { .. }
         | StopOutcome::SignalAlreadyCleared { .. }
+        // DeliverableSatisfied is only reachable via the on-Stop path
+        // (try_finalize_satisfied_deliverable_on_stop); covered for exhaustiveness.
+        | StopOutcome::DeliverableSatisfied { .. }
         // FlakyRetriggered is only reachable via the on-Stop path (it gates
         // on `execution.kind == "ci_remediation"`), never from a recheck.
         | StopOutcome::FlakyRetriggered { .. }
@@ -1775,6 +1778,9 @@ async fn sweep_late_pr(handler: &WorkerCompletionHandler, candidate: &LatePrCand
         // exhaustiveness. SignalAlreadyCleared is only reachable via on-Stop.
         | StopOutcome::NudgeBreakerParked { .. }
         | StopOutcome::SignalAlreadyCleared { .. }
+        // DeliverableSatisfied is only reachable via the on-Stop path
+        // (try_finalize_satisfied_deliverable_on_stop); covered for exhaustiveness.
+        | StopOutcome::DeliverableSatisfied { .. }
         // FlakyRetriggered is only reachable via the on-Stop path (it gates
         // on `execution.kind == "ci_remediation"`), never from a recheck.
         | StopOutcome::FlakyRetriggered { .. }
