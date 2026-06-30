@@ -172,8 +172,12 @@ pub struct LiveProgress {
 
 impl LiveProgress {
     /// Start the render loop with `renderer` and the given debounce window.
-    pub fn new(renderer: Box<dyn Renderer>, debounce: Duration) -> Self {
-        let shared = Arc::new(Mutex::new(ProgressState::new(debounce)));
+    /// `hide_skipped` suppresses checks with no applicable files from the status
+    /// block (true by default; pass false to restore the full listing).
+    pub fn new(renderer: Box<dyn Renderer>, debounce: Duration, hide_skipped: bool) -> Self {
+        let mut progress_state = ProgressState::new(debounce);
+        progress_state.hide_skipped = hide_skipped;
+        let shared = Arc::new(Mutex::new(progress_state));
         let stop = Arc::new(AtomicBool::new(false));
         let handle = spawn_render_loop(renderer, Arc::clone(&shared), Arc::clone(&stop));
         Self {
@@ -316,7 +320,7 @@ mod tests {
         use super::render::testing::RecordingRenderer;
 
         let renderer = Box::new(RecordingRenderer::default());
-        let mut live = LiveProgress::new(renderer, DEFAULT_DEBOUNCE);
+        let mut live = LiveProgress::new(renderer, DEFAULT_DEBOUNCE, true);
         let reporter = live.reporter(Arc::new(|result: &CheckResult| format!("rendered:{}", result.check_id)));
 
         reporter.register("typo", 2);

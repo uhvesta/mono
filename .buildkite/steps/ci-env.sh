@@ -13,6 +13,24 @@ fi
 
 export REPOBIN_BAZEL_STARTUP_FLAGS="$BAZEL_STARTUP_FLAGS"
 
+# On macOS, detect Xcode version changes and expunge the stale Bazel output
+# base. The apple_cc_configure module extension caches Xcode paths in the
+# output base; if Xcode is updated without a clean, subsequent builds fail
+# with "Xcode version X is not available on the host machine".
+if [[ "$OS_TYPE" == "darwin" ]]; then
+  CURRENT_XCODE_VERSION=$(xcrun xcodebuild -version 2>/dev/null | tr '\n' ' ' | xargs || echo "unknown")
+  XCODE_VERSION_FILE="${HOME}/.cache/bazelcache/.xcode_version"
+  if [[ -f "$XCODE_VERSION_FILE" ]]; then
+    LAST_XCODE_VERSION=$(cat "$XCODE_VERSION_FILE")
+    if [[ "$CURRENT_XCODE_VERSION" != "$LAST_XCODE_VERSION" ]]; then
+      echo "--- [ci-env] Xcode changed ('$LAST_XCODE_VERSION' → '$CURRENT_XCODE_VERSION'); expunging stale Bazel output base"
+      command bazel clean --expunge
+    fi
+  fi
+  mkdir -p "$(dirname "$XCODE_VERSION_FILE")"
+  echo "$CURRENT_XCODE_VERSION" > "$XCODE_VERSION_FILE"
+fi
+
 # Wrap bazel and pass in ci configuration.
 # Automatically detects Xcode version mismatch errors (caused by a stale disk
 # cache after an Xcode upgrade) and recovers by running `bazel clean --expunge`

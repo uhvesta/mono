@@ -71,6 +71,9 @@ pub struct ProgressState {
     debounce: Duration,
     /// Rendered finding lines awaiting a flush into the scrolling log area.
     log: Vec<String>,
+    /// When true, checks that had zero applicable files are omitted from the
+    /// status block. On by default; pass `--show-skipped` to disable.
+    pub hide_skipped: bool,
 }
 
 impl ProgressState {
@@ -80,6 +83,7 @@ impl ProgressState {
             index: HashMap::new(),
             debounce,
             log: Vec::new(),
+            hide_skipped: true,
         }
     }
 
@@ -177,6 +181,11 @@ impl ProgressState {
                     });
                 }
                 Lifecycle::Done { files_failed, elapsed } => {
+                    // Suppress checks with no applicable files when hide_skipped
+                    // is enabled (the default). Failed checks are never hidden.
+                    if files_failed == 0 && entry.total_files == 0 && self.hide_skipped {
+                        continue;
+                    }
                     let (icon, text) = if files_failed > 0 {
                         (IconKind::Failed, done_failed_text(entry, files_failed, elapsed))
                     } else if entry.total_files == 0 {
@@ -416,8 +425,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_eligible_files_renders_as_skipped() {
+    fn zero_eligible_files_renders_as_skipped_when_show_skipped() {
         let mut state = ProgressState::new(DEBOUNCE);
+        state.hide_skipped = false;
         state.register("format/bazel", 0);
         state.start("format/bazel", Instant::now());
         state.finish("format/bazel", 0, Duration::from_millis(3));
@@ -426,6 +436,35 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].icon, IconKind::Skipped);
         assert_eq!(lines[0].text, "format/bazel: skipped — no applicable files [3ms]");
+    }
+
+    #[test]
+    fn zero_eligible_files_hidden_by_default() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        // hide_skipped defaults to true
+        state.register("format/bazel", 0);
+        state.start("format/bazel", Instant::now());
+        state.finish("format/bazel", 0, Duration::from_millis(3));
+
+        let lines = state.visible_lines(Instant::now());
+        assert!(
+            lines.is_empty(),
+            "skipped check must not render when hide_skipped is true"
+        );
+    }
+
+    #[test]
+    fn hide_skipped_does_not_affect_failed_checks() {
+        let mut state = ProgressState::new(DEBOUNCE);
+        // hide_skipped defaults to true, but a failed check with 0 total_files
+        // (locationless failure) must still render.
+        state.register("bad-check", 0);
+        state.start("bad-check", Instant::now());
+        state.finish("bad-check", 1, Duration::from_millis(5));
+
+        let lines = state.visible_lines(Instant::now());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].icon, IconKind::Failed);
     }
 
     #[test]

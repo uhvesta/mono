@@ -58,6 +58,11 @@ struct RunArgs {
     /// (or `=true`) forces it on.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     show_progress: Option<bool>,
+    /// Include skipped checks (checks with no applicable files) in the progress
+    /// summary. By default they are hidden to reduce noise; pass this flag to
+    /// restore the full per-check listing.
+    #[arg(long)]
+    show_skipped: bool,
     /// Emit findings to a GitHub-UI annotation backend after the run. Repeatable,
     /// so several backends can be active at once; default is none (off — output
     /// is unchanged). Supported: `check-run` (POST findings to the GitHub Check
@@ -484,6 +489,7 @@ async fn dispatch_run(
         default_branch,
         format,
         show_progress,
+        show_skipped,
         annotations,
         annotations_out,
         annotations_strict,
@@ -527,7 +533,8 @@ async fn dispatch_run(
             stderr().is_terminal(),
             detect_ci(),
         );
-    let mut live = progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE));
+    let mut live =
+        progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
     let reporter: Arc<dyn ProgressReporter> = match &live {
         Some(progress) => progress.reporter(make_render_findings(style)),
         None => Arc::new(NoopProgressReporter),
@@ -1207,6 +1214,7 @@ async fn dispatch_fix(
                 default_branch,
                 format,
                 show_progress,
+                show_skipped,
                 annotations,
                 annotations_out: _,
                 annotations_strict: _,
@@ -1253,7 +1261,8 @@ async fn dispatch_fix(
             stderr().is_terminal(),
             detect_ci(),
         );
-    let mut live = progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE));
+    let mut live =
+        progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
     let reporter: Arc<dyn ProgressReporter> = match &live {
         Some(progress) => progress.reporter(make_render_findings(style)),
         None => Arc::new(NoopProgressReporter),
