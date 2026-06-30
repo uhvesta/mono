@@ -152,8 +152,17 @@ build_native_bazel() {
   log "[checkleft-release] bazel build -c opt ${BIN_TARGET}" >&2
   bazel build -c opt "${extra_bazel_flags[@]}" "${BIN_TARGET}" >&2
   local path
-  # `|| true`: head can SIGPIPE cquery under pipefail; the guard below reports.
-  path="$(bazel cquery -c opt "${extra_bazel_flags[@]}" --output=files "${BIN_TARGET}" 2>/dev/null | head -1 || true)"
+  # ci-env.sh's bazel() wrapper does `2>&1 | tee`, merging bazel's progress and
+  # INFO messages (normally on stderr) into stdout. `2>/dev/null` here therefore
+  # only suppresses the wrapper function's own stderr (empty) — it does NOT
+  # suppress bazel's merged informational output. With a cold or invalidated
+  # analysis cache, those INFO/Loading/Analyzing lines arrive before the actual
+  # file path in the merged stream, causing `head -1` to capture a message line
+  # instead of the path. Filter to `bazel-out/…` lines, which is the invariant
+  # prefix for all `--output=files` paths regardless of --output_user_root.
+  # `|| true`: grep/head can SIGPIPE cquery under pipefail; the guard below reports.
+  path="$(bazel cquery -c opt "${extra_bazel_flags[@]}" --output=files "${BIN_TARGET}" 2>/dev/null \
+    | grep '^bazel-out/' | head -1 || true)"
   [[ -n "${path}" && -f "${path}" ]] || { echo "could not locate bazel binary output" >&2; return 1; }
   echo "${path}"
 }
@@ -437,7 +446,9 @@ phase_musl() {
   log "[checkleft-release] bazel build -c opt ${version_define} ${musl_target}"
   bazel build -c opt "${version_define}" "${musl_target}"
   local musl_path
-  musl_path="$(bazel cquery -c opt "${version_define}" --output=files "${musl_target}" 2>/dev/null | head -1 || true)"
+  # Same ci-env.sh wrapper concern as in build_native_bazel: filter to bazel-out/ lines.
+  musl_path="$(bazel cquery -c opt "${version_define}" --output=files "${musl_target}" 2>/dev/null \
+    | grep '^bazel-out/' | head -1 || true)"
   [[ -n "${musl_path}" && -f "${musl_path}" ]] || die "musl build succeeded but binary not found; check bazel cquery output for ${musl_target}"
 
   # Version guard: the musl binary must embed NEW_VERSION, not the dev placeholder.
