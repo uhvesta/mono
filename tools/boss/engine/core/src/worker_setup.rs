@@ -60,7 +60,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json;
 
-use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig};
+use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig, ToolUseInterceptionConfig};
+
+// Re-export guard command constants so the test module (which uses `use
+// super::*;`) can run the Python scripts end-to-end and verify their behaviour.
+// Scoped to test builds: the constants are not needed at runtime in this module.
+#[cfg(test)]
+pub(crate) use crate::driver::claude::{PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 
 /// The kind of worker being spawned, used to select the per-kind tool
 /// denylist. Kept in this module so the denylist rules and the kind
@@ -340,150 +346,6 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
-/// Inline Python decision hook that blocks ALL standard workers from pushing
-/// branches or opening PRs via bare VCS commands (`gh pr create`, `jj git push`,
-/// `git push`). Workers must use `cube pr create` (new PR) or `cube pr update`
-/// (existing PR) instead, which are jj-aware and resolve the GitHub repo without
-/// a GIT_DIR override.
-///
-/// Uses `shlex.split()` so push/PR-creation phrases inside quoted arguments
-/// (commit messages, `--body` strings) do NOT trigger the block — only the
-/// actual invoked program + verb/subcommand tokens are inspected.
-///
-/// Applies to ALL `WorkerKind::Standard` workers (local and remote). The
-/// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
-/// revision workers and adds additional blocks (`cube pr create`, `cube pr
-/// ensure`) with revision-specific messaging.
-///
-/// Known limitation: the guard inspects only the top-level program token of
-/// each delimiter-split group. Invocations that wrap the blocked command in
-/// another program (`sh -c 'jj git push ...'`, `bash -lc '...'`, `xargs git
-/// push`, etc.) will not match and are approved. Workers are not adversarial
-/// and this edge case is covered by the checkleft gate and deny rules as
-/// defense-in-depth, so the limitation is acceptable.
-const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
-    "python3 -c \"\n",
-    "import json,os,sys,re,shlex\n",
-    "inp=json.load(sys.stdin)\n",
-    "cmd=inp.get('tool_input',{}).get('command','')\n",
-    "DELIMS={'&&','||',';','|','&'}\n",
-    "try:\n",
-    "    toks=shlex.split(cmd,posix=True)\n",
-    "except Exception:\n",
-    "    toks=cmd.split()\n",
-    "groups=[]\n",
-    "cur=[]\n",
-    "for t in toks:\n",
-    "    if t in DELIMS:\n",
-    "        if cur:\n",
-    "            groups.append(cur[:])\n",
-    "        cur=[]\n",
-    "    else:\n",
-    "        cur.append(t)\n",
-    "if cur:\n",
-    "    groups.append(cur)\n",
-    "matched=None\n",
-    "for g in groups:\n",
-    "    i=0\n",
-    "    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n",
-    "        i+=1\n",
-    "    rest=g[i:]\n",
-    "    prog=os.path.basename(rest[0]) if rest else ''\n",
-    "    if len(rest)>=3 and prog=='gh' and rest[1]=='pr' and rest[2]=='create':\n",
-    "        matched='gh pr create'\n",
-    "        break\n",
-    "    if len(rest)>=3 and prog=='jj' and rest[1]=='git' and rest[2]=='push':\n",
-    "        matched='jj git push'\n",
-    "        break\n",
-    "    if len(rest)>=2 and prog=='git' and rest[1]=='push':\n",
-    "        matched='git push'\n",
-    "        break\n",
-    "if matched:\n",
-    "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: cube pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or cube pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
-    "    print(json.dumps({'decision':'block','reason':msg}))\n",
-    "else:\n",
-    "    print(json.dumps({'decision':'approve'}))\n",
-    "\""
-);
-
-/// Inline Python decision hook that guards revision tasks from opening new
-/// PRs. Uses `shlex.split()` to tokenise the Bash command string so that
-/// PR-creation phrases inside quoted arguments (commit messages, `--body`
-/// strings) do NOT trigger the block — only the actual invoked program +
-/// verb/subcommand tokens are inspected.
-///
-/// Blocks PR *creation* (`gh pr create`, `cube pr create`, and the
-/// deprecated `cube pr ensure` which still create-or-reuses) and allows PR
-/// *updates* (`cube pr update`), matching a revision worker's intent: push
-/// commits to the existing parent PR, never open a new one. The block reason
-/// names the offending command AND prints the exact `cube pr update` command
-/// — reusing the `--branch`/`--head` value from the blocked command when the
-/// worker supplied one — so no jj forensics are needed to recover.
-///
-/// Specifically:
-///   • `jj describe -m "fix: intercept cube pr create"` → APPROVE
-///   • `git commit -m "docs about gh pr create"` → APPROVE
-///   • `cube pr update --branch feat/foo` → APPROVE
-///   • `cube pr create --branch feat/foo` → BLOCK ("cube pr create")
-///   • `cube pr ensure --branch feat/foo` → BLOCK ("cube pr ensure")
-///   • `gh pr create --head feat/foo` → BLOCK ("gh pr create")
-///   • `jj describe -m "msg" && cube pr create` → BLOCK ("cube pr create")
-///
-/// Fallback: when `shlex.split` fails (unmatched quotes or exotic syntax)
-/// the script falls back to whitespace-splitting, which may have false
-/// positives for heredoc content but is conservative and safe.
-const REVISION_PR_GUARD_COMMAND: &str = concat!(
-    "python3 -c \"\n",
-    "import json,sys,re,shlex\n",
-    "inp=json.load(sys.stdin)\n",
-    "cmd=inp.get('tool_input',{}).get('command','')\n",
-    "DELIMS={'&&','||',';','|','&'}\n",
-    "try:\n",
-    "    toks=shlex.split(cmd,posix=True)\n",
-    "except Exception:\n",
-    "    toks=cmd.split()\n",
-    "groups=[]\n",
-    "cur=[]\n",
-    "for t in toks:\n",
-    "    if t in DELIMS:\n",
-    "        if cur:\n",
-    "            groups.append(cur[:])\n",
-    "        cur=[]\n",
-    "    else:\n",
-    "        cur.append(t)\n",
-    "if cur:\n",
-    "    groups.append(cur)\n",
-    "def branch_of(g):\n",
-    "    for j,t in enumerate(g):\n",
-    "        if t in ('--branch','--head') and j+1<len(g):\n",
-    "            return g[j+1]\n",
-    "        if t.startswith('--branch=') or t.startswith('--head='):\n",
-    "            return t.split('=',1)[1]\n",
-    "    return None\n",
-    "matched=None\n",
-    "br=None\n",
-    "for g in groups:\n",
-    "    i=0\n",
-    "    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n",
-    "        i+=1\n",
-    "    rest=g[i:]\n",
-    "    if len(rest)>=3 and rest[0]=='gh' and rest[1]=='pr' and rest[2]=='create':\n",
-    "        matched='gh pr create'\n",
-    "        br=branch_of(rest)\n",
-    "        break\n",
-    "    if len(rest)>=3 and rest[0]=='cube' and rest[1]=='pr' and rest[2] in ('create','ensure'):\n",
-    "        matched='cube pr '+rest[2]\n",
-    "        br=branch_of(rest)\n",
-    "        break\n",
-    "if matched:\n",
-    "    sug='cube pr update --branch '+br if br else 'cube pr update --branch <your-pr-bookmark>'\n",
-    "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
-    "    print(json.dumps({'decision':'block','reason':msg}))\n",
-    "else:\n",
-    "    print(json.dumps({'decision':'approve'}))\n",
-    "\""
-);
-
 /// Render worker settings for a *remote* (SSH-dispatched) worker.
 ///
 /// Identical to [`render_settings_json`] — the same `boss-event` hooks
@@ -518,181 +380,37 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     });
     let mut hooks = wiring.hooks;
 
-    // For revision tasks, add a PreToolUse guard that blocks any PR-creation
-    // invocation (`gh pr create`, `cube pr create`, or the deprecated
-    // `cube pr ensure`) while allowing PR updates (`cube pr update`).
-    // Revision workers push commits to an existing PR; opening a new PR
-    // violates the one-PR-per-task invariant. The guard tokenises the command
-    // with shlex so PR-creation phrases inside quoted arguments (commit
-    // messages, --body strings) do NOT trigger the block.
-    //
-    // Defense-in-depth: the guard fires when EITHER the execution kind
-    // is `revision_implementation` OR the task kind is `revision`.
-    // This ensures a mis-derived execution kind (e.g. revision
-    // re-dispatched as `task_implementation`) still cannot open a PR.
-    //
-    // All of these interception guards are appended to the forwarder hook
-    // the driver wired, which stays the first `PreToolUse` entry.
+    // ToolUseInterception (design §1.5): delegate guard wiring to the driver.
+    // All interception guards are appended to the forwarder hook the driver
+    // wired, which stays the first `PreToolUse` entry so the live-status
+    // machine sees every tool call before any guard can block it.
     let pre_tool_use_hooks = hooks
         .get_mut("PreToolUse")
         .and_then(serde_json::Value::as_array_mut)
         .expect("Claude ProgressObservation wiring always includes PreToolUse");
 
-    // Deterministic Boss-data-dir gate (every session, every tool). The
-    // script canonicalises the working dir and every candidate path
-    // (Bash argv tokens + file-tool `file_path`/`notebook_path`) and
-    // blocks if any resolves inside the Boss data dir. This is the real
-    // gate the issue asks for: unlike the `deny` globs below and the
-    // engine-side audit, it resolves symlinks / `..` / `~` / `$VAR`
-    // indirection, so the boundary holds regardless of which tool
-    // dresses up the access or whether the model spots the path string.
-    // Matcher is `*` (not a per-tool list) so a future tool that takes a
-    // path is covered without a settings change; the script fast-paths
-    // tools it doesn't inspect. The Boss data dir is derived from
-    // `events_socket_path`'s parent — same source as `deny_rules`.
-    //
-    // Remote SSH workers skip this entirely (see `EngineDataDirSandbox`):
-    // their `events_socket_path` is the forwarded `/tmp` socket, not a
-    // Boss data dir, and the python guard script is never shipped there.
-    if sandbox == EngineDataDirSandbox::Enabled
-        && let Some(state_dir) = input.events_socket_path.parent()
-    {
-        let guard_command = format!(
-            "BOSS_DATA_DIR={dir} python3 {script}",
-            dir = shell_escape(&state_dir.display().to_string()),
-            script = shell_escape(&path_guard_script_path().display().to_string()),
-        );
-        pre_tool_use_hooks.push(serde_json::json!({
-            "matcher": "*",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": guard_command,
-                }
-            ],
-        }));
-    }
-
-    // Block a worker from *launching Boss itself* — the macOS app or its
-    // bundled engine. A worker that starts Boss attaches to the operator's
-    // live engine on `/tmp/boss-engine.sock` (the dev build defaults to that
-    // socket), collides with the running engine, and triggers repeated macOS
-    // permission prompts. This is the route-independent guard: it blocks the
-    // launch *action* regardless of how it's reached (a `verify`-style
-    // "run the app" step, a direct `open`, `bazel run`, `swift run`, etc.),
-    // so we keep skills like `verify` enabled while making "run the real
-    // Boss" impossible from a sandboxed worker.
-    //
-    // Blocks (matcher `Bash`, inspecting the command string):
-    //   - `open` of a Boss.app bundle / `-a Boss` / `-b dev.spinyfin.bossmacapp`
-    //   - executing the bundled app or engine binary
-    //     (`Boss.app/Contents/MacOS/Boss`, `…/Resources/bin/engine`)
-    //   - `bazel run` of `//tools/boss/app-macos` or `//tools/boss/engine`
-    //   - `swift run`
-    //
-    // Deliberately does NOT block `bazel test`/`swift test` of app-macos:
-    // those targets are `macos_unit_test`s with no test_host, so they run
-    // pure view-model/logic unit tests and do not launch the app or engine
-    // (a dedicated regression test, TestSourcesDoNotCallRealOpenerTests, even
-    // fails the build if a test reaches a real OS opener). Blocking them would
-    // only cost app-macos workers their pre-push test gate for no safety gain.
-    // `bazel build` is likewise allowed. Mirrors the inline-Python decision
-    // hook used by the revision `gh pr create` guard below.
-    let boss_launch_guard_command = concat!(
-        "python3 -c \"",
-        "import json,sys,re; ",
-        "inp=json.load(sys.stdin); ",
-        "cmd=inp.get('tool_input',{}).get('command',''); ",
-        r#"m=re.search(r'(\bopen\b[^\n]*(Boss\.app|-a\s+Boss\b|-b\s+dev\.spinyfin\.bossmacapp))|Boss\.app/Contents/MacOS/Boss|Boss\.app/Contents/Resources/bin/engine|((bazel|bazelisk)\s+run\b[^\n]*tools/boss/(app-macos|engine))|(\bswift\s+run\b)',cmd); "#,
-        "msg='Workers must not launch or run Boss itself. This command would start the Boss app or its bundled engine, which attaches to the operator live engine on /tmp/boss-engine.sock, collides with the running engine, and triggers OS permission prompts. Building and unit tests are fine (bazel build, bazel test); launching/running the app or engine is not. Runtime and UI verification are the coordinator job.'; ",
-        "print(json.dumps({'decision':'block','reason':msg}) if m else json.dumps({'decision':'approve'})); ",
-        "\""
-    );
-    pre_tool_use_hooks.push(serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [
-            {
-                "type": "command",
-                "command": boss_launch_guard_command,
-            }
-        ],
-    }));
-
-    // PR redirect guard (all standard workers, local AND remote). Blocks
-    // bare-VCS PR creation and branch-push attempts (`gh pr create`,
-    // `jj git push`, `git push`) and redirects to cube pr create / cube pr
-    // update. This is the primary guardrail that makes correct PR-creation
-    // behaviour deterministic across ALL worker execution kinds (chore,
-    // task, design, investigation, revision) regardless of prompt drift.
-    //
-    // Revision workers receive this guard PLUS the revision-specific guard
-    // below — the revision guard stacks on top and adds additional blocks
-    // (`cube pr create`, `cube pr ensure`) with revision-specific messaging.
-    //
-    // Reviewer and triage workers do not get this guard because their deny
-    // rules already block all push operations; the guard is redundant and
-    // would add noise without benefit.
-    if input.worker_kind == WorkerKind::Standard {
-        pre_tool_use_hooks.push(serde_json::json!({
-            "matcher": "Bash",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": PR_REDIRECT_GUARD_COMMAND,
-                }
-            ],
-        }));
-    }
-
-    // Deterministic pre-push checkleft gate (local standard workers only).
-    // Matches Bash commands that push (`jj git push` / `git push`) and
-    // blocks the push when the repo's checkleft reports errors, echoing the
-    // findings + bypass guidance. The whole worker fleet pushes with jj,
-    // whose native `jj git push` does not run git's pre-push hook — so this
-    // restores the gate at the harness layer (the same mechanism as the path
-    // guard above).
-    //
-    // In practice the PR redirect guard above blocks direct `jj git push` /
-    // `git push` first, but this guard provides defense-in-depth and still
-    // fires if the PR redirect guard ever misses an edge case.
-    //
-    // Scoped to local standard workers:
-    //   • Reviewer / triage workers cannot push (their deny rules block
-    //     it), so the guard would never fire — omit it.
-    //   • Remote SSH workers skip it for the same reason the path guard
-    //     does: the gate script is materialised next to the local worker
-    //     settings and is never shipped to the remote host. Remote workers
-    //     are still covered for the sanctioned flows by the cube verb
-    //     gates (`cube pr ensure` / `cube pr push`).
-    if sandbox == EngineDataDirSandbox::Enabled && input.worker_kind == WorkerKind::Standard {
-        let guard_command = format!(
-            "python3 {script}",
-            script = shell_escape(&checkleft_push_guard_script_path().display().to_string()),
-        );
-        pre_tool_use_hooks.push(serde_json::json!({
-            "matcher": "Bash",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": guard_command,
-                }
-            ],
-        }));
-    }
-
     let is_revision =
         input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
-    if is_revision {
-        pre_tool_use_hooks.push(serde_json::json!({
-            "matcher": "Bash",
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": REVISION_PR_GUARD_COMMAND,
-                }
-            ],
-        }));
-    }
+    let interception_wiring = ClaudeDriver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+        data_dir: if sandbox == EngineDataDirSandbox::Enabled {
+            input.events_socket_path.parent().map(|p| p.to_path_buf())
+        } else {
+            None
+        },
+        path_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
+            Some(path_guard_script_path())
+        } else {
+            None
+        },
+        checkleft_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
+            Some(checkleft_push_guard_script_path())
+        } else {
+            None
+        },
+        is_revision,
+        is_standard_worker: input.worker_kind == WorkerKind::Standard,
+    });
+    pre_tool_use_hooks.extend(interception_wiring.pre_tool_use_hooks);
 
     let mut value = serde_json::json!({
         // Auto mode for the worker pane. The engine's worker prompt

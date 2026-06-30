@@ -266,6 +266,80 @@ pub struct ProgressObservationWiring {
     pub hooks: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Inputs the [`Capability::ToolUseInterception`] wiring needs to build the
+/// per-session PreToolUse guard hooks.
+///
+/// Built by the spawn flow from per-session and per-execution data; the driver
+/// turns it into the PreToolUse hook entries that guard the tool-call surface
+/// (path guard, boss-launch guard, PR-redirect guard, checkleft push guard,
+/// revision PR guard).
+#[derive(Debug, Clone)]
+pub struct ToolUseInterceptionConfig {
+    /// Parent directory of the engine events socket (the Boss data dir). The
+    /// path guard uses this to fence workers off the engine's runtime state.
+    /// `None` for remote workers, which have no local Boss data to sandbox.
+    pub data_dir: Option<PathBuf>,
+    /// Absolute path to the `boss-path-guard.py` script materialised next to
+    /// the worker settings file. `None` for remote workers (the script is
+    /// never shipped to the remote host).
+    pub path_guard_script: Option<PathBuf>,
+    /// Absolute path to the `boss-checkleft-push-guard.py` script materialised
+    /// next to the worker settings file. `None` for remote workers.
+    pub checkleft_guard_script: Option<PathBuf>,
+    /// Whether this is a revision execution. Revision workers must not open
+    /// new PRs — the revision PR guard blocks `gh pr create`, `cube pr create`,
+    /// and the deprecated `cube pr ensure`.
+    pub is_revision: bool,
+    /// Whether this is a Standard worker. Reviewer and triage workers skip the
+    /// PR-redirect guard and the checkleft push guard because their deny rules
+    /// already block push operations.
+    pub is_standard_worker: bool,
+}
+
+/// The PreToolUse hook entries the driver wires for [`Capability::ToolUseInterception`].
+///
+/// Returned by [`AgentDriver::tool_use_interception_wiring`]. The spawn flow
+/// pushes these entries onto the `PreToolUse` array in the worker settings
+/// file, after the progress-observation forwarder entry (which stays first so
+/// the live-status machine sees every tool call).
+#[derive(Debug, Clone, Default)]
+pub struct ToolUseInterceptionWiring {
+    /// Ordered hook entries to append to `PreToolUse`. Each entry is a Claude
+    /// settings-file hook object:
+    /// `{ "matcher": "…", "hooks": [{ "type": "command", "command": "…" }] }`.
+    pub pre_tool_use_hooks: Vec<serde_json::Value>,
+}
+
+/// What a post-hoc interception adapter does after reviewing a tool output.
+///
+/// Used when a driver lacks a real-time PreToolUse hook surface and must
+/// inspect the artefact after the tool has already run. No driver currently
+/// implements this — `ClaudeDriver` provides real-time PreToolUse hook
+/// interception via [`AgentDriver::tool_use_interception_wiring`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostHocInterceptionAction {
+    /// The artefact is acceptable; no follow-up needed.
+    Accept,
+    /// The artefact needs editing; the engine should ask the worker to redact
+    /// or revise it, with `reason` as the actionable explanation.
+    RequestEdit { reason: String },
+}
+
+/// Signature of the post-hoc interception adapter for drivers that do not
+/// provide real-time [`Capability::ToolUseInterception`].
+///
+/// Called by the engine after a Bash tool call completes, with the tool name,
+/// its input, and its output. Returns the [`PostHocInterceptionAction`] the
+/// engine should take.
+///
+/// This is the declared seam for future hookless drivers (e.g. Copilot,
+/// Codex). Not yet implemented for any driver: `ClaudeDriver` provides
+/// real-time PreToolUse interception and the engine's
+/// `dispatch_editorial_on_pretooluse` handles the editorial surface
+/// server-side.
+pub type PostHocInterceptionFn =
+    fn(tool_name: &str, tool_input: &serde_json::Value, tool_output: &serde_json::Value) -> PostHocInterceptionAction;
+
 /// An agent driver: the abstraction layer between Boss and a coding-agent CLI.
 ///
 /// A driver declares its [`CapabilitySet`] and implements the behavioural
@@ -324,6 +398,24 @@ pub trait AgentDriver: Send + Sync {
     /// the raw payload is a hook JSON object; this delegates to
     /// [`boss_protocol::normalize_hook_event`].
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
+
+    // ── ToolUseInterception capability ──────────────────────────────────────
+
+    /// Build the PreToolUse hook entries for the `ToolUseInterception`
+    /// capability. The spawn flow appends these to the `PreToolUse` array of
+    /// the worker settings file, after the progress-observation forwarder entry
+    /// (which stays first so the live-status machine sees every tool call).
+    ///
+    /// For `ClaudeDriver` this returns Python guard scripts (path guard,
+    /// boss-launch guard, PR-redirect guard, checkleft push guard, revision PR
+    /// guard) as `command`-type hook entries; each guard is conditional on
+    /// `config` fields — remote workers, non-standard workers, and
+    /// non-revision executions each skip some guards.
+    ///
+    /// A driver without a synchronous PreToolUse hook surface should not
+    /// declare [`Capability::ToolUseInterception`]; the absence disposition
+    /// (degrade to [`PostHocInterceptionFn`] or refuse) applies instead.
+    fn tool_use_interception_wiring(&self, config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring;
 
     // ── PromptComposition capability ────────────────────────────────────────
 
@@ -446,5 +538,34 @@ mod tests {
             Capability::TurnBoundary.default_absence_disposition(),
             AbsenceDisposition::Synthesize,
         );
+    }
+
+    #[test]
+    fn post_hoc_interception_action_variants_are_distinct() {
+        assert_eq!(PostHocInterceptionAction::Accept, PostHocInterceptionAction::Accept);
+        let edit = PostHocInterceptionAction::RequestEdit {
+            reason: "bad content".to_owned(),
+        };
+        assert_ne!(PostHocInterceptionAction::Accept, edit);
+    }
+
+    #[test]
+    fn tool_use_interception_wiring_default_is_empty() {
+        let wiring = ToolUseInterceptionWiring::default();
+        assert!(wiring.pre_tool_use_hooks.is_empty());
+    }
+
+    #[test]
+    fn tool_use_interception_config_fields_are_accessible() {
+        let config = ToolUseInterceptionConfig {
+            data_dir: Some(PathBuf::from("/Library/Boss")),
+            path_guard_script: Some(PathBuf::from("/tmp/boss-path-guard.py")),
+            checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
+            is_revision: true,
+            is_standard_worker: true,
+        };
+        assert!(config.is_revision);
+        assert!(config.is_standard_worker);
+        assert_eq!(config.data_dir.unwrap(), PathBuf::from("/Library/Boss"));
     }
 }
