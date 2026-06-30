@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use boss_protocol::{NormalizeError, TaskKind, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, TaskKind, WorkerEvent};
 
 /// A named capability Boss needs from an agent driver.
 ///
@@ -127,7 +127,34 @@ impl CapabilitySet {
     }
 }
 
-/// Static data-half of a driver: binary, file layout, display labels.
+/// Per-driver model and effort menu (capability: [`Capability::ModelAndEffortMenu`]).
+///
+/// All fields are function pointers so the menu can live in a `static`
+/// [`DriverDescriptor`]. Each driver supplies its own table; `resolve_spawn_config`
+/// resolves model/effort precedence against the selected driver's menu
+/// (design §1.4 / §Mix-and-match).
+#[derive(Debug, Clone, Copy)]
+pub struct ModelMenu {
+    /// Engine-default model slug for this driver (resolve-spawn precedence step 5:
+    /// last resort when no override, pool override, effort level, or product default applies).
+    pub engine_default: &'static str,
+    /// Maps a Boss [`EffortLevel`] to this driver's effort-knob value
+    /// (e.g. `"low"`, `"medium"` for Claude Code's `--effort` flag).
+    /// Returns `None` when the driver omits the effort flag for this level
+    /// (e.g. a 3-value collapse that does not model `trivial` separately).
+    pub effort_value_for_level: fn(EffortLevel) -> Option<&'static str>,
+    /// Maps a Boss [`EffortLevel`] to the default model slug for this driver.
+    pub default_model_for_level: fn(EffortLevel) -> &'static str,
+    /// Optional per-level worker-prompt addendum to prepend to the initial-prompt body.
+    /// `None` for levels where no addendum is appropriate.
+    pub prompt_addendum_for_level: fn(EffortLevel) -> Option<&'static str>,
+    /// Returns `true` iff the given model slug requires `--permission-mode auto`
+    /// (top-tier models such as Opus and Fable on Claude Code).
+    /// Used to branch the spawn invocation's permission flag.
+    pub model_requires_auto_permissions: fn(&str) -> bool,
+}
+
+/// Static data-half of a driver: binary, file layout, display labels, and model/effort menu.
 /// The behavioural half is the `AgentDriver` trait methods.
 #[derive(bon::Builder, Debug, Clone)]
 #[builder(on(String, into))]
@@ -148,6 +175,8 @@ pub struct DriverDescriptor {
     /// Filename for the initial prompt inside `config_dir`
     /// (e.g. `"initial-prompt.txt"`).
     pub initial_prompt_filename: &'static str,
+    /// Per-driver model and effort menu (design §1.4 / §Mix-and-match).
+    pub model_menu: ModelMenu,
 }
 
 /// Per-[`TaskKind`] capability escalations. A kind can mark specific

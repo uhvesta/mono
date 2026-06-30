@@ -6,12 +6,73 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use boss_protocol::{NormalizeError, WorkerEvent, normalize_hook_event};
+use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_event};
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ProgressFidelity, ProgressObservationConfig,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
     ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
 };
+
+// ---------------------------------------------------------------------------
+// Claude model / effort menu (design §1.4 / §Mix-and-match)
+// ---------------------------------------------------------------------------
+//
+// These are the per-driver table functions referenced from CLAUDE_DESCRIPTOR.model_menu.
+// The same tables lived in `effort.rs` as global functions prior to this move.
+// All callers now route through the driver's ModelMenu rather than calling
+// these functions directly.
+
+fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
+    Some(match level {
+        EffortLevel::Trivial => "low",
+        EffortLevel::Small => "medium",
+        EffortLevel::Medium => "high",
+        EffortLevel::Large => "xhigh",
+        EffortLevel::Max => "max",
+    })
+}
+
+/// Default model slug for a given effort level.
+///
+/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine auto-tracks the
+/// latest snapshot per family without requiring a code change on each model release.
+///
+/// `Trivial` maps to `sonnet`, NOT `haiku`. Per issue #746 ("don't use haiku")
+/// Boss must never dispatch a worker on Haiku: on the user's work machine Haiku
+/// supports neither auto mode nor `--dangerously-skip-permissions`, so it prompts
+/// for every edit. Trivial work still runs at `--effort low`; only the model floor
+/// is raised to Sonnet. Do not lower it back to Haiku.
+fn claude_default_model_for_level(level: EffortLevel) -> &'static str {
+    match level {
+        EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
+        EffortLevel::Large | EffortLevel::Max => "opus",
+    }
+}
+
+/// Optional per-level worker-prompt addendum prepended to `.claude/initial-prompt.txt`.
+/// `None` for levels where the existing task-implementation framing is already correct.
+fn claude_prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {
+    match level {
+        EffortLevel::Trivial | EffortLevel::Small => None,
+        EffortLevel::Medium => Some("Sketch a brief plan before you start editing."),
+        EffortLevel::Large | EffortLevel::Max => Some(
+            "Begin with a written plan. Identify the files you expect to touch and the \
+             order you'll touch them in. Confirm the approach against the work item's \
+             description before writing code.",
+        ),
+    }
+}
+
+/// Returns `true` iff the model slug belongs to the Opus or Fable tier (both require
+/// `--permission-mode auto` instead of `--dangerously-skip-permissions`).
+/// Matching is case-insensitive substring search.
+///
+/// Note: Fable (`claude-fable-5`) has been suspended but existing rows may carry it
+/// as a `model_override`; they still receive `--permission-mode auto`.
+fn claude_model_requires_auto_permissions(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("opus") || lower.contains("fable")
+}
 
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     name: "claude",
@@ -20,6 +81,13 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     config_dir: ".claude",
     agent_rules_filename: "CLAUDE.md",
     initial_prompt_filename: "initial-prompt.txt",
+    model_menu: ModelMenu {
+        engine_default: "opus",
+        effort_value_for_level: claude_effort_value_for_level,
+        default_model_for_level: claude_default_model_for_level,
+        prompt_addendum_for_level: claude_prompt_addendum_for_level,
+        model_requires_auto_permissions: claude_model_requires_auto_permissions,
+    },
 };
 
 /// The seven Claude hook events wired to the `boss-event` forwarder for
@@ -222,7 +290,7 @@ impl AgentDriver for ClaudeDriver {
             cmd.push_str(" --effort ");
             cmd.push_str(e);
         }
-        if crate::effort::model_requires_auto_permissions(model) || non_opus_auto_mode {
+        if claude_model_requires_auto_permissions(model) || non_opus_auto_mode {
             cmd.push_str(" --permission-mode auto");
         } else {
             cmd.push_str(" --dangerously-skip-permissions");

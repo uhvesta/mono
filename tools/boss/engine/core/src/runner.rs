@@ -4791,7 +4791,7 @@ mod pane_spawn_tests {
             input.initial_input,
             format!(
                 "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
-                crate::effort::ENGINE_DEFAULT_MODEL,
+                crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
                 settings_path.display(),
             ),
             "untagged row should re-prepend BOSS_BIN_DIR to PATH, then spawn with the engine default model, --permission-mode auto (Opus), --settings <worker file>, and no --effort",
@@ -4819,7 +4819,7 @@ mod pane_spawn_tests {
     /// and no prompt addendum. Per #746 ("don't use haiku") the model
     /// floor is Sonnet, not Haiku, even at the trivial tier — only the
     /// effort value stays `low`. See
-    /// [`crate::effort::default_model_for_level`].
+    /// [`crate::driver::ClaudeDriver`]'s `claude_default_model_for_level`.
     #[tokio::test]
     async fn trivial_row_spawn_uses_sonnet_at_low_effort() {
         let workspace = TempDir::new().unwrap();

@@ -1,13 +1,7 @@
-//! Effort-level → dispatch knobs (Claude effort value, default
-//! model, prompt addendum) per the merged
-//! [`tools/boss/docs/designs/effort-and-model-estimation.md`] (PR
-//! #370) §Q2.
-//!
-//! The mapping table is centralised here on purpose: the design's
-//! open question 2 explicitly says we expect to retune the per-level
-//! effort/model defaults without a schema change, so every consumer
-//! that needs an effort-derived knob looks it up through this module
-//! rather than re-spelling the table.
+//! Effort-level → dispatch knobs (model, effort value, prompt addendum) resolved
+//! against the selected driver's [`crate::driver::ModelMenu`]. The per-driver tables
+//! live in each driver's static descriptor; this module owns the resolution
+//! precedence logic (design §Q2 / §Q3 / §Mix-and-match).
 
 use std::path::Path;
 
@@ -15,85 +9,9 @@ use boss_protocol::EffortLevel;
 
 use crate::driver::AgentDriver;
 
-/// Engine default Claude model slug used when neither
-/// `tasks.model_override`, the row's effort-level default, nor the
-/// parent product's `default_model` is set (design §Q3 step 4).
-///
-/// The dispatcher always passes a concrete `--model` slug — design
-/// §Q2 says we surface the chosen model on the dispatch
-/// instrumentation stream regardless of how it was resolved, and
-/// that's only useful if the engine-default branch resolves to an
-/// explicit slug rather than relying on `claude`'s implicit default.
-/// Using the `"opus"` family alias means this auto-tracks the latest
-/// Opus snapshot without requiring a code change on each model release.
-pub const ENGINE_DEFAULT_MODEL: &str = "opus";
-
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).
 pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
-
-/// What the row's effort level maps to for `claude --effort`. Note
-/// these are **claude**'s vocabulary, not Boss's — `Trivial` becomes
-/// `"low"` on the wire, etc. The numbers in this table follow
-/// Claude's published per-model recommendations as captured in the
-/// design's Q2 §"The chosen mapping" table.
-pub fn claude_effort_for_level(level: EffortLevel) -> &'static str {
-    match level {
-        EffortLevel::Trivial => "low",
-        EffortLevel::Small => "medium",
-        EffortLevel::Medium => "high",
-        EffortLevel::Large => "xhigh",
-        EffortLevel::Max => "max",
-    }
-}
-
-/// Default model slug for a given effort level, used when the row
-/// has no explicit `model_override` (design §Q3 step 2).
-///
-/// Family aliases (`"sonnet"`, `"opus"`) are used so the engine
-/// auto-tracks the latest snapshot per family without requiring a code
-/// change on each model release.
-/// Direct-API summarization (see [`crate::live_status::SUMMARY_MODEL`])
-/// still uses a pinned model — that path doesn't go through the
-/// worker CLI.
-///
-/// `Trivial` maps to `sonnet`, NOT `haiku`. Per issue #746 ("don't
-/// use haiku") boss must never dispatch a worker on Haiku: on the
-/// user's work machine Haiku supports neither auto mode nor
-/// `--dangerously-skip-permissions`, so it prompts for every edit.
-/// Trivial work still runs at `--effort low` (see
-/// [`claude_effort_for_level`]); only the model floor is raised to
-/// Sonnet. This is the same resolution #746 closed with — do not
-/// lower it back to Haiku.
-///
-/// Tier ordering, highest to lowest:
-/// Opus (`opus`) > Sonnet (`sonnet`) > Haiku.
-///
-/// Note: Fable (`claude-fable-5`) has been suspended and is no longer
-/// available for dispatch. `Max` now falls back to `opus`.
-pub fn default_model_for_level(level: EffortLevel) -> &'static str {
-    match level {
-        EffortLevel::Trivial | EffortLevel::Small | EffortLevel::Medium => "sonnet",
-        EffortLevel::Large | EffortLevel::Max => "opus",
-    }
-}
-
-/// Optional per-level worker-prompt addendum, prepended to the
-/// existing prompt body. `None` for levels where the existing
-/// task-implementation framing is already the right framing — we
-/// deliberately don't nudge a `trivial` worker into writing a plan
-/// it doesn't need.
-pub fn prompt_addendum_for_level(level: EffortLevel) -> Option<&'static str> {
-    match level {
-        EffortLevel::Trivial | EffortLevel::Small => None,
-        EffortLevel::Medium => Some("Sketch a brief plan before you start editing."),
-        EffortLevel::Large | EffortLevel::Max => Some(
-            "Begin with a written plan. Identify the files you expect to touch and the \
-             order you'll touch them in. Confirm the approach against the work item's \
-             description before writing code.",
-        ),
-    }
-}
 
 /// Resolved dispatch knobs for one worker spawn. The dispatcher
 /// builds this once from the row's `effort_level` / `model_override`,
@@ -155,14 +73,13 @@ pub fn model_is_opus(model: &str) -> bool {
 /// Note: Fable (`claude-fable-5`) has been suspended. This function is
 /// retained for recognising existing rows that carry a Fable model_override,
 /// so they still receive `--permission-mode auto` instead of
-/// `--dangerously-skip-permissions`. No new dispatch path should resolve
-/// to Fable — see [`default_model_for_level`].
+/// `--dangerously-skip-permissions`. No new dispatch path should resolve to Fable.
 pub fn model_is_fable(model: &str) -> bool {
     model.to_ascii_lowercase().contains("fable")
 }
 
 /// Returns `true` iff the model requires `--permission-mode auto` due to its
-/// tier (Fable or Opus). Used by [`SpawnConfig::claude_invocation`].
+/// tier (Fable or Opus). Delegates to the Claude driver's family classifier.
 pub fn model_requires_auto_permissions(model: &str) -> bool {
     model_is_opus(model) || model_is_fable(model)
 }
@@ -180,6 +97,16 @@ pub fn resolve_driver(task_driver: Option<&str>, product_default_driver: Option<
     }
     ENGINE_DEFAULT_DRIVER.to_owned()
 }
+
+/// Return the [`crate::driver::ModelMenu`] for the given driver slug.
+///
+/// Currently only `"claude"` is registered; unknown slugs fall back to the
+/// Claude menu until a driver registry is added (design §Mix-and-match,
+/// "Copilot: its own menu, 3-value effort").
+fn menu_for_driver(_driver_slug: &str) -> &'static crate::driver::ModelMenu {
+    &crate::driver::ClaudeDriver.descriptor().model_menu
+}
+
 /// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
 /// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5):
 /// 1. `tasks.model_override` (when non-empty after trim).
@@ -188,14 +115,14 @@ pub fn resolve_driver(task_driver: Option<&str>, product_default_driver: Option<
 ///    `"opus"` unconditionally, so reviewer agents and automation agents are
 ///    always Opus regardless of the row's effort level. Pass `None` for
 ///    main-pool executions.
-/// 3. Effort-level default — only when the row has an `effort_level`.
+/// 3. Effort-level default — from the selected driver's model menu.
 /// 4. `products.default_model` (when non-empty after trim).
-/// 5. [`ENGINE_DEFAULT_MODEL`].
+/// 5. Driver's engine-default model (from [`crate::driver::ModelMenu::engine_default`]).
 ///
-/// The effort value and prompt addendum follow `effort_level` only; neither
-/// `model_override` nor `pool_model_override` changes them (design §Q3: "a
-/// user who overrides to Haiku on a `medium` row is asking 'use Haiku for
-/// this one,' not 'treat this as a trivial.'").
+/// The effort value and prompt addendum follow `effort_level` only via the
+/// driver's menu; neither `model_override` nor `pool_model_override` changes
+/// them (design §Q3: "a user who overrides to Haiku on a `medium` row is asking
+/// 'use Haiku for this one,' not 'treat this as a trivial.'").
 pub fn resolve_spawn_config(
     effort_level: Option<EffortLevel>,
     model_override: Option<&str>,
@@ -204,26 +131,27 @@ pub fn resolve_spawn_config(
     task_driver: Option<&str>,
     product_default_driver: Option<&str>,
 ) -> SpawnConfig {
+    let driver = resolve_driver(task_driver, product_default_driver);
+    let menu = menu_for_driver(&driver);
+
     let model = if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
     } else if let Some(m) = pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
     } else if let Some(level) = effort_level {
-        default_model_for_level(level).to_owned()
+        (menu.default_model_for_level)(level).to_owned()
     } else if let Some(pd) = product_default_model.map(str::trim).filter(|s| !s.is_empty()) {
         pd.to_owned()
     } else {
-        ENGINE_DEFAULT_MODEL.to_owned()
+        menu.engine_default.to_owned()
     };
-
-    let driver = resolve_driver(task_driver, product_default_driver);
 
     SpawnConfig {
         effort_level,
-        claude_effort: effort_level.map(claude_effort_for_level),
+        claude_effort: effort_level.and_then(|l| (menu.effort_value_for_level)(l)),
         model,
         driver,
-        prompt_addendum: effort_level.and_then(prompt_addendum_for_level),
+        prompt_addendum: effort_level.and_then(|l| (menu.prompt_addendum_for_level)(l)),
     }
 }
 
@@ -404,7 +332,11 @@ mod tests {
         let cfg = resolve_spawn_config(None, None, None, None, None, None);
         assert_eq!(cfg.effort_level, None);
         assert_eq!(cfg.claude_effort, None);
-        assert_eq!(cfg.model, ENGINE_DEFAULT_MODEL);
+        // Falls through to Claude driver's engine_default ("opus").
+        assert_eq!(
+            cfg.model,
+            crate::driver::ClaudeDriver.descriptor().model_menu.engine_default
+        );
         assert_eq!(cfg.prompt_addendum, None);
     }
 
@@ -418,7 +350,11 @@ mod tests {
     #[test]
     fn empty_product_default_does_not_satisfy_precedence_step_3() {
         let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None);
-        assert_eq!(cfg.model, ENGINE_DEFAULT_MODEL);
+        // Falls through to Claude driver's engine_default ("opus").
+        assert_eq!(
+            cfg.model,
+            crate::driver::ClaudeDriver.descriptor().model_menu.engine_default
+        );
     }
 
     #[test]
@@ -461,6 +397,7 @@ mod tests {
         // level may select Haiku as its default model. Boss must never
         // dispatch a worker on Haiku — it supports neither auto mode nor
         // --dangerously-skip-permissions on the user's work machine.
+        let menu = &crate::driver::ClaudeDriver.descriptor().model_menu;
         for level in [
             EffortLevel::Trivial,
             EffortLevel::Small,
@@ -468,7 +405,7 @@ mod tests {
             EffortLevel::Large,
             EffortLevel::Max,
         ] {
-            let model = default_model_for_level(level);
+            let model = (menu.default_model_for_level)(level);
             assert!(
                 !model.to_ascii_lowercase().contains("haiku"),
                 "effort level {level:?} must not default to a Haiku model, got {model:?}",
@@ -522,8 +459,8 @@ mod tests {
 
     #[test]
     fn null_row_invocation_matches_today_plus_explicit_model() {
-        // Untagged rows fall through to ENGINE_DEFAULT_MODEL (Opus). Must
-        // carry --permission-mode auto (Opus) and no --effort.
+        // Untagged rows fall through to the driver's engine_default (Opus for Claude).
+        // Must carry --permission-mode auto (Opus) and no --effort.
         let cfg = resolve_spawn_config(None, None, None, None, None, None);
         assert_eq!(
             cfg.claude_invocation(false, None),
