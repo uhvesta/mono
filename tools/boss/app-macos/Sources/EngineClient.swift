@@ -2063,7 +2063,8 @@ final class EngineClient: @unchecked Sendable {
             aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
-            originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue
+            originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,
+            completedAt: payload["completed_at"] as? String
         )
     }
 

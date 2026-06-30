@@ -92,7 +92,8 @@ pub(crate) fn flip_in_review_revisions_to_done(conn: &Connection, chain_root_id:
                  updated_at        = ?2,
                  last_status_actor = 'engine',
                  blocked_reason    = NULL,
-                 blocked_attempt_id = NULL
+                 blocked_attempt_id = NULL,
+                 completed_at      = COALESCE(completed_at, ?2)
              WHERE id = ?1
                AND kind = 'revision'
                AND status = 'in_review'
@@ -177,7 +178,8 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                 "UPDATE tasks
                  SET status            = 'archived',
                      last_status_actor = 'engine',
-                     updated_at        = ?2
+                     updated_at        = ?2,
+                     completed_at      = COALESCE(completed_at, ?2)
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -236,7 +238,8 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
                 "UPDATE tasks
                  SET status            = 'archived',
                      last_status_actor = 'engine',
-                     updated_at        = ?2
+                     updated_at        = ?2,
+                     completed_at      = COALESCE(completed_at, ?2)
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",

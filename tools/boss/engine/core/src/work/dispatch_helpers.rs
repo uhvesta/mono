@@ -539,7 +539,8 @@ pub(crate) fn reconcile_revision_execution(
                 "UPDATE tasks
                  SET status            = 'archived',
                      last_status_actor = 'engine',
-                     updated_at        = ?2
+                     updated_at        = ?2,
+                     completed_at      = COALESCE(completed_at, ?2)
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",
@@ -575,7 +576,8 @@ pub(crate) fn reconcile_revision_execution(
                 "UPDATE tasks
                  SET status            = 'archived',
                      last_status_actor = 'engine',
-                     updated_at        = ?2
+                     updated_at        = ?2,
+                     completed_at      = COALESCE(completed_at, ?2)
                  WHERE id = ?1
                    AND kind = 'revision'
                    AND deleted_at IS NULL",

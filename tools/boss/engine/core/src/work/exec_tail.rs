@@ -488,7 +488,8 @@ impl WorkDb {
                  updated_at         = ?2,
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
-                 blocked_attempt_id = NULL
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, ?2)
              WHERE id = ?1
                AND status NOT IN ('done', 'archived')
                AND deleted_at IS NULL",

@@ -2806,6 +2806,19 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_required_state: Option<String>,
 
+    /// Unix epoch seconds (decimal string) at which this task last
+    /// transitioned into a terminal status (`done`, `archived`, or
+    /// `cancelled`). Set once on transition; cleared when the task is
+    /// re-opened. `None` for non-terminal rows. Existing terminal rows
+    /// are backfilled with `created_at` by `migrate_tasks_completed_at`
+    /// (NOT `updated_at`, which is re-stamped by any mutation).
+    ///
+    /// The kanban Done-lane date bucketing groups by this field so a
+    /// bulk mutation that re-stamps `updated_at` on many done rows does
+    /// not mis-count them as completed today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+
     pub deleted_at: Option<String>,
     /// Effort estimate for the work item. `None` means "no level set;
     /// dispatcher falls through to product / engine default per design

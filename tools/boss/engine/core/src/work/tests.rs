@@ -473,6 +473,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         doc_link_state: None,
         origin_task_short_id: None,
         origin_pr_number: None,
+        completed_at: None,
     }
 }
 
@@ -485,3 +486,4 @@ mod t06;
 mod t07;
 mod t08;
 mod t09;
+mod t10;

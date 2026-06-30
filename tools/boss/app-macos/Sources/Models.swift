@@ -856,6 +856,16 @@ struct WorkTask: Identifiable, Hashable {
     /// Mirrors `Task.origin_pr_number` on the wire.
     var originPrNumber: Int? = nil
 
+    /// Unix epoch seconds (decimal string) at which this task last
+    /// transitioned into a terminal status (`done`, `archived`, or
+    /// `cancelled`). `nil` for non-terminal rows and for terminal rows
+    /// pre-dating the engine migration (those get `created_at` as a
+    /// conservative backfill). The Done-lane bucketing groups by this
+    /// field so a bulk mutation that re-stamps `updated_at` on many done
+    /// rows does not mis-count them as completed today.
+    /// Mirrors `Task.completed_at` on the wire.
+    var completedAt: String? = nil
+
     var isChore: Bool {
         kind == "chore" || kind == "followup"
     }

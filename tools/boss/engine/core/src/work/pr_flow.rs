@@ -76,7 +76,8 @@ impl WorkDb {
                  updated_at         = ?4,
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
-                 blocked_attempt_id = NULL
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived','cancelled') THEN ?4 END)
              WHERE id = ?1",
             params![task.id, new_status.as_str(), pr_url_for_task, now],
         )?;
@@ -199,7 +200,8 @@ impl WorkDb {
                  updated_at         = ?3,
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
-                 blocked_attempt_id = NULL
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, CASE WHEN ?2 IN ('done','archived','cancelled') THEN ?3 END)
              WHERE id = ?1",
             params![task.id, new_status.as_str(), now],
         )?;
@@ -524,7 +526,8 @@ impl WorkDb {
                  updated_at         = ?3,
                  last_status_actor  = 'engine',
                  blocked_reason     = NULL,
-                 blocked_attempt_id = NULL
+                 blocked_attempt_id = NULL,
+                 completed_at       = COALESCE(completed_at, ?3)
              WHERE id = ?1",
             params![task.id, pr_url, now],
         )?;

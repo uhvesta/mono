@@ -186,7 +186,11 @@ impl WorkDb {
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
-                 last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END
+                 last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
+                 completed_at = CASE
+                     WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
+                     ELSE NULL
+                 END
              WHERE id = ?1",
             params![
                 task.id,

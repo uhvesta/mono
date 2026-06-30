@@ -358,8 +358,11 @@ impl WorkDb {
         // on kind='followup' tasks (PR-review follow-ups created when the
         // reviewed PR merges before findings are addressed).
         migrate_tasks_followup_provenance_columns(&conn)?;
+        // Done-lane bucketing fix: add completed_at so the kanban can group
+        // done tasks by their actual completion time instead of updated_at.
+        migrate_tasks_completed_at(&conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '20')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '21')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;

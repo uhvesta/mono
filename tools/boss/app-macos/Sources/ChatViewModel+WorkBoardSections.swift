@@ -4,8 +4,9 @@ extension ChatViewModel {
     /// Bucket completed tasks by recency for the Done lane:
     ///   Today | Yesterday | <weekday names back to start of current week>
     ///   | Last Week | Earlier
-    /// Bucketing uses `updated_at` because the engine doesn't yet record a
-    /// dedicated `done_at` (status-transition) timestamp — see PR description.
+    /// Bucketing uses `completed_at` (the time the task actually transitioned
+    /// into a terminal status). Falls back to `updated_at` for rows that
+    /// pre-date the `completed_at` migration (those have `completedAt == nil`).
     static func doneSections(
         items: [WorkTask],
         now: Date = Date(),
@@ -75,7 +76,7 @@ extension ChatViewModel {
 
         return bucketOrder.compactMap { spec -> WorkBoardSection? in
             guard let tasks = buckets[spec.id], !tasks.isEmpty else { return nil }
-            let sorted = tasks.sorted { $0.updatedAt > $1.updatedAt }
+            let sorted = tasks.sorted { ($0.completedAt ?? $0.updatedAt) > ($1.completedAt ?? $1.updatedAt) }
             return WorkBoardSection(
                 id: "done-\(spec.id)",
                 title: spec.title,
@@ -95,7 +96,7 @@ extension ChatViewModel {
         calendar: Calendar,
         isoFormatters: [ISO8601DateFormatter]
     ) -> String {
-        guard let parsed = parseUpdatedAt(task.updatedAt, isoFormatters: isoFormatters) else {
+        guard let parsed = parseUpdatedAt(task.completedAt ?? task.updatedAt, isoFormatters: isoFormatters) else {
             return "earlier"
         }
         let day = calendar.startOfDay(for: parsed)

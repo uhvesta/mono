@@ -200,6 +200,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // has run. Until then the protocol field carries None.
         external_ref: None,
         parent_task_id: None,
+        // completed_at is not in the base 31-column SELECT; extended
+        // mappers (map_task_with_parent_and_provenance and
+        // map_task_with_external_ref_parent_source_and_provenance) read it
+        // from the appended column in their respective SELECTs.
+        completed_at: None,
         // Revision projections are computed in attach_revision_projections
         // (get_work_tree); they are never stored as columns.
         revision_seq: None,
@@ -253,12 +258,14 @@ pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
 }
 
 /// Like [`map_task_with_parent`] but also reads `origin_task_short_id`
-/// (index 32) and `origin_pr_number` (index 33). Used by `query_task`
-/// when those columns are appended to the standard SELECT.
+/// (index 32), `origin_pr_number` (index 33), and `completed_at`
+/// (index 34). Used by `query_task`, `get_work_item_by_short_id`, and
+/// `list_chores` when those columns are appended to the standard SELECT.
 pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent(row)?;
     task.origin_task_short_id = row.get(32)?;
     task.origin_pr_number = row.get(33)?;
+    task.completed_at = row.get::<_, Option<String>>(34)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
@@ -320,12 +327,14 @@ pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &R
 }
 
 /// Like [`map_task_with_external_ref_parent_and_source_automation_id`] but
-/// also reads `origin_task_short_id` (index 38) and `origin_pr_number`
-/// (index 39). Used by `get_work_tree` chore/followup queries.
+/// also reads `origin_task_short_id` (index 38), `origin_pr_number`
+/// (index 39), and `completed_at` (index 40). Used by `get_work_tree`
+/// for both task and chore queries, which append these columns at the end.
 pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
     task.origin_task_short_id = row.get(38)?;
     task.origin_pr_number = row.get(39)?;
+    task.completed_at = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 

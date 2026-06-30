@@ -1473,3 +1473,27 @@ pub(crate) fn migrate_tasks_followup_provenance_columns(conn: &Connection) -> Re
     }
     Ok(())
 }
+
+/// Add `tasks.completed_at` — a timestamp set once when a task transitions
+/// into a terminal status (`done`, `archived`, `cancelled`) and cleared when
+/// it transitions back to a non-terminal status (re-open). The Done-lane
+/// date bucketing in the kanban groups by this field instead of `updated_at`,
+/// which is re-stamped by any mutation and causes old tasks to appear under
+/// "Today" after a bulk operation.
+///
+/// Backfill uses `created_at` as a conservative fallback for existing
+/// terminal rows. `updated_at` is deliberately NOT used: a bulk mutation
+/// (e.g. a migration or reconciliation sweep) can re-stamp `updated_at` on
+/// many done rows simultaneously, which is the exact bug being fixed.
+/// Non-terminal rows keep `NULL`. Idempotent.
+pub(crate) fn migrate_tasks_completed_at(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "completed_at")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT", [])?;
+        conn.execute(
+            "UPDATE tasks SET completed_at = created_at
+             WHERE status IN ('done', 'archived', 'cancelled') AND deleted_at IS NULL",
+            [],
+        )?;
+    }
+    Ok(())
+}
