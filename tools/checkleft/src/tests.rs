@@ -520,9 +520,23 @@ fn detect_current_branch_gha_push_ignores_pull_request_ref() {
 // --- resolve_github_token_from_sources ---
 
 #[test]
-fn resolve_github_token_checks_github_token_beats_all() {
-    // CHECKS_GITHUB_TOKEN is the highest-priority source; it wins over all others.
+fn resolve_github_token_checkleft_gh_token_beats_all() {
+    // CHECKLEFT_GH_TOKEN is the highest-priority source; it wins over all others.
     let token = resolve_github_token_from_sources(
+        Some("checkleft-token"),
+        Some("checks-token"),
+        Some("gh-token-env"),
+        Some("github-token-env"),
+        Some("gh-cli-token"),
+    );
+    assert_eq!(token.as_deref(), Some("checkleft-token"));
+}
+
+#[test]
+fn resolve_github_token_checks_github_token_beats_gh_token_and_below() {
+    // CHECKS_GITHUB_TOKEN is second priority; it wins when CHECKLEFT_GH_TOKEN is absent.
+    let token = resolve_github_token_from_sources(
+        None,
         Some("checks-token"),
         Some("gh-token-env"),
         Some("github-token-env"),
@@ -535,6 +549,7 @@ fn resolve_github_token_checks_github_token_beats_all() {
 fn resolve_github_token_gh_token_env_beats_github_token_and_gh_cli() {
     let token = resolve_github_token_from_sources(
         None,
+        None,
         Some("gh-token-env"),
         Some("github-token-env"),
         Some("gh-cli-token"),
@@ -544,7 +559,7 @@ fn resolve_github_token_gh_token_env_beats_github_token_and_gh_cli() {
 
 #[test]
 fn resolve_github_token_github_token_env_beats_gh_cli() {
-    let token = resolve_github_token_from_sources(None, None, Some("github-token-env"), Some("gh-cli-token"));
+    let token = resolve_github_token_from_sources(None, None, None, Some("github-token-env"), Some("gh-cli-token"));
     assert_eq!(token.as_deref(), Some("github-token-env"));
 }
 
@@ -552,7 +567,7 @@ fn resolve_github_token_github_token_env_beats_gh_cli() {
 fn resolve_github_token_falls_back_to_gh_cli_when_no_env_vars() {
     // Simulates a developer workstation where no token env vars are set but
     // `gh auth login` has been run — the gh cli token should be used.
-    let token = resolve_github_token_from_sources(None, None, None, Some("gh-cli-token"));
+    let token = resolve_github_token_from_sources(None, None, None, None, Some("gh-cli-token"));
     assert_eq!(token.as_deref(), Some("gh-cli-token"));
 }
 
@@ -561,27 +576,27 @@ fn resolve_github_token_returns_none_when_gh_missing_and_no_env_vars() {
     // Simulates the gh-missing / unauthenticated path: gh_cli_token is None
     // (as try_gh_auth_token() returns when gh is absent or unauthenticated)
     // and no env vars are set. This is the warning path.
-    let token = resolve_github_token_from_sources(None, None, None, None);
+    let token = resolve_github_token_from_sources(None, None, None, None, None);
     assert_eq!(token, None);
 }
 
 #[test]
 fn resolve_github_token_ignores_empty_string_source() {
     // An empty env var (or empty gh output) must not win over a real token.
-    let token = resolve_github_token_from_sources(Some(""), None, None, Some("gh-cli-token"));
+    let token = resolve_github_token_from_sources(Some(""), None, None, None, Some("gh-cli-token"));
     assert_eq!(token.as_deref(), Some("gh-cli-token"));
 }
 
 #[test]
 fn resolve_github_token_ignores_whitespace_only_source() {
-    let token = resolve_github_token_from_sources(Some("   "), None, None, Some("gh-cli-token"));
+    let token = resolve_github_token_from_sources(Some("   "), None, None, None, Some("gh-cli-token"));
     assert_eq!(token.as_deref(), Some("gh-cli-token"));
 }
 
 #[test]
 fn resolve_github_token_trims_whitespace_from_token() {
     // gh auth token output may include a trailing newline.
-    let token = resolve_github_token_from_sources(None, None, None, Some("  gh-cli-token\n  "));
+    let token = resolve_github_token_from_sources(None, None, None, None, Some("  gh-cli-token\n  "));
     assert_eq!(token.as_deref(), Some("gh-cli-token"));
 }
 
@@ -714,12 +729,29 @@ fn footer_matches_disabled_output_for_no_findings_and_no_checks() {
 #[test]
 fn github_auth_unavailable_warning_names_all_env_vars_and_gh_cli() {
     let msg = github_auth_unavailable_warning("example/repo");
+    assert!(
+        msg.contains("CHECKLEFT_GH_TOKEN"),
+        "must mention CHECKLEFT_GH_TOKEN (canonical var)"
+    );
     assert!(msg.contains("CHECKS_GITHUB_TOKEN"), "must mention CHECKS_GITHUB_TOKEN");
     assert!(msg.contains("GH_TOKEN"), "must mention GH_TOKEN");
     assert!(msg.contains("GITHUB_TOKEN"), "must mention GITHUB_TOKEN");
     assert!(msg.contains("gh auth token"), "must mention gh auth token");
     assert!(msg.contains("gh auth login"), "must tell user how to fix it");
     assert!(msg.contains("example/repo"), "must name the repository");
+}
+
+#[test]
+fn github_auth_unavailable_warning_lists_checkleft_gh_token_first() {
+    let msg = github_auth_unavailable_warning("example/repo");
+    let checkleft_pos = msg.find("CHECKLEFT_GH_TOKEN").expect("CHECKLEFT_GH_TOKEN must appear");
+    let checks_pos = msg
+        .find("CHECKS_GITHUB_TOKEN")
+        .expect("CHECKS_GITHUB_TOKEN must appear");
+    assert!(
+        checkleft_pos < checks_pos,
+        "CHECKLEFT_GH_TOKEN must appear before CHECKS_GITHUB_TOKEN in the warning"
+    );
 }
 
 // --- truncate_tool_output ---

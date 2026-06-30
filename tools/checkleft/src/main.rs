@@ -66,8 +66,9 @@ struct RunArgs {
     /// Emit findings to a GitHub-UI annotation backend after the run. Repeatable,
     /// so several backends can be active at once; default is none (off — output
     /// is unchanged). Supported: `check-run` (POST findings to the GitHub Check
-    /// Runs API; needs a token with `Checks: write` via
-    /// `CHECKS_GITHUB_TOKEN`/`GITHUB_TOKEN`), `sarif` (write SARIF 2.1.0 JSON
+    /// Runs API; needs a token with `Checks: write` — set `CHECKLEFT_GH_TOKEN`
+    /// (recommended) or one of the legacy vars `CHECKS_GITHUB_TOKEN`,
+    /// `GH_TOKEN`, `GITHUB_TOKEN`), `sarif` (write SARIF 2.1.0 JSON
     /// to `--annotations-out=<path>`), `gha` (emit `::error::`/`::warning::`/
     /// `::notice::` workflow-command lines to stderr for GitHub Actions). `none`
     /// is an explicit no-op.
@@ -84,8 +85,8 @@ struct RunArgs {
     annotations_strict: bool,
     /// Upload SARIF findings to GitHub code scanning (POST /repos/{owner}/{repo}/code-scanning/sarifs).
     /// Requires a GitHub token with the `security_events` scope (checked in order:
-    /// CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, `gh auth token`). Can be combined
-    /// with `--annotations=sarif --annotations-out` to also write SARIF to a file.
+    /// CHECKLEFT_GH_TOKEN, CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, `gh auth token`).
+    /// Can be combined with `--annotations=sarif --annotations-out` to also write SARIF to a file.
     /// Non-fatal when the repository, commit SHA, or token cannot be resolved, or when
     /// the API call fails — checkleft logs a warning and continues.
     #[arg(long)]
@@ -241,6 +242,7 @@ const CHECKS_PR_DESCRIPTION_ENV: &str = "CHECKS_PR_DESCRIPTION";
 const CHECKS_CHANGE_ID_ENV: &str = "CHECKS_CHANGE_ID";
 const CHECKS_PR_NUMBER_ENV: &str = "CHECKS_PR_NUMBER";
 const CHECKS_REPOSITORY_ENV: &str = "CHECKS_REPOSITORY";
+const CHECKLEFT_GH_TOKEN_ENV: &str = "CHECKLEFT_GH_TOKEN";
 const CHECKS_GITHUB_TOKEN_ENV: &str = "CHECKS_GITHUB_TOKEN";
 const CHECKLEFT_EXTERNAL_CHECK_INDEX_ENV: &str = "CHECKLEFT_EXTERNAL_CHECK_INDEX";
 const CHECKLEFT_EXTERNAL_PROVIDER_MODE_ENV: &str = "CHECKLEFT_EXTERNAL_PROVIDER_MODE";
@@ -675,12 +677,12 @@ async fn post_check_run_annotations(results: &[CheckResult], env: &CiEnvironment
             )?
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no GitHub token found; checked: CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, \
+                    "no GitHub token found; checked: CHECKLEFT_GH_TOKEN, CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, \
                      `gh auth token`, and the GitHub App env vars \
                      ({CHECKS_GITHUB_APP_ID_ENV}, {CHECKS_GITHUB_APP_PRIVATE_KEY_ENV}, \
                      {CHECKS_GITHUB_INSTALLATION_ID_ENV}). \
                      A token with `Checks: write` is required to create a check run. \
-                     Recommended: set CHECKS_GITHUB_TOKEN to a fine-grained PAT with `Checks: write`."
+                     Recommended: set CHECKLEFT_GH_TOKEN to a fine-grained PAT with `Checks: write`."
                 )
             })?
     };
@@ -1813,7 +1815,7 @@ async fn attempt_sarif_upload(sarif: &serde_json::Value, env: &CiEnvironment, vc
         None => {
             eprintln!(
                 "warning: checkleft: SARIF upload skipped — no GitHub token found \
-                 (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars and `gh auth token`). \
+                 (checked CHECKLEFT_GH_TOKEN, CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars and `gh auth token`). \
                  A token with the `security_events` scope is required."
             );
             return;
@@ -1892,6 +1894,7 @@ fn resolve_ref_for_upload(env: &CiEnvironment, vcs: &Vcs) -> Option<String> {
 
 fn detect_github_token() -> Option<String> {
     resolve_github_token_from_sources(
+        std::env::var(CHECKLEFT_GH_TOKEN_ENV).ok().as_deref(),
         std::env::var(CHECKS_GITHUB_TOKEN_ENV).ok().as_deref(),
         std::env::var("GH_TOKEN").ok().as_deref(),
         std::env::var("GITHUB_TOKEN").ok().as_deref(),
@@ -1921,26 +1924,34 @@ fn try_gh_auth_token() -> Option<String> {
     }
 }
 
-/// Resolve a GitHub token from the four possible sources, in priority order:
-/// 1. `checks_github_token` — `CHECKS_GITHUB_TOKEN` env var (highest — explicit CI override)
-/// 2. `gh_token` — `GH_TOKEN` env var
-/// 3. `github_token` — `GITHUB_TOKEN` env var
-/// 4. `gh_cli_token` — result of `gh auth token` (None when gh failed or is absent)
+/// Resolve a GitHub token from the five possible sources, in priority order:
+/// 1. `checkleft_gh_token` — `CHECKLEFT_GH_TOKEN` env var (highest — canonical checkleft-specific var)
+/// 2. `checks_github_token` — `CHECKS_GITHUB_TOKEN` env var (legacy explicit CI override)
+/// 3. `gh_token` — `GH_TOKEN` env var
+/// 4. `github_token` — `GITHUB_TOKEN` env var
+/// 5. `gh_cli_token` — result of `gh auth token` (None when gh failed or is absent)
 ///
 /// Accepts each source as an explicit parameter so the resolution logic is
 /// testable without manipulating process environment variables.
 fn resolve_github_token_from_sources(
+    checkleft_gh_token: Option<&str>,
     checks_github_token: Option<&str>,
     gh_token: Option<&str>,
     github_token: Option<&str>,
     gh_cli_token: Option<&str>,
 ) -> Option<String> {
-    [checks_github_token, gh_token, github_token, gh_cli_token]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|s| !s.is_empty())
-        .map(str::to_owned)
+    [
+        checkleft_gh_token,
+        checks_github_token,
+        gh_token,
+        github_token,
+        gh_cli_token,
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|s| !s.is_empty())
+    .map(str::to_owned)
 }
 
 /// Build the warning message emitted when no GitHub auth is available but a
@@ -1948,8 +1959,8 @@ fn resolve_github_token_from_sources(
 fn github_auth_unavailable_warning(repository: &str) -> String {
     format!(
         "warning: checkleft: PR-description bypass directives may be unavailable for {repository}: \
-         no GitHub token found (checked CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars \
-         and `gh auth token`). Run `gh auth login` or set a token env var to enable \
+         no GitHub token found (checked CHECKLEFT_GH_TOKEN, CHECKS_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN env vars \
+         and `gh auth token`). Run `gh auth login` or set CHECKLEFT_GH_TOKEN to enable \
          authenticated GitHub API access."
     )
 }
