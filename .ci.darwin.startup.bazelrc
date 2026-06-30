@@ -1,1 +1,18 @@
-startup --output_user_root=/Volumes/ssd/bazel/output_base
+# Darwin CI bazel output base — must stay on the INTERNAL, case-insensitive disk.
+#
+# #1663 pointed this at /Volumes/ssd as an Xcode-version-change / "expunge"
+# workaround. Building and running //tools/boss/app-macos xctest bundles from
+# that volume breaks under Xcode 26.5: the test bundle fails to load
+# ("IDERunDestination: Supported platforms for the buildables in the current
+# scheme is empty" -> "Failed to create a bundle instance ... Check that the
+# bundle exists on disk"), which fails `mac-app-build` on BOTH CI Macs while the
+# identical code on the identical Xcode passes on developer laptops. The cause is
+# that /Volumes/ssd is case-sensitive APFS and macOS bundle loading assumes
+# case-insensitive path lookups. Verified: moving the output base back to the
+# internal (case-insensitive) volume makes mac-app-build pass on the same host
+# and Xcode.
+#
+# Only the OUTPUT BASE (where the sandbox and runnable .xctest bundles live) needs
+# to move; the large disk_cache / repository_cache stay on /Volumes/ssd (see
+# .ci.bazelrc build:ci-darwin).
+startup --output_user_root=/private/var/tmp/bazel_darwin_ci_output_base
