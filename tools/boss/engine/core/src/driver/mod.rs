@@ -452,6 +452,29 @@ pub trait AgentDriver: Send + Sync {
     /// naming the hook mechanism and the `.claude/`-style gitignore contract.
     fn agent_rules_preamble(&self) -> &'static str;
 
+    // ── TranscriptAccess capability ──────────────────────────────────────────
+
+    /// Normalise a raw transcript JSONL entry to the canonical redactable
+    /// field shape that [`crate::live_status_redact`] and the live-status
+    /// summariser expect: `tool_name` / `tool_input` / `tool_response` at the
+    /// top level, and `content[].type == "tool_use"` blocks with `name` +
+    /// `input` sub-fields.
+    ///
+    /// For the Claude driver this is the identity — Claude's transcript already
+    /// uses canonical names. Alternative drivers with different field shapes
+    /// implement the remapping here so the redaction layer is unchanged.
+    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value;
+
+    /// Extract the worker-halting API-error text from a normalised transcript
+    /// tail, but only when it is the **last meaningful entry** (i.e. the worker
+    /// did not recover and continue working after the error).
+    ///
+    /// Returns `None` when there is no API error, or when the worker emitted
+    /// normal activity (assistant text/tool use, a user/tool result) after the
+    /// most-recent error. `lines` is a slice of already-normalised JSONL values,
+    /// oldest-first.
+    fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String>;
+
     // ── ControlVerbs capability ─────────────────────────────────────────────
 
     /// Classify a raw error string from the worker's output for

@@ -437,9 +437,24 @@ impl AgentDriver for ClaudeDriver {
         unimplemented!("extracted in the PromptComposition task")
     }
 
-    fn classify_error(&self, _raw_output: &str) -> WorkerErrorClass {
-        // TODO(@brianduff,2026-12-31): extract from transient_error::classify_claude_error
-        unimplemented!("extracted in the ControlVerbs task")
+    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
+        // Claude's transcript JSONL is already in the canonical redactable
+        // field shape (tool_name / tool_input / tool_response at the top level,
+        // content[].type == "tool_use" blocks with name + input sub-fields).
+        // No remapping is needed; return the entry as-is.
+        raw.clone()
+    }
+
+    fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
+        crate::transient_error::extract_worker_error(lines)
+    }
+
+    fn classify_error(&self, raw_output: &str) -> WorkerErrorClass {
+        match crate::transient_error::classify_claude_error(raw_output) {
+            crate::transient_error::ErrorClass::Transient => WorkerErrorClass::Transient,
+            crate::transient_error::ErrorClass::Permanent => WorkerErrorClass::Permanent,
+            crate::transient_error::ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
+        }
     }
 }
 
@@ -690,6 +705,136 @@ mod tests {
         assert!(
             !cmds.iter().any(|c| c.contains("jj git push")),
             "non-standard worker must not have the PR redirect guard: {cmds:?}",
+        );
+    }
+
+    // ── TranscriptAccess ─────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_transcript_entry_is_identity_for_claude_format() {
+        // Claude's transcript is already in the canonical shape; the
+        // normaliser must return the value unchanged.
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": "file.txt\n",
+        });
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+    }
+
+    #[test]
+    fn normalize_transcript_entry_passes_through_non_tool_entries() {
+        let raw = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "working on it"}],
+            }
+        });
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+    }
+
+    #[test]
+    fn extract_error_from_transcript_returns_trailing_api_error() {
+        let lines = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "running"}]},
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "isApiErrorMessage": true,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "API Error: overloaded_error"}]},
+            }),
+        ];
+        assert_eq!(
+            ClaudeDriver.extract_error_from_transcript(&lines).as_deref(),
+            Some("API Error: overloaded_error"),
+        );
+    }
+
+    #[test]
+    fn extract_error_from_transcript_yields_none_when_worker_recovered() {
+        let lines = vec![
+            serde_json::json!({
+                "type": "assistant",
+                "isApiErrorMessage": true,
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "API Error: overloaded_error"}]},
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "retrying now"}]},
+            }),
+        ];
+        assert_eq!(ClaudeDriver.extract_error_from_transcript(&lines), None);
+    }
+
+    #[test]
+    fn extract_error_from_transcript_yields_none_for_clean_transcript() {
+        let lines = vec![serde_json::json!({
+            "type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        })];
+        assert_eq!(ClaudeDriver.extract_error_from_transcript(&lines), None);
+    }
+
+    // ── ControlVerbs ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn classify_error_maps_transient_errors() {
+        use crate::driver::WorkerErrorClass;
+        assert_eq!(
+            ClaudeDriver.classify_error("API Error: The socket connection was closed unexpectedly."),
+            WorkerErrorClass::Transient,
+        );
+        assert_eq!(
+            ClaudeDriver.classify_error("overloaded_error: Overloaded"),
+            WorkerErrorClass::Transient,
+        );
+        assert_eq!(
+            ClaudeDriver.classify_error("rate_limit_error: Too Many Requests"),
+            WorkerErrorClass::Transient,
+        );
+        assert_eq!(
+            ClaudeDriver.classify_error("Error code: 503 - service unavailable"),
+            WorkerErrorClass::Transient,
+        );
+    }
+
+    #[test]
+    fn classify_error_maps_permanent_errors() {
+        use crate::driver::WorkerErrorClass;
+        assert_eq!(
+            ClaudeDriver.classify_error("authentication_error: invalid x-api-key"),
+            WorkerErrorClass::Permanent,
+        );
+        assert_eq!(
+            ClaudeDriver.classify_error("billing_error: credit balance too low"),
+            WorkerErrorClass::Permanent,
+        );
+        assert_eq!(
+            ClaudeDriver.classify_error("prompt is too long: 250000 tokens > 200000 maximum"),
+            WorkerErrorClass::Permanent,
+        );
+    }
+
+    #[test]
+    fn classify_error_maps_unknown_errors_to_indeterminate() {
+        use crate::driver::WorkerErrorClass;
+        assert_eq!(
+            ClaudeDriver.classify_error("something we have never seen before"),
+            WorkerErrorClass::Indeterminate,
+        );
+        assert_eq!(ClaudeDriver.classify_error(""), WorkerErrorClass::Indeterminate);
+    }
+
+    #[test]
+    fn classify_error_permanent_wins_over_transient_on_overlap() {
+        use crate::driver::WorkerErrorClass;
+        assert_eq!(
+            ClaudeDriver.classify_error("authentication_error after request timed out"),
+            WorkerErrorClass::Permanent,
         );
     }
 }
