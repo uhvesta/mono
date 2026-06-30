@@ -43,6 +43,12 @@ struct BossMacApp: App {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand(updateModel: appDelegate.updateModel)
             }
+            CommandGroup(after: .toolbar) {
+                Divider()
+                Menu("Board Style") {
+                    BoardStyleMenuItems()
+                }
+            }
             CommandGroup(after: .windowList) {
                 Divider()
                 LogViewerCommand()
@@ -387,5 +393,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// explicitly Cmd-Q to hit the confirmation modal.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         (liveWorkerStates?.activeAgentCount ?? 0) == 0
+    }
+}
+
+/// View > Board Style: single-choice menu items that persist the selection
+/// in UserDefaults and sync with the kanban board's @AppStorage binding.
+private struct BoardStyleMenuItems: View {
+    @AppStorage("boss.kanban.boardStyle") private var style: KanbanBoardStyle = .classic
+
+    var body: some View {
+        ForEach(KanbanBoardStyle.allCases) { boardStyle in
+            Button {
+                style = boardStyle
+            } label: {
+                if style == boardStyle {
+                    Label(boardStyle.displayName, systemImage: "checkmark")
+                } else {
+                    Text(boardStyle.displayName)
+                }
+            }
+        }
     }
 }

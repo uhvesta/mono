@@ -37,6 +37,7 @@ struct ContentView: View {
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @Environment(\.openWindow) private var openWindow
     @AppStorage("boss.ui.standardSearch") private var useStandardSearch: Bool = false
+    @AppStorage("boss.kanban.boardStyle") private var kanbanBoardStyle: KanbanBoardStyle = .classic
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
@@ -857,8 +858,9 @@ struct ContentView: View {
                     return workBoardColumnWidth
                 }
             }()
+            let columnSpacing: CGFloat = kanbanBoardStyle == .minimal ? 24 : workBoardColumnSpacing
             ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: workBoardColumnSpacing) {
+                HStack(alignment: .top, spacing: columnSpacing) {
                     ForEach(WorkBoardColumnKey.allCases) { column in
                         workColumn(column, width: columnWidth)
                     }
@@ -869,6 +871,7 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .environment(\.kanbanBoardStyle, kanbanBoardStyle)
     }
 
     private func workColumn(_ column: WorkBoardColumnKey, width: CGFloat = workBoardColumnWidth) -> some View {
@@ -889,7 +892,9 @@ struct ContentView: View {
                     .clipShape(Capsule())
             }
 
-            Divider()
+            if kanbanBoardStyle == .classic {
+                Divider()
+            }
 
             if itemCount == 0 {
                 Text("No items")
@@ -920,15 +925,35 @@ struct ContentView: View {
         .padding(14)
         .frame(width: width, alignment: .topLeading)
         .frame(maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .background(columnBackground)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                .stroke(columnBorderColor, lineWidth: 1)
         )
         .dropDestination(for: String.self) { items, _ in
             guard let taskID = items.first else { return false }
             return model.attemptMoveTask(taskID, to: column)
+        }
+    }
+
+    private var columnBackground: Color {
+        switch kanbanBoardStyle {
+        case .classic:
+            return Color(nsColor: .controlBackgroundColor)
+        case .airy:
+            return Color(nsColor: .quaternaryLabelColor).opacity(0.06)
+        case .minimal:
+            return Color(nsColor: .separatorColor).opacity(0.12)
+        }
+    }
+
+    private var columnBorderColor: Color {
+        switch kanbanBoardStyle {
+        case .classic:
+            return Color(nsColor: .separatorColor)
+        case .airy, .minimal:
+            return .clear
         }
     }
 
@@ -2080,6 +2105,8 @@ struct WorkBoardCardView: View {
     /// PR is not already in the merge queue (`mergeQueueState != "queued"`).
     var onMergeWhenReady: (() -> Void)? = nil
 
+    @Environment(\.kanbanBoardStyle) private var boardStyle
+
     @State private var isHovered: Bool = false
     @State private var showMergeConfirmation: Bool = false
 
@@ -2370,6 +2397,10 @@ struct WorkBoardCardView: View {
                         .strokeBorder(borderColor, lineWidth: isSelected ? 2 : 1)
                 )
         )
+        .shadow(
+            color: boardStyle == .airy ? Color.black.opacity(0.07) : .clear,
+            radius: 4, x: 0, y: 1.5
+        )
         .draggable(task.id)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
@@ -2438,7 +2469,12 @@ struct WorkBoardCardView: View {
         if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return Color.orange.opacity(0.08)
         }
-        return Color(nsColor: .windowBackgroundColor)
+        switch boardStyle {
+        case .classic, .airy:
+            return Color(nsColor: .windowBackgroundColor)
+        case .minimal:
+            return Color(nsColor: .controlBackgroundColor)
+        }
     }
 
     private var borderColor: Color {
@@ -2448,7 +2484,12 @@ struct WorkBoardCardView: View {
         if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
             return .orange
         }
-        return Color(nsColor: .separatorColor)
+        switch boardStyle {
+        case .classic:
+            return Color(nsColor: .separatorColor)
+        case .airy, .minimal:
+            return .clear
+        }
     }
 }
 
