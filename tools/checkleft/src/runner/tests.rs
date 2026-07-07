@@ -672,6 +672,76 @@ def check(ctx):
 }
 
 #[tokio::test]
+async fn runner_executes_starlark_java_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("checkleft/java/public_api")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("src/main/java/com/acme")).expect("create java dir");
+    fs::write(
+        temp.path().join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("checkleft/java/public_api/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.java"])
+
+def check(ctx):
+    findings = []
+    for pair in ctx.files:
+        if pair.after == None:
+            continue
+        for cls in pair.after.classes:
+            if cls.visibility == "public":
+                findings.append(fail(
+                    message = "public Java class found: " + cls.full_name,
+                    path = pair.path,
+                ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    fs::write(
+        temp.path().join("src/main/java/com/acme/UserApi.java"),
+        r#"
+package com.acme;
+
+public class UserApi {
+  public String id() {
+    return "1";
+  }
+}
+"#,
+    )
+    .expect("write java file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("src/main/java/com/acme/UserApi.java"),
+            kind: ChangeKind::Added,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "java/public_api")
+        .expect("starlark java result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "public Java class found: com.acme.UserApi");
+}
+
+#[tokio::test]
 async fn runner_executes_starlark_text_check_selected_by_checks_yaml_package() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
