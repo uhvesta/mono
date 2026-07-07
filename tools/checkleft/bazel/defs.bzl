@@ -28,6 +28,14 @@ CheckIndexInfo = provider(
     },
 )
 
+StarlarkCheckPackageInfo = provider(
+    doc = "Metadata for a packaged Starlark checkleft package archive.",
+    fields = {
+        "archive": "The generated .tar.gz archive.",
+        "package_root": "Package-relative checkleft root that was packaged.",
+    },
+)
+
 def _sanitize_fragment(value):
     sanitized = value
     for needle in [" ", "/", "\\", ":", "@", "[", "]", "(", ")", "{", "}", ",", ";", "=", "\"", "'"]:
@@ -42,7 +50,7 @@ def _toml_string(value):
     )
 
 def _sh_single_quote(value):
-    return "\'" + value.replace("\'", "\'\"\'\"\'") + "\'"
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 def _render_declarative_passthrough_manifest(check_id, executable_path, args):
     # A repo-local check binary is modelled as a single declarative invocation with
@@ -162,6 +170,128 @@ def _workspace_package_root(label_package, package_root):
     if label_package:
         return "{}/{}".format(label_package, package_root)
     return package_root
+
+def _archive_entry_for_file(ctx, file, workspace_package_root):
+    short_path = file.short_path
+    if short_path.startswith("../"):
+        fail("starlark_check_package srcs must be files from this workspace, got {}".format(short_path))
+    prefix = workspace_package_root + "/"
+    if not short_path.startswith(prefix):
+        fail(
+            "starlark_check_package src `{}` is not under package_root `{}`".format(
+                short_path,
+                ctx.attr.package_root,
+            ),
+        )
+    return short_path[len(prefix):]
+
+def _validate_archive_entry(entry):
+    if entry == "package.toml":
+        return
+    if entry == "PACKAGE.lock" or entry.endswith("/PACKAGE.lock"):
+        fail("Starlark check packages do not use PACKAGE.lock")
+    parts = entry.split("/")
+    if "testdata" in parts:
+        fail("testdata is for author tests and must not be included in a published Starlark package")
+    if not entry.endswith(".checkleft"):
+        fail("Starlark package file `{}` must be package.toml or a .checkleft file".format(entry))
+    if parts[0] == "lib":
+        if len(parts) < 2:
+            fail("lib entries must name .checkleft files")
+        return
+    if len(parts) < 3:
+        fail("check files must be under <adapter>/<name>/...")
+
+def _starlark_check_package_impl(ctx):
+    package_root = _validate_package_root(ctx.attr.package_root)
+    workspace_package_root = _workspace_package_root(ctx.label.package, package_root)
+    entries = {}
+    seen = {}
+    has_manifest = False
+
+    for file in ctx.files.srcs:
+        entry = _archive_entry_for_file(ctx, file, workspace_package_root)
+        _validate_archive_entry(entry)
+        if entry in seen:
+            fail("duplicate archive entry `{}` from {} and {}".format(entry, seen[entry], file.short_path))
+        seen[entry] = file.short_path
+        has_manifest = has_manifest or entry == "package.toml"
+        entries[entry] = file
+
+    if not has_manifest:
+        fail("starlark_check_package requires {}/package.toml in srcs".format(ctx.attr.package_root))
+
+    ordered_entries = [(entry, entries[entry]) for entry in sorted(entries.keys())]
+    manifest = ctx.actions.declare_file("{}.archive-manifest".format(ctx.label.name))
+    ctx.actions.write(
+        output = manifest,
+        content = "\n".join(["{}\t{}".format(entry, file.path) for entry, file in ordered_entries]) + "\n",
+    )
+
+    packager = ctx.actions.declare_file("{}.packager.py".format(ctx.label.name))
+    ctx.actions.write(
+        output = packager,
+        content = """#!/usr/bin/env python3
+import gzip
+import os
+import sys
+import tarfile
+
+manifest_path = sys.argv[1]
+archive_path = sys.argv[2]
+
+with open(archive_path, "wb") as raw:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tar:
+            with open(manifest_path, "r", encoding="utf-8") as manifest:
+                for line in manifest:
+                    line = line.rstrip("\\n")
+                    if not line:
+                        continue
+                    entry, source = line.split("\\t", 1)
+                    stat = os.stat(source)
+                    info = tarfile.TarInfo(entry)
+                    info.size = stat.st_size
+                    info.mode = 0o644
+                    info.mtime = 0
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    with open(source, "rb") as source_file:
+                        tar.addfile(info, source_file)
+""",
+        is_executable = True,
+    )
+
+    archive = ctx.actions.declare_file("{}.tar.gz".format(ctx.label.name))
+    ctx.actions.run(
+        inputs = [manifest] + [file for _, file in ordered_entries],
+        outputs = [archive],
+        executable = packager,
+        arguments = [manifest.path, archive.path],
+        mnemonic = "CheckleftStarlarkPackage",
+        progress_message = "Packaging Starlark check package {}".format(ctx.label),
+    )
+
+    return [
+        DefaultInfo(files = depset([archive])),
+        StarlarkCheckPackageInfo(
+            archive = archive,
+            package_root = package_root,
+        ),
+    ]
+
+starlark_check_package = rule(
+    implementation = _starlark_check_package_impl,
+    attrs = {
+        "srcs": attr.label_list(
+            mandatory = True,
+            allow_files = True,
+        ),
+        "package_root": attr.string(default = "checkleft"),
+    },
+)
 
 def _starlark_check_test_impl(ctx):
     checkleft_toolchain = _checkleft_toolchain(ctx)
