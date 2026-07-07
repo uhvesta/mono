@@ -13,7 +13,7 @@ use starlark::values::{Heap, UnpackValue, Value};
 
 use crate::check::{Check, ConfiguredCheck};
 use crate::input::{ChangeSet, SourceTree};
-use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::output::{CheckResult, FileEdit, Finding, Location, Severity};
 use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
 use crate::starlark::loader::{CheckleftFileLoader, LoadContext};
 
@@ -77,6 +77,26 @@ impl StarlarkCheckRunner {
         self.evaluate_parsed_adapter(parsed, &output, tree)
     }
 
+    pub fn evaluate_fix_text(
+        &self,
+        fix_source: StarlarkCheckSource,
+        changeset: &ChangeSet,
+        findings: &[Finding],
+        tree: &dyn SourceTree,
+    ) -> Result<Vec<FileEdit>> {
+        let parsed = ParsedCheck::parse(&self.source)?;
+        let package_scope = self.package_scope();
+        let output = AdapterRegistry::with_builtin_adapters()
+            .require("text")?
+            .prepare(AdapterInput {
+                changeset,
+                tree,
+                applies_to: &parsed.meta.applies_to,
+                package_scope: package_scope.as_deref(),
+            })?;
+        self.evaluate_fix_prepared_adapter(fix_source, &output, findings, tree)
+    }
+
     pub(crate) fn evaluate_prepared_adapter(
         &self,
         output: &AdapterPreparedOutput,
@@ -84,6 +104,63 @@ impl StarlarkCheckRunner {
     ) -> Result<CheckResult> {
         let parsed = ParsedCheck::parse(&self.source)?;
         self.evaluate_parsed_adapter(parsed, output, tree)
+    }
+
+    pub(crate) fn evaluate_fix_prepared_adapter(
+        &self,
+        fix_source: StarlarkCheckSource,
+        output: &AdapterPreparedOutput,
+        findings: &[Finding],
+        tree: &dyn SourceTree,
+    ) -> Result<Vec<FileEdit>> {
+        if output.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ast = parse_module(&fix_source)?;
+        Module::with_temp_heap(|module| {
+            let globals = starlark_globals();
+            let edits = if let Some(context) = &fix_source.load_context {
+                let loader = CheckleftFileLoader {
+                    tree,
+                    globals: &globals,
+                    context: context.clone(),
+                };
+                let mut eval = Evaluator::new(&module);
+                eval.set_loader(&loader);
+                eval.eval_module(ast, &globals)
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to evaluate {}", fix_source.path.display()))?;
+
+                let fix = module
+                    .get("fix")
+                    .ok_or_else(|| anyhow!("{} does not define fix(ctx, findings)", fix_source.path.display()))?;
+                let ctx = output.alloc_context(eval.heap());
+                let findings = alloc_findings(eval.heap(), findings);
+                let result = eval
+                    .eval_function(fix, &[ctx, findings], &[])
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to run fix(ctx, findings) in {}", fix_source.path.display()))?;
+                unpack_file_edits(result)?
+            } else {
+                let mut eval = Evaluator::new(&module);
+                eval.eval_module(ast, &globals)
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to evaluate {}", fix_source.path.display()))?;
+
+                let fix = module
+                    .get("fix")
+                    .ok_or_else(|| anyhow!("{} does not define fix(ctx, findings)", fix_source.path.display()))?;
+                let ctx = output.alloc_context(eval.heap());
+                let findings = alloc_findings(eval.heap(), findings);
+                let result = eval
+                    .eval_function(fix, &[ctx, findings], &[])
+                    .map_err(|e| anyhow!(e.to_string()))
+                    .with_context(|| format!("failed to run fix(ctx, findings) in {}", fix_source.path.display()))?;
+                unpack_file_edits(result)?
+            };
+            Ok(edits)
+        })
     }
 
     fn evaluate_parsed_adapter(
@@ -186,20 +263,24 @@ struct ParsedCheck {
 
 impl ParsedCheck {
     fn parse(source: &StarlarkCheckSource) -> Result<Self> {
-        let dialect = Dialect {
-            enable_types: DialectTypes::Enable,
-            enable_load: source.load_context.is_some(),
-            enable_keyword_only_arguments: true,
-            enable_f_strings: true,
-            ..Dialect::Standard
-        };
-        let ast = AstModule::parse(source.path.to_string_lossy().as_ref(), source.source.clone(), &dialect)
-            .map_err(|e| anyhow!(e))
-            .with_context(|| format!("failed to parse {}", source.path.display()))?;
+        let ast = parse_module(source)?;
         let meta = CheckMeta::parse_from_source(&source.source)
             .with_context(|| format!("failed to parse check_meta() in {}", source.path.display()))?;
         Ok(Self { ast, meta })
     }
+}
+
+fn parse_module(source: &StarlarkCheckSource) -> Result<AstModule> {
+    let dialect = Dialect {
+        enable_types: DialectTypes::Enable,
+        enable_load: source.load_context.is_some(),
+        enable_keyword_only_arguments: true,
+        enable_f_strings: true,
+        ..Dialect::Standard
+    };
+    AstModule::parse(source.path.to_string_lossy().as_ref(), source.source.clone(), &dialect)
+        .map_err(|e| anyhow!(e))
+        .with_context(|| format!("failed to parse {}", source.path.display()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +383,14 @@ fn checkleft_globals(builder: &mut GlobalsBuilder) {
         )
     }
 
+    fn file_edit<'v>(path: String, old_text: String, new_text: String, heap: Heap<'v>) -> anyhow::Result<Value<'v>> {
+        Ok(heap.alloc(AllocStruct([
+            ("path", heap.alloc(path)),
+            ("old_text", heap.alloc(old_text)),
+            ("new_text", heap.alloc(new_text)),
+        ])))
+    }
+
     fn regex_match(pattern: String, s: String) -> anyhow::Result<bool> {
         Ok(Regex::new(&pattern)
             .with_context(|| format!("invalid regex pattern `{pattern}`"))?
@@ -346,6 +435,40 @@ fn alloc_finding<'v>(
     ])))
 }
 
+fn alloc_findings<'v>(heap: Heap<'v>, findings: &[Finding]) -> Value<'v> {
+    let values = findings
+        .iter()
+        .map(|finding| {
+            let severity = match finding.severity {
+                Severity::Error => "fail",
+                Severity::Warning => "fail_but_overridable",
+                Severity::Info => "info",
+            };
+            let path = finding
+                .location
+                .as_ref()
+                .map(|location| location.path.to_string_lossy().to_string());
+            let line = finding.location.as_ref().and_then(|location| location.line);
+            let column = finding.location.as_ref().and_then(|location| location.column);
+            heap.alloc(AllocStruct([
+                ("severity", heap.alloc(severity)),
+                ("message", heap.alloc(finding.message.clone())),
+                ("path", path.map_or_else(Value::new_none, |path| heap.alloc(path))),
+                (
+                    "line",
+                    line.map_or_else(Value::new_none, |line| heap.alloc(line as i32)),
+                ),
+                (
+                    "column",
+                    column.map_or_else(Value::new_none, |column| heap.alloc(column as i32)),
+                ),
+                ("remediations", heap.alloc(finding.remediations.clone())),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    heap.alloc(values)
+}
+
 fn unpack_findings(value: Value<'_>) -> Result<Vec<Finding>> {
     let list = ListRef::from_value(value).ok_or_else(|| anyhow!("check(ctx) must return list[Finding]"))?;
     list.iter().map(unpack_finding).collect()
@@ -373,6 +496,20 @@ fn unpack_finding(value: Value<'_>) -> Result<Finding> {
         }),
         remediations: remediation.into_iter().collect(),
         suggested_fix: None,
+    })
+}
+
+fn unpack_file_edits(value: Value<'_>) -> Result<Vec<FileEdit>> {
+    let list = ListRef::from_value(value).ok_or_else(|| anyhow!("fix(ctx, findings) must return list[FileEdit]"))?;
+    list.iter().map(unpack_file_edit).collect()
+}
+
+fn unpack_file_edit(value: Value<'_>) -> Result<FileEdit> {
+    let edit = StructRef::from_value(value).ok_or_else(|| anyhow!("file_edit value must be a struct"))?;
+    Ok(FileEdit {
+        path: PathBuf::from(required_string_field(edit, "path")?),
+        old_text: required_string_field(edit, "old_text")?,
+        new_text: required_string_field(edit, "new_text")?,
     })
 }
 
