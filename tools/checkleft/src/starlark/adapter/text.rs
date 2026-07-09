@@ -6,7 +6,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, Value};
 
 use crate::input::{ChangeKind, ChangedFile, SourceTree, TreeVersion};
-use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, FormatAdapter};
+use crate::starlark::adapter::{AdapterFileSelector, AdapterInput, AdapterPreparedOutput, FormatAdapter};
 
 #[derive(Debug)]
 pub(crate) struct TextAdapterOutput {
@@ -33,6 +33,16 @@ pub(crate) struct TextAdapter;
 impl FormatAdapter for TextAdapter {
     fn kind(&self) -> &'static str {
         "text"
+    }
+
+    fn file_selectors(&self) -> &'static [AdapterFileSelector] {
+        &[
+            AdapterFileSelector::Ext("txt"),
+            AdapterFileSelector::Ext("text"),
+            AdapterFileSelector::Ext("md"),
+            AdapterFileSelector::Name("CHECKS.yaml"),
+            AdapterFileSelector::Name("CHECKS.toml"),
+        ]
     }
 
     fn prepare(&self, input: AdapterInput<'_>) -> Result<AdapterPreparedOutput> {

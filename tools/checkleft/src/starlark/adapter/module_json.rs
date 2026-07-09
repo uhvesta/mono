@@ -8,7 +8,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, Value};
 
 use crate::input::{ChangeKind, ChangedFile, SourceTree, TreeVersion};
-use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, FormatAdapter};
+use crate::starlark::adapter::{AdapterFileSelector, AdapterInput, AdapterPreparedOutput, FormatAdapter};
 
 #[derive(Debug)]
 pub(crate) struct ModuleJsonAdapterOutput {
@@ -44,6 +44,10 @@ pub(crate) struct ModuleJsonAdapter;
 impl FormatAdapter for ModuleJsonAdapter {
     fn kind(&self) -> &'static str {
         "module_json"
+    }
+
+    fn file_selectors(&self) -> &'static [AdapterFileSelector] {
+        &[AdapterFileSelector::Name("module-info.json")]
     }
 
     fn prepare(&self, input: AdapterInput<'_>) -> Result<AdapterPreparedOutput> {
@@ -139,7 +143,7 @@ fn parse_module_json(path: &Path, bytes: &[u8]) -> Result<ModuleJsonFile> {
         .filter(|(key, _)| !known_module_keys().contains(key.as_str()))
         .map(|(key, value)| serde_json::to_string(value).map(|text| (key.clone(), text)))
         .collect::<std::result::Result<BTreeMap<_, _>, _>>()
-        .context("failed to serialize module.json metadata")?;
+        .context("failed to serialize module-info.json metadata")?;
     Ok(ModuleJsonFile {
         name,
         version,
@@ -157,7 +161,7 @@ fn string_field(object: &Map<String, JsonValue>, key: &str) -> Result<Option<Str
     value
         .as_str()
         .map(|value| Some(value.to_owned()))
-        .ok_or_else(|| anyhow!("module.json `{key}` must be a string"))
+        .ok_or_else(|| anyhow!("module-info.json `{key}` must be a string"))
 }
 
 fn string_map_field(object: &Map<String, JsonValue>, key: &str) -> Result<BTreeMap<String, String>> {
@@ -165,14 +169,14 @@ fn string_map_field(object: &Map<String, JsonValue>, key: &str) -> Result<BTreeM
         return Ok(BTreeMap::new());
     };
     let Some(map) = value.as_object() else {
-        bail!("module.json `{key}` must be an object");
+        bail!("module-info.json `{key}` must be an object");
     };
     map.iter()
         .map(|(name, value)| {
             value
                 .as_str()
                 .map(|version| (name.clone(), version.to_owned()))
-                .ok_or_else(|| anyhow!("module.json `{key}.{name}` must be a string"))
+                .ok_or_else(|| anyhow!("module-info.json `{key}.{name}` must be a string"))
         })
         .collect()
 }
@@ -391,7 +395,7 @@ fn before_path(changed: &ChangedFile) -> &Path {
 }
 
 fn is_module_json_path(path: &Path) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("module.json")
+    path.file_name().and_then(|name| name.to_str()) == Some("module-info.json")
 }
 
 fn alloc_file_pair<'v>(heap: Heap<'v>, pair: &ModuleJsonFilePair) -> Value<'v> {

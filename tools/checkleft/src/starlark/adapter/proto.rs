@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 use crate::input::{ChangeKind, ChangedFile, SourceTree, TreeVersion};
 use crate::path::validate_relative_path;
-use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, FormatAdapter};
+use crate::starlark::adapter::{AdapterFileSelector, AdapterInput, AdapterPreparedOutput, FormatAdapter};
 
 #[derive(Debug)]
 pub(crate) struct ProtoAdapterOutput {
@@ -52,6 +52,10 @@ pub(crate) struct ProtoAdapter;
 impl FormatAdapter for ProtoAdapter {
     fn kind(&self) -> &'static str {
         "proto"
+    }
+
+    fn file_selectors(&self) -> &'static [AdapterFileSelector] {
+        &[AdapterFileSelector::Ext("proto")]
     }
 
     fn prepare(&self, input: AdapterInput<'_>) -> Result<AdapterPreparedOutput> {
