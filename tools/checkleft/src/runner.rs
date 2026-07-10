@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use tokio::task::JoinSet;
 
 use crate::progress::{NoopProgressReporter, ProgressReporter, files_failed_count};
@@ -20,6 +21,8 @@ use crate::external::{
 };
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::starlark::discovery::{self, DiscoveredCheck};
+use crate::starlark::{StarlarkCheckRunner, StarlarkCheckSource};
 use tracing::info;
 
 struct ScheduledCheckRun {
@@ -44,6 +47,9 @@ enum ScheduledExecution {
     },
     ExternalResolved {
         package: Box<ExternalCheckPackage>,
+    },
+    StarlarkLocal {
+        check: Arc<StarlarkCheckRunner>,
     },
     Invalid {
         message: String,
@@ -330,6 +336,48 @@ impl Runner {
                             reporter.finish(&check_id_clone, 1, Duration::ZERO);
                             Err((check_id_clone, source_path_clone, anyhow!("executor panicked: {e}")))
                         })
+                    });
+                }
+                ScheduledExecution::StarlarkLocal { check } => {
+                    let source_tree = Arc::clone(&self.source_tree);
+                    let configured_check_id = run.configured_check_id.clone();
+                    let run_changeset = run.changeset;
+                    let run_policy = run.policy;
+                    let source_path = run.source_path;
+                    let exclusion_matcher = run.exclusion_matcher;
+                    let file_count = run_changeset.changed_files.len();
+                    info!(
+                        check_id = %configured_check_id,
+                        file_count,
+                        "running local Starlark check"
+                    );
+                    reporter.register(&configured_check_id, file_count);
+                    let reporter = Arc::clone(&reporter);
+
+                    join_set.spawn(async move {
+                        reporter.start(&configured_check_id);
+                        let check_start = Instant::now();
+                        match check.run(&run_changeset, source_tree.as_ref()).await {
+                            Ok(mut result) => {
+                                let elapsed = check_start.elapsed();
+                                result.check_id = configured_check_id.clone();
+                                let result =
+                                    apply_policy_to_result(result, &run_policy, &run_changeset, &exclusion_matcher);
+                                info!(
+                                    check_id = %configured_check_id,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    findings = result.findings.len(),
+                                    "local Starlark check complete"
+                                );
+                                reporter.stream_findings(&result);
+                                reporter.finish(&configured_check_id, files_failed_count(&result), elapsed);
+                                Ok(result)
+                            }
+                            Err(err) => {
+                                reporter.finish(&configured_check_id, 1, check_start.elapsed());
+                                Err((configured_check_id, source_path, err))
+                            }
+                        }
                     });
                 }
                 ScheduledExecution::Invalid { message, remediation } => {
@@ -984,6 +1032,20 @@ impl Runner {
             }
         }
 
+        if let Ok(discovered) = discovery::discover_local_checks(changeset, self.source_tree.as_ref()) {
+            for check in discovered {
+                if check.adapter != "text" {
+                    continue;
+                }
+                if starlark_changeset_for_check(changeset, &check)
+                    .map(|changeset| !changeset.changed_files.is_empty())
+                    .unwrap_or(false)
+                {
+                    checks.insert(check.id);
+                }
+            }
+        }
+
         if !resolution_errors.is_empty() {
             let details = resolution_errors
                 .into_iter()
@@ -1125,11 +1187,160 @@ impl Runner {
                 }
             }
         }
+        self.schedule_local_starlark_runs(changeset, &mut grouped_runs, &mut grouped_diagnostics);
 
         Ok(ScheduledRuns {
             runs: grouped_runs.into_values().collect(),
             diagnostics: grouped_diagnostics.into_values().collect(),
         })
+    }
+
+    fn schedule_local_starlark_runs(
+        &self,
+        changeset: &ChangeSet,
+        grouped_runs: &mut BTreeMap<(String, String, String, String, String, String), ScheduledCheckRun>,
+        grouped_diagnostics: &mut BTreeMap<(String, PathBuf, Option<u32>, Option<u32>, String, String), CheckResult>,
+    ) {
+        let discovered = match discovery::discover_local_checks(changeset, self.source_tree.as_ref()) {
+            Ok(checks) => checks,
+            Err(err) => {
+                let diagnostic = ConfigDiagnostic {
+                    check_id: "starlark-discovery".to_owned(),
+                    message: format!("failed to discover local Starlark checks: {err:#}"),
+                    location: Location {
+                        path: PathBuf::from("checkleft/package.toml"),
+                        line: None,
+                        column: None,
+                    },
+                    remediation: Some("Fix the local checkleft package structure or package.toml.".to_owned()),
+                };
+                let key = (
+                    diagnostic.check_id.clone(),
+                    diagnostic.location.path.clone(),
+                    diagnostic.location.line,
+                    diagnostic.location.column,
+                    diagnostic.message.clone(),
+                    diagnostic.remediation.clone().unwrap_or_default(),
+                );
+                grouped_diagnostics
+                    .entry(key)
+                    .or_insert_with(|| config_diagnostic_result(&diagnostic));
+                return;
+            }
+        };
+
+        for check in discovered {
+            if check.adapter != "text" {
+                continue;
+            }
+            let check_changeset = match starlark_changeset_for_check(changeset, &check) {
+                Ok(changeset) => changeset,
+                Err(err) => {
+                    let diagnostic = ConfigDiagnostic {
+                        check_id: check.id.clone(),
+                        message: format!("failed to schedule local Starlark check: {err:#}"),
+                        location: Location {
+                            path: check.check_path.clone(),
+                            line: None,
+                            column: None,
+                        },
+                        remediation: Some("Fix check_meta(applies_to = [...]) for this check.".to_owned()),
+                    };
+                    let key = (
+                        diagnostic.check_id.clone(),
+                        diagnostic.location.path.clone(),
+                        diagnostic.location.line,
+                        diagnostic.location.column,
+                        diagnostic.message.clone(),
+                        diagnostic.remediation.clone().unwrap_or_default(),
+                    );
+                    grouped_diagnostics
+                        .entry(key)
+                        .or_insert_with(|| config_diagnostic_result(&diagnostic));
+                    continue;
+                }
+            };
+            if check_changeset.changed_files.is_empty() {
+                continue;
+            }
+
+            let source = match self.source_tree.read_file(&check.check_path) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(source) => source,
+                    Err(err) => {
+                        self.insert_starlark_invalid_run(
+                            grouped_runs,
+                            &check,
+                            format!("{} is not valid UTF-8: {err}", check.check_path.display()),
+                        );
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    self.insert_starlark_invalid_run(
+                        grouped_runs,
+                        &check,
+                        format!("failed to read {}: {err:#}", check.check_path.display()),
+                    );
+                    continue;
+                }
+            };
+            let runner = Arc::new(StarlarkCheckRunner::new(
+                StarlarkCheckSource::file(check.id.clone(), check.check_path.clone(), source)
+                    .with_load_context(check.checkleft_root.clone(), check.check_dir.clone()),
+            ));
+            let key = (
+                check.id.clone(),
+                "starlark-local".to_owned(),
+                check.check_path.display().to_string(),
+                String::new(),
+                starlark_policy(&check.id).fingerprint(),
+                String::new(),
+            );
+            grouped_runs.insert(
+                key,
+                ScheduledCheckRun {
+                    configured_check_id: check.id.clone(),
+                    source_path: check.check_path.clone(),
+                    execution: ScheduledExecution::StarlarkLocal { check: runner },
+                    policy: starlark_policy(&check.id),
+                    config: toml::Value::Table(Default::default()),
+                    changeset: check_changeset,
+                    exclusion_matcher: ExclusionMatcher::default(),
+                },
+            );
+        }
+    }
+
+    fn insert_starlark_invalid_run(
+        &self,
+        grouped_runs: &mut BTreeMap<(String, String, String, String, String, String), ScheduledCheckRun>,
+        check: &DiscoveredCheck,
+        message: String,
+    ) {
+        let key = (
+            check.id.clone(),
+            "starlark-local-invalid".to_owned(),
+            check.check_path.display().to_string(),
+            String::new(),
+            starlark_policy(&check.id).fingerprint(),
+            String::new(),
+        );
+        grouped_runs.insert(
+            key,
+            ScheduledCheckRun {
+                configured_check_id: check.id.clone(),
+                source_path: check.check_path.clone(),
+                execution: ScheduledExecution::Invalid {
+                    message,
+                    remediation: Some("Fix this local Starlark check file.".to_owned()),
+                },
+                policy: starlark_policy(&check.id),
+                config: toml::Value::Table(Default::default()),
+                changeset: ChangeSet::default(),
+                exclusion_matcher: ExclusionMatcher::default(),
+            },
+        );
     }
 
     fn resolve_effective_policy(&self, check: &CheckConfig) -> EffectiveCheckPolicy {
@@ -1229,6 +1440,79 @@ impl Runner {
             package: Box::new(package),
         }
     }
+}
+
+fn starlark_policy(check_id: &str) -> EffectiveCheckPolicy {
+    EffectiveCheckPolicy {
+        severity_override: None,
+        allow_bypass: false,
+        bypass_name: bypass_name_for_check_id(check_id),
+        preserve_finding_severity: true,
+    }
+}
+
+fn starlark_changeset_for_check(changeset: &ChangeSet, check: &DiscoveredCheck) -> Result<ChangeSet> {
+    let applies_to = build_glob_set(&check.check_meta.applies_to)?;
+    let package_scope = package_scope_for_checkleft_root(&check.checkleft_root);
+    let changed_files = changeset
+        .changed_files
+        .iter()
+        .filter(|changed| !matches!(changed.kind, ChangeKind::Deleted))
+        .filter(|changed| path_in_scope(&changed.path, &package_scope))
+        .filter(|changed| starlark_applies_to_path(&applies_to, &changed.path, &package_scope))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut scoped = ChangeSet {
+        changed_files,
+        file_line_deltas: HashMap::new(),
+        file_diffs: HashMap::new(),
+        commit_description: changeset.commit_description.clone(),
+        pr_description: changeset.pr_description.clone(),
+        change_id: changeset.change_id.clone(),
+        repository: changeset.repository.clone(),
+    };
+    for changed in &scoped.changed_files {
+        if let Some(delta) = changeset.file_line_deltas.get(&changed.path) {
+            scoped.file_line_deltas.insert(changed.path.clone(), *delta);
+        }
+        if let Some(diff) = changeset.file_diffs.get(&changed.path) {
+            scoped.file_diffs.insert(changed.path.clone(), diff.clone());
+        }
+    }
+    Ok(scoped)
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern)?);
+    }
+    Ok(builder.build()?)
+}
+
+fn package_scope_for_checkleft_root(checkleft_root: &Path) -> PathBuf {
+    checkleft_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+fn path_in_scope(path: &Path, scope: &Path) -> bool {
+    scope.as_os_str().is_empty() || path.starts_with(scope)
+}
+
+fn starlark_applies_to_path(applies_to: &GlobSet, path: &Path, scope: &Path) -> bool {
+    if applies_to.is_match(path) {
+        return true;
+    }
+    if scope.as_os_str().is_empty() {
+        return false;
+    }
+    path.strip_prefix(scope)
+        .map(|relative| applies_to.is_match(relative))
+        .unwrap_or(false)
 }
 
 fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::ResolvedChecks) -> bool {
