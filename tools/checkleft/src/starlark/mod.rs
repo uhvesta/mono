@@ -6,6 +6,7 @@
 
 pub mod discovery;
 mod evaluator;
+mod loader;
 pub mod manifest;
 
 pub use evaluator::{StarlarkCheckRunner, StarlarkCheckSource};
