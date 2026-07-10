@@ -754,6 +754,7 @@ dependencies = [
  "sha2",
  "starlark",
  "syn 2.0.117",
+ "tar",
  "tempfile",
  "tokio",
  "toml",

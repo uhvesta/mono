@@ -58,7 +58,10 @@ fn ensure_version_set_defines_no_checks(tree: &dyn SourceTree, checkleft_root: &
         let relative = relative_to_root(checkleft_root, &entry)?;
         let components = path_components(&relative)?;
         if components.first() == Some(&"lib") {
-            bail!("version_set package {} must not define lib/ helpers", checkleft_root.display());
+            bail!(
+                "version_set package {} must not define lib/ helpers",
+                checkleft_root.display()
+            );
         }
         if components
             .first()
