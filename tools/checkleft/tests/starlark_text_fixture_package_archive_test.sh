@@ -22,6 +22,7 @@ require_entry() {
 require_entry "package.toml"
 require_entry "lib/messages.checkleft"
 require_entry "text/no_debug/check.checkleft"
+require_entry "text/no_debug/fix.checkleft"
 require_entry "text/nested/no_todo/check.checkleft"
 
 if grep -q "testdata" <<<"${entries}"; then
