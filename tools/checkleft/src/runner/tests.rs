@@ -812,6 +812,66 @@ def check(ctx):
 }
 
 #[tokio::test]
+async fn runner_applies_global_excludes_to_starlark_package_checks() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("notes")).expect("create notes dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+exclude:
+  - notes/**
+
+checkleft_packages:
+  packages:
+    - source: path://central/checkleft
+      version: 0.1.0
+      mode: all
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return [fail(message = "debug text added", path = ctx.files[0].path)]
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("notes/example.txt"), "debug mode\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes/example.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().all(|result| result.check_id != "text/no_debug"),
+        "global exclude should suppress Starlark package check, got {results:?}"
+    );
+}
+
+#[tokio::test]
 async fn runner_executes_starlark_text_check_from_local_package_archive() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("packages")).expect("create packages dir");
@@ -1094,6 +1154,73 @@ def check(ctx):
             .iter()
             .any(|finding| finding.message.contains("unknown implementation"))),
         "explicit Starlark selection must not also produce built-in missing diagnostics: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn runner_rejects_config_on_explicit_starlark_package_selector() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://central/checkleft
+      version: 0.1.0
+      mode: explicit
+
+checks:
+  - id: text/no_debug
+    config:
+      forbidden_word: debug
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    return []
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("notes.txt"), "debug\n").expect("write changed file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("notes.txt"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    assert!(
+        results.iter().any(|result| {
+            result.check_id == "text/no_debug"
+                && result
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("`config` is not supported"))
+        }),
+        "expected Starlark selector config diagnostic, got {results:?}"
     );
 }
 

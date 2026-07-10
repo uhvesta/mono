@@ -1306,6 +1306,15 @@ impl Runner {
         // (check_id, path, line, column, message, remediation).
         type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, String);
         let mut grouped_diagnostics: BTreeMap<DiagnosticGroupKey, CheckResult> = BTreeMap::new();
+        let mut starlark_changeset = ChangeSet {
+            changed_files: Vec::new(),
+            file_line_deltas: HashMap::new(),
+            file_diffs: HashMap::new(),
+            commit_description: changeset.commit_description.clone(),
+            pr_description: changeset.pr_description.clone(),
+            change_id: changeset.change_id.clone(),
+            repository: changeset.repository.clone(),
+        };
 
         for changed_file in &changeset.changed_files {
             if matches!(changed_file.kind, ChangeKind::Deleted) {
@@ -1331,8 +1340,51 @@ impl Runner {
             if should_skip_file(changed_file, &resolved) {
                 continue;
             }
+            if !global_excludes_file(changed_file, &resolved) {
+                starlark_changeset.changed_files.push(ChangedFile {
+                    path: changed_file.path.clone(),
+                    kind: changed_file.kind,
+                    old_path: changed_file.old_path.clone(),
+                });
+                if let Some(delta) = changeset.file_line_deltas.get(&changed_file.path) {
+                    starlark_changeset
+                        .file_line_deltas
+                        .insert(changed_file.path.clone(), *delta);
+                }
+                if let Some(diff) = changeset.file_diffs.get(&changed_file.path) {
+                    starlark_changeset
+                        .file_diffs
+                        .insert(changed_file.path.clone(), diff.clone());
+                }
+            }
             for check in resolved.enabled() {
                 if self.is_explicit_starlark_selection(&resolved, check) {
+                    if !toml_value_is_empty_table(&check.config) {
+                        let diagnostic = ConfigDiagnostic {
+                            check_id: check.id.clone(),
+                            message: "`config` is not supported on CHECKS.yaml entries that select Starlark package checks".to_owned(),
+                            location: Location {
+                                path: check.source_path.clone(),
+                                line: None,
+                                column: None,
+                            },
+                            remediation: Some(
+                                "Move check behavior into check.checkleft/check_meta and publish a new package version."
+                                    .to_owned(),
+                            ),
+                        };
+                        let key = (
+                            diagnostic.check_id.clone(),
+                            diagnostic.location.path.clone(),
+                            diagnostic.location.line,
+                            diagnostic.location.column,
+                            diagnostic.message.clone(),
+                            diagnostic.remediation.clone().unwrap_or_default(),
+                        );
+                        grouped_diagnostics
+                            .entry(key)
+                            .or_insert_with(|| config_diagnostic_result(&diagnostic));
+                    }
                     continue;
                 }
                 let policy = self.resolve_effective_policy(check);
@@ -1425,7 +1477,7 @@ impl Runner {
                 }
             }
         }
-        self.schedule_local_starlark_runs(changeset, &mut grouped_runs, &mut grouped_diagnostics);
+        self.schedule_local_starlark_runs(&starlark_changeset, &mut grouped_runs, &mut grouped_diagnostics);
 
         Ok(ScheduledRuns {
             runs: grouped_runs.into_values().collect(),
@@ -1999,6 +2051,10 @@ fn explicit_selection_matches(explicit_check_ids: &BTreeSet<String>, check_id: &
             .any(|suffix| suffix == check_id)
 }
 
+fn toml_value_is_empty_table(value: &toml::Value) -> bool {
+    matches!(value, toml::Value::Table(table) if table.is_empty())
+}
+
 fn starlark_package_selection_key(package: &StarlarkPackageConfig) -> String {
     format!(
         "{:?}\0{}\0{}\0{}",
@@ -2301,6 +2357,12 @@ fn starlark_applies_to_path(applies_to: &GlobSet, path: &Path, scope: &Path) -> 
 
 fn should_skip_file(changed_file: &ChangedFile, resolved: &crate::config::ResolvedChecks) -> bool {
     is_checks_config_file(&changed_file.path) && !resolved.include_config_files()
+}
+
+fn global_excludes_file(changed_file: &ChangedFile, resolved: &crate::config::ResolvedChecks) -> bool {
+    ExclusionMatcher::new(resolved.global_exclude_patterns())
+        .map(|matcher| matcher.is_excluded(&changed_file.path))
+        .unwrap_or(false)
 }
 
 fn config_diagnostic_result(diagnostic: &ConfigDiagnostic) -> CheckResult {
