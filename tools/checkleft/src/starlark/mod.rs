@@ -4,6 +4,7 @@
 //! `.checkleft` file against a text evolution context. Discovery, package
 //! manifests, richer adapters, and fix evaluation build on this foundation.
 
+pub mod adapter;
 pub mod discovery;
 mod evaluator;
 mod loader;

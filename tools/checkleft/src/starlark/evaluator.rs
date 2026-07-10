@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use globset::{Glob, GlobSetBuilder};
+use globset::Glob;
 use regex::Regex;
 use starlark::environment::{GlobalsBuilder, Module};
 use starlark::eval::Evaluator;
@@ -12,8 +12,9 @@ use starlark::values::structs::{AllocStruct, StructRef};
 use starlark::values::{Heap, UnpackValue, Value};
 
 use crate::check::{Check, ConfiguredCheck};
-use crate::input::{ChangeKind, ChangeSet, ChangedFile, SourceTree, TreeVersion};
+use crate::input::{ChangeSet, SourceTree};
 use crate::output::{CheckResult, Finding, Location, Severity};
+use crate::starlark::adapter::{AdapterInput, AdapterPreparedOutput, AdapterRegistry};
 use crate::starlark::loader::{CheckleftFileLoader, LoadContext};
 
 #[derive(Debug, Clone)]
@@ -63,24 +64,42 @@ impl StarlarkCheckRunner {
     }
 
     pub fn evaluate_text(&self, changeset: &ChangeSet, tree: &dyn SourceTree) -> Result<CheckResult> {
-        Module::with_temp_heap(|module| {
-            let parsed = ParsedCheck::parse(&self.source)?;
-            let package_scope = self.source.load_context.as_ref().map(|context| {
-                context
-                    .checkleft_root
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .map(Path::to_path_buf)
-                    .unwrap_or_default()
-            });
-            let files = collect_text_file_pairs(changeset, tree, &parsed.meta.applies_to, package_scope.as_deref())?;
-            if files.is_empty() {
-                return Ok(CheckResult {
-                    check_id: self.source.id.clone(),
-                    findings: Vec::new(),
-                });
-            }
+        let parsed = ParsedCheck::parse(&self.source)?;
+        let package_scope = self.package_scope();
+        let output = AdapterRegistry::with_builtin_adapters()
+            .require("text")?
+            .prepare(AdapterInput {
+                changeset,
+                tree,
+                applies_to: &parsed.meta.applies_to,
+                package_scope: package_scope.as_deref(),
+            })?;
+        self.evaluate_parsed_adapter(parsed, &output, tree)
+    }
 
+    pub(crate) fn evaluate_prepared_adapter(
+        &self,
+        output: &AdapterPreparedOutput,
+        tree: &dyn SourceTree,
+    ) -> Result<CheckResult> {
+        let parsed = ParsedCheck::parse(&self.source)?;
+        self.evaluate_parsed_adapter(parsed, output, tree)
+    }
+
+    fn evaluate_parsed_adapter(
+        &self,
+        parsed: ParsedCheck,
+        output: &AdapterPreparedOutput,
+        tree: &dyn SourceTree,
+    ) -> Result<CheckResult> {
+        if output.is_empty() {
+            return Ok(CheckResult {
+                check_id: self.source.id.clone(),
+                findings: Vec::new(),
+            });
+        }
+
+        Module::with_temp_heap(|module| {
             let globals = starlark_globals();
             let findings = if let Some(context) = &self.source.load_context {
                 let loader = CheckleftFileLoader {
@@ -97,7 +116,7 @@ impl StarlarkCheckRunner {
                 let check = module
                     .get("check")
                     .ok_or_else(|| anyhow!("{} does not define check(ctx)", self.source.path.display()))?;
-                let ctx = alloc_text_context(eval.heap(), &files);
+                let ctx = output.alloc_context(eval.heap());
                 let result = eval
                     .eval_function(check, &[ctx], &[])
                     .map_err(|e| anyhow!(e.to_string()))
@@ -112,7 +131,7 @@ impl StarlarkCheckRunner {
                 let check = module
                     .get("check")
                     .ok_or_else(|| anyhow!("{} does not define check(ctx)", self.source.path.display()))?;
-                let ctx = alloc_text_context(eval.heap(), &files);
+                let ctx = output.alloc_context(eval.heap());
                 let result = eval
                     .eval_function(check, &[ctx], &[])
                     .map_err(|e| anyhow!(e.to_string()))
@@ -123,6 +142,17 @@ impl StarlarkCheckRunner {
                 check_id: self.source.id.clone(),
                 findings,
             })
+        })
+    }
+
+    pub(crate) fn package_scope(&self) -> Option<PathBuf> {
+        self.source.load_context.as_ref().map(|context| {
+            context
+                .checkleft_root
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(Path::to_path_buf)
+                .unwrap_or_default()
         })
     }
 }
@@ -203,118 +233,6 @@ impl CheckMeta {
         }
         Ok(Self { applies_to })
     }
-}
-
-#[derive(Debug)]
-struct TextFilePair {
-    path: PathBuf,
-    before: Option<TextFile>,
-    after: Option<TextFile>,
-    added_lines: Vec<Line>,
-    removed_lines: Vec<Line>,
-    change_kind: ChangeKind,
-}
-
-#[derive(Debug)]
-struct TextFile {
-    lines: Vec<Line>,
-}
-
-#[derive(Debug, Clone)]
-struct Line {
-    number: u32,
-    text: String,
-}
-
-fn collect_text_file_pairs(
-    changeset: &ChangeSet,
-    tree: &dyn SourceTree,
-    applies_to: &[String],
-    package_scope: Option<&Path>,
-) -> Result<Vec<TextFilePair>> {
-    let glob_set = build_glob_set(applies_to)?;
-    let mut files = Vec::new();
-    for changed in &changeset.changed_files {
-        if !matches_applies_to(&glob_set, &changed.path, package_scope) {
-            continue;
-        }
-        let before = read_text_file(tree, before_path(changed), TreeVersion::Base).transpose()?;
-        let after = read_text_file(tree, &changed.path, TreeVersion::Current).transpose()?;
-        let (added_lines, removed_lines) = line_delta(before.as_ref(), after.as_ref());
-        files.push(TextFilePair {
-            path: changed.path.clone(),
-            before,
-            after,
-            added_lines,
-            removed_lines,
-            change_kind: changed.kind,
-        });
-    }
-    Ok(files)
-}
-
-fn matches_applies_to(glob_set: &globset::GlobSet, path: &Path, package_scope: Option<&Path>) -> bool {
-    if glob_set.is_match(path) {
-        return true;
-    }
-    let Some(scope) = package_scope else {
-        return false;
-    };
-    if scope.as_os_str().is_empty() {
-        return false;
-    }
-    path.strip_prefix(scope)
-        .map(|relative| glob_set.is_match(relative))
-        .unwrap_or(false)
-}
-
-fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
-    }
-    builder.build().context("failed to build applies_to glob set")
-}
-
-fn before_path(changed: &ChangedFile) -> &Path {
-    changed.old_path.as_deref().unwrap_or(&changed.path)
-}
-
-fn read_text_file(tree: &dyn SourceTree, path: &Path, version: TreeVersion) -> Option<Result<TextFile>> {
-    let bytes = match tree.read_file_versioned(path, version) {
-        Ok(bytes) => bytes,
-        Err(_) => return None,
-    };
-    Some(
-        String::from_utf8(bytes)
-            .with_context(|| format!("{} is not valid UTF-8", path.display()))
-            .map(|contents| TextFile {
-                lines: contents
-                    .lines()
-                    .enumerate()
-                    .map(|(idx, text)| Line {
-                        number: (idx + 1) as u32,
-                        text: text.to_owned(),
-                    })
-                    .collect(),
-            }),
-    )
-}
-
-fn line_delta(before: Option<&TextFile>, after: Option<&TextFile>) -> (Vec<Line>, Vec<Line>) {
-    let before_lines = before.map(|f| f.lines.as_slice()).unwrap_or(&[]);
-    let after_lines = after.map(|f| f.lines.as_slice()).unwrap_or(&[]);
-    let added = after_lines
-        .iter()
-        .filter(|line| !before_lines.iter().any(|old| old.text == line.text))
-        .cloned()
-        .collect();
-    let removed = before_lines
-        .iter()
-        .filter(|line| !after_lines.iter().any(|new| new.text == line.text))
-        .cloned()
-        .collect();
-    (added, removed)
 }
 
 fn starlark_globals() -> starlark::environment::Globals {
@@ -428,68 +346,6 @@ fn alloc_finding<'v>(
     ])))
 }
 
-fn alloc_text_context<'v>(heap: Heap<'v>, files: &[TextFilePair]) -> Value<'v> {
-    let file_values = files
-        .iter()
-        .map(|file| alloc_text_file_pair(heap, file))
-        .collect::<Vec<_>>();
-    heap.alloc(AllocStruct([("files", heap.alloc(file_values))]))
-}
-
-fn alloc_text_file_pair<'v>(heap: Heap<'v>, file: &TextFilePair) -> Value<'v> {
-    let before = file
-        .before
-        .as_ref()
-        .map_or_else(Value::new_none, |f| alloc_text_file(heap, f));
-    let after = file
-        .after
-        .as_ref()
-        .map_or_else(Value::new_none, |f| alloc_text_file(heap, f));
-    let added_lines = file
-        .added_lines
-        .iter()
-        .map(|line| alloc_line(heap, line))
-        .collect::<Vec<_>>();
-    let removed_lines = file
-        .removed_lines
-        .iter()
-        .map(|line| alloc_line(heap, line))
-        .collect::<Vec<_>>();
-    heap.alloc(AllocStruct([
-        ("path", heap.alloc(file.path.to_string_lossy().to_string())),
-        ("before", before),
-        ("after", after),
-        ("added_lines", heap.alloc(added_lines)),
-        ("removed_lines", heap.alloc(removed_lines)),
-        ("change_kind", heap.alloc(change_kind_name(file.change_kind))),
-    ]))
-}
-
-fn alloc_text_file<'v>(heap: Heap<'v>, file: &TextFile) -> Value<'v> {
-    let lines = file.lines.iter().map(|line| alloc_line(heap, line)).collect::<Vec<_>>();
-    heap.alloc(AllocStruct([
-        ("lines", heap.alloc(lines)),
-        ("line_count", heap.alloc(file.lines.len() as i32)),
-    ]))
-}
-
-fn alloc_line<'v>(heap: Heap<'v>, line: &Line) -> Value<'v> {
-    heap.alloc(AllocStruct([
-        ("number", heap.alloc(line.number as i32)),
-        ("text", heap.alloc(line.text.clone())),
-    ]))
-}
-
-fn change_kind_name(kind: ChangeKind) -> String {
-    match kind {
-        ChangeKind::Added => "added",
-        ChangeKind::Modified => "modified",
-        ChangeKind::Deleted => "deleted",
-        ChangeKind::Renamed => "renamed",
-    }
-    .to_owned()
-}
-
 fn unpack_findings(value: Value<'_>) -> Result<Vec<Finding>> {
     let list = ListRef::from_value(value).ok_or_else(|| anyhow!("check(ctx) must return list[Finding]"))?;
     list.iter().map(unpack_finding).collect()
@@ -555,6 +411,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::input::{ChangeKind, ChangedFile, TreeVersion};
 
     #[derive(Default)]
     struct MapTree {
