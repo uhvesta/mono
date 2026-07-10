@@ -812,6 +812,92 @@ def check(ctx):
 }
 
 #[tokio::test]
+async fn runner_filters_starlark_package_files_by_activation_globs() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("notes/generated")).expect("create notes dir");
+    fs::create_dir_all(temp.path().join("docs")).expect("create docs dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checkleft_packages:
+  packages:
+    - source: path://central/checkleft
+      version: 0.1.0
+      mode: all
+      include:
+        - notes/**
+      exclude:
+        - notes/generated/**
+"#,
+    )
+    .expect("write CHECKS.yaml");
+    fs::write(
+        temp.path().join("central/checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path().join("central/checkleft/text/no_debug/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        findings.append(fail(
+            message = "checked " + file.path,
+            path = file.path,
+            line = 1,
+            column = 1,
+        ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    fs::write(temp.path().join("notes/example.txt"), "debug\n").expect("write included file");
+    fs::write(temp.path().join("notes/generated/example.txt"), "debug\n").expect("write excluded file");
+    fs::write(temp.path().join("docs/example.txt"), "debug\n").expect("write outside file");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![
+            ChangedFile {
+                path: PathBuf::from("notes/example.txt"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: PathBuf::from("notes/generated/example.txt"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: PathBuf::from("docs/example.txt"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "text/no_debug")
+        .expect("starlark result");
+    assert_eq!(result.findings.len(), 1, "expected only the included file: {results:?}");
+    assert_eq!(result.findings[0].message, "checked notes/example.txt");
+}
+
+#[tokio::test]
 async fn runner_applies_global_excludes_to_starlark_package_checks() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");

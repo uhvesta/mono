@@ -15,6 +15,8 @@ pub struct DiscoveredCheck {
     pub adapter: String,
     pub checkleft_root: PathBuf,
     pub scope_root: PathBuf,
+    pub activation_include_patterns: Vec<String>,
+    pub activation_exclude_patterns: Vec<String>,
     pub check_dir: PathBuf,
     pub check_path: PathBuf,
     pub fix_path: Option<PathBuf>,
@@ -214,6 +216,8 @@ fn parse_check_file(
         adapter,
         checkleft_root: checkleft_root.to_path_buf(),
         scope_root: default_scope_root(checkleft_root),
+        activation_include_patterns: vec!["**".to_owned()],
+        activation_exclude_patterns: Vec::new(),
         fix_path: tree
             .exists(&check_dir.join("fix.checkleft"))
             .then(|| check_dir.join("fix.checkleft")),
