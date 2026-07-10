@@ -112,6 +112,35 @@ Each directory with a `check.checkleft` is an independent check. Nesting is pure
 
 **Cross-package consumption — even within the same monorepo — goes through `CHECKS.yaml`.** A consumer selects packages and local path packages in validation policy. `checkleft-package.toml` never decides what another repo runs.
 
+**Routing rule: a changed file is checked by selected packages whose policy scope covers that file.** A selected package contributes its discovered checks only after the adapter's selectors match the file and `CHECKS.yaml` include/exclude policy allows it. Nested package roots can add checks for their selected subtree, but they do not remove or replace ancestor/root packages. Package-local `lib/` helpers are only loadable from checks in that same package; ancestor, sibling, child, and external package libraries are not importable.
+
+**Example: monorepo with cross-project consumption**
+
+```
+repo/
+├── CHECKS.yaml
+├── checks/
+│   ├── checkleft-package.toml
+│   └── proto/
+│       ├── evolution/
+│       │   └── check.checkleft
+│       └── internal_lint/
+│           └── check.checkleft
+├── a/b/c/
+│   ├── billing-checks/
+│   │   ├── checkleft-package.toml
+│   │   └── proto/
+│   │       ├── wire_compat/
+│   │       │   └── check.checkleft
+│   │       └── billing/
+│   │           └── check.checkleft
+│   └── service.proto
+├── a/b/d/
+│   └── api.proto
+```
+
+If `CHECKS.yaml` selects `path://checks` and `path://a/b/c/billing-checks`, then `a/b/d/api.proto` can run checks from both selected packages when adapter selectors and include/exclude policy match. Package selection composes additively; it does not create package dependencies or importable library edges.
+
 **Key principles:**
 
 - `checkleft-package.toml` is producer metadata, not consumer validation policy.
@@ -1324,6 +1353,8 @@ testdata/field_removal/
 ```
 
 The test runner applies the fix edits to the `after/` workspace and diffs the result against `expected_fix/`. Any mismatch fails the test with a unified diff.
+
+If `expected_fix/` is present but the check has no `fix.checkleft`, the test fails. If `fix.checkleft` exists but the case has no `expected_fix/`, the runner only asserts findings for that case and does not execute the fix.
 
 ### 13.5 Running tests
 
