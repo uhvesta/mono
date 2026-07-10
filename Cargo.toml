@@ -83,6 +83,7 @@ syn = { version = "2.0.117", features = ["full"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 sha2 = { version = "0.10.9", features = ["asm"] }
 shell-words = "1.0"
+starlark = "0.14.2"
 tempfile = "3.25.0"
 thiserror = "1.0"
 tar = "0.4.45"
