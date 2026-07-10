@@ -10,6 +10,6 @@ rust_library(
         "//tools/checkleft/checks/rust/giant-structs-create:__pkg__",
     ],
     deps = [
-        "@@rules_rust++crate+mono_crates__syn-2.0.117//:syn",
+        "@@rules_rust++crate+mono_crates__syn-2.0.118//:syn",
     ] + all_crate_deps(normal = True),
 )

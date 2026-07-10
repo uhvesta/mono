@@ -6,8 +6,10 @@ use anyhow::{Result, anyhow};
 use starlark::values::{Heap, Value};
 
 use crate::input::{ChangeSet, SourceTree};
+use crate::starlark::adapter::proto::{ProtoAdapter, ProtoAdapterOutput};
 use crate::starlark::adapter::text::{TextAdapter, TextAdapterOutput};
 
+pub(crate) mod proto;
 pub(crate) mod text;
 
 pub(crate) struct AdapterInput<'a> {
@@ -25,18 +27,21 @@ pub(crate) trait FormatAdapter: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) enum AdapterPreparedOutput {
+    Proto(ProtoAdapterOutput),
     Text(TextAdapterOutput),
 }
 
 impl AdapterPreparedOutput {
     pub fn is_empty(&self) -> bool {
         match self {
+            Self::Proto(output) => output.is_empty(),
             Self::Text(output) => output.is_empty(),
         }
     }
 
     pub fn alloc_context<'v>(&self, heap: Heap<'v>) -> Value<'v> {
         match self {
+            Self::Proto(output) => output.alloc_context(heap),
             Self::Text(output) => output.alloc_context(heap),
         }
     }
@@ -50,6 +55,7 @@ pub(crate) struct AdapterRegistry {
 impl AdapterRegistry {
     pub fn with_builtin_adapters() -> Self {
         let mut registry = Self::default();
+        registry.register(ProtoAdapter);
         registry.register(TextAdapter);
         registry
     }
