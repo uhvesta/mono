@@ -1,0 +1,5 @@
+[[findings]]
+severity = "fail"
+message_contains = "checkleft package version downgraded"
+path = "CHECKS.yaml"
+line = 1

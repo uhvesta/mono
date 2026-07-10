@@ -1,0 +1,5 @@
+checkleft_packages:
+  version_sets:
+    - source: registry://checkleft-hub/acme-baseline
+      version: 2025.12.1
+      sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
