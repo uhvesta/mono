@@ -2,6 +2,7 @@ load("@mono_crates//:defs.bzl", "all_crate_deps")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("//tools/checkleft/musl:transition.bzl", "musl_binary")
 load("//tools/checkleft/wasm:defs.bzl", "precompiled_cwasm_dir")
+load("//tools/checkleft/bazel:defs.bzl", "checkleft_toolchain", "starlark_check_test")
 
 exports_files(["Cargo.toml"])
 
@@ -63,6 +64,18 @@ rust_binary(
     deps = [
         ":checkleft_lib",
     ] + all_crate_deps(normal = True),
+)
+
+checkleft_toolchain(
+    name = "checkleft_toolchain_impl",
+    checkleft = ":checkleft",
+)
+
+toolchain(
+    name = "checkleft_toolchain",
+    toolchain = ":checkleft_toolchain_impl",
+    toolchain_type = "//tools/checkleft/bazel:toolchain_type",
+    visibility = ["//visibility:public"],
 )
 
 # Host tool: precompile each bundled wasm check component to an AOT `.cwasm`
@@ -205,4 +218,30 @@ rust_test(
         normal = True,
         normal_dev = True,
     ),
+)
+
+rust_test(
+    name = "starlark_text_package_test",
+    size = "small",
+    srcs = ["tests/starlark_text_package_test.rs"],
+    data = glob(["tests/fixtures/starlark_text_package/**"]),
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":checkleft_lib",
+        "@rules_rust//rust/runfiles",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+starlark_check_test(
+    name = "starlark_text_fixture_checkleft_test",
+    srcs = glob(["tests/fixtures/starlark_text_package/**"]),
+    package_root = "tests/fixtures/starlark_text_package/checkleft",
+    selector = "text/no_debug/debug_added",
 )

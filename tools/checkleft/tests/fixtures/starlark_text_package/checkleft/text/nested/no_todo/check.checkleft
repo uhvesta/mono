@@ -1,0 +1,14 @@
+check_meta(applies_to = ["**/*.txt"])
+
+def check(ctx):
+    findings = []
+    for file in ctx.files:
+        for line in file.added_lines:
+            if "TODO" in line.text:
+                findings.append(fail_but_overridable(
+                    message = "TODO marker",
+                    path = file.path,
+                    line = line.number,
+                    column = 1,
+                ))
+    return findings

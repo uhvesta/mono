@@ -43,6 +43,8 @@ register_toolchains(
     "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
 )
 
+register_toolchains("//tools/checkleft:checkleft_toolchain")
+
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
 rust.toolchain(
     edition = "2024",
