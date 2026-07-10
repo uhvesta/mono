@@ -15,7 +15,7 @@ fn runs_checked_in_text_package_fixtures() {
     let result = run_package_tests(&fixture_root, Path::new("checkleft"), &StarlarkTestOptions::default())
         .expect("run Starlark package tests");
 
-    assert_eq!(result.cases.len(), 3);
+    assert_eq!(result.cases.len(), 4);
     for case in result.cases {
         assert!(
             case.passed,

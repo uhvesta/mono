@@ -607,6 +607,71 @@ message User {
 }
 
 #[tokio::test]
+async fn runner_executes_starlark_module_json_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("checkleft/module_json/required_fields")).expect("create check dirs");
+    fs::create_dir_all(temp.path().join("services/auth")).expect("create module dir");
+    fs::write(
+        temp.path().join("checkleft/package.toml"),
+        r#"
+[package]
+name = "local/checks"
+version = "0.1.0"
+"#,
+    )
+    .expect("write package manifest");
+    fs::write(
+        temp.path()
+            .join("checkleft/module_json/required_fields/check.checkleft"),
+        r#"
+check_meta(applies_to = ["**/module.json"])
+
+def check(ctx):
+    findings = []
+    for pair in ctx.files:
+        if pair.after != None and pair.after.version == "":
+            findings.append(fail(
+                message = "module.json version is required",
+                path = pair.path,
+            ))
+    return findings
+"#,
+    )
+    .expect("write check");
+    fs::write(
+        temp.path().join("services/auth/module.json"),
+        r#"
+{
+  "name": "auth",
+  "version": ""
+}
+"#,
+    )
+    .expect("write module.json");
+
+    let runner = Runner::new(
+        Arc::new(CheckRegistry::new()),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![ChangedFile {
+            path: PathBuf::from("services/auth/module.json"),
+            kind: ChangeKind::Added,
+            old_path: None,
+        }]))
+        .await
+        .expect("run checks");
+
+    let result = results
+        .iter()
+        .find(|result| result.check_id == "module_json/required_fields")
+        .expect("starlark module_json result");
+    assert_eq!(result.findings.len(), 1);
+    assert_eq!(result.findings[0].message, "module.json version is required");
+}
+
+#[tokio::test]
 async fn runner_executes_starlark_text_check_selected_by_checks_yaml_package() {
     let temp = tempdir().expect("create temp dir");
     fs::create_dir_all(temp.path().join("central/checkleft/text/no_debug")).expect("create check dirs");

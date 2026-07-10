@@ -1,0 +1,8 @@
+{
+  "name": "auth",
+  "version": "",
+  "dependencies": {
+    "core": "^1.1.0"
+  },
+  "team": "identity"
+}
