@@ -15,11 +15,11 @@ relative to the previous node branch. The same DAG can be mirrored to
 - Validate each node with focused `bazel test` targets before pushing.
 - When the spec or operating model changes, update the earliest affected node
   first and propagate the change through every dependent branch.
-- Keep `checkleft-package.toml` producer-only: package identity, publishing
-  metadata, and version-set membership.
-- Keep validation policy in `CHECKS.yaml`: selected packages/version sets, local
+- Keep `checkleft-package.toml` producer-only: package identity and publishing
+  metadata.
+- Keep validation policy in `CHECKS.yaml`: selected packages, local
   package paths, path scoping, excludes, severity, and policy.
-- Exact refs plus hashes on package and version-set selections provide the
+- Exact refs plus hashes on package selections provide the
   reproducibility boundary. Hash pins are canonical lowercase 64-hex SHA-256
   digests.
 - Use Bazel for check-author integration: fixture tests should be schedulable by
@@ -43,6 +43,13 @@ relative to the previous node branch. The same DAG can be mirrored to
 | 11 | `uhvesta/mono#3` | `abarzega/starlark-checks-fixes` | `abarzega/starlark-checks-proto-adapter` | Proto adapter |
 | 12 | `uhvesta/mono#14` | `abarzega/starlark-checks-proto-adapter` | `abarzega/starlark-checks-module-json-adapter` | `module_json` adapter |
 | 13 | `uhvesta/mono#15` | `abarzega/starlark-checks-module-json-adapter` | `abarzega/starlark-checks-java-adapter` | Java adapter |
+| 14 | `uhvesta/mono#16` | `abarzega/starlark-checks-java-adapter` | `abarzega/starlark-checks-git-resolver` | Git package resolver |
+| 15 | `uhvesta/mono#17` | `abarzega/starlark-checks-git-resolver` | `abarzega/starlark-checks-routing-selection` | Routing and exact package selection |
+| 16 | `uhvesta/mono#18` | `abarzega/starlark-checks-routing-selection` | `abarzega/starlark-checks-selector-policy` | Remove selector-local Starlark config |
+| 17 | `uhvesta/mono#19` | `abarzega/starlark-checks-selector-policy` | `abarzega/starlark-checks-bazel-author-tests` | Harden Bazel author tests |
+| 18 | `uhvesta/mono#20` | `abarzega/starlark-checks-bazel-author-tests` | `abarzega/starlark-checks-enable-spec` | Full enablement model and Linguist mapping |
+| 19 | `uhvesta/mono#21` | `abarzega/starlark-checks-enable-spec` | `abarzega/starlark-checks-package-activation-globs` | Package path policy |
+| 20 | `uhvesta/mono#22` | `abarzega/starlark-checks-package-activation-globs` | `abarzega/starlark-checks-adapter-file-selectors` | Adapter `ext`/`name` selectors and uniqueness |
 
 ## Node Scopes
 
@@ -52,7 +59,7 @@ Scope:
 - Document the Starlark-backed checkleft API.
 - Define the split between producer packaging metadata and consumer validation
   policy.
-- Specify package distribution, version sets, text package tests, fixes, Bazel
+- Specify package distribution, text package tests, fixes, Bazel
   check-author integration, and adapter semantics.
 
 Required verification:
@@ -76,7 +83,7 @@ Required verification:
 
 Scope:
 - Parse `checkleft-package.toml` as producer metadata only.
-- Discover local checks from `checkleft/<adapter>/<nested/name>/check.checkleft`.
+- Discover local checks from `<package_root>/<adapter>/<nested/name>/check.checkleft`.
 - Validate unknown adapters, missing package manifests, and invalid `.checkleft`
   placement.
 - Add changeset-scoped ancestor discovery without full-repo walking.
@@ -125,7 +132,7 @@ Required verification:
 Scope:
 - Add `checkleft test` for check-author package fixtures.
 - Preserve path-based author semantics:
-  `checkleft/<adapter>/<nested/name>/check.checkleft` plus sibling
+  `<package_root>/<adapter>/<nested/name>/check.checkleft` plus sibling
   `testdata/<case>/`.
 - Run fixture cases with `before/`, `after/`, `expected.toml`, and optional
   `expected_fix/`.
@@ -133,7 +140,8 @@ Scope:
   actual findings.
 - Add `checkleft_test` Bazel author-test integration and use it for the
   checked-in fixture package.
-- Add the Checkleft Bazel toolchain used by author-test and validation rules.
+- Use the compiled-from-source `//tools/checkleft:checkleft` binary in
+  author-test and validation rules.
 - Exercise the full text path: nested check IDs, lib loading, expected findings,
   fixes when present, and path scoping.
 
@@ -143,12 +151,13 @@ Required verification:
 ### Node 7: `CHECKS.yaml` Activation
 
 Scope:
-- Add Starlark package and version-set selection to `CHECKS.yaml`.
+- Add Starlark package selection to `CHECKS.yaml`.
 - Support local path package directories and local `.tar.gz` package archives
   for iteration.
 - Keep package selection, path scoping, and excludes in consumer validation
   policy.
-- Make version-set selection activate all checks from all included packages.
+- Selecting a package enables its exported checks; no transitive package
+  activation.
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test`
@@ -170,7 +179,7 @@ Required verification:
 
 Scope:
 - Add a Starlark policy guard check targeting `CHECKS.yaml` and `CHECKS.toml`.
-- Fail downgrades of selected package/version-set versions.
+- Fail downgrades of selected package versions.
 - Fail removal of hardcoded protected entries.
 - Keep this policy as a normal Starlark check so organizations can supply it
   through their own always-merged root policy.
@@ -222,3 +231,90 @@ Scope:
 
 Required verification:
 - `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 14: Git Package Resolver
+
+Scope:
+- Resolve `git://` package refs through archive bytes pinned by `sha256`.
+- Strip repository package roots into the same archive-root layout used by
+  package tarballs.
+- Preserve local `path://` directory and archive iteration.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 15: Routing And Exact Package Selection
+
+Scope:
+- Clarify and enforce exact package selection keys: source, version, and
+  `sha256`.
+- Keep package resolution deterministic without a lockfile or
+  transitive dependency solver.
+- Preserve duplicate-ref de-duplication only for exact equivalent refs.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 16: Selector Policy Cleanup
+
+Scope:
+- Remove configurable/embeddable Starlark package config from `CHECKS.yaml`.
+- Treat `checks:` entries for Starlark packages as activation/path selectors
+  only.
+- Reject selector-local `config` for Starlark package checks.
+- Apply top-level global excludes before Starlark package scheduling.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 17: Bazel Author-Test Hardening
+
+Scope:
+- Add Bazel coverage for full text package authoring.
+- Exercise `checkleft test` all-test discovery, package archive construction,
+  `fix.checkleft` inclusion, libs, nested paths, and path-based fixture
+  semantics.
+- Keep custom-check author iteration through Bazel first-class.
+
+Required verification:
+- `bazel test //tools/checkleft:starlark_text_fixture_checkleft_all_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test`
+
+### Node 18: Enablement Model Spec And Linguist Mapping
+
+Scope:
+- Document the full Starlark enablement model across package selection, path
+  policy, adapter selectors, and global excludes.
+- Clarify the public API as producer package identity, check/fix
+  implementation, consumer activation, and Rust adapter registration.
+- Add `.gitattributes` so GitHub Linguist treats `*.checkleft` as Starlark.
+
+Required verification:
+- `bazel test //tools/checkleft:starlark_text_fixture_checkleft_all_test //tools/checkleft:starlark_text_fixture_package_archive_test`
+
+### Node 19: Package Path Policy
+
+Scope:
+- Parse `include` and `exclude` on `CHECKS.yaml` Starlark check policy entries.
+- Normalize path globs relative to the declaring `CHECKS.yaml` directory.
+- Apply path globs when building each Starlark check changeset, for checks whose
+  policy allows consumer path narrowing.
+- Keep exact duplicate package refs de-duplicated; package selection is not
+  scoped by path policy.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test`
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test //tools/checkleft:starlark_text_package_test //tools/checkleft:starlark_text_fixture_checkleft_test //tools/checkleft:starlark_text_fixture_package_archive_test //tools/checkleft:checks_policy_guard_package_test`
+
+### Node 20: Adapter File Selectors
+
+Scope:
+- Replace adapter parseable globs with explicit file selectors: `ext:
+  <extension>` and `name: <basename>`.
+- Enforce selector uniqueness at adapter registry startup: two adapters cannot
+  claim the same extension or basename.
+- Filter changed files through adapter selectors before adapter preparation.
+- Document and test examples: `ext: proto` matches `a.proto`; `name:
+  module-info.json` matches `a/b/c/module-info.json`.
+
+Required verification:
+- `bazel test //tools/checkleft:checkleft_lib_test //tools/checkleft:checkleft_bin_test`
