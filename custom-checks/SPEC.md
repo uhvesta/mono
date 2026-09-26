@@ -46,12 +46,11 @@ The host restricts the process and its children to:
 - Declared network URLs only; no other external IPC or inherited sockets.
 - A fixed environment and execution limits; no host `PATH`, home, or credentials.
 
-Use macOS sandbox policies or Linux namespaces/Landlock. Enforce network rules at
-the URL level, not just host/port; block bypasses and unlisted redirects. Fail
+Checkleft will use macOS sandbox policies or Linux namespaces/Landlock. Enforce network rules at
+the URL level, not just host/port; block bypasses, it only isolates which networks the client reaches out to. Fail
 preparation if the required restrictions cannot be enforced.
 
-Offline results must be repeatable for the same inputs and runtime. Network-enabled
-runs are not cached, since responses can change. The host also validates the protocol.
+All checks must be reproducible.
 
 ## One input layout
 
@@ -68,28 +67,33 @@ output/                           # initially empty
 ```
 
 Run once for the selected files; skip an empty selection. Match either path of a
-rename. `always_read` files cannot receive findings or fixes unless also selected.
+rename or copy. `always_read` files cannot receive findings or fixes unless also selected.
 
-`change.json` identifies the selected files:
+`change.json` lists the selected entries from the same Git diff as `diff.patch`.
+It is a JSON array with no version field:
 
 ```json
-{
-  "schema_version": 1,
-  "files": [
-    { "before_path": "api/x.proto", "after_path": "api/x.proto" },
-    { "before_path": null, "after_path": "api/new.proto" },
-    { "before_path": "api/gone.proto", "after_path": null },
-    { "before_path": "api/old.proto", "after_path": "api/renamed.proto" }
-  ]
-}
+[
+  { "status": "M", "before_path": "api/x.proto", "after_path": "api/x.proto" },
+  { "status": "A", "before_path": null, "after_path": "api/new.proto" },
+  { "status": "D", "before_path": "api/gone.proto", "after_path": null },
+  { "status": "R", "before_path": "api/old.proto", "after_path": "api/renamed.proto" },
+  { "status": "C", "before_path": "api/source.proto", "after_path": "api/copied.proto" }
+]
 ```
 
-Paths are relative to `before/` and `after/`. Null marks an absent side; at least
-one side must exist. Freeze complete file bytes, current `always_read` files, and
-a matching before-to-after patch. Missing content or a requested baseline is an error.
+`status` uses [Git's status letters](https://git-scm.com/docs/git-diff#_raw_output_format):
+`A` added, `D` deleted, `M` modified, `R` renamed, `C` copied, `T` type changed,
+without similarity scores. Include binary and mode-only changes too; `diff.patch`
+contains the hunks and Git headers. Unmerged files fail preparation.
+
+Paths are relative to `before/` and `after/`. Null marks an absent side: additions
+only have after content; deletions only have before content. Both paths are required
+for other statuses. Freeze complete file bytes, current `always_read` files, and
+the matching before-to-after patch. Missing content or a requested baseline is an error.
 
 Content-only checks read `after/`. A full-code scan supplies identical before/after
-files and an empty patch. Bundle or `always_read` changes rerun all matching files
+files with `status: null` and an empty patch. Bundle or `always_read` changes rerun all matching files
 and invalidate cached results. Identify each result by `after_path`, or `before_path`
 for deletions.
 
@@ -134,7 +138,7 @@ For a removed field in `api/x.proto`:
   "schema_version": 1,
   "findings": [
     {
-      "severity": "error",
+      "severity": "blocking",
       "message": "Field customer_id was removed.",
       "location": { "side": "before", "line": 12 }
     }
@@ -142,7 +146,12 @@ For a removed field in `api/x.proto`:
 }
 ```
 
-Require `severity` (`error`, `warning`, `info`) and `message`. Optional fields:
+Require `severity` and `message`. The only severities are:
+
+- `blocking`: fails validation.
+- `shadow`: experimental finding collected as telemetry; never fails validation.
+
+Optional fields:
 
 - `location`: 1-based `line`, optional inclusive `end_line`, optional 1-based UTF-8
   byte `column` on the start line, and `side` (default `after`). Omit for a whole file.
@@ -155,17 +164,17 @@ A report for `docs/a.txt` can use a column, line range, or whole-file location:
   "schema_version": 1,
   "findings": [
     {
-      "severity": "warning",
+      "severity": "blocking",
       "message": "Remove trailing whitespace.",
       "location": { "line": 2, "column": 5 },
       "fixable": true
     },
     {
-      "severity": "info",
+      "severity": "shadow",
       "message": "Review this paragraph.",
       "location": { "line": 3, "end_line": 4 }
     },
-    { "severity": "info", "message": "Prefer a shorter file." }
+    { "severity": "shadow", "message": "Prefer a shorter file." }
   ]
 }
 ```
@@ -183,13 +192,14 @@ Every completed run writes `output/result.json`:
 
 Report and replacement paths are relative to `output/`.
 `findings` here is for whole-change findings without locations, e.g.
-`{"severity":"error","message":"A migration note is required."}`.
+`{"severity":"blocking","message":"A migration note is required."}`.
 Arrays default to empty: `{"schema_version":1}` means a clean run. Files without
 findings need no report. Reject missing/unlisted reports, missing `result.json`,
 bad schemas or locations, duplicate files, and out-of-scope paths.
 
-Exit `0` means completed, even with error findings. Nonzero, timeout, or crash means
-execution failed. Checkleft decides pass/fail. Stdout/stderr are logs. Preserve
+Exit `0` means completed, even with blocking findings. Nonzero, timeout, or crash means
+execution failed. Checkleft fails validation if any finding is `blocking`; a run with
+only `shadow` findings passes. Stdout/stderr are logs. Preserve
 before-side findings through added-line filters; display a summary if needed.
 
 ## Optional autofix through the same entry point
