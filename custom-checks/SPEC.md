@@ -1,64 +1,57 @@
 # Custom checks: process protocol v1
 
-Status: proposed extension API. Existing checkleft configuration and reporting
-remain supported. MUST and MAY describe required and optional behavior.
+Proposed extension API. Existing checkleft configuration and reporting still apply.
 
 ## One bundle per check
 
-Authors distribute the CLI, metadata, runtime dependencies, and supporting files
-together. Every bundle has this layout:
+Bundle the CLI and its runtime dependencies with this metadata:
 
 ```text
-check.yaml
-check                           # fixed executable entry point
-runtime/                        # packaged interpreter/libraries, if needed
-constant_inputs/
-  policy.json                   # check-specific configuration is an ordinary file
-  shared.proto                  # other explicitly packaged validation inputs
+check.toml
+check       # fixed executable entry point
 ```
 
-`check.yaml` contains exactly these required fields:
+`check.toml`:
 
-```yaml
-schema_version: 1
-id: proto/compatibility
-include: ["api/**/*.proto"]
+```toml
+schema_version = 1
+id = "proto/compatibility"
+include = ["api/**/*.proto"]
+always_read = ["proto/validator.toml"]
+network = ["https://google.com/some/endpoint"]
 ```
 
-Checkleft executes `check` directly. The bundle supplies any launcher needed for
-its implementation language. Metadata does not select an executable, subcommand,
-build system, or runtime mode. Packaging and installation belong to the host.
+Checkleft runs `check` directly. The bundle includes any launcher it needs.
 
-`constant_inputs/` is always present, possibly empty. Its packaged regular files
-are the explicit supporting input set: no repository globs, directory discovery,
-or separate configuration channel. Bundle contents are immutable and identified
-by digest, including executable, dependencies, metadata, and constant inputs.
+- `schema_version`, `id`, and a nonempty `include` are required.
+- `include` selects files using checkleft globs and exclusions; `**` matches all.
+- `always_read` lists exact repository-relative files to copy into every run,
+  such as configs or shared schemas. No globs or directories. Missing files fail
+  preparation. These files come from the repository, not the bundle.
+- `network` lists exact HTTPS URLs the process may request. Redirect targets must
+  also be listed. Omitted or empty means no network.
+
+`always_read` and `network` default to `[]`. The bundle is immutable and identified
+by digest. Configuration is an ordinary `always_read` file.
 
 ## Host and process boundaries
 
-Checkleft owns all planning: file selection, diff generation, snapshotting, input
-materialization, sandbox setup, execution, output validation, and fix application.
-The process implements only `validate` and `fix` using supplied files.
+Checkleft selects files, builds the input tree, runs the sandbox, reads results,
+and applies fixes. The CLI only validates or proposes fixes.
 
-The host MUST enforce these restrictions for the process and its descendants:
+The host restricts the process and its children to:
 
-- Read-only access to the bundle and frozen inputs, plus the host's explicitly
-  defined platform runtime. No ambient checkout, home directory, credentials,
-  inherited sockets, or executables found through the host's `PATH`.
-- Writes only to a fresh output directory and private scratch space.
-- No network access or IPC access to services outside the sandbox.
-- An explicit environment and host-enforced execution limits.
+- Read-only bundle, inputs, and a defined platform runtime.
+- Writes to fresh output and scratch directories only.
+- Declared network URLs only; no other external IPC or inherited sockets.
+- A fixed environment and execution limits; no host `PATH`, home, or credentials.
 
-macOS uses sandbox policies to restrict filesystem, process, and network access;
-these are access restrictions, not Linux-style filesystem/network namespaces.
-Linux may combine namespaces and Landlock to enforce the same boundary. The host
-MUST verify the required isolation is available and fail preparation otherwise.
-Landlock's available restrictions depend on the kernel ABI; it is not an assumed
-complete replacement for namespace isolation. See the [kernel documentation](https://docs.kernel.org/userspace-api/landlock.html).
+Use macOS sandbox policies or Linux namespaces/Landlock. Enforce network rules at
+the URL level, not just host/port; block bypasses and unlisted redirects. Fail
+preparation if the required restrictions cannot be enforced.
 
-The sandbox enforces access; the host enforces argument/output schemas. Authors
-MUST produce the same results for the same inputs and declared runtime, without
-depending on ambient time or randomness.
+Offline results must be repeatable for the same inputs and runtime. Network-enabled
+runs are not cached, since responses can change. The host also validates the protocol.
 
 ## One input layout
 
@@ -70,14 +63,12 @@ input/
   diff.patch
   before/api/x.proto
   after/api/x.proto
-  constant_inputs/              # read-only materialization of the bundled files
-output/                        # initially empty
+  always_read/proto/validator.toml
+output/                           # initially empty
 ```
 
-`include` uses existing checkleft glob/exclusion semantics. The host selects whole
-change records, matching either path of a rename, and invokes the check once for
-the selected set. Empty selection means no run. Supporting files are readable
-dependencies, not additional subjects on which findings or fixes may be emitted.
+Run once for the selected files; skip an empty selection. Match either path of a
+rename. `always_read` files cannot receive findings or fixes unless also selected.
 
 `change.json` identifies the selected files:
 
@@ -93,56 +84,50 @@ dependencies, not additional subjects on which findings or fixes may be emitted.
 }
 ```
 
-Paths refer to the respective `before/` and `after/` roots. Null means that side
-does not exist; both sides MUST NOT be null. Renames retain their original paths.
-Files contain complete bytes, including binary contents. The host freezes both
-sides and a consistent before-to-after patch, without user-specific diff drivers.
-Missing expected content or an unavailable requested baseline is an error.
+Paths are relative to `before/` and `after/`. Null marks an absent side; at least
+one side must exist. Freeze complete file bytes, current `always_read` files, and
+a matching before-to-after patch. Missing content or a requested baseline is an error.
 
-Content-only validators simply read `after/`; there is no input mode. For an
-explicit full-code scan, the host supplies identical before/after files and an
-empty patch. Bundle changes invalidate cached results and require revalidation of
-all matching subjects. Output paths identify a subject by its `after_path`, or
-`before_path` for a deletion.
+Content-only checks read `after/`. A full-code scan supplies identical before/after
+files and an empty patch. Bundle or `always_read` changes rerun all matching files
+and invalidate cached results. Identify each result by `after_path`, or `before_path`
+for deletions.
 
 ## Standard invocation, including argfiles
 
-Every bundled `check` MUST accept these two equivalent forms:
+Every `check` accepts both forms:
 
 ```sh
-bundle/check --checkleft-protocol-version 1 --checkleft-mode validate --checkleft-input input --checkleft-output output
-bundle/check --checkleft-argfile invocation.json
+check --checkleft-protocol-version 1 --checkleft-mode validate --checkleft-input input --checkleft-output output
+check --checkleft-argfile invocation.args
 ```
 
-The argfile is a UTF-8 JSON argument array, with no shell expansion:
+`invocation.args` is UTF-8, one literal argument per line. No JSON or shell parsing;
+spaces, quotes, and backslashes are literal. Accept LF or CRLF and an optional final
+newline. Arguments cannot contain newlines.
 
-```json
-[
-  "--checkleft-protocol-version",
-  "1",
-  "--checkleft-mode",
-  "validate",
-  "--checkleft-input",
-  "input",
-  "--checkleft-output",
-  "output"
-]
+```text
+--checkleft-protocol-version
+1
+--checkleft-mode
+validate
+--checkleft-input
+input
+--checkleft-output
+output
 ```
 
-All four direct flags are required exactly once. The only modes are `validate`
-and `fix`. Argfile support is mandatory; it replaces all direct flags and cannot
-nest. Unknown flags, versions, or modes are errors. The host MAY always use an
-argfile. `--checkleft-input` names the directory with the fixed layout above.
+The four flags appear exactly once, directly or in the argfile. Modes are `validate`
+and `fix`. Reject unknown flags/versions/modes, mixed forms, and nested argfiles.
+`--checkleft-input` names the input directory. The host may always use an argfile.
 
-Argument paths are relative to the invocation root. Protocol paths use `/`, MUST
-be relative, and MUST NOT contain `..`. V1 rejects symlink subjects, supporting
-files, and outputs. The host validates containment before reading or applying them.
+Argument paths are relative to the run directory. File paths use `/` and cannot
+be absolute or contain `..`. Reject symlink inputs and outputs; validate containment.
 
 ## Standard findings
 
-Write one JSON report per subject with findings to
-`output/validations/<subject>.checkleft.validation`. For example, removing a field
-from `api/x.proto` produces `output/validations/api/x.proto.checkleft.validation`:
+Write findings to `output/validations/<file>.checkleft.validation`.
+For a removed field in `api/x.proto`:
 
 ```json
 {
@@ -157,13 +142,13 @@ from `api/x.proto` produces `output/validations/api/x.proto.checkleft.validation
 }
 ```
 
-Each finding requires `severity` (`error`, `warning`, `info`) and `message`.
-Optional `location` requires a 1-based `line`; `end_line` is an optional inclusive
-range end. Optional `column` is a 1-based UTF-8 byte position on the start line.
-`side` defaults to `after`. Omit `location` for a whole-file finding.
-Optional `fixable` defaults to `false` and indicates an available automatic fix.
+Require `severity` (`error`, `warning`, `info`) and `message`. Optional fields:
 
-A text check reading only `after/docs/a.txt` can emit all three location forms:
+- `location`: 1-based `line`, optional inclusive `end_line`, optional 1-based UTF-8
+  byte `column` on the start line, and `side` (default `after`). Omit for a whole file.
+- `fixable`: whether an autofix exists; defaults to `false`.
+
+A report for `docs/a.txt` can use a column, line range, or whole-file location:
 
 ```json
 {
@@ -185,7 +170,7 @@ A text check reading only `after/docs/a.txt` can emit all three location forms:
 }
 ```
 
-Every completed invocation MUST write `output/result.json`, listing its reports:
+Every completed run writes `output/result.json`:
 
 ```json
 {
@@ -196,48 +181,32 @@ Every completed invocation MUST write `output/result.json`, listing its reports:
 }
 ```
 
-`findings` here uses the same schema without locations for whole-change findings,
-e.g. `{"severity":"error","message":"A migration note is required."}`.
-The three arrays default to empty; `{"schema_version":1}` is a completed clean run.
-Sparse per-file reports are allowed. Missing completion output, missing or unlisted
-reports, malformed documents, unknown fields, duplicate subjects, invalid locations,
-and out-of-scope paths are protocol errors. Stdout/stderr are logs only.
+Report and replacement paths are relative to `output/`.
+`findings` here is for whole-change findings without locations, e.g.
+`{"severity":"error","message":"A migration note is required."}`.
+Arrays default to empty: `{"schema_version":1}` means a clean run. Files without
+findings need no report. Reject missing/unlisted reports, missing `result.json`,
+bad schemas or locations, duplicate files, and out-of-scope paths.
 
-Exit `0` means execution completed, including when findings contain errors.
-Nonzero exit, timeout, or crash means execution failed. Checkleft decides pass/fail
-from findings and policy. Before-side findings MUST NOT be discarded by filters
-that only consider added after-side lines; use a summary when inline display is
-unavailable. Each invocation has its own output root.
+Exit `0` means completed, even with error findings. Nonzero, timeout, or crash means
+execution failed. Checkleft decides pass/fail. Stdout/stderr are logs. Preserve
+before-side findings through added-line filters; display a summary if needed.
 
 ## Optional autofix through the same entry point
 
-For the text example, the host invokes the same standard arguments with mode `fix`.
-The process writes complete replacement bytes to `output/fixes/docs/a.txt` and emits:
+Use the same arguments with mode `fix`. Write replacement bytes to
+`output/fixes/docs/a.txt` and list them in `output/result.json`:
 
 ```json
 { "schema_version": 1, "fixes": [{ "path": "docs/a.txt", "replacement": "fixes/docs/a.txt" }] }
 ```
 
-Both modes MUST be understood. Implementing fixes is optional: a check with no
-available fixes returns no replacements; the host reruns validation and retains
-remaining findings. There is no capability declaration or additional discovery call.
-`validate` MUST NOT emit fixes.
+Both modes must work; a check without autofixes returns no replacements.
+`validate` cannot emit fixes. Only replace selected existing after-side files;
+no creates, deletes, or renames. Unlisted files stay unchanged; empty bytes empty a file.
 
-Only selected existing after-side files may be replaced. V1 has no create/delete/
-rename fix operations. An absent replacement leaves a file unchanged; an empty
-replacement empties it. The host validates the entire proposal, rejects stale
-originals or unauthorized paths before writing, applies replacements, and reruns
-validation against the updated inputs. Processes never modify the checkout.
+Checkleft validates all fixes, rejects changed originals or unauthorized paths
+before writing, applies replacements, then reruns validation. The CLI never writes
+the checkout. Remaining findings still apply.
 
-Proposed user entry point: `checkleft fix --check text/style`. The host finds the
-installed bundle and handles the complete invocation.
-
-## Deferred work
-
-Network request declarations and brokered responses need a separate concrete
-design; they are not part of v1. Validators remain offline. Any future network
-data must be fetched by checkleft and frozen before validator execution.
-
-A future ReAPI backend executes the same bundled CLI, input tree, arguments, and
-explicit environment/platform, returning `output/`. Packaging transport and remote
-execution do not change the process contract; checkout mutation remains host-owned.
+Proposed command: `checkleft fix --check text/style`.
